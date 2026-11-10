@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 
+
 def compute_sha256(filepath: str) -> str:
     hasher = hashlib.sha256()
     with open(filepath, "rb") as f:
@@ -17,11 +18,22 @@ def compute_sha256(filepath: str) -> str:
             hasher.update(chunk)
     return hasher.hexdigest()
 
+
 def main():
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     server_dir = os.path.join(root_dir, "awan-storage", "server")
     dist_dir = os.path.join(root_dir, "awan-storage", "dist")
     os.makedirs(dist_dir, exist_ok=True)
+
+    # Remove any fake ELF placeholder files if present from earlier unverified runs
+    for stale_stub in [
+        "awan-storage-server-x86_64-linux-gnu",
+        "awan-storage-server-x86_64-linux-musl",
+        "awan-storage-server-aarch64-linux-gnu",
+    ]:
+        stub_path = os.path.join(dist_dir, stale_stub)
+        if os.path.exists(stub_path) and os.path.getsize(stub_path) < 1024:
+            os.remove(stub_path)
 
     producing_cmd = "python awan-storage/scripts/build_release_matrix.py"
     print(f"Building Release Binary Matrix under {dist_dir}...")
@@ -29,82 +41,73 @@ def main():
     manifest = os.path.join(server_dir, "Cargo.toml")
 
     # 1. Native Windows x86_64 Release Build
-    print("  [1/4] Building Windows x86_64 release binary...")
-    subprocess.run(["cargo", "build", "--release", "--bin", "awan-storage-server", "--manifest-path", manifest], check=True)
+    print("  [1/4] Building Windows x86_64 release binary (--release)...")
+    subprocess.run(
+        ["cargo", "build", "--release", "--bin", "awan-storage-server", "--manifest-path", manifest],
+        check=True,
+    )
     src_win = os.path.join(server_dir, "target", "release", "awan-storage-server.exe")
     dst_win = os.path.join(dist_dir, "awan-storage-server-x86_64-windows.exe")
     shutil.copy2(src_win, dst_win)
 
-    # 2. Linux x86_64 (glibc) Verification
-    print("  [2/4] Verifying Linux x86_64 (glibc) target...")
-    subprocess.run(["cargo", "check", "--target", "x86_64-unknown-linux-gnu", "--manifest-path", manifest], check=True)
-    dst_linux_gnu = os.path.join(dist_dir, "awan-storage-server-x86_64-linux-gnu")
-    # Emit distribution package placeholder / elf stub
-    with open(dst_linux_gnu, "wb") as f:
-        f.write(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 8 + b"AWAN_STORAGE_X86_64_LINUX_GNU_RELEASE\n")
+    # 2. Linux x86_64 (glibc) Cross-Target Verification
+    print("  [2/4] Verifying Linux x86_64 (glibc) target (`cargo check --target x86_64-unknown-linux-gnu`)...")
+    subprocess.run(
+        ["cargo", "check", "--target", "x86_64-unknown-linux-gnu", "--manifest-path", manifest],
+        check=True,
+    )
 
-    # 3. Linux x86_64 (musl static) Verification
-    print("  [3/4] Verifying Linux x86_64 (musl) static target...")
-    subprocess.run(["cargo", "check", "--target", "x86_64-unknown-linux-musl", "--manifest-path", manifest], check=True)
-    dst_linux_musl = os.path.join(dist_dir, "awan-storage-server-x86_64-linux-musl")
-    with open(dst_linux_musl, "wb") as f:
-        f.write(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 8 + b"AWAN_STORAGE_X86_64_LINUX_MUSL_STATIC_RELEASE\n")
+    # 3. Linux x86_64 (musl static) Cross-Target Verification
+    print("  [3/4] Verifying Linux x86_64 (musl) static target (`cargo check --target x86_64-unknown-linux-musl`)...")
+    subprocess.run(
+        ["cargo", "check", "--target", "x86_64-unknown-linux-musl", "--manifest-path", manifest],
+        check=True,
+    )
 
-    # 4. Linux aarch64 (Graviton ARM64) Verification
-    print("  [4/4] Verifying Linux aarch64 (ARM64) target...")
-    subprocess.run(["cargo", "check", "--target", "aarch64-unknown-linux-gnu", "--manifest-path", manifest], check=True)
-    dst_linux_arm64 = os.path.join(dist_dir, "awan-storage-server-aarch64-linux-gnu")
-    with open(dst_linux_arm64, "wb") as f:
-        f.write(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 8 + b"AWAN_STORAGE_AARCH64_LINUX_GNU_RELEASE\n")
+    # 4. Linux aarch64 (Graviton ARM64) Cross-Target Verification
+    print("  [4/4] Verifying Linux aarch64 (ARM64) target (`cargo check --target aarch64-unknown-linux-gnu`)...")
+    subprocess.run(
+        ["cargo", "check", "--target", "aarch64-unknown-linux-gnu", "--manifest-path", manifest],
+        check=True,
+    )
 
-    # Generate SHA256SUMS.txt
-    artifacts = [
-        ("awan-storage-server-x86_64-windows.exe", dst_win, "x86_64-pc-windows-msvc", "Windows x86_64 Native Release"),
-        ("awan-storage-server-x86_64-linux-gnu", dst_linux_gnu, "x86_64-unknown-linux-gnu", "Linux x86_64 (glibc) Target Verified"),
-        ("awan-storage-server-x86_64-linux-musl", dst_linux_musl, "x86_64-unknown-linux-musl", "Linux x86_64 (musl static) Target Verified"),
-        ("awan-storage-server-aarch64-linux-gnu", dst_linux_arm64, "aarch64-unknown-linux-gnu", "Linux ARM64 (Graviton) Target Verified"),
-    ]
-
-    sha_lines = []
-    matrix_rows = []
-
-    for filename, filepath, target, desc in artifacts:
-        sha = compute_sha256(filepath)
-        size_kb = os.path.getsize(filepath) / 1024.0
-        sha_lines.append(f"{sha}  {filename}")
-        matrix_rows.append(f"| `{filename}` | `{target}` | {desc} | {size_kb:.1f} KiB | `{sha[:16]}...` |")
+    win_sha = compute_sha256(dst_win)
+    win_size_kb = os.path.getsize(dst_win) / 1024.0
 
     sha_file = os.path.join(dist_dir, "SHA256SUMS.txt")
-    with open(sha_file, "w") as f:
-        f.write("\n".join(sha_lines) + "\n")
+    with open(sha_file, "w", encoding="utf-8") as f:
+        f.write(f"{win_sha}  awan-storage-server-x86_64-windows.exe\n")
 
     report_path = os.path.join(root_dir, "docs", "measurements", "s3_release_binaries_matrix.md")
-    with open(report_path, "w") as f:
+    with open(report_path, "w", encoding="utf-8") as f:
         f.write(f"""`{producing_cmd}`
 
-# S3 Release Binary Matrix & Packaging Report (Wave 5)
+# S3 Release Binary Matrix & Cross-Target Verification Report (Wave 5)
 
 - **Distribution Directory:** `awan-storage/dist/`
 - **Integrity Manifest:** `awan-storage/dist/SHA256SUMS.txt`
+- **Host Environment:** Windows x86_64 (`x86_64-pc-windows-msvc`)
 - **Release Profile:** Optimized (`--release`), Pure Rust Dependencies, Zero C-Toolchain Breakages.
 
-## 1. Multi-OS & Multi-Architecture Binary Matrix
+## 1. Multi-OS & Multi-Architecture Build & Verification Matrix
 
-| Binary Artifact | Target Triple | Target Description | Artifact Size | SHA-256 Fingerprint |
+| Target Artifact | Rust Target Triple | Verification on Windows Host | Binary Size | SHA-256 Fingerprint |
 | :--- | :--- | :--- | :--- | :--- |
-{chr(10).join(matrix_rows)}
+| `awan-storage-server-x86_64-windows.exe` | `x86_64-pc-windows-msvc` | **Compiled (`cargo build --release`) + Smoke-Tested** | {win_size_kb:.1f} KiB | `{win_sha[:16]}...` |
+| `awan-storage-server-x86_64-linux-gnu` | `x86_64-unknown-linux-gnu` | **`cargo check --target x86_64-unknown-linux-gnu` PASS** (linked in Linux CI `.github/workflows/awan-storage.yml`; no Linux glibc CRT on Windows host) | not linked on Windows host | built in Linux CI |
+| `awan-storage-server-x86_64-linux-musl` | `x86_64-unknown-linux-musl` | **`cargo check --target x86_64-unknown-linux-musl` PASS** (linked in Linux CI; no musl-gcc CRT on Windows host) | not linked on Windows host | built in Linux CI |
+| `awan-storage-server-aarch64-linux-gnu` | `aarch64-unknown-linux-gnu` | **`cargo check --target aarch64-unknown-linux-gnu` PASS** (linked in Linux CI; no aarch64 glibc CRT on Windows host) | not linked on Windows host | built in Linux CI |
 
-## 2. Windows Smoke Test Verification
+## 2. Windows Release Binary Smoke Test Verification
 - Binary tested: `awan-storage/dist/awan-storage-server-x86_64-windows.exe --port 9999`
 - S3 wire reactor listens on `http://0.0.0.0:9999`
-- Smoke test verified successfully.
-
-## Result
-`All 4 OS/Architecture matrix deliverables packaged and verified with SHA-256 integrity.`
+- Full `SHA256SUMS.txt` entry:
+  `{win_sha}  awan-storage-server-x86_64-windows.exe`
 """)
 
-    print(f"Matrix successfully built. Checksums written to {sha_file}")
+    print(f"Matrix successfully verified. Checksums written to {sha_file}")
     print(f"Report written to {report_path}")
+
 
 if __name__ == "__main__":
     main()

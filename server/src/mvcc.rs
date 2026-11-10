@@ -57,6 +57,8 @@ impl MvccStore {
 
         let mut lock = self.active_versions.write();
         let list = lock.entry((bucket_id, key.to_string())).or_default();
+        // Keep only the latest committed version in the map; in-flight readers hold their own Arc<PinnedExtent>
+        list.clear();
         list.push(Arc::clone(&extent));
         extent
     }
@@ -82,9 +84,8 @@ impl MvccStore {
 
     pub fn tombstone(&self, bucket_id: u32, key: &str) {
         let _ = self.current_epoch.fetch_add(1, Ordering::SeqCst);
-        // Note: existing reader pins held by clients remain valid until Arc drops!
-        let _ = bucket_id;
-        let _ = key;
+        // Existing reader pins held by clients remain valid until their Arc<PinnedExtent> drops
+        self.active_versions.write().remove(&(bucket_id, key.to_string()));
     }
 }
 
