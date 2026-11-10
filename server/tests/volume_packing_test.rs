@@ -172,3 +172,48 @@ fn test_background_compaction_reclaims_dead_space() {
         assert_eq!(&data, expected_payload);
     }
 }
+
+#[tokio::test]
+async fn test_s3_reactor_persists_needles_and_recovers_after_cache_eviction() {
+    use awan_storage_server::{start_s3_reactor, S3ServiceState};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    let dir = temp_dir("s3_reactor_vol_integration");
+    let state = Arc::new(S3ServiceState::with_data_dir(&dir));
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let handle = start_s3_reactor(addr, Arc::clone(&state)).await.expect("start reactor");
+    let base_url = format!("http://{}", handle.local_addr);
+    let client = reqwest::Client::new();
+
+    // 1. Create bucket and PUT object
+    client.put(&format!("{}/vol-bucket", base_url)).send().await.unwrap();
+    let payload = b"Persistent 4096B-aligned WORM Needle payload via S3 PUT!";
+    let put_res = client
+        .put(&format!("{}/vol-bucket/needle-obj.bin", base_url))
+        .body(payload.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put_res.status(), reqwest::StatusCode::OK);
+
+    // 2. Verify volume_0001.dat grew on disk (>= 8192 bytes: 4096B superblock + 4096B needle)
+    let vol_file = dir.join("volume_0001.dat");
+    assert!(vol_file.exists(), "volume_0001.dat must exist on disk");
+    let file_len = fs::metadata(&vol_file).unwrap().len();
+    assert!(file_len >= 8192 && file_len % SECTOR_SIZE as u64 == 0);
+
+    // 3. Evict in-memory payload_store cache to force GET to read and CRC32C-verify from disk needle
+    state.payload_store.write().clear();
+
+    let get_res = client
+        .get(&format!("{}/vol-bucket/needle-obj.bin", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_res.status(), reqwest::StatusCode::OK);
+    let fetched = get_res.bytes().await.unwrap();
+    assert_eq!(fetched.as_ref(), payload);
+    handle.shutdown();
+}
+

@@ -274,4 +274,19 @@ fn test_sigv4_presigned_url_and_skew_checks() {
     set_fault_tamper_sigv4(true);
     assert_eq!(validate_sigv4_auth(None, &q, now).unwrap_err(), "SignatureDoesNotMatch");
     set_fault_tamper_sigv4(false);
+
+    // Cryptographic HMAC-SHA256 verification & key derivation cache test
+    use awan_storage_server::{compute_sigv4_signature, verify_sigv4_signature, SigV4KeyCache};
+    let cache = SigV4KeyCache::new();
+    let string_to_sign = "AWS4-HMAC-SHA256\n20251110T120000Z\n20251110/us-east-1/s3/aws4_request\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let valid_sig = compute_sigv4_signature(&cache, "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "20251110", "us-east-1", "s3", string_to_sign);
+    assert_eq!(valid_sig.len(), 64);
+    assert!(verify_sigv4_signature(&cache, "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "20251110", "us-east-1", "s3", string_to_sign, &valid_sig).is_ok());
+    // Negative Control: 1-char tampered signature hex fails cryptographic verification
+    let mut tampered_sig = valid_sig.clone();
+    tampered_sig.replace_range(0..1, if &valid_sig[0..1] == "a" { "b" } else { "a" });
+    assert_eq!(
+        verify_sigv4_signature(&cache, "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "20251110", "us-east-1", "s3", string_to_sign, &tampered_sig).unwrap_err(),
+        "SignatureDoesNotMatch"
+    );
 }

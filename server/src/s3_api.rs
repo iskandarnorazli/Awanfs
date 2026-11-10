@@ -20,7 +20,10 @@ use crate::lifecycle::*;
 use crate::multipart::*;
 use crate::mvcc::MvccStore;
 use crate::sigv4::*;
+use crate::volume::VolumeManager;
 use crate::xml::*;
+use std::path::Path;
+use std::sync::atomic::AtomicU64;
 
 pub type ResponseBody = BoxBody<Bytes, std::convert::Infallible>;
 
@@ -218,6 +221,8 @@ pub fn validate_s3_key(key: &str) -> Result<(), crate::error::S3ErrorCode> {
     Ok(())
 }
 
+static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 pub struct S3ServiceState {
     pub engine: Arc<RwLock<AwanStorageEngine>>,
     pub multipart: Arc<MultipartManager>,
@@ -225,12 +230,22 @@ pub struct S3ServiceState {
     pub lifecycle: Arc<LifecycleManager>,
     pub single_flight: Arc<SingleFlight>,
     pub mvcc: Arc<MvccStore>,
+    pub volume_manager: Option<Arc<VolumeManager>>,
+    pub needle_crc_map: Arc<RwLock<HashMap<(u32, u64), u32>>>,
     pub payload_store: Arc<RwLock<HashMap<(u32, u64), Bytes>>>,
     pub next_vol_offset: Arc<RwLock<u64>>,
 }
 
 impl S3ServiceState {
     pub fn new() -> Self {
+        let id = INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let default_dir = std::env::temp_dir().join(format!(
+            "awan_s3_vol_{}_{}",
+            std::process::id(),
+            id
+        ));
+        let _ = std::fs::create_dir_all(&default_dir);
+        let vol_mgr = VolumeManager::open(&default_dir, 1).ok().map(Arc::new);
         Self {
             engine: Arc::new(RwLock::new(AwanStorageEngine::new(100_000, 4_194_304, 65536))),
             multipart: Arc::new(MultipartManager::new()),
@@ -238,9 +253,67 @@ impl S3ServiceState {
             lifecycle: Arc::new(LifecycleManager::new()),
             single_flight: Arc::new(SingleFlight::new()),
             mvcc: Arc::new(MvccStore::new()),
+            volume_manager: vol_mgr,
+            needle_crc_map: Arc::new(RwLock::new(HashMap::new())),
             payload_store: Arc::new(RwLock::new(HashMap::new())),
             next_vol_offset: Arc::new(RwLock::new(4096)),
         }
+    }
+
+    pub fn with_data_dir(dir: &Path) -> Self {
+        let _ = std::fs::create_dir_all(dir);
+        let vol_mgr = VolumeManager::open(dir, 1).ok().map(Arc::new);
+        Self {
+            engine: Arc::new(RwLock::new(AwanStorageEngine::new(100_000, 4_194_304, 65536))),
+            multipart: Arc::new(MultipartManager::new()),
+            sigv4_cache: Arc::new(SigV4KeyCache::new()),
+            lifecycle: Arc::new(LifecycleManager::new()),
+            single_flight: Arc::new(SingleFlight::new()),
+            mvcc: Arc::new(MvccStore::new()),
+            volume_manager: vol_mgr,
+            needle_crc_map: Arc::new(RwLock::new(HashMap::new())),
+            payload_store: Arc::new(RwLock::new(HashMap::new())),
+            next_vol_offset: Arc::new(RwLock::new(4096)),
+        }
+    }
+
+    pub fn store_payload(&self, b_id: u32, key: &str, data: &Bytes, flags: u16) -> u64 {
+        if data.is_empty() {
+            return 0;
+        }
+        if let Some(ref vm) = self.volume_manager {
+            if let Ok(loc) = vm.write_needle(b_id as u16, key, data, flags) {
+                self.needle_crc_map.write().insert((b_id, loc.offset), loc.payload_crc32c);
+                self.payload_store.write().insert((b_id, loc.offset), data.clone());
+                return loc.offset;
+            }
+        }
+        let off = self.allocate_offset(data.len());
+        self.payload_store.write().insert((b_id, off), data.clone());
+        off
+    }
+
+    pub fn load_payload(&self, b_id: u32, vol_offset: u64, expected_size: usize) -> Bytes {
+        if expected_size == 0 || vol_offset == 0 {
+            return Bytes::new();
+        }
+        if let Some(cached) = self.payload_store.read().get(&(b_id, vol_offset)).cloned() {
+            return cached;
+        }
+        if let Some(ref vm) = self.volume_manager {
+            let expected_crc = self
+                .needle_crc_map
+                .read()
+                .get(&(b_id, vol_offset))
+                .copied()
+                .unwrap_or(0);
+            if let Ok(vec) = vm.read_needle(1, vol_offset, expected_crc) {
+                let b = Bytes::from(vec);
+                self.payload_store.write().insert((b_id, vol_offset), b.clone());
+                return b;
+            }
+        }
+        Bytes::from(vec![0u8; expected_size])
     }
 
     pub fn allocate_offset(&self, size: usize) -> u64 {
@@ -573,12 +646,25 @@ pub async fn handle_s3_request(
                     };
 
                     let mut deleted = Vec::new();
+                    let mut offsets_to_remove = Vec::new();
                     for k in &keys_to_delete {
+                        if let Ok(m) = engine.get_object(b_id, k.as_bytes()) {
+                            if m.vol_offset > 0 {
+                                offsets_to_remove.push(m.vol_offset);
+                            }
+                        }
                         let _ = engine.delete_object(b_id, k.as_bytes());
                         deleted.push(DeleteItemResult {
                             key: k.as_str(),
                             version_id: None,
                         });
+                    }
+                    drop(engine);
+                    if !offsets_to_remove.is_empty() {
+                        let mut pstore = state.payload_store.write();
+                        for off in offsets_to_remove {
+                            pstore.remove(&(b_id, off));
+                        }
                     }
 
                     let xml = delete_objects_result_xml(&deleted, &[]);
@@ -670,8 +756,7 @@ pub async fn handle_s3_request(
                 };
 
                 let (hi, lo, hex, raw_md5) = compute_md5(&decoded_bytes);
-                let vol_offset = state.allocate_offset(decoded_bytes.len());
-                state.payload_store.write().insert((b_id, vol_offset), decoded_bytes.clone());
+                let vol_offset = state.store_payload(b_id, &key, &decoded_bytes, AWAN_FLAG_ACTIVE);
 
                 match state.multipart.upload_part(
                     upload_id,
@@ -956,13 +1041,22 @@ pub async fn handle_s3_request(
                         AWAN_FLAG_ACTIVE
                     };
 
+                    let old_offset = {
+                        let engine = state.engine.read();
+                        engine.get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset)
+                    };
+
                     let vol_offset = if decoded_bytes.is_empty() {
                         0
                     } else {
-                        let off = state.allocate_offset(decoded_bytes.len());
-                        state.payload_store.write().insert((b_id, off), decoded_bytes.clone());
-                        off
+                        state.store_payload(b_id, &key, &decoded_bytes, flags)
                     };
+
+                    if let Some(prev_off) = old_offset {
+                        if prev_off > 0 && prev_off != vol_offset {
+                            state.payload_store.write().remove(&(b_id, prev_off));
+                        }
+                    }
 
                     state.mvcc.commit_version(b_id, &key, 1, vol_offset, payload_len, decoded_bytes);
 
@@ -1038,33 +1132,39 @@ pub async fn handle_s3_request(
                         }
                     }
 
-                    // Fetch payload (either single volume needle or multi-part extent stitched)
-                    let payload = if is_multipart {
-                        if let Some(extents) = state.multipart.get_completed_extents(b_id, &key) {
-                            let pstore = state.payload_store.read();
-                            let mut stitched = Vec::with_capacity(meta.size as usize);
-                            for ext in extents {
-                                if let Some(chunk) = pstore.get(&(b_id, ext.vol_offset)) {
-                                    stitched.extend_from_slice(chunk);
+                    // Coalesce concurrent hot GET requests via SingleFlight before reading/stitching payload
+                    let single_flight_key = format!("{}/{}/{}", bucket, key, meta.vol_offset);
+                    let state_for_read = Arc::clone(&state);
+                    let key_for_read = key.clone();
+                    let payload = state
+                        .single_flight
+                        .execute_or_join(&single_flight_key, || async move {
+                            if is_multipart {
+                                if let Some(extents) =
+                                    state_for_read.multipart.get_completed_extents(b_id, &key_for_read)
+                                {
+                                    let mut stitched = Vec::with_capacity(meta.size as usize);
+                                    for ext in extents {
+                                        let chunk = state_for_read.load_payload(
+                                            b_id,
+                                            ext.vol_offset,
+                                            ext.part_size as usize,
+                                        );
+                                        stitched.extend_from_slice(&chunk);
+                                    }
+                                    Bytes::from(stitched)
+                                } else {
+                                    Bytes::from(vec![0u8; meta.size as usize])
                                 }
+                            } else {
+                                state_for_read.load_payload(
+                                    b_id,
+                                    meta.vol_offset,
+                                    meta.size as usize,
+                                )
                             }
-                            Bytes::from(stitched)
-                        } else {
-                            Bytes::from(vec![0u8; meta.size as usize])
-                        }
-                    } else {
-                        state
-                            .payload_store
-                            .read()
-                            .get(&(b_id, meta.vol_offset))
-                            .cloned()
-                            .unwrap_or_else(|| Bytes::from(vec![0u8; meta.size as usize]))
-                    };
-
-                    let single_flight_key = format!("{}/{}", bucket, key);
-                    let payload = state.single_flight.execute_or_join(&single_flight_key, || async move {
-                        payload
-                    }).await;
+                        })
+                        .await;
 
                     let range_hdr = req.headers().get("Range").and_then(|v| v.to_str().ok());
                     let range_res = range_hdr.map(|h| parse_range_header(h, meta.size));
@@ -1126,8 +1226,17 @@ pub async fn handle_s3_request(
 
                 Method::DELETE => {
                     state.mvcc.tombstone(b_id, &key);
-                    let mut engine = state.engine.write();
-                    let _ = engine.delete_object(b_id, key.as_bytes());
+                    let old_offset = {
+                        let mut engine = state.engine.write();
+                        let off = engine.get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset);
+                        let _ = engine.delete_object(b_id, key.as_bytes());
+                        off
+                    };
+                    if let Some(off) = old_offset {
+                        if off > 0 {
+                            state.payload_store.write().remove(&(b_id, off));
+                        }
+                    }
                     Ok(Response::builder()
                         .status(StatusCode::NO_CONTENT)
                         .header(CONTENT_LENGTH, "0")

@@ -175,3 +175,52 @@ pub fn validate_sigv4_auth(
     // Unauthenticated (or anonymous): allowed if server permits public access
     Ok(())
 }
+
+/// Cryptographically computes and verifies an AWS Signature Version 4 HMAC-SHA256 hex digest
+/// against a canonical String-To-Sign using the cached 4-step derived signing key.
+pub fn compute_sigv4_signature(
+    cache: &SigV4KeyCache,
+    secret_key: &str,
+    date_yyyymmdd: &str,
+    region: &str,
+    service: &str,
+    string_to_sign: &str,
+) -> String {
+    let signing_key = cache.get_or_derive(secret_key, date_yyyymmdd, region, service);
+    let mut mac = HmacSha256::new_from_slice(&signing_key).expect("HMAC takes any key length");
+    mac.update(string_to_sign.as_bytes());
+    let result = mac.finalize().into_bytes();
+    let mut hex = String::with_capacity(64);
+    for b in result {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    hex
+}
+
+pub fn verify_sigv4_signature(
+    cache: &SigV4KeyCache,
+    secret_key: &str,
+    date_yyyymmdd: &str,
+    region: &str,
+    service: &str,
+    string_to_sign: &str,
+    provided_signature_hex: &str,
+) -> Result<(), &'static str> {
+    if FAULT_TAMPER_SIGV4.load(Ordering::Relaxed) {
+        return Err("SignatureDoesNotMatch");
+    }
+    let expected = compute_sigv4_signature(
+        cache,
+        secret_key,
+        date_yyyymmdd,
+        region,
+        service,
+        string_to_sign,
+    );
+    if expected.eq_ignore_ascii_case(provided_signature_hex.trim()) {
+        Ok(())
+    } else {
+        Err("SignatureDoesNotMatch")
+    }
+}
+
