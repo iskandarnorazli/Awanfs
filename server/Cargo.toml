@@ -1,0 +1,33 @@
+[package]
+name = "awan-storage-server"
+version = "0.1.0"
+edition = "2021"
+authors = ["Iskandar Norazli <111472977+iskandarnorazli@users.noreply.github.com>"]
+description = "High-performance S3-compatible hybrid object storage daemon with Awan columnar index"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "awan_storage_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "awan-storage-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1.6"
+md-5 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+crc32c = "0.6"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+quick-xml = "0.36"
+parking_lot = "0.12"
+
+[dev-dependencies]
+proptest = "1.4"
+reqwest = { version = "0.12", features = ["stream"] }
