@@ -535,10 +535,10 @@ python awan-storage/scripts/build_release_matrix.py
 ./awan-storage/dist/awan-compiler-x86_64-windows.exe test awan-storage/tests/meta_index.test.awan
 
 # 3. Execute script directly in the JIT/VM engine
-./awan-storage/dist/awan-compiler-x86_64-windows.exe run benchmarks/object_storage_poc/storage_engine.awan
+./awan-storage/dist/awan-compiler-x86_64-windows.exe run awan-storage/benchmarks/storage_engine.awan
 
 # 4. Compile to a standalone native executable via the LLVM backend
-./awan-storage/dist/awan-compiler-x86_64-windows.exe emit-llvm benchmarks/object_storage_poc/storage_engine.awan -o storage_bench.exe --target-cpu x86-64-v3
+./awan-storage/dist/awan-compiler-x86_64-windows.exe emit-llvm awan-storage/benchmarks/storage_engine.awan -o storage_bench.exe --target-cpu x86-64-v3
 
 # 5. Compile an Awan module as a C-ABI shared library (.dll / .so / .dylib) for Rust FFI
 ./awan-storage/dist/awan-compiler-x86_64-windows.exe build awan-storage/engine/storage_core.awan --release --shared -o awan-storage/dist/

@@ -26,7 +26,7 @@ In pure scalar software loops, computing SHA-256 on a 1 GB payload takes over **
 
 ## 3. Catalog Signatures & Built-in Mapping
 
-Added to [`core/src/builtins/catalog.rs`](../core/src/builtins/catalog.rs):
+Added to `core/src/builtins/catalog.rs`:
 
 ```rust
 // Built-in Catalog Entry
@@ -75,7 +75,7 @@ In `core/src/codegen/llvm_bridge.rs`, calls to `crypto_sha256_slice` and `crypto
 ## 5. VM Reference Oracle & Parity Verification
 
 To enforce Core Invariant 2 ("One oracle for every engine"):
-- **Reference Oracle:** The VM executes the FIPS PUB 180-4 standard pure-Awan implementation in [`libs/awan-crypto/sha256.awan`](../libs/awan-crypto/sha256.awan).
-- **Parity Probe:** Added to [`core/tests/feature_parity_test.rs`](../core/tests/feature_parity_test.rs):
+- **Reference Oracle:** The VM executes the FIPS PUB 180-4 standard pure-Awan implementation in `libs/awan-crypto/sha256.awan`.
+- **Parity Probe:** Added to `core/tests/feature_parity_test.rs`:
   - Feeds identical NIST test vectors (empty string, 3-byte `"abc"`, 1 MB repeated pattern) to both the VM and Native LLVM engines.
   - Asserts identical 64-character hexadecimal digest outputs.

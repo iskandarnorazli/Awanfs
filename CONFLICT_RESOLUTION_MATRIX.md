@@ -47,17 +47,17 @@ This document details the **5 critical conflict zones**, their failure modes, an
 - **The Tension:** Awan enforces strict value semantics (Decisions N13/N14). By default, container index assignments (`arr[i] = v`) pass through the VSSA frontend's `vssa_lower_mut_place`, emitting copy-on-write checks (`VSSA_OP_MAKE_MUT`) to prevent aliasing.
 - **The Failure Mode:** When streaming 10,000 chunks of 64 KB (640 MB), checking `MAKE_MUT` on every packet iteration adds 13,000,000 C runtime calls, causing severe register spilling and killing throughput (as diagnosed in [Issue #436](../docs/measurements/pipeline_plain_lists_ir_2026-11-08.md)).
 - **Formal Resolution (Provably Unshared Analysis):**
-  - Leverage the whole-program unshared container analysis implemented in [`vssa_builder.awan`](../compiler_src/backend/vssa_builder.awan):
+  - Leverage the whole-program unshared container analysis implemented in `vssa_builder.awan`:
     - When a chunk ring buffer is allocated locally with a fresh literal or leased from the runtime slab, and never escapes to global references, `vssa_is_provably_unshared` returns `true`.
   - The compiler lowers writes directly to raw memory pointer stores (`vals[idx] = val`), bypassing `MAKE_MUT` and alloca reload/stores entirely.
 
 ---
 
 ### Conflict 3: Hardware-Accelerated Intrinsics vs "One Oracle for Every Engine" (Rule 2)
-- **The Tension:** Rule 2 of `AGENTS.md` mandates that **the VM is the reference oracle for the language**. Every language feature must produce bit-identical results on both the VM and Native backends, verified by differential parity probes ([`core/tests/feature_parity_test.rs`](../core/tests/feature_parity_test.rs)). If the Native backend lowers `sha256` to hardware CPU instructions (Intel SHA-NI), how does the VM comply?
+- **The Tension:** Rule 2 of `AGENTS.md` mandates that **the VM is the reference oracle for the language**. Every language feature must produce bit-identical results on both the VM and Native backends, verified by differential parity probes (`core/tests/feature_parity_test.rs`). If the Native backend lowers `sha256` to hardware CPU instructions (Intel SHA-NI), how does the VM comply?
 - **The Failure Mode:** If Native and VM implement different hashing semantics, differential parity tests fail, or VM mocks produce different S3 ETags than production native binaries.
 - **Formal Resolution (Coupled Reference Implementation):**
-  - The VM executes the pure-Awan standard implementation in [`libs/awan-crypto/sha256.awan`](../libs/awan-crypto/sha256.awan) (FIPS PUB 180-4 compliant).
+  - The VM executes the pure-Awan standard implementation in `libs/awan-crypto/sha256.awan` (FIPS PUB 180-4 compliant).
   - The Native compiler lowers the exact same built-in signature (`crypto_sha256_update`, `crypto_crc32c`) to hardware intrinsics in `llvm_bridge.rs`.
   - Both implementations are validated against the standard NIST test vectors in `feature_parity_test.rs`. The VM serves as the oracle for logical correctness; Native accelerates the execution.
 

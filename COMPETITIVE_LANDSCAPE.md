@@ -73,7 +73,7 @@ The Phase 2 head-to-head benchmark matrix will execute using MinIO's official [`
 
 When infrastructure teams evaluate S3-compatible engines (`warp`, `s5cmd`, `rclone`, PyTorch DataLoader, DuckDB/Polars), they look at four distinct axes depending on object size:
 
-| Metric | What It Measures | When Engineers Care Most | How `awan-storage` Performs (Measured in [`s3_warp_minio_vs_awan.md`](../docs/measurements/s3_warp_minio_vs_awan.md)) |
+| Metric | What It Measures | When Engineers Care Most | How `awan-storage` Performs (Measured in [`s3_warp_minio_vs_awan.md`](measurements/s3_warp_minio_vs_awan.md)) |
 | :--- | :--- | :--- | :--- |
 | **Operations/sec (IOPS)** | Metadata lookup, HTTP framing, SigV4 auth, and small-needle disk append rate | **Small Objects (`<= 64 KiB`)** & **Byte-Range Reads (`206 Partial Content`)** (e.g., Parquet footer/column headers, Safetensors metadata, JSON logs) | **5,984 PUT ops/s** (5.94x over file-per-object baseline), **6,061 GET ops/s** (3.08x), **6,585 Range GET ops/s** (3.20x) at 64-client concurrency |
 | **Throughput (`MiB/s` / `GiB/s`)** | Sustained NVMe + socket DMA bandwidth | **Large Objects (`1 MiB` – `10 GiB`)** & **Multipart Uploads (`16 x 64 MiB` parts)** (e.g., LLM checkpoints, container snapshots, Parquet blobs) | **794.4 MiB/s** (1 MiB PUT), **1,273.8 MiB/s** (1 MiB GET), **826.8 MiB/s** (1 MiB Multipart Upload, 3.39x), **1,203.8 MiB/s** (1 GiB Multipart Range GET), **1,244.1 MiB/s** (10 GiB Volume GET) |
