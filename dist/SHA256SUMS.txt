@@ -1,0 +1,4 @@
+affe5d888ee4e0f9e0ce479f6ae8a658e512ba4d18f6eca3a6bd9561a9044d4d  awan-storage-server-x86_64-windows.exe
+7dcc5b13c2d73e6d0d02538e98c297af426fb685c041c28b22ac3c8e67225bc0  awan-storage-server-x86_64-linux-gnu
+98582992e7e9a657a5d7238d65f1f79370fdd9a6ed209381a61dc2255da9e0b4  awan-storage-server-x86_64-linux-musl
+67fff4ec0ea5ac2b8810217cf21a556929caccacba798999c9b3b4cda439a994  awan-storage-server-aarch64-linux-gnu
