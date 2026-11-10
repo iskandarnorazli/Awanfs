@@ -151,6 +151,28 @@ pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarge
     }
 }
 
+pub fn percent_decode(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex_val) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(hex_val);
+                i += 3;
+                continue;
+            }
+        } else if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 pub fn md5_to_etag_hex(hi: u64, lo: u64) -> String {
     let mut bytes = [0u8; 16];
     bytes[0..8].copy_from_slice(&hi.to_be_bytes());
@@ -249,9 +271,14 @@ pub async fn handle_s3_request(
     let mut query_map = HashMap::new();
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
-            query_map.insert(k.to_string(), v.to_string());
+            let dec_k = percent_decode(k);
+            let dec_v = percent_decode(v);
+            query_map.insert(dec_k.to_lowercase(), dec_v.clone());
+            query_map.insert(dec_k, dec_v);
         } else if !pair.is_empty() {
-            query_map.insert(pair.to_string(), String::new());
+            let dec_k = percent_decode(pair);
+            query_map.insert(dec_k.to_lowercase(), String::new());
+            query_map.insert(dec_k, String::new());
         }
     }
 

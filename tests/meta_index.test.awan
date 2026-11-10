@@ -1,0 +1,80 @@
+// awan-storage/tests/meta_index.test.awan
+// Awan Storage Metadata Index and Columnar Layout Tests (#464)
+
+fn make_bucket_flags(bucket_id: Int, part_count: Int, flags: Int) -> Int {
+    return (bucket_id * 4294967296) + (part_count * 65536) + flags;
+}
+
+fn get_bucket_id(bucket_flags: Int) -> Int {
+    return bucket_flags / 4294967296;
+}
+
+fn get_part_count(bucket_flags: Int) -> Int {
+    return (bucket_flags / 65536) % 65536;
+}
+
+fn get_flags(bucket_flags: Int) -> Int {
+    return bucket_flags % 65536;
+}
+
+fn make_key_slice(arena_offset: Int, key_len: Int) -> Int {
+    return (arena_offset * 65536) + key_len;
+}
+
+fn get_arena_offset(key_slice: Int) -> Int {
+    return key_slice / 65536;
+}
+
+fn get_key_len(key_slice: Int) -> Int {
+    return key_slice % 65536;
+}
+
+test "bucket_flags bitpacking and unpacking" {
+    let b_id = 7;
+    let parts = 25;
+    let flags = 3;
+
+    let packed = make_bucket_flags(b_id, parts, flags);
+    assert_eq(get_bucket_id(packed), 7);
+    assert_eq(get_part_count(packed), 25);
+    assert_eq(get_flags(packed), 3);
+}
+
+test "key_slice arena offset and length bitpacking" {
+    let offset = 655360;
+    let len = 42;
+
+    let slice = make_key_slice(offset, len);
+    assert_eq(get_arena_offset(slice), 655360);
+    assert_eq(get_key_len(slice), 42);
+}
+
+test "cumulative end prefix sums for multipart extent lookup" {
+    let part_sizes = [5242880, 5242880, 5242880, 1048576]; // 3 x 5MB + 1 x 1MB = 16MB
+    var cumulative = [0, 0, 0, 0];
+    var acc = 0;
+    var i = 0;
+    while (i < len(part_sizes)) {
+        acc += part_sizes[i];
+        cumulative[i] = acc;
+        i += 1;
+    }
+
+    assert_eq(cumulative[0], 5242880);
+    assert_eq(cumulative[1], 10485760);
+    assert_eq(cumulative[2], 15728640);
+    assert_eq(cumulative[3], 16777216);
+
+    // Range query [6000000, 7000000] falls entirely inside Part 2 (offset 5242880..10485760)
+    let query_offset = 6000000;
+    var matched_part = -1;
+    var p = 0;
+    while (p < len(cumulative)) {
+        if (query_offset < cumulative[p]) {
+            matched_part = p + 1;
+            break;
+        }
+        p += 1;
+    }
+    assert_eq(matched_part, 2);
+}
