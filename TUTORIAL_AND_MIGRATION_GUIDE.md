@@ -510,7 +510,8 @@ test "bucket_flags bitpacking and unpacking" {
 
 | Binary Artifact | Target OS / Arch | Role |
 | :--- | :--- | :--- |
-| `awan-compiler-x86_64-windows.exe` | Windows `x86_64` (`msvc`) | Full Awan Compiler CLI (`check`, `run`, `test`, `build`, `emit-llvm`, `lsp`, `mcp`) |
+| `awan-compiler-x86_64-windows.exe` | Windows `x86_64` (`msvc`) | Full Awan Compiler CLI (`check`, `run`, `test`, `emit-llvm`, `lsp`, `mcp`) |
+| `awan-vssa-frontend-x86_64-windows.exe` | Windows `x86_64` (`msvc`) | Compiled Native VSSA Frontend (`.awan` -> `.vssa.json`, zero `compiler_src/` needed) |
 | `awan-aot-x86_64-windows.exe` | Windows `x86_64` (`msvc`) | Awan AOT Standalone Builder & Sysroot Manager |
 | `awan-ld-x86_64-windows.exe` | Windows `x86_64` (`msvc`) | `AwanLink` Native Object Linker |
 | `awan-storage-server-x86_64-windows.exe` | Windows `x86_64` (`msvc`) | Drop-in S3-Compatible Storage Server |
@@ -537,11 +538,13 @@ python awan-storage/scripts/build_release_matrix.py
 # 3. Execute script directly in the JIT/VM engine
 ./awan-storage/dist/awan-compiler-x86_64-windows.exe run awan-storage/benchmarks/storage_engine.awan
 
-# 4. Compile to a standalone native executable via the LLVM backend
-./awan-storage/dist/awan-compiler-x86_64-windows.exe emit-llvm awan-storage/benchmarks/storage_engine.awan -o storage_bench.exe --target-cpu x86-64-v3
+# 4. Compile .awan to a standalone native executable using only the compiled binaries (zero compiler_src/ needed):
+#    Step A: Lower .awan -> .vssa.json via the compiled native VSSA frontend binary
+AWAN_CLI_ARGS="compile awan-storage/benchmarks/storage_engine.awan -o storage_engine.vssa.json" \
+  ./awan-storage/dist/awan-vssa-frontend-x86_64-windows.exe compile awan-storage/benchmarks/storage_engine.awan -o storage_engine.vssa.json
 
-# 5. Compile an Awan module as a C-ABI shared library (.dll / .so / .dylib) for Rust FFI
-./awan-storage/dist/awan-compiler-x86_64-windows.exe build awan-storage/engine/storage_core.awan --release --shared -o awan-storage/dist/
+#    Step B: Compile .vssa.json -> native AVX2/NEON executable via the LLVM backend
+./awan-storage/dist/awan-compiler-x86_64-windows.exe emit-llvm storage_engine.vssa.json -o storage_bench.exe --target-cpu x86-64-v3 -r
 ```
 
 ### 8.3 How Awan and Rust Mix Across the Zero-Copy C-ABI Boundary
