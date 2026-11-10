@@ -1,294 +1,241 @@
 # Awan Storage: Hybrid S3 Substrate & MinIO Benchmark PoC Specification
 
-> **Specification for Phase 2 Fast-Track PoC**  
-> **Architecture: Rust Network/Thread/Disk Substrate + Awan Compiled Native `@flat` SoA Engine**  
-> **Oracle & Benchmark Targets: MinIO Differential Fuzzing Oracle & MinIO `warp` Suite**
+> **Specification for Phase 2 Fast-Track Drop-In S3 PoC**  
+> **Architecture: Rust Network/Thread/Volume Substrate + Awan Compiled Native `@flat` SoA Engine**  
+> **Oracle & Benchmark Targets: MinIO Differential Fuzzing Oracle, Ceph `s3-tests`, & MinIO `warp` Suite**
 
 ---
 
 ## 1. Architectural Strategy & Rationale
 
-### 1.1 The Problem: Infrastructure Latency vs Engine Proof
-The fundamental thesis of Awan Storage is that:
-1. Contiguous `@flat ObjectMeta` Struct-of-Arrays (SoA) layout eliminates pointer chasing, CPU cache misses, and garbage collection pauses.
-2. Contiguous `@arena` chunk slabs eliminate dynamic memory allocation (`malloc`/`free`) on the hot read/write path.
-3. Hardware-accelerated SIMD intrinsics (CRC32c / Blake3) saturate bus bandwidth without CPU throttling.
+### 1.1 The Problem: Infrastructure Plumbing vs Engine Proof
+The core performance thesis of Awan Storage is built on three pillars:
+1. Contiguous `@flat ObjectMeta` Struct-of-Arrays (SoA) layout paired with a Key String Arena and Adaptive Radix Tree (ART) prefix index eliminates pointer chasing, CPU cache misses, and garbage collection pauses.
+2. Preallocated 4096-byte aligned `@arena` chunk slabs paired with append-only WORM Needle Volume files (`O_DIRECT` / `FILE_FLAG_NO_BUFFERING`) eliminate dynamic heap allocation (`malloc`/`free`), OS PageCache double-buffering, and filesystem inode thrashing.
+3. Hardware-accelerated SIMD intrinsics (Intel SHA-NI, ARMv8 Crypto, SSE4.2 CRC32C) saturate network and NVMe bus bandwidth without CPU bottlenecks.
 
-However, developing a production-grade async completion I/O reactor in pure Awan ([Issue #53](https://github.com/iskandarnorazli/awan-lang/issues/53)), full columnar disk format serialization ([Issue #202](https://github.com/iskandarnorazli/awan-lang/issues/202)), and NUMA thread-per-core workers from scratch requires several months of core language compiler development.
+Building a pure-Awan async completion reactor ([Issue #53](https://github.com/iskandarnorazli/awan-lang/issues/53)) and native columnar file I/O ([Issue #202](https://github.com/iskandarnorazli/awan-lang/issues/202)) in the compiler first would delay live S3 benchmarks by months.
 
 ### 1.2 The Solution: Standard Substrate / Host Pattern
-To prove the performance thesis **now**, we employ the standard systems engineering **Substrate / Host Architecture** (identical to Node.js hosting V8 inside a C++ `libuv` reactor, or PyTorch hosting tensor computation inside a C++ runtime loop):
-- **Rust Substrate (The Chassis)**: Implements standard non-blocking HTTP/1.1 socket completion, NUMA thread-per-core worker pools (`core_affinity`), and memory-mapped file chunk backing (`memmap2`).
-- **Awan Native Engine (The Core)**: Compiles Awan's `@flat ObjectMeta` SoA index, chunk slab allocator, and SIMD checksumming into a native C-ABI dynamic or static library (`libawan_storage`).
-- **MinIO as an Oracle**: Uses a local MinIO instance as a differential testing and fuzzing oracle to guarantee $100\%$ S3 REST protocol fidelity.
-- **Head-to-Head `warp` Benchmark**: Measures live network performance against MinIO using the official MinIO `warp` benchmark tool.
+We employ the **Substrate / Host Architecture**:
+- **Rust Substrate (`awan-storage-server`)**: Provides non-blocking HTTP/1.1 & HTTP/2 socket completion on port `9000`, `SO_REUSEPORT` listener partitioning, NUMA thread-per-core worker pinning (`core_affinity`), `aws-chunked` streaming decoding, and 4096-byte aligned Direct I/O volume backing.
+- **Awan Native Engine (`libawan_storage`)**: Compiles Awan's `@flat ObjectMeta` SoA index, `@flat PartExtent` multipart table, Key String Arena, and `@arena` slab allocator into a native C-ABI library called directly by the Rust workers with zero heap copies.
+- **MinIO as Differential Oracle**: Validates 100% status code, header, ETag, and byte-for-byte payload parity against a live local `minio server` instance before running `warp`.
 
 ```mermaid
 flowchart TD
-    Client["MinIO warp Benchmark Client / AWS SDK / boto3"]
+    Client["S3 Clients: MinIO warp / aws-cli / boto3 / rclone"]
 
     subgraph RustSubstrate["Rust Infrastructure Substrate (awan-storage-server)"]
-        SocketReactor["Async HTTP/1.1 Reactor<br/>(Hyper / Tokio on port 9000)"]
-        WorkerPool["NUMA Thread-per-Core Worker Pool<br/>(Core Pinning via core_affinity)"]
-        DiskSlab["Chunk Storage Slab Backing<br/>(memmap2 / direct sequential chunk files)"]
+        SocketReactor["HTTP/1.1 & HTTP/2 Reactor (Port 9000)<br/>Path & Virtual-Host Routing + 100-Continue + aws-chunked"]
+        WorkerPool["NUMA Thread-per-Core Pool<br/>(core_affinity + Deterministic Shard Routing)"]
+        VolumeIO["WORM Needle Volume Engine<br/>(32 GiB volume_XXXX.dat + O_DIRECT + .idx Journal)"]
     end
 
     subgraph AwanNative["Awan Native Storage Engine (libawan_storage)"]
-        MetadataIndex["@flat ObjectMeta SoA Index<br/>(key_hash, offset, size, etag, created_at)<br/>Zero Heap Alloc / Zero GC Churn"]
-        ChunkSlabAlloc["@arena Chunk Slab Allocator<br/>(Preallocated 64KB - 16MB Slabs)"]
-        ChecksumEngine["SIMD CRC32c / Blake3 Intrinsics<br/>Hardware Accelerated Hashing"]
+        MetadataIndex["@flat ObjectMeta SoA Index (64B/row)<br/>+ Key String Arena + Prefix ART Index"]
+        ExtentTable["@flat PartExtent Table<br/>(Zero-Copy Multipart & CopyObject Linking)"]
+        ChunkSlabAlloc["@arena Chunk Slab Allocator<br/>(4096B Aligned Pinned Ring Slots)"]
+        ChecksumEngine["Hardware Crypto & Checksums<br/>(SHA-NI SigV4 Cache + SIMD MD5 + SSE4.2 CRC32C)"]
     end
 
-    Client <-->|HTTP/1.1 REST| SocketReactor
+    Client <-->|S3 REST Wire Protocol| SocketReactor
     SocketReactor <--> WorkerPool
-    WorkerPool <-->|C-ABI FFI| MetadataIndex
-    WorkerPool <-->|C-ABI FFI| ChunkSlabAlloc
-    ChunkSlabAlloc <--> DiskSlab
+    WorkerPool <-->|Zero-Copy C-ABI FFI| MetadataIndex
+    WorkerPool <-->|Zero-Copy C-ABI FFI| ExtentTable
+    WorkerPool <-->|Zero-Copy C-ABI FFI| ChunkSlabAlloc
+    ChunkSlabAlloc <--> VolumeIO
     ChecksumEngine <--> ChunkSlabAlloc
 ```
 
 ---
 
-## 2. Supported S3 REST API Surface (PoC Scope)
+## 2. Complete Drop-In S3 REST API Surface
 
-The PoC implements the high-frequency core of the Amazon S3 REST API over HTTP/1.1 on port `9000`:
+### 2.1 Bucket, Object, Multipart & Lifecycle Operations
 
-| HTTP Method | URI Pattern | Description | Required Headers | Response Codes |
+| Category | HTTP Verb | URI Pattern | S3 Operation | Required Support & Response Contract |
 |---|---|---|---|---|
-| `PUT` | `/{bucket}/{key+}` | Uploads an object payload to the storage slab | `Content-Length`, `Content-Type` (opt) | `200 OK` (returns `ETag`), `400 Bad Request` |
-| `GET` | `/{bucket}/{key+}` | Retrieves object payload or partial byte-range | `Range: bytes=start-end` (opt) | `200 OK` or `206 Partial Content`, `404 NoSuchKey`, `416 InvalidRange` |
-| `HEAD` | `/{bucket}/{key+}` | Retrieves object metadata without payload | None | `200 OK` (with `ETag`, `Content-Length`), `404 NoSuchKey` |
-| `DELETE` | `/{bucket}/{key+}` | Tombstones an object in the `@flat` index | None | `204 No Content` |
-| `GET` | `/{bucket}` | Lists object keys matching prefix (ListObjectsV2) | `prefix`, `max-keys` (query params) | `200 OK` (XML payload) |
-
-### 2.1 Byte-Range Queries (`Range: bytes=X-Y`)
-- Supports exact offset queries without loading intermediate byte buffers:
-  - `Range: bytes=0-1023`: First 1024 bytes (`206 Partial Content`).
-  - `Range: bytes=1048576-`: From 1 MiB to end of object.
-  - `Range: bytes=-4096`: Suffix read (last 4096 bytes).
-- Out-of-bounds range returns `416 Range Not Satisfiable` with standard S3 XML payload:
-  ```xml
-  <Error>
-      <Code>InvalidRange</Code>
-      <Message>The requested range is not satisfiable</Message>
-      <RangeRequested>bytes=1000-2000</RangeRequested>
-      <ActualObjectSize>500</ActualObjectSize>
-  </Error>
-  ```
-
-### 2.2 S3 XML Error Conformance
-Standard S3 XML format returned for all failure conditions:
-```xml
-<Error>
-    <Code>NoSuchKey</Code>
-    <Message>The specified key does not exist.</Message>
-    <Key>test/file.bin</Key>
-    <RequestId>AWAN-0000000001</RequestId>
-</Error>
-```
-
-### 2.3 S3 Multipart Upload Wire State Machine
-To act as a seamless drop-in replacement for AWS S3 clients (`aws-cli`, `boto3`, `rclone`), files $> 5\text{ MB}$ transition through the standard S3 multipart upload protocol:
-
-| Action | HTTP Verb & URI | Description | Response Code & Payload |
-|---|---|---|---|
-| **Initiate** | `POST /{bucket}/{key}?uploads` | Generates a 64-bit unique `UploadId` and leases part allocation slots in the `@arena` slab. | `200 OK` (returns `InitiateMultipartUploadResult` XML) |
-| **UploadPart** | `PUT /{bucket}/{key}?partNumber={N}&uploadId={ID}` | Ingests part payload into a designated slab chunk; calculates MD5/CRC32c. | `200 OK` with `ETag: "{part_etag}"` |
-| **Complete** | `POST /{bucket}/{key}?uploadId={ID}` | Receives list of `<PartNumber>` and `<ETag>`. Stitches part offsets in `@flat ObjectMeta` without data copying. | `200 OK` (returns `CompleteMultipartUploadResult` with composite ETag `"{hash}-{part_count}"`) |
-| **Abort** | `DELETE /{bucket}/{key}?uploadId={ID}` | Immediately frees all leased part slabs and invalidates the `UploadId`. | `204 No Content` |
-
-### 2.4 AWS Signature V4 Authentication & Pre-Signed URLs
-- **Header Authentication**: Verifies `Authorization: AWS4-HMAC-SHA256 Credential=... SignedHeaders=... Signature=...`.
-- **Derived Signing Key Caching**: Precomputes and caches derived secret keys `kSigning = HMAC(HMAC(HMAC(HMAC(secret, date), region), "s3"), "aws4_request")` to eliminate redundant crypto work.
-- **Pre-Signed Query URLs**: Validates query authentication parameters (`X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`, `X-Amz-SignedHeaders`, `X-Amz-Signature`).
-- **Anonymous Access**: Buckets configured for public access bypass SigV4 validation.
-
-### 2.5 Bucket Lifecycle & Automated Expiration Daemon
-- **Lifecycle Configuration API**:
-  - `PUT /{bucket}?lifecycle`: Ingests S3 XML Lifecycle Configuration rules.
-  - `GET /{bucket}?lifecycle`: Returns active XML configuration.
-  - `DELETE /{bucket}?lifecycle`: Deactivates lifecycle rules.
-- **Automated Background Cleanup Sweeps**:
-  - `Expiration.Days`: Objects older than TTL days are flagged with tombstone bits during background sweeps and their storage slabs returned to the free pool.
-  - `AbortIncompleteMultipartUpload.DaysAfterInitiation`: Incomplete multipart upload slabs abandoned after $N$ days (e.g. 7 days) are automatically purged to prevent disk leakage.
-
-### 2.6 Edge-Case Contracts & Path Traversal Defenses
-- **Zero-Byte Objects**: Uploading a 0-byte payload allocates zero chunk bytes and creates an `@flat ObjectMeta` entry with `size = 0` and standard empty MD5 `d41d8cd98f00b204e9800998ecf8427e`.
-- **Directory Markers**: Keys ending with `/` (e.g. `datasets/train/`) are treated as 0-byte folder placeholders.
-- **URI Encoding & Unicode**: URL-encoded characters (`%20`, `+`, `&`) and multi-byte UTF-8 Unicode characters (e.g. `📁/🔑.parquet`) are decoded before hashing and indexing.
-- **Path Traversal Defenses**: Any key attempting path escaping (`../`, `..\`, `/etc/passwd`) is rejected immediately with `400 Bad Request`.
-- **Thundering Herd Coalescing**: When multiple concurrent requests miss the memory cache and query the same cold NVMe chunk, requests coalesce onto a single disk read promise.
-
-### 2.7 Direct I/O (`O_DIRECT`) & Volume Packing Needle Architecture
-- **OS PageCache Bypass**:
-  - Chunk storage volumes are opened with `O_DIRECT` (Linux) or `FILE_FLAG_NO_BUFFERING` (Windows) to prevent double-buffering and dirty page writeback latency spikes.
-  - All chunk read/write buffers are strictly 4096-byte aligned.
-- **Volume Packing (WORM Needle Format)**:
-  - Eliminates filesystem inode thrashing by storing millions of objects inside large 32 GiB contiguous Volume Slabs (`volume_001.dat`).
-  - `@flat ObjectMeta` points to `(volume_id, byte_offset, size)`, enabling instant single-syscall positional `pread`.
+| **Service** | `GET` | `/` | `ListBuckets` | `200 OK` (`<ListAllMyBucketsResult>` XML) |
+| **Bucket** | `PUT` | `/{bucket}` | `CreateBucket` | Validates name (3–63 chars); idempotent `200 OK` (`400 InvalidBucketName`) |
+| **Bucket** | `HEAD` | `/{bucket}` | `HeadBucket` | Pre-flight check for `warp` & SDKs: `200 OK` or `404 NoSuchBucket` |
+| **Bucket** | `DELETE` | `/{bucket}` | `DeleteBucket` | `204 No Content` if empty; `409 BucketNotEmpty` if live keys exist |
+| **Bucket** | `GET` | `/{bucket}?location` | `GetBucketLocation` | `200 OK` (`<LocationConstraint>us-east-1</LocationConstraint>`) |
+| **Listing** | `GET` | `/{bucket}?list-type=2` | `ListObjectsV2` | Lexicographical UTF-8 order via ART (`prefix`, `delimiter`, `max-keys`, `continuation-token`, `start-after`) |
+| **Batch** | `POST` | `/{bucket}?delete` | `DeleteObjects` | Multi-key batch delete (up to 1,000 keys/request; required by `warp` cleanup) |
+| **Object** | `PUT` | `/{bucket}/{key+}` | `PutObject` | Supports single-chunk, `UNSIGNED-PAYLOAD`, `aws-chunked`, `Expect: 100-continue`, conditional headers. Returns `200 OK` + 128-bit MD5 `ETag` |
+| **Object** | `PUT` | `/{bucket}/{key+}` | `CopyObject` | Header `x-amz-copy-source`: zero-copy extent ref-count clone (`200 OK` XML) |
+| **Object** | `GET` | `/{bucket}/{key+}` | `GetObject` | Full or RFC 9110 `Range: bytes=...` (`200 OK`, `206 Partial Content`, `304`, `404`, `412`, `416`) |
+| **Object** | `HEAD` | `/{bucket}/{key+}` | `HeadObject` | Identical metadata headers to `GET` with 0 body bytes |
+| **Object** | `DELETE` | `/{bucket}/{key+}` | `DeleteObject` | Sets tombstone in `@flat ObjectMeta` (`204 No Content`) |
+| **Multipart**| `POST` | `/{bucket}/{key+}?uploads` | `CreateMultipartUpload`| Allocates `UploadId` and staging manifest (`200 OK` XML) |
+| **Multipart**| `PUT` | `/{bucket}/{key+}?partNumber=N&uploadId=ID` | `UploadPart` | Validates $1 \le N \le 10,000$; stages part needle; returns part `ETag` |
+| **Multipart**| `POST` | `/{bucket}/{key+}?uploadId=ID` | `CompleteMultipartUpload`| Validates ascending order, ETags, $\ge 5\text{ MiB}$ size; links `@flat PartExtent`; returns composite `ETag: "<md5>-<parts>"` |
+| **Multipart**| `DELETE` | `/{bucket}/{key+}?uploadId=ID` | `AbortMultipartUpload` | Frees staged part needles (`204 No Content` or `404 NoSuchUpload`) |
+| **Multipart**| `GET` | `/{bucket}/{key+}?uploadId=ID` | `ListParts` | Returns XML list of staged parts for `uploadId` |
+| **Multipart**| `GET` | `/{bucket}?uploads` | `ListMultipartUploads` | Returns XML list of in-progress uploads in bucket |
+| **Lifecycle**| `PUT/GET/DELETE` | `/{bucket}?lifecycle` | `BucketLifecycle` | Configures/queries/deletes `Expiration.Days` and `AbortIncompleteMultipartUpload` rules |
 
 ---
 
 ## 3. C-ABI FFI Boundary (`libawan_storage`)
 
-The Rust substrate communicates with Awan's native engine via a stable, zero-copy `extern "C"` ABI:
+The Rust substrate invokes Awan's native engine across a panic-safe (`std::panic::catch_unwind`), zero-copy `extern "C"` boundary defined in `awan-storage/server/include/awan_storage.h`:
 
 ```c
-// C-ABI header: awan_storage.h
-
+// awan_storage.h — 64-byte cache-line-aligned metadata record
 typedef struct {
-    uint64_t key_hash;
-    uint64_t offset;
-    uint64_t size;
-    uint32_t etag;
-    uint32_t created_at;
+    uint64_t key_hash;      // 64-bit keyed XXH3 / SipHash-1-3 of (bucket_id, key)
+    uint64_t bucket_flags;  // [63:32] bucket_id | [31:16] part_count | [15:0] flags
+    uint64_t vol_offset;    // [63:48] volume_id | [47:0] 4KB-aligned offset or PartExtent idx
+    uint64_t size;          // Decoded payload byte length
+    uint64_t etag_hi;       // Upper 64 bits of 128-bit MD5 digest
+    uint64_t etag_lo;       // Lower 64 bits of 128-bit MD5 digest
+    uint64_t created_at;    // Unix epoch timestamp (ms)
+    uint64_t key_slice;     // [63:16] Key String Arena offset | [15:0] key_len
 } AwanObjectMeta;
 
-// Initialize the @flat ObjectMeta table and chunk slab
-void* awan_storage_init(uint64_t max_objects, uint64_t slab_capacity_bytes);
+// Return codes (all negative values represent structured errors; panics never unwind)
+#define AWAN_OK                     0
+#define AWAN_ERR_NOT_FOUND         -1
+#define AWAN_ERR_BUCKET_NOT_FOUND  -2
+#define AWAN_ERR_BUCKET_NOT_EMPTY  -3
+#define AWAN_ERR_PRECONDITION      -4
+#define AWAN_ERR_CAPACITY          -5
+#define AWAN_ERR_INVALID_ARG       -6
+#define AWAN_ERR_PANIC           -999
 
-// Ingest / update an object metadata record (Thread-safe lock-free append)
-int32_t awan_storage_index_put(void* engine, uint64_t key_hash, uint64_t offset, uint64_t size, uint32_t etag);
+// Engine lifecycle
+void*   awan_storage_init(uint64_t max_objects, uint64_t key_arena_bytes, uint64_t slab_bytes);
+void    awan_storage_destroy(void* engine);
 
-// Look up an object metadata record by key hash
-int32_t awan_storage_index_get(void* engine, uint64_t key_hash, AwanObjectMeta* out_meta);
+// Bucket operations
+int32_t awan_storage_bucket_create(void* engine, const uint8_t* name_ptr, uint32_t name_len, uint32_t* out_bucket_id);
+int32_t awan_storage_bucket_lookup(void* engine, const uint8_t* name_ptr, uint32_t name_len, uint32_t* out_bucket_id);
+int32_t awan_storage_bucket_delete(void* engine, uint32_t bucket_id);
 
-// Mark an object tombstone (DELETE)
-int32_t awan_storage_index_delete(void* engine, uint64_t key_hash);
+// Object index operations (with full key verification in Key String Arena)
+int32_t awan_storage_index_put(
+    void* engine,
+    uint32_t bucket_id,
+    const uint8_t* key_ptr,
+    uint16_t key_len,
+    uint64_t vol_offset,
+    uint64_t size,
+    uint64_t etag_hi,
+    uint64_t etag_lo,
+    uint16_t part_count,
+    uint16_t flags
+);
 
-// Prefix range scan over the @flat table (ListObjectsV2)
-uint64_t awan_storage_index_scan(void* engine, uint64_t prefix_hash, uint64_t max_results, AwanObjectMeta* out_buffer);
+int32_t awan_storage_index_get(
+    void* engine,
+    uint32_t bucket_id,
+    const uint8_t* key_ptr,
+    uint16_t key_len,
+    AwanObjectMeta* out_meta
+);
 
-// Destroy engine and release backing arena
-void awan_storage_destroy(void* engine);
+int32_t awan_storage_index_delete(
+    void* engine,
+    uint32_t bucket_id,
+    const uint8_t* key_ptr,
+    uint16_t key_len
+);
+
+// Lexicographical UTF-8 prefix scan for ListObjectsV2
+int64_t awan_storage_index_scan(
+    void* engine,
+    uint32_t bucket_id,
+    const uint8_t* prefix_ptr,
+    uint16_t prefix_len,
+    const uint8_t* start_after_ptr,
+    uint16_t start_after_len,
+    uint32_t max_keys,
+    AwanObjectMeta* out_records
+);
 ```
 
 ---
 
-## 4. Multi-Tiered Testing Strategy
-
-### 4.0 Property-Based Testing (proptest & Awan Generative Tests)
-- **Mathematical Invariants**:
-  - $\forall key, payload: \text{GET}(\text{PUT}(key, payload)) = payload$.
-  - $\forall start, end: \text{Range}(\text{PUT}(key, payload), start, end) = payload[start..=end]$.
-  - $\forall key: \text{DELETE}(key) \implies \text{GET}(key) = 404\text{ NoSuchKey}$.
-  - Incomplete multipart uploads that are aborted release $100\%$ of allocated slab chunks.
-  - Multi-threaded concurrent writes to non-overlapping keys never corrupt `@flat ObjectMeta` arrays or slab offsets.
-- **Official Conformance Gauntlet**:
-  - Run the official Ceph [`s3-tests`](https://github.com/ceph/s3-tests) suite and MinIO [`mint`](https://github.com/minio/mint) conformance suite against `awan-storage-server` to verify 100% S3 compatibility.
-
-### 4.1 Awan Engine Unit Tests (`tests/storage/*.test.awan`)
-- **Metadata Index Ingestion & Probing**:
-  - Insert $1,000,000$ entries with uniform and adversarial hash distributions.
-  - Assert zero heap reallocations and $O(1)$ lookups.
-- **Slab Allocation & Slicing**:
-  - Preallocate 1 GiB slab; slice $10,000$ chunks of variable sizes ($4\text{ KiB} \dots 16\text{ MiB}$).
-  - Assert zero out-of-bounds pointer reads.
-- **Hardware Checksum Parity**:
-  - Compare Awan native SIMD CRC32c intrinsics against standard polynomial implementations across 10,000 randomized byte slices.
-
-### 4.2 Rust Substrate Integration Tests (`awan-storage/server/tests/`)
-- **HTTP Wire Conformance**:
-  - Validate `PUT`, `GET`, `HEAD`, `DELETE` via `reqwest` and standard HTTP clients.
-  - Validate partial content headers (`Content-Range: bytes 0-1023/4096`).
-- **Thread Pinning Verification**:
-  - Assert worker threads stay bound to designated CPU affinity masks during 100,000 concurrent requests.
-- **Client SDK Compatibility**:
-  - Run end-to-end transfers using standard `aws-cli`:
-    ```bash
-    aws --endpoint-url http://127.0.0.1:9000 s3 cp testfile.bin s3://testbucket/
-    aws --endpoint-url http://127.0.0.1:9000 s3 cp s3://testbucket/testfile.bin downloaded.bin
-    cmp testfile.bin downloaded.bin
-    ```
-
----
-
-## 5. MinIO Differential Fuzzing Oracle
-
-### 5.1 Architecture of the Twin Oracle Harness
-To ensure full S3 specification compliance without manual edge-case auditing, we deploy a **Differential Testing & Fuzzing Harness** comparing `awan-storage-server` against a reference `minio server`:
+## 4. Milestone #10 Execution & Dependency Graph (Issues #462–#471)
 
 ```mermaid
 flowchart TD
-    Generator["Metamorphic Request Fuzzer<br/>(Random Keys, Sizes, Ranges, Headers)"]
+    I462["#462: Rust HTTP/1.1 Reactor & S3 Wire Framing"]
+    I463["#463: Awan Native @flat ObjectMeta & C-ABI FFI Bridge"]
+    I467["#467: Multipart Upload State Machine & AWS SigV4 Auth"]
+    I468["#468: Bucket Lifecycle XML & TTL Expiration Sweeps"]
+    I469["#469: Edge Cases, Path Defense, Single-Flight & 22 XML Errors"]
+    I470["#470: Direct I/O (O_DIRECT) & 32GiB WORM Needle Volumes"]
+    I464["#464: Dual Awan Unit Tests & aws-cli / boto3 Integration"]
+    I465["#465: Twin MinIO Differential Fuzzing Oracle (10k Ops)"]
+    I471["#471: Property-Based Tests (proptest) & Ceph s3-tests / mint"]
+    I466["#466: Live Head-to-Head MinIO warp Benchmark & Ledger"]
 
-    subgraph TwinServers["Twin Local Instances"]
-        MinIO["MinIO Reference Server<br/>http://127.0.0.1:9000"]
-        Awan["Awan Storage Server<br/>http://127.0.0.1:9001"]
-    end
-
-    Comparator{"Parity Comparator"}
-    DifferentialDefect["Differential Defect Flagged<br/>(Status / Headers / Payload Mismatch)"]
-
-    Generator -->|Identical Request Stream| MinIO
-    Generator -->|Identical Request Stream| Awan
-
-    MinIO -->|Response 1: Status, Headers, Body| Comparator
-    Awan -->|Response 2: Status, Headers, Body| Comparator
-
-    Comparator -->|100% Match| Pass["Pass"]
-    Comparator -->|Mismatch| DifferentialDefect
+    I462 & I463 --> I467 & I468 & I469 & I470
+    I467 & I468 & I469 & I470 --> I464
+    I464 --> I465 & I471
+    I465 & I471 --> I466
 ```
 
-### 5.2 Fuzzing Dimensions & Edge Cases
-1. **Namespace & Key Encoding**:
-   - Random key strings: empty string, deep slashes (`a/b/c/d/file.txt`), URL-encoded characters (`space%20file.bin`, `+`, `&`), Unicode emojis (`bucket/🔑/data.parquet`).
-2. **Payload Extremes**:
-   - $0\text{ bytes}$ (empty object).
-   - $1\text{ byte}$ (single byte boundary).
-   - Multi-chunk boundaries ($64\text{ KiB} - 1$, $64\text{ KiB}$, $64\text{ KiB} + 1$, $5\text{ MiB}$).
-3. **Arbitrary Range Requests**:
-   - `Range: bytes=0-0` (first single byte).
-   - `Range: bytes=500-1000`.
-   - `Range: bytes=4095-` (suffix stream).
-   - `Range: bytes=-100` (last 100 bytes).
-   - `Range: bytes=999999-9999999` (out of range $\to 416$).
-4. **Conditional Requests**:
-   - `If-Match: "etag"`, `If-None-Match: "etag"` (304 Not Modified).
-5. **Tombstone Sequences**:
-   - `PUT` $\to$ `HEAD` $\to$ `DELETE` $\to$ `GET` ($\to 404\text{ NoSuchKey}$).
+| Issue | Layer | Core Deliverable & Gate Summary |
+|---|---|---|
+| **[#462](https://github.com/iskandarnorazli/awan-lang/issues/462)** | Rust Substrate | Bucket (`Create`/`Head`/`Delete`/`List`/`DeleteObjects`) + Object (`PUT`/`GET`/`HEAD`/`DELETE`/`Range`/`100-continue`) reactor on `:9000`. |
+| **[#463](https://github.com/iskandarnorazli/awan-lang/issues/463)** | Awan + FFI | 64B `@flat ObjectMeta` + Key String Arena + ART prefix index + `catch_unwind` C-ABI (`< 50 ns` lookup, 0 heap allocs). |
+| **[#467](https://github.com/iskandarnorazli/awan-lang/issues/467)** | Protocol | Multipart (`Initiate`/`UploadPart`/`Complete`/`Abort`/`ListParts`), `@flat PartExtent` linking, SigV4 (`UNSIGNED-PAYLOAD` + `aws-chunked`). |
+| **[#468](https://github.com/iskandarnorazli/awan-lang/issues/468)** | Lifecycle | `PUT/GET/DELETE /{bucket}?lifecycle`, async TTL object tombstoning, and stale incomplete multipart upload reclamation. |
+| **[#469](https://github.com/iskandarnorazli/awan-lang/issues/469)** | Hardening | Zero-byte keys, folder markers, URI/UTF-8 validation, single-flight thundering herd coalescing, MVCC overwrite isolation, 22 S3 XML error codes. |
+| **[#470](https://github.com/iskandarnorazli/awan-lang/issues/470)** | Storage I/O | 4096B-aligned `O_DIRECT` / `FILE_FLAG_NO_BUFFERING` WORM Needle volumes (`volume_XXXX.dat`), `.idx` crash replay, and background compaction. |
+| **[#464](https://github.com/iskandarnorazli/awan-lang/issues/464)** | Testing | Awan `.test.awan` suites + Rust integration tests + end-to-end `aws-cli` and `boto3` compatibility suite. |
+| **[#465](https://github.com/iskandarnorazli/awan-lang/issues/465)** | Oracle Fuzz | Twin harness (`minio :9000` vs `awan :9001`): 10,000 randomized requests asserting 100% status, header, ETag, and body parity. |
+| **[#471](https://github.com/iskandarnorazli/awan-lang/issues/471)** | Conformance | Generative `proptest` mathematical invariants + Ceph `s3-tests` / MinIO `mint` conformance execution. |
+| **[#466](https://github.com/iskandarnorazli/awan-lang/issues/466)** | Benchmark | Core-pinned `warp put`, `warp get`, `warp mixed` vs MinIO recorded in `docs/measurements/s3_warp_minio_vs_awan.md` and `docs/PERF_CLAIMS_LEDGER.md`. |
 
 ---
 
-## 6. Head-to-Head `warp` Benchmark Protocol
+## 5. Multi-Tiered Testing & MinIO Differential Oracle
 
-Once differential fuzzing passes $100\%$ of cases, we execute MinIO's official [`warp`](https://github.com/minio/warp) benchmark tool:
+### 5.1 Property-Based Invariants (`proptest` & Awan Generative Tests)
+1. **Roundtrip Identity:** $\forall b, k, v: \text{GET}(b, k) \text{ after } \text{PUT}(b, k, v)$ returns status `200`, `ETag == MD5(v)`, and body `== v`.
+2. **RFC 9110 Range Slicing:** $\forall s, e \in [0, |v|-1], s \le e: \text{GET\_RANGE}(b, k, s, e) == v[s..=e]$ with `206 Partial Content`.
+3. **Multipart Equivalence:** Splitting payload $v$ into $P$ arbitrary chunks and completing a multipart upload yields the exact same byte stream on `GET` and `Range` as a single `PUT(v)`.
+4. **MVCC Overwrite Isolation:** A concurrent reader streaming $v_1$ while a writer commits $v_2$ receives either 100% of $v_1$ or 100% of $v_2$, never a mixed buffer.
+5. **Crash Truncation Safety:** Appending random truncated bytes (`1..4095` bytes) to the tail of `volume_0001.dat` and restarting the server recovers all previously committed objects with zero corruption.
+
+### 5.2 Twin-Instance MinIO Differential Fuzzing (`#465`)
+Every operation generated by the fuzzer is sent identically to `minio` (`127.0.0.1:9000`) and `awan-storage-server` (`127.0.0.1:9001`). The comparator checks:
+- Exact HTTP status code (`200`, `204`, `206`, `304`, `400`, `403`, `404`, `409`, `412`, `416`).
+- `ETag`, `Content-Length`, `Content-Range`, and `x-amz-meta-*` headers.
+- XML `<Error><Code>` on error responses and `<ListBucketResult>` keys/prefixes on `ListObjectsV2`.
+- SHA-256 digest of response bodies.
+
+---
+
+## 6. Head-to-Head `warp` Benchmark Protocol (`#466`)
 
 ```bash
-# 1. Start MinIO baseline (pinned to cores 0-3)
-taskset -c 0,1,2,3 minio server .tmp/minio_data --address :9000
+# 1. Start MinIO baseline (pinned to physical cores 0-3)
+taskset -c 0,1,2,3 minio server .tmp/minio_data --address 127.0.0.1:9000
 
-# 2. Run warp benchmark against MinIO
-warp put --host 127.0.0.1:9000 --access-key minioadmin --secret-key minioadmin --duration 1m --obj.size 64KiB --concurrent 64 --json > minio_warp_put_64k.json
-warp get --host 127.0.0.1:9000 --access-key minioadmin --secret-key minioadmin --duration 1m --obj.size 64KiB --concurrent 64 --json > minio_warp_get_64k.json
-warp mixed --host 127.0.0.1:9000 --access-key minioadmin --secret-key minioadmin --duration 1m --obj.size 64KiB --concurrent 64 --json > minio_warp_mixed_64k.json
+# 2. Run warp benchmark suite against MinIO (pinned to cores 4-7)
+taskset -c 4,5,6,7 warp put   --host 127.0.0.1:9000 --access-key minioadmin --secret-key minioadmin --duration 1m --obj.size 64KiB --concurrent 64 --json > minio_warp_put_64k.json
+taskset -c 4,5,6,7 warp get   --host 127.0.0.1:9000 --access-key minioadmin --secret-key minioadmin --duration 1m --obj.size 64KiB --concurrent 64 --json > minio_warp_get_64k.json
+taskset -c 4,5,6,7 warp mixed --host 127.0.0.1:9000 --access-key minioadmin --secret-key minioadmin --duration 1m --obj.size 64KiB --concurrent 64 --json > minio_warp_mixed_64k.json
 
-# 3. Stop MinIO, start awan-storage-server (pinned to cores 0-3)
+# 3. Stop MinIO, start awan-storage-server (pinned to physical cores 0-3)
 taskset -c 0,1,2,3 ./awan-storage-server --port 9000 --data .tmp/awan_data
 
-# 4. Run warp benchmark against awan-storage-server
-warp put --host 127.0.0.1:9000 --access-key awan --secret-key awan --duration 1m --obj.size 64KiB --concurrent 64 --json > awan_warp_put_64k.json
-warp get --host 127.0.0.1:9000 --access-key awan --secret-key awan --duration 1m --obj.size 64KiB --concurrent 64 --json > awan_warp_get_64k.json
-warp mixed --host 127.0.0.1:9000 --access-key awan --secret-key awan --duration 1m --obj.size 64KiB --concurrent 64 --json > awan_warp_mixed_64k.json
+# 4. Run identical warp benchmark suite against awan-storage-server
+taskset -c 4,5,6,7 warp put   --host 127.0.0.1:9000 --access-key minioadmin --secret-key minioadmin --duration 1m --obj.size 64KiB --concurrent 64 --json > awan_warp_put_64k.json
+taskset -c 4,5,6,7 warp get   --host 127.0.0.1:9000 --access-key minioadmin --secret-key minioadmin --duration 1m --obj.size 64KiB --concurrent 64 --json > awan_warp_get_64k.json
+taskset -c 4,5,6,7 warp mixed --host 127.0.0.1:9000 --access-key minioadmin --secret-key minioadmin --duration 1m --obj.size 64KiB --concurrent 64 --json > awan_warp_mixed_64k.json
 ```
-
-### Metrics Recorded
-- **Throughput**: MiB/s and Operations/sec.
-- **Latency Distribution**: P50, P90, P99, P99.9 in microseconds.
-- **Process Memory Profile**: Peak RSS (MB) and heap growth over the 1-minute benchmark run.
-- **Target Output**: Official measurement ledger entry in `docs/measurements/s3_warp_minio_vs_awan.md`.
 
 ---
 
 ## 7. Migration & Upgrade Path to Pure Awan
 
-The hybrid architecture is explicitly decoupled to allow progressive in-place replacement:
-
-1. **Phase 2A (Current PoC)**:
-   - Rust: HTTP/1.1 socket reactor, NUMA core pinning, disk chunk backing.
-   - Awan: `@flat ObjectMeta` SoA index, chunk slab allocator, SIMD hashing.
-2. **Phase 2B (Native Disk I/O)**:
-   - When Issue #202 (Columnar Table I/O) lands, replace Rust's `memmap2` file backing with Awan's native columnar file loader.
-3. **Phase 2C (Pure Awan Network Reactor)**:
-   - When Issue #53 (Async Completion I/O Reactor) lands, replace Rust's `tokio`/`hyper` reactor with Awan's native `sys_ring_*` reactor.
-   - The `@flat ObjectMeta` table and slab structures remain 100% identical—zero rewrite of the storage engine logic.
+1. **Phase 2A (Current Hybrid PoC)**: Rust substrate handles HTTP/1.1 & HTTP/2 socket framing, core pinning, and `O_DIRECT` volume files; Awan native engine (`libawan_storage`) owns the `@flat ObjectMeta` SoA index, `@flat PartExtent` table, Key String Arena, and `@arena` chunk slabs.
+2. **Phase 2B (Native Columnar Persistence)**: When Issue #202 lands, `.idx` and `metadata.checkpoint` transition to Awan's native columnar `mmap` table loader.
+3. **Phase 2C (Pure-Awan Completion Reactor)**: When Issue #53 lands, the Rust HTTP reactor is replaced by Awan's native `sys_ring_*` (`io_uring` / IOCP) reactor without altering the on-disk Needle Volume format or `@flat ObjectMeta` layout.
