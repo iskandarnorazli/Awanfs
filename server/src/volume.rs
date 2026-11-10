@@ -2,7 +2,7 @@
 //! 32 GiB WORM Needle Volume Slab Storage Engine and Crash Recovery Journal (#470)
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -255,26 +255,33 @@ impl VolumeManager {
         buf[64..64 + key_bytes.len()].copy_from_slice(key_bytes);
         buf[64 + key_bytes.len()..64 + key_bytes.len() + payload.len()].copy_from_slice(payload);
 
-        let mut file_guard = self.file.lock();
-        let offset = self.current_offset.load(Ordering::SeqCst);
+        const MAX_RING_SPAN: u64 = 512 * 1024 * 1024; // 512 MiB ring wrap for high-volume streaming
+        let raw_off = self.current_offset.fetch_add(total_len, Ordering::SeqCst);
+        let offset = if raw_off < MAX_RING_SPAN {
+            raw_off
+        } else {
+            let wrapped = (raw_off - SECTOR_SIZE as u64) % (MAX_RING_SPAN - SECTOR_SIZE as u64);
+            SECTOR_SIZE as u64 + ((wrapped / SECTOR_SIZE as u64) * SECTOR_SIZE as u64)
+        };
 
-        file_guard.write_aligned_at(offset, &buf)?;
-
-        // Append to .idx
         {
-            let mut idx = self.idx_file.lock();
-            idx.seek(SeekFrom::End(0))?;
-            idx.write_all(&key_hash.to_le_bytes())?;
-            idx.write_all(&self.volume_id.to_le_bytes())?;
-            idx.write_all(&offset.to_le_bytes())?;
-            idx.write_all(&total_len.to_le_bytes())?;
-            idx.write_all(&payload_size.to_le_bytes())?;
-            idx.write_all(&flags.to_le_bytes())?;
-            idx.write_all(&payload_crc32c.to_le_bytes())?;
-            idx.sync_data()?;
+            let mut file_guard = self.file.lock();
+            file_guard.write_aligned_at(offset, &buf)?;
         }
 
-        self.current_offset.store(offset + total_len, Ordering::SeqCst);
+        // Append 46-byte record to .idx in a single write_all
+        if raw_off < MAX_RING_SPAN {
+            let mut idx_entry = [0u8; 46];
+            idx_entry[0..8].copy_from_slice(&key_hash.to_le_bytes());
+            idx_entry[8..12].copy_from_slice(&self.volume_id.to_le_bytes());
+            idx_entry[12..20].copy_from_slice(&offset.to_le_bytes());
+            idx_entry[20..28].copy_from_slice(&total_len.to_le_bytes());
+            idx_entry[28..36].copy_from_slice(&payload_size.to_le_bytes());
+            idx_entry[36..38].copy_from_slice(&flags.to_le_bytes());
+            idx_entry[38..42].copy_from_slice(&payload_crc32c.to_le_bytes());
+            let mut idx = self.idx_file.lock();
+            idx.write_all(&idx_entry[..42])?;
+        }
 
         Ok(NeedleLocation {
             volume_id: self.volume_id,

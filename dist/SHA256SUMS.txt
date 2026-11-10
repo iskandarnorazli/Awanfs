@@ -1,1 +1,1 @@
-664452d224b7dde6c00a0ac92652ded5cd347ddb199943a0f5673614619ede17  awan-storage-server-x86_64-windows.exe
+e13d35a749e2075921502e93cdeadfc5ac1254fde8c822e463d264335022c65b  awan-storage-server-x86_64-windows.exe

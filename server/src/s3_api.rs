@@ -284,7 +284,14 @@ impl S3ServiceState {
         if let Some(ref vm) = self.volume_manager {
             if let Ok(loc) = vm.write_needle(b_id as u16, key, data, flags) {
                 self.needle_crc_map.write().insert((b_id, loc.offset), loc.payload_crc32c);
-                self.payload_store.write().insert((b_id, loc.offset), data.clone());
+                // Bound hot payload cache to objects <= 256 KiB and <= 256 entries (~16 MiB max RSS)
+                if data.len() <= 256 * 1024 {
+                    let mut pstore = self.payload_store.write();
+                    if pstore.len() >= 256 && !pstore.contains_key(&(b_id, loc.offset)) {
+                        pstore.clear();
+                    }
+                    pstore.insert((b_id, loc.offset), data.clone());
+                }
                 return loc.offset;
             }
         }
@@ -309,7 +316,13 @@ impl S3ServiceState {
                 .unwrap_or(0);
             if let Ok(vec) = vm.read_needle(1, vol_offset, expected_crc) {
                 let b = Bytes::from(vec);
-                self.payload_store.write().insert((b_id, vol_offset), b.clone());
+                if b.len() <= 256 * 1024 {
+                    let mut pstore = self.payload_store.write();
+                    if pstore.len() >= 256 && !pstore.contains_key(&(b_id, vol_offset)) {
+                        pstore.clear();
+                    }
+                    pstore.insert((b_id, vol_offset), b.clone());
+                }
                 return b;
             }
         }
@@ -1055,10 +1068,9 @@ pub async fn handle_s3_request(
                     if let Some(prev_off) = old_offset {
                         if prev_off > 0 && prev_off != vol_offset {
                             state.payload_store.write().remove(&(b_id, prev_off));
+                            state.needle_crc_map.write().remove(&(b_id, prev_off));
                         }
                     }
-
-                    state.mvcc.commit_version(b_id, &key, 1, vol_offset, payload_len, decoded_bytes);
 
                     let mut engine = state.engine.write();
                     engine.put_object(
@@ -1132,40 +1144,6 @@ pub async fn handle_s3_request(
                         }
                     }
 
-                    // Coalesce concurrent hot GET requests via SingleFlight before reading/stitching payload
-                    let single_flight_key = format!("{}/{}/{}", bucket, key, meta.vol_offset);
-                    let state_for_read = Arc::clone(&state);
-                    let key_for_read = key.clone();
-                    let payload = state
-                        .single_flight
-                        .execute_or_join(&single_flight_key, || async move {
-                            if is_multipart {
-                                if let Some(extents) =
-                                    state_for_read.multipart.get_completed_extents(b_id, &key_for_read)
-                                {
-                                    let mut stitched = Vec::with_capacity(meta.size as usize);
-                                    for ext in extents {
-                                        let chunk = state_for_read.load_payload(
-                                            b_id,
-                                            ext.vol_offset,
-                                            ext.part_size as usize,
-                                        );
-                                        stitched.extend_from_slice(&chunk);
-                                    }
-                                    Bytes::from(stitched)
-                                } else {
-                                    Bytes::from(vec![0u8; meta.size as usize])
-                                }
-                            } else {
-                                state_for_read.load_payload(
-                                    b_id,
-                                    meta.vol_offset,
-                                    meta.size as usize,
-                                )
-                            }
-                        })
-                        .await;
-
                     let range_hdr = req.headers().get("Range").and_then(|v| v.to_str().ok());
                     let range_res = range_hdr.map(|h| parse_range_header(h, meta.size));
                     let is_head = method == Method::HEAD;
@@ -1173,13 +1151,42 @@ pub async fn handle_s3_request(
                     if let Some(range_opt) = range_res {
                         match range_opt {
                             Ok(Some(range)) => {
-                                let start = range.start as usize;
-                                let end = range.end as usize;
-                                let sub_bytes = if start < payload.len() {
-                                    let actual_end = (end + 1).min(payload.len());
-                                    payload.slice(start..actual_end)
-                                } else {
+                                let sub_bytes = if is_head {
                                     Bytes::new()
+                                } else if is_multipart {
+                                    if let Some(extents) = state.multipart.get_completed_extents(b_id, &key) {
+                                        let req_len = (range.end - range.start + 1) as usize;
+                                        let mut out = Vec::with_capacity(req_len);
+                                        let mut part_start = 0u64;
+                                        for ext in extents {
+                                            let part_end = ext.cumulative_end;
+                                            if part_end > range.start && part_start <= range.end {
+                                                let chunk = state.load_payload(
+                                                    b_id,
+                                                    ext.vol_offset,
+                                                    ext.part_size as usize,
+                                                );
+                                                let slice_start = range.start.saturating_sub(part_start) as usize;
+                                                let slice_end = ((range.end + 1).min(part_end) - part_start) as usize;
+                                                if slice_start < chunk.len() {
+                                                    out.extend_from_slice(&chunk[slice_start..slice_end.min(chunk.len())]);
+                                                }
+                                            }
+                                            part_start = part_end;
+                                        }
+                                        Bytes::from(out)
+                                    } else {
+                                        Bytes::from(vec![0u8; (range.end - range.start + 1) as usize])
+                                    }
+                                } else {
+                                    let full = state.load_payload(b_id, meta.vol_offset, meta.size as usize);
+                                    let start = range.start as usize;
+                                    let end = range.end as usize;
+                                    if start < full.len() {
+                                        full.slice(start..(end + 1).min(full.len()))
+                                    } else {
+                                        Bytes::new()
+                                    }
                                 };
                                 let content_range = format!("bytes {}-{}/{}", range.start, range.end, meta.size);
                                 let body = if is_head { empty_body() } else { full_body(sub_bytes) };
@@ -1210,6 +1217,44 @@ pub async fn handle_s3_request(
                             Ok(None) => {}
                         }
                     }
+
+                    // Coalesce concurrent hot GET requests via SingleFlight before reading/stitching payload
+                    let payload = if is_head {
+                        Bytes::new()
+                    } else {
+                        let single_flight_key = format!("{}/{}/{}", bucket, key, meta.vol_offset);
+                        let state_for_read = Arc::clone(&state);
+                        let key_for_read = key.clone();
+                        state
+                            .single_flight
+                            .execute_or_join(&single_flight_key, || async move {
+                                if is_multipart {
+                                    if let Some(extents) =
+                                        state_for_read.multipart.get_completed_extents(b_id, &key_for_read)
+                                    {
+                                        let mut stitched = Vec::with_capacity(meta.size as usize);
+                                        for ext in extents {
+                                            let chunk = state_for_read.load_payload(
+                                                b_id,
+                                                ext.vol_offset,
+                                                ext.part_size as usize,
+                                            );
+                                            stitched.extend_from_slice(&chunk);
+                                        }
+                                        Bytes::from(stitched)
+                                    } else {
+                                        Bytes::from(vec![0u8; meta.size as usize])
+                                    }
+                                } else {
+                                    state_for_read.load_payload(
+                                        b_id,
+                                        meta.vol_offset,
+                                        meta.size as usize,
+                                    )
+                                }
+                            })
+                            .await
+                    };
 
                     let body = if is_head { empty_body() } else { full_body(payload) };
                     let resp = Response::builder()

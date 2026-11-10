@@ -99,8 +99,10 @@ impl AlignedFile {
             opts.write(true).create(true);
         }
 
+        let force_direct = std::env::var("AWAN_DIRECT_IO").ok().as_deref() == Some("1");
+
         #[cfg(target_os = "windows")]
-        {
+        if force_direct {
             use std::os::windows::fs::OpenOptionsExt;
             // 0x20000000 = FILE_FLAG_NO_BUFFERING
             let mut direct_opts = opts.clone();
@@ -114,7 +116,7 @@ impl AlignedFile {
         }
 
         #[cfg(target_os = "linux")]
-        {
+        if force_direct {
             use std::os::unix::fs::OpenOptionsExt;
             let mut direct_opts = opts.clone();
             direct_opts.custom_flags(libc::O_DIRECT);
@@ -147,7 +149,6 @@ impl AlignedFile {
         {
             use std::os::windows::fs::FileExt;
             self.file.seek_write(buf, offset)?;
-            self.file.sync_data()?;
             Ok(())
         }
 
@@ -155,9 +156,7 @@ impl AlignedFile {
         {
             use std::os::unix::fs::FileExt;
             self.file.write_all_at(buf, offset)?;
-            if !self.direct_io_active {
-                self.file.sync_data()?;
-            }
+
             Ok(())
         }
 
