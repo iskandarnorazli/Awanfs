@@ -51,3 +51,4 @@ This specification is organized across dedicated modular documents:
 10. [**`ERASURE_CODING_SPEC.md`**](ERASURE_CODING_SPEC.md): $8+4$ Cauchy Reed-Solomon matrix formulation and SIMD vector look-up table (LUT) reconstruction.
 11. [**`EDGE_CASES_AND_CONTRACTS.md`**](EDGE_CASES_AND_CONTRACTS.md): Comprehensive edge case handling: mid-stream disconnects, zero-byte folder markers, thundering herd coalescing, path traversal defenses, and S3 XML error code matrix.
 12. [**`USE_CASES_AND_WORKLOADS.md`**](USE_CASES_AND_WORKLOADS.md): Industrial workload blueprints: sub-15ms AI agent sandbox restoration, PyTorch model checkpoints, distributed mutex locking, and video stream ingestion.
+13. [**`COMPETITIVE_LANDSCAPE.md`**](COMPETITIVE_LANDSCAPE.md): S3 alternatives matrix: Open-source Phase 2 (MinIO, Ceph RGW, SeaweedFS, Garage) and hyperscale cloud Phase 3 (AWS S3 Standard & S3 Express One Zone, Azure Premium Blob, Google Cloud Storage, Cloudflare R2).
