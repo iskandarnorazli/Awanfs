@@ -23,11 +23,21 @@ flowchart TD
         P1_1 & P1_2 & P1_3 --> P1_Gate["Gate: 3.5 GB/s hashing throughput & parity probes"]
     end
 
-    subgraph Reactor["Phase 2: High-Throughput Async I/O (#53)"]
+    subgraph HybridPoC["Phase 2A: Fast-Track Hybrid S3 Substrate PoC"]
+        P2A_1["Rust HTTP/1.1 Substrate & Core Pinning"]
+        P2A_2["Awan Native @flat ObjectMeta C-ABI Bridge"]
+        P2A_3["MinIO Differential Testing & Fuzzing Oracle"]
+        P2A_4["MinIO warp Live Benchmark Harness"]
+        P1_Gate --> P2A_1 & P2A_2
+        P2A_1 & P2A_2 --> P2A_3 --> P2A_4
+        P2A_4 --> P2A_Gate["Gate: warp mixed head-to-head evidence vs MinIO"]
+    end
+
+    subgraph Reactor["Phase 2B: Pure-Awan Async I/O Reactor (#53)"]
         P2_1["Linux io_uring registered buffer engine"]
         P2_2["Windows IOCP / RIO engine"]
         P2_3["Unified sys_ring_* runtime built-ins"]
-        P1_Gate --> P2_1 & P2_2 & P2_3
+        P2A_Gate --> P2_1 & P2_2 & P2_3
         P2_1 & P2_2 & P2_3 --> P2_Gate["Gate: 50,000 concurrent sockets without thread spawn"]
     end
 
@@ -81,7 +91,20 @@ flowchart TD
 
 ---
 
-### Phase 2: Async Completion I/O Reactor (Issue #53)
+### Phase 2A: Fast-Track Hybrid S3 Substrate PoC (`HYBRID_POC_SPECIFICATION.md`)
+- **Objective:** Deliver runnable S3 REST daemon (`PUT`, `GET`, `HEAD`, `DELETE`, `Range`) combining Rust substrate with Awan native `@flat ObjectMeta` index to benchmark head-to-head against MinIO via `warp`.
+- **Tasks:**
+  1. Stand up Rust HTTP/1.1 socket reactor and thread-per-core NUMA worker pool.
+  2. Implement C-ABI bridge to Awan compiled native `@flat ObjectMeta` table and chunk slab allocator.
+  3. Deploy MinIO differential testing and fuzzing oracle (verifying 100% status code, ETag, and byte-range parity).
+  4. Run official MinIO `warp` benchmark suite (`put`, `get`, `mixed`) with core pinning.
+- **Exit Gate:**
+  - Differential fuzzing passes 10,000 randomized operations against MinIO with 0 mismatches.
+  - `warp mixed` records throughput and latency in `docs/measurements/s3_warp_minio_vs_awan.md`.
+
+---
+
+### Phase 2B: Pure-Awan Async Completion I/O Reactor (Issue #53)
 - **Objective:** Eliminate thread-per-connection scaling bottleneck via kernel completion rings.
 - **Tasks:**
   1. Implement `sys_ring_*` runtime abstraction in `core/src/runtime/reactor.rs`.
