@@ -6,7 +6,7 @@
 
 ## 1. System Topology Overview
 
-Awan Storage leverages the proven consensus and routing primitives from [`libs/awan-cluster`](../libs/awan-cluster/) and [`libs/awan-cache`](../libs/awan-cache/) to form a self-healing, horizontally scalable cluster:
+Awan Storage leverages the proven consensus and routing primitives from `libs/awan-cluster` and `libs/awan-cache` to form a self-healing, horizontally scalable cluster:
 
 ```mermaid
 flowchart TD

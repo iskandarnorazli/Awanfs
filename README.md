@@ -23,7 +23,7 @@ Awan Storage delivers **19.4 GB/s throughput per CPU core** and **sub-microsecon
 
 ## 2. Key Performance Benchmarks (Empirical Evidence)
 
-Measured on `LAPTOP-6RBIQUM5` (AMD Ryzen 7 5800H, Windows 11) using [`benchmarks/object_storage_poc/`](../benchmarks/object_storage_poc/):
+Measured on `LAPTOP-6RBIQUM5` (AMD Ryzen 7 5800H, Windows 11) using [`benchmarks/storage_engine.awan`](benchmarks/storage_engine.awan):
 
 | Operation | Awan Native (`@flat` / `@arena`) | Node.js / Go S3 Baseline | Advantage / Speedup |
 | :--- | :---: | :---: | :---: |

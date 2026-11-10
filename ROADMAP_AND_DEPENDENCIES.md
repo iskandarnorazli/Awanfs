@@ -69,7 +69,7 @@ flowchart TD
 ## 2. Detailed Phase Specifications & Gates
 
 ### Phase 0: VM Hardening Consolidation (Issues #447, #451, #454)
-- **Objective:** Maintain Core Invariant 2 ("One oracle for every engine") by resolving all pending triaged failures in [`tests/KNOWN_FAILING.txt`](../tests/KNOWN_FAILING.txt).
+- **Objective:** Maintain Core Invariant 2 ("One oracle for every engine") by resolving all pending triaged failures in `tests/KNOWN_FAILING.txt`.
 - **Tasks:**
   1. Fix `Vector` literals and types in the VM compiler ([#447](https://github.com/iskandarnorazli/awan-lang/issues/447)).
   2. Fix stream particle pipeline identifier `B` resolution in VM ([#451](https://github.com/iskandarnorazli/awan-lang/issues/451)).
@@ -81,7 +81,7 @@ flowchart TD
 ### Phase 1: Hardware-Accelerated Crypto Intrinsics
 - **Objective:** Replace scalar bitwise hashing with hardware-accelerated CPU instructions.
 - **Tasks:**
-  1. Add `crypto_sha256_block`, `crypto_crc32c_block`, and `crypto_hmac_sha256` to [`core/src/builtins/catalog.rs`](../core/src/builtins/catalog.rs).
+  1. Add `crypto_sha256_block`, `crypto_crc32c_block`, and `crypto_hmac_sha256` to `core/src/builtins/catalog.rs`.
   2. Implement pure-software reference in VM (`libs/awan-crypto/sha256.awan`).
   3. Implement native LLVM lowering in `llvm_bridge.rs` using Intel SHA extensions and ARMv8 Crypto intrinsics.
   4. Add parity probes in `core/tests/feature_parity_test.rs`.
