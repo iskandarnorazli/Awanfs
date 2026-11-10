@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::aws_chunked::decode_aws_chunked;
 use crate::ffi_bridge::*;
+use crate::lifecycle::*;
 use crate::multipart::*;
 use crate::sigv4::*;
 use crate::xml::*;
@@ -177,6 +178,7 @@ pub struct S3ServiceState {
     pub engine: Arc<RwLock<AwanStorageEngine>>,
     pub multipart: Arc<MultipartManager>,
     pub sigv4_cache: Arc<SigV4KeyCache>,
+    pub lifecycle: Arc<LifecycleManager>,
     pub payload_store: Arc<RwLock<HashMap<(u32, u64), Bytes>>>,
     pub next_vol_offset: Arc<RwLock<u64>>,
 }
@@ -187,6 +189,7 @@ impl S3ServiceState {
             engine: Arc::new(RwLock::new(AwanStorageEngine::new(100_000, 4_194_304, 65536))),
             multipart: Arc::new(MultipartManager::new()),
             sigv4_cache: Arc::new(SigV4KeyCache::new()),
+            lifecycle: Arc::new(LifecycleManager::new()),
             payload_store: Arc::new(RwLock::new(HashMap::new())),
             next_vol_offset: Arc::new(RwLock::new(4096)),
         }
@@ -271,6 +274,29 @@ pub async fn handle_s3_request(
         ParsedTarget::Bucket { bucket } => {
             match method {
                 Method::PUT => {
+                    if query_map.contains_key("lifecycle") {
+                        let body_bytes = req.into_body().collect().await?.to_bytes();
+                        let body_str = String::from_utf8_lossy(&body_bytes);
+                        match parse_lifecycle_xml(&body_str) {
+                            Ok(rules) => {
+                                state.lifecycle.set_rules(&bucket, rules);
+                                return Ok(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_LENGTH, "0")
+                                    .body(empty_body())
+                                    .unwrap());
+                            }
+                            Err(_) => {
+                                let xml = s3_error_xml("MalformedXML", "The XML provided was not well-formed", &bucket, "req-lc");
+                                return Ok(Response::builder()
+                                    .status(StatusCode::BAD_REQUEST)
+                                    .header(CONTENT_TYPE, "application/xml")
+                                    .body(full_body(Bytes::from(xml)))
+                                    .unwrap());
+                            }
+                        }
+                    }
+
                     let mut engine = state.engine.write();
                     match engine.create_bucket(&bucket) {
                         Ok(_) => {
@@ -318,6 +344,15 @@ pub async fn handle_s3_request(
                 }
 
                 Method::DELETE => {
+                    if query_map.contains_key("lifecycle") {
+                        state.lifecycle.delete_rules(&bucket);
+                        return Ok(Response::builder()
+                            .status(StatusCode::NO_CONTENT)
+                            .header(CONTENT_LENGTH, "0")
+                            .body(empty_body())
+                            .unwrap());
+                    }
+
                     let mut engine = state.engine.write();
                     let b_id = match engine.lookup_bucket(&bucket) {
                         Ok(id) => id,
@@ -357,6 +392,27 @@ pub async fn handle_s3_request(
                 }
 
                 Method::GET => {
+                    if query_map.contains_key("lifecycle") {
+                        match state.lifecycle.get_rules(&bucket) {
+                            Some(rules) => {
+                                let xml = lifecycle_config_xml(&rules);
+                                return Ok(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/xml")
+                                    .body(full_body(Bytes::from(xml)))
+                                    .unwrap());
+                            }
+                            None => {
+                                let xml = s3_error_xml("NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist", &bucket, "req-lc");
+                                return Ok(Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .header(CONTENT_TYPE, "application/xml")
+                                    .body(full_body(Bytes::from(xml)))
+                                    .unwrap());
+                            }
+                        }
+                    }
+
                     if query_map.contains_key("location") {
                         let xml = location_constraint_xml("us-east-1");
                         return Ok(Response::builder()
@@ -955,6 +1011,15 @@ pub async fn handle_s3_request(
                 }
 
                 Method::DELETE => {
+                    if query_map.contains_key("lifecycle") {
+                        state.lifecycle.delete_rules(&bucket);
+                        return Ok(Response::builder()
+                            .status(StatusCode::NO_CONTENT)
+                            .header(CONTENT_LENGTH, "0")
+                            .body(empty_body())
+                            .unwrap());
+                    }
+
                     let mut engine = state.engine.write();
                     let _ = engine.delete_object(b_id, key.as_bytes());
                     Ok(Response::builder()

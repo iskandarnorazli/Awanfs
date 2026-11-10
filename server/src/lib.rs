@@ -3,6 +3,7 @@
 
 pub mod aws_chunked;
 pub mod ffi_bridge;
+pub mod lifecycle;
 pub mod multipart;
 pub mod reactor;
 pub mod s3_api;
@@ -11,6 +12,7 @@ pub mod xml;
 
 pub use aws_chunked::*;
 pub use ffi_bridge::*;
+pub use lifecycle::*;
 pub use multipart::*;
 pub use reactor::*;
 pub use s3_api::*;
