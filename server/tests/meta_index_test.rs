@@ -1,7 +1,7 @@
 //! awan-storage/server/tests/ffi_bridge_test.rs
 //! Gate and verification tests for Issue #463 (Awan Native @flat ObjectMeta Index & C-ABI FFI Bridge)
 
-use awan_storage_server::ffi_bridge::*;
+use s3_server::ffi_bridge::*;
 use std::time::Instant;
 
 #[test]

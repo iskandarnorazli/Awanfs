@@ -1,7 +1,7 @@
 //! awan-storage/server/tests/edge_cases_test.rs
 //! Production Edge Cases, Path Traversal Defenses, Single-Flight & MVCC Tests for Issue #469
 
-use awan_storage_server::{
+use s3_server::{
     set_fault_corrupt_in_flight_reader, start_s3_reactor, S3ServiceState, SingleFlight,
 };
 use reqwest::header::{CONTENT_LENGTH, ETAG, RANGE};
@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-async fn spawn_test_server() -> (String, Arc<S3ServiceState>, awan_storage_server::ServerHandle) {
+async fn spawn_test_server() -> (String, Arc<S3ServiceState>, s3_server::ServerHandle) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let state = Arc::new(S3ServiceState::new());
     let handle = start_s3_reactor(addr, Arc::clone(&state)).await.expect("start reactor");
@@ -67,7 +67,7 @@ async fn test_zero_byte_object_and_folder_marker() {
 
 #[tokio::test]
 async fn test_key_validation_and_path_traversal_defenses() {
-    use awan_storage_server::validate_s3_key;
+    use s3_server::validate_s3_key;
     let (base_url, _state, handle) = spawn_test_server().await;
     let client = reqwest::Client::new();
 
@@ -176,7 +176,7 @@ async fn test_if_none_match_atomic_mutex_contention() {
 
 #[tokio::test]
 async fn test_mvcc_isolation_and_negative_control() {
-    let mvcc = awan_storage_server::MvccStore::new();
+    let mvcc = s3_server::MvccStore::new();
     let bucket_id = 1;
     let key = "important-document.pdf";
 

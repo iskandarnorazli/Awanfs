@@ -1,13 +1,13 @@
 //! awan-storage/server/tests/wire_test.rs
 //! Wire Protocol, REST Endpoints, Routing & RFC 9110 Range Tests for Issue #462
 
-use awan_storage_server::{parse_range_header, set_fault_disable_range_clamping, start_s3_reactor, S3ServiceState};
+use s3_server::{parse_range_header, set_fault_disable_range_clamping, start_s3_reactor, S3ServiceState};
 use reqwest::header::{CONTENT_TYPE, ETAG, HOST, RANGE};
 use reqwest::StatusCode;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-async fn spawn_test_server() -> (String, awan_storage_server::ServerHandle) {
+async fn spawn_test_server() -> (String, s3_server::ServerHandle) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let state = Arc::new(S3ServiceState::new());
     let handle = start_s3_reactor(addr, state).await.expect("start reactor");

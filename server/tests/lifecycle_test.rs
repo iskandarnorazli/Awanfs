@@ -1,7 +1,7 @@
 //! awan-storage/server/tests/lifecycle_test.rs
 //! S3 Bucket Lifecycle Configuration and Expiration Sweep Tests for Issue #468
 
-use awan_storage_server::{
+use s3_server::{
     run_lifecycle_sweep, set_fault_disable_prefix_check, start_s3_reactor, S3ServiceState,
 };
 use reqwest::header::CONTENT_TYPE;
@@ -9,7 +9,7 @@ use reqwest::StatusCode;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-async fn spawn_test_server() -> (String, Arc<S3ServiceState>, awan_storage_server::ServerHandle) {
+async fn spawn_test_server() -> (String, Arc<S3ServiceState>, s3_server::ServerHandle) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let state = Arc::new(S3ServiceState::new());
     let handle = start_s3_reactor(addr, Arc::clone(&state)).await.expect("start reactor");

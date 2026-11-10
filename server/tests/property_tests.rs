@@ -4,8 +4,8 @@
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use awan_storage_server::ffi_bridge::AwanStorageEngine;
-use awan_storage_server::s3_api::{compute_md5, md5_to_etag_hex};
+use s3_server::ffi_bridge::AwanStorageEngine;
+use s3_server::s3_api::{compute_md5, md5_to_etag_hex};
 
 static INJECT_RANGE_OFF_BY_ONE: AtomicBool = AtomicBool::new(false);
 

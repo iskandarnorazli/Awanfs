@@ -1,18 +1,20 @@
 //! awan-storage/server/src/main.rs
-//! Awan Storage S3 Server binary entry point
+//! S3 Storage Server binary entry point
 
-use awan_storage_server::{start_s3_reactor, S3ServiceState};
+use s3_server::{start_s3_reactor, S3ServiceState};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut port: u16 = std::env::var("AWAN_S3_PORT")
+    let mut port: u16 = std::env::var("S3_PORT")
+        .or_else(|_| std::env::var("AWAN_S3_PORT"))
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(9000);
-    let mut data_dir: Option<PathBuf> = std::env::var("AWAN_S3_DATA_DIR")
+    let mut data_dir: Option<PathBuf> = std::env::var("S3_DATA_DIR")
+        .or_else(|_| std::env::var("AWAN_S3_DATA_DIR"))
         .ok()
         .map(PathBuf::from);
 
@@ -37,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None => Arc::new(S3ServiceState::new()),
     };
 
-    println!("Awan Storage S3 Server listening on http://{}", addr);
+    println!("S3 Storage Server listening on http://{}", addr);
     let handle = start_s3_reactor(addr, state).await?;
 
     tokio::signal::ctrl_c().await?;

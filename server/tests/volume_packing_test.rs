@@ -4,9 +4,9 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use awan_storage_server::direct_io::AlignedBuffer;
-use awan_storage_server::volume::{VolumeManager, VolumeError, SECTOR_SIZE};
-use awan_storage_server::compaction::compact_volume;
+use s3_server::direct_io::AlignedBuffer;
+use s3_server::volume::{VolumeManager, VolumeError, SECTOR_SIZE};
+use s3_server::compaction::compact_volume;
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("awan_vol_test_{}_{}", name, std::process::id()));
@@ -175,7 +175,7 @@ fn test_background_compaction_reclaims_dead_space() {
 
 #[tokio::test]
 async fn test_s3_reactor_persists_needles_and_recovers_after_cache_eviction() {
-    use awan_storage_server::{start_s3_reactor, S3ServiceState};
+    use s3_server::{start_s3_reactor, S3ServiceState};
     use std::net::SocketAddr;
     use std::sync::Arc;
 

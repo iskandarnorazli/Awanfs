@@ -38,7 +38,7 @@ pub fn list_buckets_xml(buckets: &[(&str, &str)], request_id: &str) -> String {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
         <ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  \
           <Owner>\n    \
-            <ID>awan-storage-root</ID>\n    \
+            <ID>s3-storage-root</ID>\n    \
             <DisplayName>root</DisplayName>\n  \
           </Owner>\n  \
           <Buckets>\n"
