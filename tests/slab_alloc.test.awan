@@ -1,0 +1,49 @@
+// awan-storage/tests/slab_alloc.test.awan
+// Awan Storage Slab Allocation, Leased Slots, and Capacity Exhaustion Tests (#464)
+
+fn allocate_slot(bitmap: [Int], capacity: Int) -> [Int] {
+    // Returns [updated_bitmap_entry, slot_index] or [-1, -1] if full
+    var i = 0;
+    while (i < len(bitmap)) {
+        var word = bitmap[i];
+        if (word < 65535) {
+            // Find first free bit (0..15)
+            var bit = 0;
+            var probe = 1;
+            while (bit < 16) {
+                if ((word / probe) % 2 == 0) {
+                    let slot_idx = (i * 16) + bit;
+                    if (slot_idx < capacity) {
+                        return [i, word + probe, slot_idx];
+                    }
+                }
+                probe *= 2;
+                bit += 1;
+            }
+        }
+        i += 1;
+    }
+    return [-1, -1, -1];
+}
+
+test "slab slot leasing and bit manipulation" {
+    // 2 words of 16 bits = 32 slots capacity
+    var bitmap = [0, 0];
+    let res1 = allocate_slot(bitmap, 32);
+    assert_eq(res1[0], 0); // word 0
+    assert_eq(res1[1], 1); // new word value: 1
+    assert_eq(res1[2], 0); // slot 0 allocated
+
+    bitmap[0] = res1[1];
+    let res2 = allocate_slot(bitmap, 32);
+    assert_eq(res2[0], 0);
+    assert_eq(res2[1], 3); // 1 + 2 = 3
+    assert_eq(res2[2], 1); // slot 1 allocated
+}
+
+test "slab capacity boundary and exhaustion" {
+    // Capacity 3: slots 0, 1, 2
+    var bitmap = [7]; // bits 0, 1, 2 occupied (1+2+4 = 7)
+    let res = allocate_slot(bitmap, 3);
+    assert_eq(res[2], -1); // allocation fails cleanly
+}
