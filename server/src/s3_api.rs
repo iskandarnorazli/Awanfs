@@ -240,7 +240,7 @@ impl S3ServiceState {
     pub fn new() -> Self {
         let id = INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let default_dir = std::env::temp_dir().join(format!(
-            "awan_s3_vol_{}_{}",
+            "s3_vol_{}_{}",
             std::process::id(),
             id
         ));

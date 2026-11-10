@@ -1,17 +1,17 @@
 [package]
-name = "awan-storage-server"
+name = "s3-server"
 version = "0.1.0"
 edition = "2021"
 authors = ["Iskandar Norazli <111472977+iskandarnorazli@users.noreply.github.com>"]
-description = "High-performance S3-compatible hybrid object storage daemon with Awan columnar index"
+description = "High-performance S3-compatible object storage server with columnar SoA metadata index and 4096B WORM needle volume"
 license = "MIT OR Apache-2.0"
 
 [lib]
-name = "awan_storage_server"
+name = "s3_server"
 path = "src/lib.rs"
 
 [[bin]]
-name = "awan-storage-server"
+name = "s3-server"
 path = "src/main.rs"
 
 [dependencies]

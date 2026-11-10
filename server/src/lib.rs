@@ -1,5 +1,5 @@
 //! awan-storage/server/src/lib.rs
-//! Awan Storage Server — Hybrid S3 Engine and Columnar Index Substrate
+//! High-Performance S3 Storage Server — Columnar SoA Index & Needle Storage Substrate
 
 pub mod aws_chunked;
 pub mod coalesce;
@@ -8,6 +8,7 @@ pub mod direct_io;
 pub mod error;
 pub mod ffi_bridge;
 pub mod lifecycle;
+pub mod meta_index;
 pub mod multipart;
 pub mod mvcc;
 pub mod reactor;
@@ -21,8 +22,8 @@ pub use coalesce::*;
 pub use compaction::*;
 pub use direct_io::*;
 pub use error::*;
-pub use ffi_bridge::*;
 pub use lifecycle::*;
+pub use meta_index::*;
 pub use multipart::*;
 pub use mvcc::*;
 pub use reactor::*;

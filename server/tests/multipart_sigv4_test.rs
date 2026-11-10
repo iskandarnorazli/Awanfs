@@ -1,7 +1,7 @@
 //! awan-storage/server/tests/multipart_sigv4_test.rs
 //! S3 Multipart Upload and AWS Signature V4 Verification Tests for Issue #467
 
-use awan_storage_server::{
+use s3_server::{
     decode_aws_chunked, set_fault_tamper_chunk_signature,
     set_fault_tamper_sigv4, start_s3_reactor, validate_sigv4_auth, S3ServiceState,
 };
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-async fn spawn_test_server(enforce_min_size: bool) -> (String, awan_storage_server::ServerHandle) {
+async fn spawn_test_server(enforce_min_size: bool) -> (String, s3_server::ServerHandle) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let state = Arc::new(S3ServiceState::new());
     state.multipart.enforce_min_part_size.store(enforce_min_size, std::sync::atomic::Ordering::SeqCst);
@@ -250,7 +250,7 @@ fn test_aws_chunked_decoder_and_signature_tamper_control() {
 
 #[test]
 fn test_sigv4_presigned_url_and_skew_checks() {
-    use awan_storage_server::parse_iso8601_epoch;
+    use s3_server::parse_iso8601_epoch;
     let date_str = "20251110T120000Z";
     let now = parse_iso8601_epoch(date_str).expect("parse date");
 
@@ -276,7 +276,7 @@ fn test_sigv4_presigned_url_and_skew_checks() {
     set_fault_tamper_sigv4(false);
 
     // Cryptographic HMAC-SHA256 verification & key derivation cache test
-    use awan_storage_server::{compute_sigv4_signature, verify_sigv4_signature, SigV4KeyCache};
+    use s3_server::{compute_sigv4_signature, verify_sigv4_signature, SigV4KeyCache};
     let cache = SigV4KeyCache::new();
     let string_to_sign = "AWS4-HMAC-SHA256\n20251110T120000Z\n20251110/us-east-1/s3/aws4_request\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     let valid_sig = compute_sigv4_signature(&cache, "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "20251110", "us-east-1", "s3", string_to_sign);
