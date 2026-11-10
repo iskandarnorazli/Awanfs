@@ -14,9 +14,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::aws_chunked::decode_aws_chunked;
+use crate::coalesce::SingleFlight;
 use crate::ffi_bridge::*;
 use crate::lifecycle::*;
 use crate::multipart::*;
+use crate::mvcc::MvccStore;
 use crate::sigv4::*;
 use crate::xml::*;
 
@@ -174,11 +176,33 @@ pub fn compute_md5(data: &[u8]) -> (u64, u64, String, [u8; 16]) {
     (hi, lo, hex, bytes)
 }
 
+pub fn validate_s3_key(key: &str) -> Result<(), crate::error::S3ErrorCode> {
+    if key.is_empty() {
+        return Err(crate::error::S3ErrorCode::InvalidObjectName);
+    }
+    if key.len() > 1024 {
+        return Err(crate::error::S3ErrorCode::KeyTooLongError);
+    }
+    for b in key.bytes() {
+        if b == 0 || b < 0x20 {
+            return Err(crate::error::S3ErrorCode::InvalidObjectName);
+        }
+    }
+    for segment in key.split('/') {
+        if segment == ".." {
+            return Err(crate::error::S3ErrorCode::InvalidObjectName);
+        }
+    }
+    Ok(())
+}
+
 pub struct S3ServiceState {
     pub engine: Arc<RwLock<AwanStorageEngine>>,
     pub multipart: Arc<MultipartManager>,
     pub sigv4_cache: Arc<SigV4KeyCache>,
     pub lifecycle: Arc<LifecycleManager>,
+    pub single_flight: Arc<SingleFlight>,
+    pub mvcc: Arc<MvccStore>,
     pub payload_store: Arc<RwLock<HashMap<(u32, u64), Bytes>>>,
     pub next_vol_offset: Arc<RwLock<u64>>,
 }
@@ -190,6 +214,8 @@ impl S3ServiceState {
             multipart: Arc::new(MultipartManager::new()),
             sigv4_cache: Arc::new(SigV4KeyCache::new()),
             lifecycle: Arc::new(LifecycleManager::new()),
+            single_flight: Arc::new(SingleFlight::new()),
+            mvcc: Arc::new(MvccStore::new()),
             payload_store: Arc::new(RwLock::new(HashMap::new())),
             next_vol_offset: Arc::new(RwLock::new(4096)),
         }
@@ -548,6 +574,15 @@ pub async fn handle_s3_request(
         }
 
         ParsedTarget::Object { bucket, key } => {
+            if let Err(err_code) = validate_s3_key(&key) {
+                let xml = s3_error_xml(err_code.as_str(), err_code.description(), &key, "req-val-key");
+                return Ok(Response::builder()
+                    .status(err_code.status_code())
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(full_body(Bytes::from(xml)))
+                    .unwrap());
+            }
+
             let b_id = {
                 let engine = state.engine.read();
                 match engine.lookup_bucket(&bucket) {
@@ -833,9 +868,37 @@ pub async fn handle_s3_request(
                             .unwrap());
                     }
 
+                    // Check If-None-Match: * (Atomic mutex creation)
+                    if let Some(inm) = req.headers().get("If-None-Match").and_then(|v| v.to_str().ok()) {
+                        if inm.trim() == "*" {
+                            let engine = state.engine.read();
+                            if engine.get_object(b_id, key.as_bytes()).is_ok() {
+                                let xml = s3_error_xml("PreconditionFailed", "At least one of the pre-conditions you specified did not hold.", &key, "req-inm");
+                                return Ok(Response::builder()
+                                    .status(StatusCode::PRECONDITION_FAILED)
+                                    .header(CONTENT_TYPE, "application/xml")
+                                    .body(full_body(Bytes::from(xml)))
+                                    .unwrap());
+                            }
+                        }
+                    }
+
                     // Standard PutObject
+                    let expected_len = req.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok());
                     let is_chunked = req.headers().get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
                     let raw_bytes = req.into_body().collect().await?.to_bytes();
+
+                    if let Some(exp) = expected_len {
+                        if raw_bytes.len() < exp {
+                            let xml = s3_error_xml("IncompleteBody", "You did not provide the number of bytes specified by the Content-Length HTTP header.", &key, "req-inc");
+                            return Ok(Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .header(CONTENT_TYPE, "application/xml")
+                                .body(full_body(Bytes::from(xml)))
+                                .unwrap());
+                        }
+                    }
+
                     let decoded_bytes = if is_chunked {
                         match decode_aws_chunked(&raw_bytes) {
                             Ok(b) => b,
@@ -854,9 +917,27 @@ pub async fn handle_s3_request(
 
                     let payload_len = decoded_bytes.len() as u64;
                     let (etag_hi, etag_lo, etag_hex, _) = compute_md5(&decoded_bytes);
+                    let final_etag_hex = if decoded_bytes.is_empty() {
+                        "d41d8cd98f00b204e9800998ecf8427e".to_string()
+                    } else {
+                        etag_hex
+                    };
 
-                    let vol_offset = state.allocate_offset(decoded_bytes.len());
-                    state.payload_store.write().insert((b_id, vol_offset), decoded_bytes);
+                    let flags = if key.ends_with('/') || decoded_bytes.is_empty() {
+                        AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE
+                    } else {
+                        AWAN_FLAG_ACTIVE
+                    };
+
+                    let vol_offset = if decoded_bytes.is_empty() {
+                        0
+                    } else {
+                        let off = state.allocate_offset(decoded_bytes.len());
+                        state.payload_store.write().insert((b_id, off), decoded_bytes.clone());
+                        off
+                    };
+
+                    state.mvcc.commit_version(b_id, &key, 1, vol_offset, payload_len, decoded_bytes);
 
                     let mut engine = state.engine.write();
                     engine.put_object(
@@ -867,12 +948,12 @@ pub async fn handle_s3_request(
                         etag_hi,
                         etag_lo,
                         0,
-                        AWAN_FLAG_ACTIVE,
+                        flags,
                     ).unwrap();
 
                     let resp = Response::builder()
                         .status(StatusCode::OK)
-                        .header(ETAG, format!("\"{}\"", etag_hex))
+                        .header(ETAG, format!("\"{}\"", final_etag_hex))
                         .header(CONTENT_LENGTH, "0")
                         .body(empty_body())
                         .unwrap();
@@ -880,21 +961,22 @@ pub async fn handle_s3_request(
                 }
 
                 Method::GET | Method::HEAD => {
-                    let engine = state.engine.read();
-                    let meta = match engine.get_object(b_id, key.as_bytes()) {
-                        Ok(m) => m,
-                        Err(_) => {
-                            let xml = s3_error_xml("NoSuchKey", "The specified key does not exist.", &key, "req-get-obj");
-                            return Ok(Response::builder()
-                                .status(StatusCode::NOT_FOUND)
-                                .header(CONTENT_TYPE, "application/xml")
-                                .body(full_body(Bytes::from(xml)))
-                                .unwrap());
-                        }
+                    let (meta, is_multipart) = {
+                        let engine = state.engine.read();
+                        let m = match engine.get_object(b_id, key.as_bytes()) {
+                            Ok(m) => m,
+                            Err(_) => {
+                                let xml = s3_error_xml("NoSuchKey", "The specified key does not exist.", &key, "req-get-obj");
+                                return Ok(Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .header(CONTENT_TYPE, "application/xml")
+                                    .body(full_body(Bytes::from(xml)))
+                                    .unwrap());
+                            }
+                        };
+                        let flags = unpack_flags(m.bucket_flags);
+                        (m, flags & AWAN_FLAG_MULTIPART != 0)
                     };
-
-                    let flags = unpack_flags(meta.bucket_flags);
-                    let is_multipart = flags & AWAN_FLAG_MULTIPART != 0;
 
                     let etag_val = if is_multipart {
                         let part_count = unpack_part_count(meta.bucket_flags);
@@ -951,6 +1033,11 @@ pub async fn handle_s3_request(
                             .cloned()
                             .unwrap_or_else(|| Bytes::from(vec![0u8; meta.size as usize]))
                     };
+
+                    let single_flight_key = format!("{}/{}", bucket, key);
+                    let payload = state.single_flight.execute_or_join(&single_flight_key, || async move {
+                        payload
+                    }).await;
 
                     let range_hdr = req.headers().get("Range").and_then(|v| v.to_str().ok());
                     let range_res = range_hdr.map(|h| parse_range_header(h, meta.size));
@@ -1011,15 +1098,7 @@ pub async fn handle_s3_request(
                 }
 
                 Method::DELETE => {
-                    if query_map.contains_key("lifecycle") {
-                        state.lifecycle.delete_rules(&bucket);
-                        return Ok(Response::builder()
-                            .status(StatusCode::NO_CONTENT)
-                            .header(CONTENT_LENGTH, "0")
-                            .body(empty_body())
-                            .unwrap());
-                    }
-
+                    state.mvcc.tombstone(b_id, &key);
                     let mut engine = state.engine.write();
                     let _ = engine.delete_object(b_id, key.as_bytes());
                     Ok(Response::builder()
