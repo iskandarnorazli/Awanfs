@@ -6,13 +6,17 @@ use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HOST, LAST_MODIFIED};
 use hyper::{Method, Request, Response, StatusCode};
+use md5::{Digest, Md5};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-
+use crate::aws_chunked::decode_aws_chunked;
 use crate::ffi_bridge::*;
+use crate::multipart::*;
+use crate::sigv4::*;
 use crate::xml::*;
 
 pub type ResponseBody = BoxBody<Bytes, std::convert::Infallible>;
@@ -52,7 +56,6 @@ pub fn parse_range_header(header: &str, object_size: u64) -> Result<Option<ByteR
     }
     let spec = &header["bytes=".len()..].trim();
     if spec.contains(',') {
-        // Multi-range not required for S3 drop-in compatibility
         return Err(());
     }
 
@@ -91,7 +94,6 @@ pub fn parse_range_header(header: &str, object_size: u64) -> Result<Option<ByteR
 
         let end = if parsed_end >= object_size {
             if disable_clamping {
-                // Negative control: do not clamp
                 parsed_end
             } else {
                 object_size - 1
@@ -110,10 +112,8 @@ pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarge
     let raw_path = uri_path.split('?').next().unwrap_or(uri_path);
     let trimmed_path = raw_path.trim_start_matches('/');
 
-    // Check virtual-hosted-style: Host: {bucket}.s3.localhost:9000 or {bucket}.localhost:9000
     if let Some(host) = host_header {
         let host_no_port = host.split(':').next().unwrap_or(host);
-        // Common domains to strip
         for base in &["s3.localhost", "localhost", "s3.internal", "s3.amazonaws.com", "127.0.0.1"] {
             if host_no_port.ends_with(base) && host_no_port.len() > base.len() + 1 {
                 let prefix = &host_no_port[..host_no_port.len() - base.len() - 1];
@@ -132,7 +132,6 @@ pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarge
         }
     }
 
-    // Path-style: /{bucket}/{key...}
     if trimmed_path.is_empty() {
         return ParsedTarget::Service;
     }
@@ -160,9 +159,7 @@ pub fn md5_to_etag_hex(hi: u64, lo: u64) -> String {
     s
 }
 
-use md5::{Digest, Md5};
-
-pub fn compute_md5(data: &[u8]) -> (u64, u64, String) {
+pub fn compute_md5(data: &[u8]) -> (u64, u64, String, [u8; 16]) {
     let mut hasher = Md5::new();
     hasher.update(data);
     let result = hasher.finalize();
@@ -173,12 +170,13 @@ pub fn compute_md5(data: &[u8]) -> (u64, u64, String) {
     for b in bytes {
         hex.push_str(&format!("{:02x}", b));
     }
-    (hi, lo, hex)
+    (hi, lo, hex, bytes)
 }
 
 pub struct S3ServiceState {
     pub engine: Arc<RwLock<AwanStorageEngine>>,
-    /// Keyed by (bucket_id, vol_offset) -> raw payload bytes
+    pub multipart: Arc<MultipartManager>,
+    pub sigv4_cache: Arc<SigV4KeyCache>,
     pub payload_store: Arc<RwLock<HashMap<(u32, u64), Bytes>>>,
     pub next_vol_offset: Arc<RwLock<u64>>,
 }
@@ -187,6 +185,8 @@ impl S3ServiceState {
     pub fn new() -> Self {
         Self {
             engine: Arc::new(RwLock::new(AwanStorageEngine::new(100_000, 4_194_304, 65536))),
+            multipart: Arc::new(MultipartManager::new()),
+            sigv4_cache: Arc::new(SigV4KeyCache::new()),
             payload_store: Arc::new(RwLock::new(HashMap::new())),
             next_vol_offset: Arc::new(RwLock::new(4096)),
         }
@@ -217,12 +217,35 @@ pub async fn handle_s3_request(
     let query = uri.query().unwrap_or("");
     let host_hdr = req.headers().get(HOST).and_then(|v| v.to_str().ok());
 
+    let mut query_map = HashMap::new();
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            query_map.insert(k.to_string(), v.to_string());
+        } else if !pair.is_empty() {
+            query_map.insert(pair.to_string(), String::new());
+        }
+    }
+
+    // SigV4 Authentication Check
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let auth_header = req.headers().get("Authorization").and_then(|v| v.to_str().ok());
+    if let Err(code) = validate_sigv4_auth(auth_header, &query_map, now_sec) {
+        let xml = s3_error_xml(code, "Authentication failed", path, "req-auth");
+        return Ok(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(CONTENT_TYPE, "application/xml")
+            .body(full_body(Bytes::from(xml)))
+            .unwrap());
+    }
+
     let target = parse_s3_target(path, host_hdr);
 
     match target {
         ParsedTarget::Service => {
             if method == Method::GET {
-                // ListBuckets
                 let engine = state.engine.read();
                 let mut b_list = Vec::new();
                 for (name, _) in &engine.bucket_names {
@@ -246,7 +269,6 @@ pub async fn handle_s3_request(
         }
 
         ParsedTarget::Bucket { bucket } => {
-            // Bucket operations
             match method {
                 Method::PUT => {
                     let mut engine = state.engine.write();
@@ -335,8 +357,20 @@ pub async fn handle_s3_request(
                 }
 
                 Method::GET => {
-                    if query.contains("location") {
+                    if query_map.contains_key("location") {
                         let xml = location_constraint_xml("us-east-1");
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/xml")
+                            .body(full_body(Bytes::from(xml)))
+                            .unwrap());
+                    }
+
+                    if query_map.contains_key("uploads") {
+                        // ListMultipartUploads
+                        let uploads_guard = state.multipart.uploads.read();
+                        let active: Vec<_> = uploads_guard.values().filter(|u| u.bucket == bucket).cloned().collect();
+                        let xml = list_multipart_uploads_result_xml(&bucket, &active);
                         return Ok(Response::builder()
                             .status(StatusCode::OK)
                             .header(CONTENT_TYPE, "application/xml")
@@ -358,22 +392,9 @@ pub async fn handle_s3_request(
                         }
                     };
 
-                    let mut prefix = "";
-                    let mut start_after = "";
-                    let mut max_keys = 1000u32;
-                    for q in query.split('&') {
-                        if let Some((k, v)) = q.split_once('=') {
-                            if k == "prefix" {
-                                prefix = v;
-                            } else if k == "start-after" {
-                                start_after = v;
-                            } else if k == "max-keys" {
-                                if let Ok(n) = v.parse::<u32>() {
-                                    max_keys = n;
-                                }
-                            }
-                        }
-                    }
+                    let prefix = query_map.get("prefix").map(|s| s.as_str()).unwrap_or("");
+                    let start_after = query_map.get("start-after").map(|s| s.as_str()).unwrap_or("");
+                    let max_keys = query_map.get("max-keys").and_then(|s| s.parse().ok()).unwrap_or(1000u32);
 
                     let mut records = vec![AwanObjectMeta::default(); max_keys as usize];
                     let count = engine.scan_objects(
@@ -413,12 +434,10 @@ pub async fn handle_s3_request(
                         .unwrap())
                 }
 
-                Method::POST if query.contains("delete") => {
-                    // Batch DeleteObjects
+                Method::POST if query_map.contains_key("delete") => {
                     let body_bytes = req.into_body().collect().await?.to_bytes();
                     let body_str = String::from_utf8_lossy(&body_bytes);
 
-                    // Extract keys: <Key>...</Key>
                     let mut keys_to_delete = Vec::new();
                     let mut cursor = body_str.as_ref();
                     while let Some(start) = cursor.find("<Key>") {
@@ -473,7 +492,227 @@ pub async fn handle_s3_request(
         }
 
         ParsedTarget::Object { bucket, key } => {
-            // Object operations
+            let b_id = {
+                let engine = state.engine.read();
+                match engine.lookup_bucket(&bucket) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        let xml = s3_error_xml("NoSuchBucket", "The specified bucket does not exist", &bucket, "req-obj");
+                        return Ok(Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .header(CONTENT_TYPE, "application/xml")
+                            .body(full_body(Bytes::from(xml)))
+                            .unwrap());
+                    }
+                }
+            };
+
+            // 1. Multipart POST /{bucket}/{key}?uploads -> CreateMultipartUpload
+            if method == Method::POST && query_map.contains_key("uploads") {
+                let upload_id = state.multipart.create_upload(&bucket, b_id, &key);
+                let xml = initiate_multipart_upload_result_xml(&bucket, &key, &upload_id);
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(full_body(Bytes::from(xml)))
+                    .unwrap());
+            }
+
+            // 2. Multipart PUT /{bucket}/{key}?partNumber=N&uploadId=ID -> UploadPart
+            if method == Method::PUT && query_map.contains_key("uploadId") && query_map.contains_key("partNumber") {
+                let upload_id = &query_map["uploadId"];
+                let part_num: u32 = match query_map["partNumber"].parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        let xml = s3_error_xml("InvalidArgument", "Invalid partNumber", &key, "req-up-part");
+                        return Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header(CONTENT_TYPE, "application/xml")
+                            .body(full_body(Bytes::from(xml)))
+                            .unwrap());
+                    }
+                };
+
+                let is_chunked = req.headers().get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
+                let raw_bytes = req.into_body().collect().await?.to_bytes();
+                let decoded_bytes = if is_chunked {
+                    match decode_aws_chunked(&raw_bytes) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let xml = s3_error_xml(e, "Error decoding chunked body", &key, "req-up-part");
+                            return Ok(Response::builder()
+                                .status(StatusCode::FORBIDDEN)
+                                .header(CONTENT_TYPE, "application/xml")
+                                .body(full_body(Bytes::from(xml)))
+                                .unwrap());
+                        }
+                    }
+                } else {
+                    raw_bytes
+                };
+
+                let (hi, lo, hex, raw_md5) = compute_md5(&decoded_bytes);
+                let vol_offset = state.allocate_offset(decoded_bytes.len());
+                state.payload_store.write().insert((b_id, vol_offset), decoded_bytes.clone());
+
+                match state.multipart.upload_part(
+                    upload_id,
+                    part_num,
+                    vol_offset,
+                    decoded_bytes.len() as u64,
+                    raw_md5,
+                    hi,
+                    lo,
+                    hex.clone(),
+                ) {
+                    Ok(_) => {
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(ETAG, format!("\"{}\"", hex))
+                            .header(CONTENT_LENGTH, "0")
+                            .body(empty_body())
+                            .unwrap());
+                    }
+                    Err(err) => {
+                        let xml = s3_error_xml(err, "Failed to upload part", &key, "req-up-part");
+                        let status = if err == "NoSuchUpload" { StatusCode::NOT_FOUND } else { StatusCode::BAD_REQUEST };
+                        return Ok(Response::builder()
+                            .status(status)
+                            .header(CONTENT_TYPE, "application/xml")
+                            .body(full_body(Bytes::from(xml)))
+                            .unwrap());
+                    }
+                }
+            }
+
+            // 3. Multipart POST /{bucket}/{key}?uploadId=ID -> CompleteMultipartUpload
+            if method == Method::POST && query_map.contains_key("uploadId") {
+                let upload_id = &query_map["uploadId"];
+                let body_bytes = req.into_body().collect().await?.to_bytes();
+                let body_str = String::from_utf8_lossy(&body_bytes);
+
+                // Parse XML <Part><PartNumber>N</PartNumber><ETag>E</ETag></Part>
+                let mut declared_parts = Vec::new();
+                let mut cursor = body_str.as_ref();
+                while let Some(start) = cursor.find("<Part>") {
+                    let rest = &cursor[start + 6..];
+                    let part_end = match rest.find("</Part>") {
+                        Some(e) => e,
+                        None => break,
+                    };
+                    let part_block = &rest[..part_end];
+                    cursor = &rest[part_end + 7..];
+
+                    let p_num = part_block
+                        .find("<PartNumber>")
+                        .and_then(|s| {
+                            let r = &part_block[s + 12..];
+                            let e = r.find("</PartNumber>")?;
+                            r[..e].parse::<u32>().ok()
+                        })
+                        .unwrap_or(0);
+
+                    let etag = part_block
+                        .find("<ETag>")
+                        .and_then(|s| {
+                            let r = &part_block[s + 6..];
+                            let e = r.find("</ETag>")?;
+                            Some(r[..e].to_string())
+                        })
+                        .unwrap_or_default();
+
+                    declared_parts.push((p_num, etag));
+                }
+
+                match state.multipart.complete_upload(upload_id, &declared_parts) {
+                    Ok((composite_etag, total_size, extents)) => {
+                        // Store object in @flat ObjectMeta
+                        let (hi, lo, _, _) = compute_md5(composite_etag.as_bytes());
+                        let first_vol_offset = extents.first().map(|e| e.vol_offset).unwrap_or(0);
+                        let mut engine = state.engine.write();
+                        engine.put_object(
+                            b_id,
+                            key.as_bytes(),
+                            first_vol_offset,
+                            total_size,
+                            hi,
+                            lo,
+                            extents.len() as u16,
+                            AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART,
+                        ).unwrap();
+
+                        let location = format!("http://127.0.0.1:9000/{}/{}", bucket, key);
+                        let xml = complete_multipart_upload_result_xml(&bucket, &key, &composite_etag, &location);
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/xml")
+                            .header(ETAG, format!("\"{}\"", composite_etag))
+                            .body(full_body(Bytes::from(xml)))
+                            .unwrap());
+                    }
+                    Err(err) => {
+                        let xml = s3_error_xml(err, "CompleteMultipartUpload error", &key, "req-cmp-part");
+                        let status = if err == "NoSuchUpload" {
+                            StatusCode::NOT_FOUND
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        };
+                        return Ok(Response::builder()
+                            .status(status)
+                            .header(CONTENT_TYPE, "application/xml")
+                            .body(full_body(Bytes::from(xml)))
+                            .unwrap());
+                    }
+                }
+            }
+
+            // 4. Multipart DELETE /{bucket}/{key}?uploadId=ID -> AbortMultipartUpload
+            if method == Method::DELETE && query_map.contains_key("uploadId") {
+                let upload_id = &query_map["uploadId"];
+                match state.multipart.abort_upload(upload_id) {
+                    Ok(()) => {
+                        return Ok(Response::builder()
+                            .status(StatusCode::NO_CONTENT)
+                            .header(CONTENT_LENGTH, "0")
+                            .body(empty_body())
+                            .unwrap());
+                    }
+                    Err(err) => {
+                        let xml = s3_error_xml(err, "NoSuchUpload", &key, "req-ab-part");
+                        return Ok(Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .header(CONTENT_TYPE, "application/xml")
+                            .body(full_body(Bytes::from(xml)))
+                            .unwrap());
+                    }
+                }
+            }
+
+            // 5. Multipart GET /{bucket}/{key}?uploadId=ID -> ListParts
+            if method == Method::GET && query_map.contains_key("uploadId") {
+                let upload_id = &query_map["uploadId"];
+                match state.multipart.get_upload(upload_id) {
+                    Some(u) => {
+                        let parts: Vec<_> = u.parts.values().cloned().collect();
+                        let xml = list_parts_result_xml(&bucket, &key, upload_id, &parts);
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/xml")
+                            .body(full_body(Bytes::from(xml)))
+                            .unwrap());
+                    }
+                    None => {
+                        let xml = s3_error_xml("NoSuchUpload", "The specified upload does not exist", &key, "req-lp");
+                        return Ok(Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .header(CONTENT_TYPE, "application/xml")
+                            .body(full_body(Bytes::from(xml)))
+                            .unwrap());
+                    }
+                }
+            }
+
+            // Standard Object operations
             match method {
                 Method::PUT => {
                     // Check copy source
@@ -503,18 +742,6 @@ pub async fn handle_s3_request(
                                     .unwrap());
                             }
                         };
-                        let dst_b_id = match engine.lookup_bucket(&bucket) {
-                            Ok(id) => id,
-                            Err(_) => {
-                                let xml = s3_error_xml("NoSuchBucket", "Target bucket does not exist", &bucket, "req-cp");
-                                return Ok(Response::builder()
-                                    .status(StatusCode::NOT_FOUND)
-                                    .header(CONTENT_TYPE, "application/xml")
-                                    .body(full_body(Bytes::from(xml)))
-                                    .unwrap());
-                            }
-                        };
-
                         let src_meta = match engine.get_object(src_b_id, src_key.as_bytes()) {
                             Ok(m) => m,
                             Err(_) => {
@@ -528,10 +755,9 @@ pub async fn handle_s3_request(
                         };
                         drop(engine);
 
-                        // Clone metadata pointing to same volume offset
                         let mut engine = state.engine.write();
                         engine.put_object(
-                            dst_b_id,
+                            b_id,
                             key.as_bytes(),
                             src_meta.vol_offset,
                             src_meta.size,
@@ -551,28 +777,30 @@ pub async fn handle_s3_request(
                             .unwrap());
                     }
 
-                    // Standard PutObject: verify bucket exists first (for Expect: 100-continue validation)
-                    let b_id = {
-                        let engine = state.engine.read();
-                        match engine.lookup_bucket(&bucket) {
-                            Ok(id) => id,
-                            Err(_) => {
-                                let xml = s3_error_xml("NoSuchBucket", "The specified bucket does not exist", &bucket, "req-put-obj");
+                    // Standard PutObject
+                    let is_chunked = req.headers().get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
+                    let raw_bytes = req.into_body().collect().await?.to_bytes();
+                    let decoded_bytes = if is_chunked {
+                        match decode_aws_chunked(&raw_bytes) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                let xml = s3_error_xml(e, "Error decoding chunked body", &key, "req-put-obj");
                                 return Ok(Response::builder()
-                                    .status(StatusCode::NOT_FOUND)
+                                    .status(StatusCode::FORBIDDEN)
                                     .header(CONTENT_TYPE, "application/xml")
                                     .body(full_body(Bytes::from(xml)))
                                     .unwrap());
                             }
                         }
+                    } else {
+                        raw_bytes
                     };
 
-                    let body_bytes = req.into_body().collect().await?.to_bytes();
-                    let payload_len = body_bytes.len() as u64;
-                    let (etag_hi, etag_lo, etag_hex) = compute_md5(&body_bytes);
+                    let payload_len = decoded_bytes.len() as u64;
+                    let (etag_hi, etag_lo, etag_hex, _) = compute_md5(&decoded_bytes);
 
-                    let vol_offset = state.allocate_offset(body_bytes.len());
-                    state.payload_store.write().insert((b_id, vol_offset), body_bytes);
+                    let vol_offset = state.allocate_offset(decoded_bytes.len());
+                    state.payload_store.write().insert((b_id, vol_offset), decoded_bytes);
 
                     let mut engine = state.engine.write();
                     engine.put_object(
@@ -597,18 +825,6 @@ pub async fn handle_s3_request(
 
                 Method::GET | Method::HEAD => {
                     let engine = state.engine.read();
-                    let b_id = match engine.lookup_bucket(&bucket) {
-                        Ok(id) => id,
-                        Err(_) => {
-                            let xml = s3_error_xml("NoSuchBucket", "The specified bucket does not exist", &bucket, "req-get-obj");
-                            return Ok(Response::builder()
-                                .status(StatusCode::NOT_FOUND)
-                                .header(CONTENT_TYPE, "application/xml")
-                                .body(full_body(Bytes::from(xml)))
-                                .unwrap());
-                        }
-                    };
-
                     let meta = match engine.get_object(b_id, key.as_bytes()) {
                         Ok(m) => m,
                         Err(_) => {
@@ -621,13 +837,21 @@ pub async fn handle_s3_request(
                         }
                     };
 
-                    let etag_hex = md5_to_etag_hex(meta.etag_hi, meta.etag_lo);
-                    let etag_val = format!("\"{}\"", etag_hex);
+                    let flags = unpack_flags(meta.bucket_flags);
+                    let is_multipart = flags & AWAN_FLAG_MULTIPART != 0;
+
+                    let etag_val = if is_multipart {
+                        let part_count = unpack_part_count(meta.bucket_flags);
+                        let hex = md5_to_etag_hex(meta.etag_hi, meta.etag_lo);
+                        format!("\"{}-{}\"", hex, part_count)
+                    } else {
+                        format!("\"{}\"", md5_to_etag_hex(meta.etag_hi, meta.etag_lo))
+                    };
 
                     // Conditional headers: If-Match
                     if let Some(if_match) = req.headers().get("If-Match").and_then(|v| v.to_str().ok()) {
                         let if_match = if_match.trim();
-                        if if_match != "*" && if_match != etag_val && if_match != etag_hex {
+                        if if_match != "*" && if_match != etag_val && if_match != etag_val.trim_matches('"') {
                             return Ok(Response::builder()
                                 .status(StatusCode::PRECONDITION_FAILED)
                                 .header(CONTENT_LENGTH, "0")
@@ -639,7 +863,7 @@ pub async fn handle_s3_request(
                     // Conditional headers: If-None-Match
                     if let Some(if_none_match) = req.headers().get("If-None-Match").and_then(|v| v.to_str().ok()) {
                         let if_none_match = if_none_match.trim();
-                        if if_none_match == "*" || if_none_match == etag_val || if_none_match == etag_hex {
+                        if if_none_match == "*" || if_none_match == etag_val || if_none_match == etag_val.trim_matches('"') {
                             return Ok(Response::builder()
                                 .status(StatusCode::NOT_MODIFIED)
                                 .header(ETAG, etag_val)
@@ -649,18 +873,31 @@ pub async fn handle_s3_request(
                         }
                     }
 
-                    // Fetch payload
-                    let payload = state
-                        .payload_store
-                        .read()
-                        .get(&(b_id, meta.vol_offset))
-                        .cloned()
-                        .unwrap_or_else(|| Bytes::from(vec![0u8; meta.size as usize]));
+                    // Fetch payload (either single volume needle or multi-part extent stitched)
+                    let payload = if is_multipart {
+                        if let Some(extents) = state.multipart.get_completed_extents(b_id, &key) {
+                            let pstore = state.payload_store.read();
+                            let mut stitched = Vec::with_capacity(meta.size as usize);
+                            for ext in extents {
+                                if let Some(chunk) = pstore.get(&(b_id, ext.vol_offset)) {
+                                    stitched.extend_from_slice(chunk);
+                                }
+                            }
+                            Bytes::from(stitched)
+                        } else {
+                            Bytes::from(vec![0u8; meta.size as usize])
+                        }
+                    } else {
+                        state
+                            .payload_store
+                            .read()
+                            .get(&(b_id, meta.vol_offset))
+                            .cloned()
+                            .unwrap_or_else(|| Bytes::from(vec![0u8; meta.size as usize]))
+                    };
 
-                    // Check Range header
                     let range_hdr = req.headers().get("Range").and_then(|v| v.to_str().ok());
                     let range_res = range_hdr.map(|h| parse_range_header(h, meta.size));
-
                     let is_head = method == Method::HEAD;
 
                     if let Some(range_opt) = range_res {
@@ -690,7 +927,6 @@ pub async fn handle_s3_request(
                                 return Ok(resp);
                             }
                             Err(()) => {
-                                // 416 Range Not Satisfiable
                                 let xml = s3_error_xml("InvalidRange", "The requested range cannot be satisfied.", &key, "req-range-err");
                                 let body = if is_head { empty_body() } else { full_body(Bytes::from(xml)) };
                                 let resp = Response::builder()
@@ -705,7 +941,6 @@ pub async fn handle_s3_request(
                         }
                     }
 
-                    // Full object GET/HEAD
                     let body = if is_head { empty_body() } else { full_body(payload) };
                     let resp = Response::builder()
                         .status(StatusCode::OK)
@@ -721,10 +956,7 @@ pub async fn handle_s3_request(
 
                 Method::DELETE => {
                     let mut engine = state.engine.write();
-                    if let Ok(b_id) = engine.lookup_bucket(&bucket) {
-                        let _ = engine.delete_object(b_id, key.as_bytes());
-                    }
-                    // S3 spec: DeleteObject is idempotent 204 No Content even if key did not exist
+                    let _ = engine.delete_object(b_id, key.as_bytes());
                     Ok(Response::builder()
                         .status(StatusCode::NO_CONTENT)
                         .header(CONTENT_LENGTH, "0")
