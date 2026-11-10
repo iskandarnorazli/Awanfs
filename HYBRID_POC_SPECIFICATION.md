@@ -87,6 +87,46 @@ Standard S3 XML format returned for all failure conditions:
 </Error>
 ```
 
+### 2.3 S3 Multipart Upload Wire State Machine
+To act as a seamless drop-in replacement for AWS S3 clients (`aws-cli`, `boto3`, `rclone`), files $> 5\text{ MB}$ transition through the standard S3 multipart upload protocol:
+
+| Action | HTTP Verb & URI | Description | Response Code & Payload |
+|---|---|---|---|
+| **Initiate** | `POST /{bucket}/{key}?uploads` | Generates a 64-bit unique `UploadId` and leases part allocation slots in the `@arena` slab. | `200 OK` (returns `InitiateMultipartUploadResult` XML) |
+| **UploadPart** | `PUT /{bucket}/{key}?partNumber={N}&uploadId={ID}` | Ingests part payload into a designated slab chunk; calculates MD5/CRC32c. | `200 OK` with `ETag: "{part_etag}"` |
+| **Complete** | `POST /{bucket}/{key}?uploadId={ID}` | Receives list of `<PartNumber>` and `<ETag>`. Stitches part offsets in `@flat ObjectMeta` without data copying. | `200 OK` (returns `CompleteMultipartUploadResult` with composite ETag `"{hash}-{part_count}"`) |
+| **Abort** | `DELETE /{bucket}/{key}?uploadId={ID}` | Immediately frees all leased part slabs and invalidates the `UploadId`. | `204 No Content` |
+
+### 2.4 AWS Signature V4 Authentication & Pre-Signed URLs
+- **Header Authentication**: Verifies `Authorization: AWS4-HMAC-SHA256 Credential=... SignedHeaders=... Signature=...`.
+- **Derived Signing Key Caching**: Precomputes and caches derived secret keys `kSigning = HMAC(HMAC(HMAC(HMAC(secret, date), region), "s3"), "aws4_request")` to eliminate redundant crypto work.
+- **Pre-Signed Query URLs**: Validates query authentication parameters (`X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`, `X-Amz-SignedHeaders`, `X-Amz-Signature`).
+- **Anonymous Access**: Buckets configured for public access bypass SigV4 validation.
+
+### 2.5 Bucket Lifecycle & Automated Expiration Daemon
+- **Lifecycle Configuration API**:
+  - `PUT /{bucket}?lifecycle`: Ingests S3 XML Lifecycle Configuration rules.
+  - `GET /{bucket}?lifecycle`: Returns active XML configuration.
+  - `DELETE /{bucket}?lifecycle`: Deactivates lifecycle rules.
+- **Automated Background Cleanup Sweeps**:
+  - `Expiration.Days`: Objects older than TTL days are flagged with tombstone bits during background sweeps and their storage slabs returned to the free pool.
+  - `AbortIncompleteMultipartUpload.DaysAfterInitiation`: Incomplete multipart upload slabs abandoned after $N$ days (e.g. 7 days) are automatically purged to prevent disk leakage.
+
+### 2.6 Edge-Case Contracts & Path Traversal Defenses
+- **Zero-Byte Objects**: Uploading a 0-byte payload allocates zero chunk bytes and creates an `@flat ObjectMeta` entry with `size = 0` and standard empty MD5 `d41d8cd98f00b204e9800998ecf8427e`.
+- **Directory Markers**: Keys ending with `/` (e.g. `datasets/train/`) are treated as 0-byte folder placeholders.
+- **URI Encoding & Unicode**: URL-encoded characters (`%20`, `+`, `&`) and multi-byte UTF-8 Unicode characters (e.g. `📁/🔑.parquet`) are decoded before hashing and indexing.
+- **Path Traversal Defenses**: Any key attempting path escaping (`../`, `..\`, `/etc/passwd`) is rejected immediately with `400 Bad Request`.
+- **Thundering Herd Coalescing**: When multiple concurrent requests miss the memory cache and query the same cold NVMe chunk, requests coalesce onto a single disk read promise.
+
+### 2.7 Direct I/O (`O_DIRECT`) & Volume Packing Needle Architecture
+- **OS PageCache Bypass**:
+  - Chunk storage volumes are opened with `O_DIRECT` (Linux) or `FILE_FLAG_NO_BUFFERING` (Windows) to prevent double-buffering and dirty page writeback latency spikes.
+  - All chunk read/write buffers are strictly 4096-byte aligned.
+- **Volume Packing (WORM Needle Format)**:
+  - Eliminates filesystem inode thrashing by storing millions of objects inside large 32 GiB contiguous Volume Slabs (`volume_001.dat`).
+  - `@flat ObjectMeta` points to `(volume_id, byte_offset, size)`, enabling instant single-syscall positional `pread`.
+
 ---
 
 ## 3. C-ABI FFI Boundary (`libawan_storage`)
@@ -126,6 +166,16 @@ void awan_storage_destroy(void* engine);
 ---
 
 ## 4. Multi-Tiered Testing Strategy
+
+### 4.0 Property-Based Testing (proptest & Awan Generative Tests)
+- **Mathematical Invariants**:
+  - $\forall key, payload: \text{GET}(\text{PUT}(key, payload)) = payload$.
+  - $\forall start, end: \text{Range}(\text{PUT}(key, payload), start, end) = payload[start..=end]$.
+  - $\forall key: \text{DELETE}(key) \implies \text{GET}(key) = 404\text{ NoSuchKey}$.
+  - Incomplete multipart uploads that are aborted release $100\%$ of allocated slab chunks.
+  - Multi-threaded concurrent writes to non-overlapping keys never corrupt `@flat ObjectMeta` arrays or slab offsets.
+- **Official Conformance Gauntlet**:
+  - Run the official Ceph [`s3-tests`](https://github.com/ceph/s3-tests) suite and MinIO [`mint`](https://github.com/minio/mint) conformance suite against `awan-storage-server` to verify 100% S3 compatibility.
 
 ### 4.1 Awan Engine Unit Tests (`tests/storage/*.test.awan`)
 - **Metadata Index Ingestion & Probing**:
