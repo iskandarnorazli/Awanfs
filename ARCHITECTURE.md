@@ -115,10 +115,12 @@ Each object or multipart segment written to a Volume Slab is encapsulated in a s
 - `etag_hi: u64`, `etag_lo: u64`
 - Followed by `key_bytes` (`key_len` bytes), `payload_bytes` (`payload_size` bytes), and zero-padding to the next 4096-byte boundary.
 
-### B. Crash Recovery & Persistence Lifecycle
-1. **Write Path:**
+### B. Crash Recovery, Writeback Modes & Persistence Lifecycle
+1. **Write Path & Durability Modes:**
    - Payload streams into 4096-byte aligned `@arena` slots while hardware CRC32C/MD5/SHA256 computes in register.
-   - Needle is written via `O_DIRECT` positional write to the active volume slab (`volume_XXXX.dat`), and a compact 64-byte index entry is appended to the volume's `.idx` journal file.
+   - Needle is written via 4096-byte aligned positional write (`seek_write` / `write_all_at`) to the active volume slab (`volume_XXXX.dat`), and a compact 42-byte index entry is appended to the volume's `.idx` journal file.
+   - **OS Writeback Mode (Default) vs Strict Direct I/O (`AWAN_DIRECT_IO=1`):** By default, `AlignedFile::open_direct` uses 4096-byte aligned positional I/O backed by OS writeback caching (avoiding per-request synchronous NVMe controller cache flushes on every 64 KiB `PUT`), while setting `AWAN_DIRECT_IO=1` enables strict hardware `FILE_FLAG_NO_BUFFERING` (Windows) / `O_DIRECT` (Linux) bypass.
+   - **Bounded Small-Object Hot Slab Cache (`<= 16 MiB`):** Objects `<= 256 KiB` are cached in a bounded 256-slot hot ring (`<= 16 MiB` total RSS ceiling) for sub-millisecond hot reads, while larger objects and multipart extents stream directly from `volume_XXXX.dat` without growing server heap memory over uptime.
    - Only after the write completes is the row atomically published into `@flat ObjectMeta`.
 2. **Startup & Crash Replay:**
    - On startup, the daemon memory-maps the latest `metadata.checkpoint` snapshot into the `@flat ObjectMeta` columns and replays any subsequent entries from `.idx`.

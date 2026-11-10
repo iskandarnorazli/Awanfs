@@ -66,3 +66,17 @@ The Phase 2 head-to-head benchmark matrix will execute using MinIO's official [`
 2. **Large-Object Multi-Part Streaming (64 MB to 1 GB Objects)**: Sustained NVMe read/write throughput and kernel DMA efficiency.
 3. **Mixed Read/Write Concurrency**: 70% GET, 20% PUT, 10% DELETE under 64 concurrent connections.
 4. **Cold Start AI Sandbox Restoration**: Timing the parallel retrieval of 10,000 container filesystem images (500 MB each).
+
+---
+
+## 6. Which S3 Metrics Matter in Practice (Concurrency vs IOPS vs MiB/s vs Tail Latency)
+
+When infrastructure teams evaluate S3-compatible engines (`warp`, `s5cmd`, `rclone`, PyTorch DataLoader, DuckDB/Polars), they look at four distinct axes depending on object size:
+
+| Metric | What It Measures | When Engineers Care Most | How `awan-storage` Performs (Measured in [`s3_warp_minio_vs_awan.md`](../docs/measurements/s3_warp_minio_vs_awan.md)) |
+| :--- | :--- | :--- | :--- |
+| **Operations/sec (IOPS)** | Metadata lookup, HTTP framing, SigV4 auth, and small-needle disk append rate | **Small Objects (`<= 64 KiB`)** & **Byte-Range Reads (`206 Partial Content`)** (e.g., Parquet footer/column headers, Safetensors metadata, JSON logs) | **5,984 PUT ops/s** (5.94x over file-per-object baseline), **6,061 GET ops/s** (3.08x), **6,585 Range GET ops/s** (3.20x) at 64-client concurrency |
+| **Throughput (`MiB/s` / `GiB/s`)** | Sustained NVMe + socket DMA bandwidth | **Large Objects (`1 MiB` – `10 GiB`)** & **Multipart Uploads (`16 x 64 MiB` parts)** (e.g., LLM checkpoints, container snapshots, Parquet blobs) | **794.4 MiB/s** (1 MiB PUT), **1,273.8 MiB/s** (1 MiB GET), **826.8 MiB/s** (1 MiB Multipart Upload, 3.39x), **1,203.8 MiB/s** (1 GiB Multipart Range GET), **1,244.1 MiB/s** (10 GiB Volume GET) |
+| **Concurrency Scaling & P99 / P99.9 Tail Latency** | Queueing stability under 32–256 parallel client connections (whether `SingleFlight`, lock-free reads, and WORM append prevent latency spikes) | **Multi-tenant AI/Analytics Clusters** where 64+ workers read/write simultaneously; Go-based stores suffer GC tail spikes (`>100 ms`) and file-per-object stores suffer NTFS/ext4 directory lock contention | At `C=64`: 64 KiB PUT P99.9 is **31.96 ms** (vs **135.37 ms** baseline, **4.2x lower**); 64 KiB GET P99.9 is **34.20 ms** (vs **323.62 ms** baseline, **9.5x lower**); 10 GiB PUT P99.9 is **1,074 ms** (vs **5,146 ms** baseline, **4.8x lower**) |
+| **Peak RSS Memory & Uptime Stability** | Server resident memory under sustained load | **Edge / Sidecar / Co-located Compute Nodes** where the storage daemon cannot steal GBs of RAM from GPU/AI workers | **41.4 MB** (64 KiB workload) and **82.9 MB** (1 MiB workload) via fixed 64B `@flat ObjectMeta` SoA slabs + bounded 16 MiB hot cache |
+
