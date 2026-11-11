@@ -250,7 +250,7 @@ impl S3ServiceState {
             id
         ));
         let _ = std::fs::create_dir_all(&default_dir);
-        let vol_mgr = VolumeManager::open(&default_dir, 1).ok().map(Arc::new);
+        let vol_mgr = VolumeManager::open_sparse(&default_dir, 1).ok().map(Arc::new);
         let initial_bytes = if let Some(ref vm) = vol_mgr { vm.offset() } else { 0 };
         Self {
             data_dir: None,
@@ -272,7 +272,7 @@ impl S3ServiceState {
 
     pub fn with_data_dir(dir: &Path) -> Self {
         let _ = std::fs::create_dir_all(dir);
-        let vol_mgr = VolumeManager::open(dir, 1).ok().map(Arc::new);
+        let vol_mgr = VolumeManager::open_sparse(dir, 1).ok().map(Arc::new);
         let mut engine = AwanStorageEngine::new(100_000, 4_194_304, 65536);
         let db_path = dir.join("metadata.db");
         if let Ok(spill) = crate::spill::SpillIndex::open(&db_path) {
