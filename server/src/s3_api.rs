@@ -1144,6 +1144,7 @@ pub async fn handle_s3_request(
                     // Standard PutObject
                     let expected_len = req.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok());
                     let is_chunked = req.headers().get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
+                    let content_md5_hdr = req.headers().get("content-md5").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
                     let raw_bytes = req.into_body().collect().await?.to_bytes();
 
                     if let Some(exp) = expected_len {
@@ -1174,7 +1175,23 @@ pub async fn handle_s3_request(
                     };
 
                     let payload_len = decoded_bytes.len() as u64;
-                    let (etag_hi, etag_lo, etag_hex, _) = compute_md5(&decoded_bytes);
+                    let mut digest = crate::digest::StreamingDigest::new();
+                    digest.update(&decoded_bytes);
+                    let (etag_hi, etag_lo, etag_hex, raw_md5, _) = digest.finalize();
+
+                    // Verify Content-MD5 header if present
+                    if let Some(ref content_md5) = content_md5_hdr {
+                        let expected_b64 = crate::digest::base64_encode(&raw_md5);
+                        if content_md5 != &expected_b64 {
+                            let xml = s3_error_xml("BadDigest", "The Content-MD5 you specified did not match what we received.", &key, "req-bad-digest");
+                            return Ok(Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .header(CONTENT_TYPE, "application/xml")
+                                .body(full_body(Bytes::from(xml)))
+                                .unwrap());
+                        }
+                    }
+
                     let final_etag_hex = if decoded_bytes.is_empty() {
                         "d41d8cd98f00b204e9800998ecf8427e".to_string()
                     } else {
