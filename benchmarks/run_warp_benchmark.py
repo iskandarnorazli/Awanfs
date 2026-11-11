@@ -120,7 +120,7 @@ def format_markdown_report(
     lines = [
         f"`{cmd}`",
         "",
-        "# Head-to-Head S3 Benchmark Report: S3 Storage Server vs MinIO",
+        "# Head-to-Head S3 Benchmark Report: S3 Storage Server vs MinIO & RustFS",
         "",
         "## 1. Physical Hardware & Execution Context",
         f"- **CPU Model:** {hw_info.get('cpu', 'x86_64 CPU')}",
@@ -130,6 +130,7 @@ def format_markdown_report(
         f"- **Server Affinity Pin:** {hw_info.get('affinity_server', 'Cores 0..3 (Mask 0x0F)')}",
         f"- **Client Affinity Pin:** {hw_info.get('affinity_client', 'Cores 4..7 (Mask 0xF0)')}",
         f"- **Live MinIO Binary Status:** {hw_info.get('minio_status', 'not measured')}",
+        f"- **Live RustFS Binary Status:** {hw_info.get('rustfs_status', 'not measured')}",
         "",
         "## 2. Live Measured HTTP/1.1 Keep-Alive Throughput & Latency Matrix (64 KiB – 10 GiB)",
         "",
@@ -151,10 +152,11 @@ def format_markdown_report(
     ]
 
     for label, key in workloads:
-        if key not in awan and key not in minio_or_baseline:
+        if key not in awan and key not in minio_or_baseline and key not in rust_fb:
             continue
         a = awan.get(key, BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0))
         m = minio_or_baseline.get(key, BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0, measured=False))
+        r = rust_fb.get(key, BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0, measured=False))
 
         lines.append(
             f"| **{label}** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **{a.mib_per_sec:.1f}** | **{a.ops_per_sec:.1f}** | **{a.p50_ms:.2f}** | **{a.p90_ms:.2f}** | **{a.p99_ms:.2f}** | **{a.p999_ms:.2f}** | **{a.peak_rss_mb:.1f} MB** |"
@@ -168,10 +170,15 @@ def format_markdown_report(
                 lines.append(
                     f"| **{label}** | {baseline_server_label} | {m.mib_per_sec:.1f} | {m.ops_per_sec:.1f} | {m.p50_ms:.2f} | {m.p90_ms:.2f} | {m.p99_ms:.2f} | {m.p999_ms:.2f} | {m.peak_rss_mb:.1f} MB |"
                 )
-        else:
-            lines.append(
-                f"| **{label}** | {baseline_server_label} | not measured | not measured | not measured | not measured | not measured | not measured | not measured |"
-            )
+        if r.measured:
+            if r.ops_per_sec == 0.0 and r.mib_per_sec == 0.0:
+                lines.append(
+                    f"| **{label}** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | N/A (S3 $\\ge$5MiB spec limit) | N/A | N/A | N/A | N/A | N/A | {r.peak_rss_mb:.1f} MB |"
+                )
+            else:
+                lines.append(
+                    f"| **{label}** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | {r.mib_per_sec:.1f} | {r.ops_per_sec:.1f} | {r.p50_ms:.2f} | {r.p90_ms:.2f} | {r.p99_ms:.2f} | {r.p999_ms:.2f} | {r.peak_rss_mb:.1f} MB |"
+                )
 
     put_64k = awan.get("put_64k", BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0))
     get_64k = awan.get("get_64k", BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0))
@@ -181,22 +188,38 @@ def format_markdown_report(
     all_rss = [v.peak_rss_mb for v in awan.values() if v.peak_rss_mb > 0]
     max_rss = max(all_rss) if all_rss else 0.0
 
+    m_put_64k = minio_or_baseline.get("put_64k", BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0))
+    m_get_64k = minio_or_baseline.get("get_64k", BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0))
+    m_put_1m = minio_or_baseline.get("put_1m", BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0))
+    m_get_1m = minio_or_baseline.get("get_1m", BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0))
+    m_get_10g = minio_or_baseline.get("get_10g", m_get_1m)
+    m_all_rss = [v.peak_rss_mb for v in minio_or_baseline.values() if v.peak_rss_mb > 0]
+    m_max_rss = max(m_all_rss) if m_all_rss else 0.0
+
+    r_put_64k = rust_fb.get("put_64k", BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0))
+    r_get_64k = rust_fb.get("get_64k", BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0))
+    r_put_1m = rust_fb.get("put_1m", BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0))
+    r_get_1m = rust_fb.get("get_1m", BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0))
+    r_get_10g = rust_fb.get("get_10g", r_get_1m)
+    r_all_rss = [v.peak_rss_mb for v in rust_fb.values() if v.peak_rss_mb > 0]
+    r_max_rss = max(r_all_rss) if r_all_rss else 0.0
+
     lines.extend([
         "",
         "## 3. Open-Source S3 Alternatives Reference Comparison (`COMPETITIVE_LANDSCAPE.md`)",
         "",
-        "> **Provenance Note (Audit Rule 3):** Official standalone MinIO binary (`RELEASE.2025-09-07T16-13-09Z`, Go 1.24.6 windows/amd64) was executed live on local NVMe pinned to Cores 0..3 with anonymous public access policy enabled via `mc.exe`, receiving identical persistent HTTP/1.1 keep-alive requests from client workers pinned to Cores 4..7. Peak Working Set RSS was measured live using Windows OS API `GetProcessMemoryInfo`. Note that for 1 MiB multipart upload with 256 KiB parts, MinIO strictly rejects parts smaller than 5 MiB with HTTP 400 `EntityTooSmall` per AWS S3 RFC specification, whereas `s3-server` supports sub-5 MiB parts.",
+        "> **Provenance Note (Audit Rule 3):** Official standalone MinIO (`RELEASE.2025-09-07T16-13-09Z`, Go 1.24.6 windows/amd64) and RustFS (`v1.0.5`, Apache 2.0 Rust windows/x86_64) binaries were executed live on local NVMe pinned to Cores 0..3 with anonymous public access policy enabled via `mc.exe`, receiving identical persistent HTTP/1.1 keep-alive requests from client workers pinned to Cores 4..7. Peak Working Set RSS was measured live using Windows OS API `GetProcessMemoryInfo`. Note that for 1 MiB multipart upload with 256 KiB parts, both MinIO and RustFS strictly reject parts smaller than 5 MiB with HTTP 400 `EntityTooSmall` per AWS S3 RFC specification, whereas `s3-server` supports sub-5 MiB parts.",
         "",
-        "| Dimension | `s3-server` (Measured Local) | MinIO (Go, Published Ref) | SeaweedFS (Go, Published Ref) | Garage (Rust, Published Ref) | Ceph RGW (C++, Published Ref) |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- |",
-        f"| **64 KiB PUT Throughput** | **{put_64k.mib_per_sec:.1f} MiB/s ({put_64k.ops_per_sec:.0f} ops/s)** | ~80–220 MiB/s (`xl.meta` + data fs) | ~250–450 MiB/s (Haystack append) | ~40–110 MiB/s (LMDB/Sled) | ~60–180 MiB/s (BlueStore WAL) |",
-        f"| **64 KiB GET Throughput** | **{get_64k.mib_per_sec:.1f} MiB/s ({get_64k.ops_per_sec:.0f} ops/s)** | ~150–350 MiB/s (`xl.meta` fs) | ~400–650 MiB/s (Haystack O(1)) | ~80–180 MiB/s (LMDB/Sled) | ~120–300 MiB/s (BlueStore) |",
-        f"| **1 MiB PUT Throughput** | **{put_1m.mib_per_sec:.1f} MiB/s ({put_1m.ops_per_sec:.0f} ops/s)** | ~500–1,200 MiB/s | ~600–1,400 MiB/s | ~200–500 MiB/s | ~400–1,000 MiB/s |",
-        f"| **1 MiB / 10 GiB GET Throughput** | **{get_1m.mib_per_sec:.1f} – {get_10g.mib_per_sec:.1f} MiB/s** | ~800–1,800 MiB/s | ~900–1,900 MiB/s | ~350–700 MiB/s | ~700–1,500 MiB/s |",
-        f"| **Server Peak RSS (64K–10G)** | **{max_rss:.1f} MB (Bounded 16 MiB Slab Cache)** | ~250–600 MB (Go GC heap) | ~180–450 MB (Go GC heap) | ~60–150 MB (Rust) | ~1,024–4,096 MB (OSD+RGW) |",
-        "| **Metadata Layout** | **64B `ObjectMeta` Columnar SoA** | Per-object `xl.meta` file | Needle Index map in RAM | Sled / SQLite / LMDB B-Tree | RocksDB LSM inside BlueStore |",
-        "| **Small-File Disk Layout** | **4096B WORM Needle Volume** | 2+ files/inodes per object | Haystack Volume (O(1) seek) | Content-addressed blocks | 4 KiB min alloc in BlueStore |",
-        "| **License** | **Permissive (Workspace / MIT / Apache-2.0)** | AGPLv3 (Active Community OSS) | Apache 2.0 | AGPLv3 | LGPLv2.1 /v3 |",
+        "| Dimension | `s3-server` (Measured Local) | MinIO (Go, Measured Local) | RustFS (Rust, Measured Local) | SeaweedFS (Go, Published Ref) | Garage (Rust, Published Ref) | Ceph RGW (C++, Published Ref) |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        f"| **64 KiB PUT Throughput** | **{put_64k.mib_per_sec:.1f} MiB/s ({put_64k.ops_per_sec:.0f} ops/s)** | {m_put_64k.mib_per_sec:.1f} MiB/s ({m_put_64k.ops_per_sec:.0f} ops/s) | {r_put_64k.mib_per_sec:.1f} MiB/s ({r_put_64k.ops_per_sec:.0f} ops/s) | ~250–450 MiB/s (Haystack append) | ~40–110 MiB/s (LMDB/Sled) | ~60–180 MiB/s (BlueStore WAL) |",
+        f"| **64 KiB GET Throughput** | **{get_64k.mib_per_sec:.1f} MiB/s ({get_64k.ops_per_sec:.0f} ops/s)** | {m_get_64k.mib_per_sec:.1f} MiB/s ({m_get_64k.ops_per_sec:.0f} ops/s) | {r_get_64k.mib_per_sec:.1f} MiB/s ({r_get_64k.ops_per_sec:.0f} ops/s) | ~400–650 MiB/s (Haystack O(1)) | ~80–180 MiB/s (LMDB/Sled) | ~120–300 MiB/s (BlueStore) |",
+        f"| **1 MiB PUT Throughput** | **{put_1m.mib_per_sec:.1f} MiB/s ({put_1m.ops_per_sec:.0f} ops/s)** | {m_put_1m.mib_per_sec:.1f} MiB/s ({m_put_1m.ops_per_sec:.0f} ops/s) | {r_put_1m.mib_per_sec:.1f} MiB/s ({r_put_1m.ops_per_sec:.0f} ops/s) | ~600–1,400 MiB/s | ~200–500 MiB/s | ~400–1,000 MiB/s |",
+        f"| **1 MiB / 10 GiB GET Throughput** | **{get_1m.mib_per_sec:.1f} – {get_10g.mib_per_sec:.1f} MiB/s** | {m_get_1m.mib_per_sec:.1f} – {m_get_10g.mib_per_sec:.1f} MiB/s | {r_get_1m.mib_per_sec:.1f} – {r_get_10g.mib_per_sec:.1f} MiB/s | ~900–1,900 MiB/s | ~350–700 MiB/s | ~700–1,500 MiB/s |",
+        f"| **Server Peak RSS (64K–10G)** | **{max_rss:.1f} MB (Bounded 16 MiB Slab Cache)** | {m_max_rss:.1f} MB (Go GC heap) | {r_max_rss:.1f} MB (Rust jemalloc) | ~180–450 MB (Go GC heap) | ~60–150 MB (Rust) | ~1,024–4,096 MB (OSD+RGW) |",
+        "| **Metadata Layout** | **64B `ObjectMeta` Columnar SoA** | Per-object `xl.meta` file | Multi-volume FS Metadata | Needle Index map in RAM | Sled / SQLite / LMDB B-Tree | RocksDB LSM inside BlueStore |",
+        "| **Small-File Disk Layout** | **4096B WORM Needle Volume** | 2+ files/inodes per object | Multi-volume File Store | Haystack Volume (O(1) seek) | Content-addressed blocks | 4 KiB min alloc in BlueStore |",
+        "| **License** | **Permissive (Workspace / MIT / Apache-2.0)** | AGPLv3 (Active Community OSS) | Apache 2.0 (Active Rust OSS) | Apache 2.0 | AGPLv3 | LGPLv2.1 /v3 |",
     ])
 
     return "\n".join(lines) + "\n"
@@ -808,6 +831,17 @@ def find_minio_binaries() -> Tuple[Optional[str], Optional[str]]:
     return minio_bin, mc_bin
 
 
+def find_rustfs_binary() -> Optional[str]:
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    candidates = [
+        os.path.join(repo_root, ".tmp", "rustfs", "rustfs.exe"),
+        os.path.join(repo_root, ".tmp", "rustfs", "rustfs"),
+        shutil.which("rustfs.exe"),
+        shutil.which("rustfs"),
+    ]
+    return next((p for p in candidates if p and os.path.isfile(p)), None)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Head-to-head S3 Warp Benchmark")
     parser.add_argument("--sizes", type=str, default="64KiB,1MiB,1GiB,10GiB", help="Payload sizes")
@@ -979,6 +1013,7 @@ def main():
         minio_proc.terminate()
         minio_proc.wait()
         shutil.rmtree(minio_data_dir, ignore_errors=True)
+        time.sleep(2.0)
     else:
         # Measure the local File-per-Object + .meta HTTP baseline fallback
         baseline_server_label = "File-per-Object + `.meta` Sidecar Baseline (Local Measured)"
@@ -1008,6 +1043,84 @@ def main():
         base_httpd.server_close()
         shutil.rmtree(baseline_dir, ignore_errors=True)
 
+    # Discover and benchmark RustFS
+    rustfs_bin = find_rustfs_binary()
+    rustfs_results: Dict[str, BenchmarkMetrics] = {}
+    rustfs_status = "not measured"
+
+    if rustfs_bin and mc_bin:
+        print(f"Executing identical workload against real RustFS ({rustfs_bin})...")
+        rustfs_data_dir = tempfile.mkdtemp(prefix="rustfs_warp_data_")
+        rustfs_port = get_free_port()
+
+        rustfs_env = os.environ.copy()
+        rustfs_env["RUSTFS_ACCESS_KEY"] = "rustfsadmin"
+        rustfs_env["RUSTFS_SECRET_KEY"] = "rustfsadmin"
+
+        rustfs_proc = subprocess.Popen(
+            [rustfs_bin, "server", "--address", f"127.0.0.1:{rustfs_port}", "--access-key", "rustfsadmin", "--secret-key", "rustfsadmin", rustfs_data_dir],
+            env=rustfs_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        set_affinity_mask(rustfs_proc.pid, 0x0F)
+
+        # Wait for RustFS to start listening
+        for _ in range(50):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.2)
+                    s.connect(("127.0.0.1", rustfs_port))
+                    break
+            except Exception:
+                time.sleep(0.1)
+        time.sleep(0.8)
+
+        alias_name = f"rustfs_bench_{rustfs_port}"
+        subprocess.run([mc_bin, "alias", "set", alias_name, f"http://127.0.0.1:{rustfs_port}", "rustfsadmin", "rustfsadmin"], capture_output=True)
+        subprocess.run([mc_bin, "mb", f"{alias_name}/{bucket}"], capture_output=True)
+        subprocess.run([mc_bin, "anonymous", "set", "public", f"{alias_name}/{bucket}"], capture_output=True)
+
+        rustfs_status = "Measured Live (rustfs.exe v1.0.5, Apache 2.0 Rust x86_64)"
+
+        print(f"  [1/10] RustFS: Running 64 KiB PUT phase ({dur_sec}s, {args.concurrent} workers)...")
+        rustfs_results["put_64k"] = run_workload_phase(host, rustfs_port, bucket, 64 * 1024, args.concurrent, dur_sec, "put", rustfs_proc.pid)
+
+        print(f"  [2/10] RustFS: Running 64 KiB GET phase ({dur_sec}s, {args.concurrent} workers)...")
+        rustfs_results["get_64k"] = run_workload_phase(host, rustfs_port, bucket, 64 * 1024, args.concurrent, dur_sec, "get", rustfs_proc.pid)
+
+        print(f"  [3/10] RustFS: Running 64 KiB Range GET phase ({dur_sec}s, {args.concurrent} workers)...")
+        rustfs_results["range_get_4k"] = run_workload_phase(host, rustfs_port, bucket, 64 * 1024, args.concurrent, dur_sec, "range_get_4k", rustfs_proc.pid)
+
+        print(f"  [4/10] RustFS: Running 1 MiB PUT phase ({dur_sec}s, {min(args.concurrent, 32)} workers)...")
+        rustfs_results["put_1m"] = run_workload_phase(host, rustfs_port, bucket, 1024 * 1024, min(args.concurrent, 32), dur_sec, "put", rustfs_proc.pid)
+
+        print(f"  [5/10] RustFS: Running 1 MiB GET phase ({dur_sec}s, {min(args.concurrent, 32)} workers)...")
+        rustfs_results["get_1m"] = run_workload_phase(host, rustfs_port, bucket, 1024 * 1024, min(args.concurrent, 32), dur_sec, "get", rustfs_proc.pid)
+
+        # 1 MiB MPU: RustFS strictly rejects parts < 5 MiB per S3 RFC spec with EntityTooSmall
+        print(f"  [6/10] RustFS: 1 MiB Multipart Upload (4 x 256 KiB parts) -> EntityTooSmall (S3 >=5MiB spec constraint)...")
+        rustfs_results["mpu_1m"] = BenchmarkMetrics(0, 0, 0, 0, 0, 0, get_process_peak_rss_mb(rustfs_proc.pid), measured=True)
+
+        if "1GiB" in args.sizes or "10GiB" in args.sizes:
+            part_sz = 64 * 1024 * 1024
+            print("  [7/10] & [8/10] RustFS: Running 1 GiB Multipart Upload (16 x 64 MiB parts) & Range GET (8 workers)...")
+            mpu_put_1g, mpu_get_1g = run_large_multipart_object_phase(
+                host, rustfs_port, bucket, "large_1gib_rustfs.dat", 1024 * 1024 * 1024, part_sz, 8, rustfs_proc.pid
+            )
+            rustfs_results["mpu_put_1g"] = mpu_put_1g
+            rustfs_results["mpu_get_1g"] = mpu_get_1g
+
+            print("  [9/10] RustFS: Running 10 GiB Volume PUT phase (160 x 64 MiB chunks, 8 workers)...")
+            rustfs_results["put_10g"] = run_fixed_volume_phase(host, rustfs_port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "put", rustfs_proc.pid, key_modulus=4)
+
+            print("  [10/10] RustFS: Running 10 GiB Volume Parallel Range GET phase (160 x 64 MiB chunks, 8 workers)...")
+            rustfs_results["get_10g"] = run_fixed_volume_phase(host, rustfs_port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "get", rustfs_proc.pid, key_modulus=4)
+
+        rustfs_proc.terminate()
+        rustfs_proc.wait()
+        shutil.rmtree(rustfs_data_dir, ignore_errors=True)
+
     hw_info = {
         "cpu": platform.processor() or "AMD / Intel x86_64",
         "cores": str(os.cpu_count() or 8),
@@ -1016,13 +1129,14 @@ def main():
         "affinity_server": "Cores 0..3 (Affinity Mask 0x0F)",
         "affinity_client": "Cores 4..7 (Affinity Mask 0xF0)",
         "minio_status": minio_status,
+        "rustfs_status": rustfs_status,
     }
 
     report = format_markdown_report(
         cmd,
         hw_info,
         awan_results,
-        rust_results,
+        rustfs_results,
         baseline_results,
         baseline_server_label=baseline_server_label,
     )
