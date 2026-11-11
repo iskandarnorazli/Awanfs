@@ -437,12 +437,11 @@ impl S3ServiceState {
                 .get(&(b_id, vol_offset))
                 .copied()
                 .unwrap_or(0);
-            if let Ok(vec) = vm.read_needle(1, vol_offset, expected_crc) {
-                let b = Bytes::from(vec);
-                if b.len() <= 4 * 1024 * 1024 {
-                    self.payload_cache.insert(b_id, vol_offset, b.clone());
+            if let Ok(bytes) = vm.read_needle_bytes(1, vol_offset, expected_crc) {
+                if bytes.len() <= 4 * 1024 * 1024 {
+                    self.payload_cache.insert(b_id, vol_offset, bytes.clone());
                 }
-                return b;
+                return bytes;
             }
         }
         Bytes::from(vec![0u8; expected_size])

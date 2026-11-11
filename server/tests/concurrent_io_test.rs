@@ -112,8 +112,8 @@ fn test_negative_control_overlapping_offset_corruption_detected() {
     let empty_read = vol_mgr.read_needle(loc.volume_id, unwritten_offset, 0);
     assert!(empty_read.is_err(), "Reading unwritten needle must fail");
     match empty_read.err().unwrap() {
-        VolumeError::InvalidMagic { .. } | VolumeError::HeaderCrcMismatch { .. } | VolumeError::Io(_) => {}
-        other => panic!("Expected InvalidMagic, HeaderCrcMismatch or Io error, got: {:?}", other),
+        VolumeError::InvalidMagic { .. } | VolumeError::HeaderCrcMismatch { .. } | VolumeError::Io(_) | VolumeError::TornNeedleAtOffset(_) => {}
+        other => panic!("Expected InvalidMagic, HeaderCrcMismatch, TornNeedleAtOffset or Io error, got: {:?}", other),
     }
 
     // 4. NEGATIVE CONTROL: Overwriting header magic on disk causes InvalidMagic
