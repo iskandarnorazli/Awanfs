@@ -14,6 +14,7 @@ pub mod mvcc;
 pub mod reactor;
 pub mod s3_api;
 pub mod sigv4;
+pub mod spill;
 pub mod volume;
 pub mod xml;
 
@@ -29,5 +30,6 @@ pub use mvcc::*;
 pub use reactor::*;
 pub use s3_api::*;
 pub use sigv4::*;
+pub use spill::*;
 pub use volume::*;
 pub use xml::*;

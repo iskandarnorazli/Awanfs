@@ -27,6 +27,7 @@ crc32c = "0.6"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 quick-xml = "0.36"
 parking_lot = "0.12"
+redb = "2.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

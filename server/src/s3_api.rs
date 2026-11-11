@@ -273,6 +273,10 @@ impl S3ServiceState {
         let _ = std::fs::create_dir_all(dir);
         let vol_mgr = VolumeManager::open(dir, 1).ok().map(Arc::new);
         let mut engine = AwanStorageEngine::new(100_000, 4_194_304, 65536);
+        let db_path = dir.join("metadata.db");
+        if let Ok(spill) = crate::spill::SpillIndex::open(&db_path) {
+            engine.attach_spill_index(spill);
+        }
         let needle_crc_map = Arc::new(RwLock::new(HashMap::new()));
         let mut initial_vol_offset = 4096;
 
