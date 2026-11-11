@@ -22,7 +22,7 @@ use crate::mvcc::MvccStore;
 use crate::sigv4::*;
 use crate::volume::VolumeManager;
 use crate::xml::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 
 pub type ResponseBody = BoxBody<Bytes, std::convert::Infallible>;
@@ -230,6 +230,7 @@ pub struct S3ServiceState {
     pub lifecycle: Arc<LifecycleManager>,
     pub single_flight: Arc<SingleFlight>,
     pub mvcc: Arc<MvccStore>,
+    pub data_dir: Option<PathBuf>,
     pub volume_manager: Option<Arc<VolumeManager>>,
     pub needle_crc_map: Arc<RwLock<HashMap<(u32, u64), u32>>>,
     pub payload_store: Arc<RwLock<HashMap<(u32, u64), Bytes>>>,
@@ -247,6 +248,7 @@ impl S3ServiceState {
         let _ = std::fs::create_dir_all(&default_dir);
         let vol_mgr = VolumeManager::open(&default_dir, 1).ok().map(Arc::new);
         Self {
+            data_dir: None,
             engine: Arc::new(RwLock::new(AwanStorageEngine::new(100_000, 4_194_304, 65536))),
             multipart: Arc::new(MultipartManager::new()),
             sigv4_cache: Arc::new(SigV4KeyCache::new()),
@@ -263,26 +265,75 @@ impl S3ServiceState {
     pub fn with_data_dir(dir: &Path) -> Self {
         let _ = std::fs::create_dir_all(dir);
         let vol_mgr = VolumeManager::open(dir, 1).ok().map(Arc::new);
+        let mut engine = AwanStorageEngine::new(100_000, 4_194_304, 65536);
+        let needle_crc_map = Arc::new(RwLock::new(HashMap::new()));
+        let mut initial_vol_offset = 4096;
+
+        // 1. Replay buckets manifest
+        let manifest_path = dir.join("buckets.manifest");
+        if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix('+') {
+                    if let Some((id_str, name)) = rest.split_once(':') {
+                        if let Ok(id) = id_str.parse::<u32>() {
+                            engine.restore_bucket(id, name);
+                        }
+                    }
+                } else if let Some(rest) = line.strip_prefix('-') {
+                    if let Some((id_str, _)) = rest.split_once(':') {
+                        if let Ok(id) = id_str.parse::<u32>() {
+                            let _ = engine.delete_bucket(id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Replay needle volume
+        if let Some(ref vm) = vol_mgr {
+            initial_vol_offset = vm.offset().max(4096);
+            let mut crcs = needle_crc_map.write();
+            let _ = vm.recover_needles(|b_id, key, offset, size, etag_hi, etag_lo, flags, crc32c| {
+                crcs.insert((b_id as u32, offset), crc32c);
+                if flags & AWAN_FLAG_TOMBSTONE != 0 {
+                    let _ = engine.delete_object(b_id as u32, key.as_bytes());
+                } else {
+                    let _ = engine.put_object(
+                        b_id as u32,
+                        key.as_bytes(),
+                        offset,
+                        size,
+                        etag_hi,
+                        etag_lo,
+                        0,
+                        flags,
+                    );
+                }
+            });
+        }
+
         Self {
-            engine: Arc::new(RwLock::new(AwanStorageEngine::new(100_000, 4_194_304, 65536))),
+            data_dir: Some(dir.to_path_buf()),
+            engine: Arc::new(RwLock::new(engine)),
             multipart: Arc::new(MultipartManager::new()),
             sigv4_cache: Arc::new(SigV4KeyCache::new()),
             lifecycle: Arc::new(LifecycleManager::new()),
             single_flight: Arc::new(SingleFlight::new()),
             mvcc: Arc::new(MvccStore::new()),
             volume_manager: vol_mgr,
-            needle_crc_map: Arc::new(RwLock::new(HashMap::new())),
+            needle_crc_map,
             payload_store: Arc::new(RwLock::new(HashMap::new())),
-            next_vol_offset: Arc::new(RwLock::new(4096)),
+            next_vol_offset: Arc::new(RwLock::new(initial_vol_offset)),
         }
     }
 
-    pub fn store_payload(&self, b_id: u32, key: &str, data: &Bytes, flags: u16) -> u64 {
+    pub fn store_payload(&self, b_id: u32, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64) -> u64 {
         if data.is_empty() {
             return 0;
         }
         if let Some(ref vm) = self.volume_manager {
-            if let Ok(loc) = vm.write_needle(b_id as u16, key, data, flags) {
+            if let Ok(loc) = vm.write_needle(b_id as u16, key, data, flags, etag_hi, etag_lo) {
                 self.needle_crc_map.write().insert((b_id, loc.offset), loc.payload_crc32c);
                 // Bound hot payload cache to objects <= 256 KiB and <= 256 entries (~16 MiB max RSS)
                 if data.len() <= 256 * 1024 {
@@ -438,7 +489,14 @@ pub async fn handle_s3_request(
 
                     let mut engine = state.engine.write();
                     match engine.create_bucket(&bucket) {
-                        Ok(_) => {
+                        Ok(id) => {
+                            if let Some(ref d) = state.data_dir {
+                                let manifest = d.join("buckets.manifest");
+                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&manifest) {
+                                    use std::io::Write;
+                                    let _ = writeln!(f, "+{}:{}", id, bucket);
+                                }
+                            }
                             let resp = Response::builder()
                                 .status(StatusCode::OK)
                                 .header(CONTENT_LENGTH, "0")
@@ -506,11 +564,20 @@ pub async fn handle_s3_request(
                     };
 
                     match engine.delete_bucket(b_id) {
-                        Ok(()) => Ok(Response::builder()
-                            .status(StatusCode::NO_CONTENT)
-                            .header(CONTENT_LENGTH, "0")
-                            .body(empty_body())
-                            .unwrap()),
+                        Ok(()) => {
+                            if let Some(ref d) = state.data_dir {
+                                let manifest = d.join("buckets.manifest");
+                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&manifest) {
+                                    use std::io::Write;
+                                    let _ = writeln!(f, "-{}:{}", b_id, bucket);
+                                }
+                            }
+                            Ok(Response::builder()
+                                .status(StatusCode::NO_CONTENT)
+                                .header(CONTENT_LENGTH, "0")
+                                .body(empty_body())
+                                .unwrap())
+                        }
                         Err(AWAN_ERR_BUCKET_NOT_EMPTY) => {
                             let xml = s3_error_xml("BucketNotEmpty", "The bucket you tried to delete is not empty", &bucket, "req-del-b");
                             Ok(Response::builder()
@@ -769,7 +836,7 @@ pub async fn handle_s3_request(
                 };
 
                 let (hi, lo, hex, raw_md5) = compute_md5(&decoded_bytes);
-                let vol_offset = state.store_payload(b_id, &key, &decoded_bytes, AWAN_FLAG_ACTIVE);
+                let vol_offset = state.store_payload(b_id, &key, &decoded_bytes, AWAN_FLAG_ACTIVE, hi, lo);
 
                 match state.multipart.upload_part(
                     upload_id,
@@ -1062,7 +1129,7 @@ pub async fn handle_s3_request(
                     let vol_offset = if decoded_bytes.is_empty() {
                         0
                     } else {
-                        state.store_payload(b_id, &key, &decoded_bytes, flags)
+                        state.store_payload(b_id, &key, &decoded_bytes, flags, etag_hi, etag_lo)
                     };
 
                     if let Some(prev_off) = old_offset {
@@ -1281,6 +1348,9 @@ pub async fn handle_s3_request(
                         if off > 0 {
                             state.payload_store.write().remove(&(b_id, off));
                         }
+                    }
+                    if let Some(ref vm) = state.volume_manager {
+                        let _ = vm.write_needle(b_id as u16, &key, &[], AWAN_FLAG_TOMBSTONE, 0, 0);
                     }
                     Ok(Response::builder()
                         .status(StatusCode::NO_CONTENT)

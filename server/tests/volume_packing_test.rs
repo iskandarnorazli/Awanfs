@@ -35,7 +35,7 @@ fn test_needle_4096_alignment_across_odd_sizes() {
     for (i, &sz) in sizes.iter().enumerate() {
         let key = format!("odd_key_{}_{}", i, sz);
         let payload = vec![(i % 255) as u8; sz];
-        let loc = vol_mgr.write_needle(1, &key, &payload, 1).expect("write needle");
+        let loc = vol_mgr.write_needle(1, &key, &payload, 1, 0, 0).expect("write needle");
 
         assert_eq!(loc.offset % SECTOR_SIZE as u64, 0, "Needle offset must be 4096-byte aligned");
         assert_eq!(loc.total_len % SECTOR_SIZE as u64, 0, "Total needle length must be multiple of 4096");
@@ -53,7 +53,7 @@ fn test_detects_silent_bitrot_crc32c_negative_control() {
 
     let key = "bitrot_target_object";
     let payload = b"Super sensitive financial or model weights data that must not corrupt silently!";
-    let loc = vol_mgr.write_needle(1, key, payload, 1).expect("write needle");
+    let loc = vol_mgr.write_needle(1, key, payload, 1, 0, 0).expect("write needle");
 
     // Normal read works bit-identically
     let valid_read = vol_mgr.read_needle(loc.volume_id, loc.offset, loc.payload_crc32c).expect("normal read");
@@ -96,7 +96,7 @@ fn test_crash_recovery_torn_needle_truncation() {
     for i in 0..1000 {
         let key = format!("recovered_key_{:04}", i);
         let payload = format!("payload_value_{:04}", i).into_bytes();
-        let loc = vol_mgr.write_needle(1, &key, &payload, 1).expect("write needle");
+        let loc = vol_mgr.write_needle(1, &key, &payload, 1, 0, 0).expect("write needle");
         written_keys.push((key, payload, loc));
     }
 
@@ -131,7 +131,7 @@ fn test_crash_recovery_torn_needle_truncation() {
     }
 
     // Subsequent writes must succeed seamlessly
-    let new_loc = restarted_mgr.write_needle(1, "post_recovery_key", b"fresh_data", 1).expect("write after recovery");
+    let new_loc = restarted_mgr.write_needle(1, "post_recovery_key", b"fresh_data", 1, 0, 0).expect("write after recovery");
     assert_eq!(new_loc.offset, valid_file_size);
     let new_read = restarted_mgr.read_needle(new_loc.volume_id, new_loc.offset, new_loc.payload_crc32c).expect("read fresh");
     assert_eq!(new_read, b"fresh_data");
@@ -147,7 +147,7 @@ fn test_background_compaction_reclaims_dead_space() {
     for i in 0..500 {
         let key = format!("compact_key_{:04}", i);
         let payload = vec![(i % 255) as u8; 512];
-        let loc = vol_mgr.write_needle(1, &key, &payload, 1).expect("write needle");
+        let loc = vol_mgr.write_needle(1, &key, &payload, 1, 0, 0).expect("write needle");
         objects.push((key, payload, loc));
     }
 

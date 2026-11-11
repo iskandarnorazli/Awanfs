@@ -68,7 +68,14 @@ pub fn compact_volume(
         };
 
         if live_keys.contains(&key_str) {
-            let new_loc = target_mgr.write_needle(hdr.bucket_id, &key_str, &payload, hdr.flags)?;
+            let new_loc = target_mgr.write_needle(
+                hdr.bucket_id,
+                &key_str,
+                &payload,
+                hdr.flags,
+                hdr.etag_hi,
+                hdr.etag_lo,
+            )?;
             report.new_locations.insert(key_str, new_loc);
             report.live_needles_copied += 1;
         } else {

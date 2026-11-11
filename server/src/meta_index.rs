@@ -216,6 +216,18 @@ impl StorageEngine {
         Ok(id)
     }
 
+    pub fn restore_bucket(&mut self, id: u32, name: &str) {
+        if id >= self.next_bucket_id {
+            self.next_bucket_id = id + 1;
+        }
+        self.bucket_names.insert(name.to_string(), id);
+        self.buckets.entry(id).or_insert_with(|| BucketEntry {
+            id,
+            name: name.to_string(),
+            key_index: BTreeMap::new(),
+        });
+    }
+
     pub fn lookup_bucket(&self, name: &str) -> Result<u32, i32> {
         self.bucket_names.get(name).copied().ok_or(ERR_BUCKET_NOT_FOUND)
     }
