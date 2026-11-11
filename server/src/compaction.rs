@@ -23,7 +23,7 @@ pub fn compact_volume(
     let source_dat = dir.join(format!("volume_{:04}.dat", source_volume_id));
     let source_idx = dir.join(format!("volume_{:04}.idx", source_volume_id));
 
-    let mut src_file = AlignedFile::open_direct(&source_dat, true)?;
+    let src_file = AlignedFile::open_direct(&source_dat, true)?;
     let target_mgr = VolumeManager::open(dir, target_volume_id)?;
 
     let file_len = src_file.metadata()?.len();
