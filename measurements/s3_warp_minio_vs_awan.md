@@ -1,6 +1,6 @@
-`python benchmarks/s3_warp/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB,10GiB --concurrent 64 --duration 3s --output docs/measurements/s3_warp_minio_vs_awan.md`
+`python benchmarks/s3_warp/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB,10GiB --concurrent 64 --duration 3s --output awan-storage/measurements/s3_warp_minio_vs_awan.md`
 
-# Head-to-Head S3 Benchmark Report: S3 Storage Server vs S3 Baselines
+# Head-to-Head S3 Benchmark Report: S3 Storage Server vs MinIO
 
 ## 1. Physical Hardware & Execution Context
 - **CPU Model:** AMD64 Family 25 Model 80 Stepping 0, AuthenticAMD
@@ -9,44 +9,44 @@
 - **Operating System:** Windows 11 (AMD64)
 - **Server Affinity Pin:** Cores 0..3 (Affinity Mask 0x0F)
 - **Client Affinity Pin:** Cores 4..7 (Affinity Mask 0xF0)
-- **Live MinIO Binary Status:** not measured (upstream dl.min.io/server/minio/release/windows-amd64/minio.exe returned HTTP 410 Gone — OSS project archived)
+- **Live MinIO Binary Status:** Measured Live (minio.exe RELEASE.2025-09-07T16-13-09Z, Go 1.24.6 windows/amd64)
 
 ## 2. Live Measured HTTP/1.1 Keep-Alive Throughput & Latency Matrix (64 KiB – 10 GiB)
 
 | Workload | Target Engine | Throughput (MiB/s) | Operations/sec | P50 (ms) | P90 (ms) | P99 (ms) | P99.9 (ms) | Peak RSS (MB) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **64 KiB PUT (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **363.2** | **5811.2** | **10.12** | **17.68** | **26.01** | **32.69** | **42.8 MB** |
-| **64 KiB PUT (Single Object)** | File-per-Object + `.meta` Sidecar Baseline (Local Measured) | 60.1 | 961.4 | 62.18 | 76.28 | 169.62 | 173.10 | 798.6 MB |
-| **64 KiB GET (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **365.8** | **5852.4** | **9.86** | **17.57** | **26.19** | **33.82** | **42.8 MB** |
-| **64 KiB GET (Single Object)** | File-per-Object + `.meta` Sidecar Baseline (Local Measured) | 127.0 | 2031.7 | 28.50 | 40.85 | 59.27 | 286.26 | 798.6 MB |
-| **64 KiB Range GET (bytes=0-4095, 206 Partial)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **24.8** | **6359.5** | **8.96** | **17.40** | **28.21** | **36.18** | **42.8 MB** |
-| **64 KiB Range GET (bytes=0-4095, 206 Partial)** | File-per-Object + `.meta` Sidecar Baseline (Local Measured) | 8.6 | 2192.0 | 26.65 | 37.79 | 54.60 | 338.27 | 798.6 MB |
-| **1 MiB PUT (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **773.2** | **773.2** | **37.25** | **65.08** | **106.37** | **157.74** | **72.8 MB** |
-| **1 MiB PUT (Single Object)** | File-per-Object + `.meta` Sidecar Baseline (Local Measured) | 841.7 | 841.7 | 35.73 | 40.37 | 121.03 | 123.95 | 798.6 MB |
-| **1 MiB GET (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **1285.1** | **1285.1** | **24.50** | **31.47** | **38.12** | **43.12** | **72.8 MB** |
-| **1 MiB GET (Single Object)** | File-per-Object + `.meta` Sidecar Baseline (Local Measured) | 1265.2 | 1265.2 | 24.27 | 32.53 | 43.22 | 105.66 | 798.6 MB |
-| **1 MiB Multipart Upload (4x256KiB Parts + Complete)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **837.5** | **837.5** | **18.48** | **24.65** | **30.91** | **36.01** | **97.8 MB** |
-| **1 MiB Multipart Upload (4x256KiB Parts + Complete)** | File-per-Object + `.meta` Sidecar Baseline (Local Measured) | 227.1 | 227.1 | 63.33 | 71.16 | 295.08 | 298.37 | 798.6 MB |
-| **1 GiB Multipart Upload (16x64MiB Parts + Complete)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **595.2** | **9.3** | **627.19** | **1076.72** | **1165.58** | **1165.58** | **1194.6 MB** |
-| **1 GiB Multipart Upload (16x64MiB Parts + Complete)** | File-per-Object + `.meta` Sidecar Baseline (Local Measured) | 52.5 | 0.8 | 11791.30 | 14875.64 | 19363.50 | 19363.50 | 798.6 MB |
-| **1 GiB Multipart Range GET (16x64MiB Parallel Ranges)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **1160.8** | **18.1** | **375.96** | **451.14** | **494.03** | **494.03** | **1194.6 MB** |
-| **1 GiB Multipart Range GET (16x64MiB Parallel Ranges)** | File-per-Object + `.meta` Sidecar Baseline (Local Measured) | 1168.7 | 18.3 | 343.17 | 497.17 | 539.39 | 539.39 | 1025.2 MB |
-| **10 GiB Volume PUT (160x64MiB Streamed Parts)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **783.9** | **12.2** | **626.68** | **681.71** | **1028.02** | **1185.05** | **1194.6 MB** |
-| **10 GiB Volume PUT (160x64MiB Streamed Parts)** | File-per-Object + `.meta` Sidecar Baseline (Local Measured) | 662.3 | 10.3 | 299.91 | 2061.82 | 3243.87 | 4129.05 | 1025.2 MB |
-| **10 GiB Volume GET (160x64MiB Parallel Ranges)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **1155.3** | **18.1** | **428.38** | **478.10** | **584.79** | **601.95** | **1194.6 MB** |
-| **10 GiB Volume GET (160x64MiB Parallel Ranges)** | File-per-Object + `.meta` Sidecar Baseline (Local Measured) | 1262.2 | 19.7 | 393.37 | 470.39 | 521.48 | 698.79 | 1153.5 MB |
+| **64 KiB PUT (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **313.0** | **5008.7** | **11.72** | **20.40** | **30.11** | **37.54** | **38.4 MB** |
+| **64 KiB PUT (Single Object)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 6.8 | 108.9 | 593.59 | 887.96 | 1027.43 | 1040.32 | 442.2 MB |
+| **64 KiB GET (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **301.5** | **4824.6** | **12.08** | **21.64** | **32.60** | **41.34** | **38.4 MB** |
+| **64 KiB GET (Single Object)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 202.3 | 3236.9 | 17.69 | 30.53 | 45.29 | 65.85 | 544.7 MB |
+| **64 KiB Range GET (bytes=0-4095, 206 Partial)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **18.9** | **4825.6** | **11.56** | **23.28** | **37.61** | **53.05** | **38.4 MB** |
+| **64 KiB Range GET (bytes=0-4095, 206 Partial)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 12.7 | 3261.5 | 17.68 | 31.57 | 45.66 | 70.58 | 550.6 MB |
+| **1 MiB PUT (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **734.3** | **734.3** | **42.10** | **59.98** | **76.66** | **92.16** | **76.7 MB** |
+| **1 MiB PUT (Single Object)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 119.6 | 119.6 | 249.69 | 353.85 | 496.67 | 585.13 | 592.7 MB |
+| **1 MiB GET (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **1114.2** | **1114.2** | **28.04** | **36.84** | **46.54** | **53.05** | **76.7 MB** |
+| **1 MiB GET (Single Object)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 1268.8 | 1268.8 | 23.56 | 41.78 | 57.48 | 83.12 | 921.4 MB |
+| **1 MiB Multipart Upload (4x256KiB Parts + Complete)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **725.8** | **725.8** | **21.46** | **28.14** | **34.90** | **39.95** | **96.3 MB** |
+| **1 MiB Multipart Upload (4x256KiB Parts + Complete)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | N/A (S3 $\ge$5MiB spec limit) | N/A | N/A | N/A | N/A | N/A | 921.4 MB |
+| **1 GiB Multipart Upload (16x64MiB Parts + Complete)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **536.3** | **8.4** | **705.59** | **1178.12** | **1264.53** | **1264.53** | **1196.7 MB** |
+| **1 GiB Multipart Upload (16x64MiB Parts + Complete)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 870.5 | 13.6 | 535.34 | 681.43 | 813.91 | 813.91 | 921.4 MB |
+| **1 GiB Multipart Range GET (16x64MiB Parallel Ranges)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **1106.7** | **17.3** | **398.42** | **501.69** | **530.52** | **530.52** | **1196.7 MB** |
+| **1 GiB Multipart Range GET (16x64MiB Parallel Ranges)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 948.5 | 14.8 | 475.89 | 574.67 | 618.70 | 618.70 | 921.4 MB |
+| **10 GiB Volume PUT (160x64MiB Streamed Parts)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **191.0** | **3.0** | **670.94** | **8235.36** | **12818.66** | **12861.74** | **1199.5 MB** |
+| **10 GiB Volume PUT (160x64MiB Streamed Parts)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 190.7 | 3.0 | 993.01 | 4152.65 | 18236.59 | 18916.92 | 921.4 MB |
+| **10 GiB Volume GET (160x64MiB Parallel Ranges)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **1106.8** | **17.3** | **458.05** | **485.12** | **522.12** | **540.62** | **1199.5 MB** |
+| **10 GiB Volume GET (160x64MiB Parallel Ranges)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 1030.0 | 16.1 | 492.92 | 611.19 | 673.57 | 779.85 | 921.4 MB |
 
 ## 3. Open-Source S3 Alternatives Reference Comparison (`COMPETITIVE_LANDSCAPE.md`)
 
-> **Provenance Note (Audit Rule 3):** Live `minio.exe` binary download from `dl.min.io` returned `HTTP 410 Gone` because the upstream MinIO open-source repository was archived. Above table reports live OS-measured numbers on this machine for `s3-server --release` (with `GetProcessMemoryInfo` Peak Working Set RSS and persistent HTTP/1.1 keep-alive connections) alongside the local file-per-object + `.meta` sidecar HTTP baseline server. Below table compares `s3-server` against published architectural characteristics of open-source S3 alternatives.
+> **Provenance Note (Audit Rule 3):** Official standalone MinIO binary (`RELEASE.2025-09-07T16-13-09Z`, Go 1.24.6 windows/amd64) was executed live on local NVMe pinned to Cores 0..3 with anonymous public access policy enabled via `mc.exe`, receiving identical persistent HTTP/1.1 keep-alive requests from client workers pinned to Cores 4..7. Peak Working Set RSS was measured live using Windows OS API `GetProcessMemoryInfo`. Note that for 1 MiB multipart upload with 256 KiB parts, MinIO strictly rejects parts smaller than 5 MiB with HTTP 400 `EntityTooSmall` per AWS S3 RFC specification, whereas `s3-server` supports sub-5 MiB parts.
 
 | Dimension | `s3-server` (Measured Local) | MinIO (Go, Published Ref) | SeaweedFS (Go, Published Ref) | Garage (Rust, Published Ref) | Ceph RGW (C++, Published Ref) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **64 KiB PUT Throughput** | **363.2 MiB/s (5811 ops/s)** | ~80–220 MiB/s (`xl.meta` + data fs) | ~250–450 MiB/s (Haystack append) | ~40–110 MiB/s (LMDB/Sled) | ~60–180 MiB/s (BlueStore WAL) |
-| **64 KiB GET Throughput** | **365.8 MiB/s (5852 ops/s)** | ~150–350 MiB/s (`xl.meta` fs) | ~400–650 MiB/s (Haystack O(1)) | ~80–180 MiB/s (LMDB/Sled) | ~120–300 MiB/s (BlueStore) |
-| **1 MiB PUT Throughput** | **773.2 MiB/s (773 ops/s)** | ~500–1,200 MiB/s | ~600–1,400 MiB/s | ~200–500 MiB/s | ~400–1,000 MiB/s |
-| **1 MiB / 10 GiB GET Throughput** | **1285.1 – 1155.3 MiB/s** | ~800–1,800 MiB/s | ~900–1,900 MiB/s | ~350–700 MiB/s | ~700–1,500 MiB/s |
-| **Server Peak RSS (64K–10G)** | **1194.6 MB (Bounded 16 MiB Slab Cache)** | ~250–600 MB (Go GC heap) | ~180–450 MB (Go GC heap) | ~60–150 MB (Rust) | ~1,024–4,096 MB (OSD+RGW) |
+| **64 KiB PUT Throughput** | **313.0 MiB/s (5009 ops/s)** | ~80–220 MiB/s (`xl.meta` + data fs) | ~250–450 MiB/s (Haystack append) | ~40–110 MiB/s (LMDB/Sled) | ~60–180 MiB/s (BlueStore WAL) |
+| **64 KiB GET Throughput** | **301.5 MiB/s (4825 ops/s)** | ~150–350 MiB/s (`xl.meta` fs) | ~400–650 MiB/s (Haystack O(1)) | ~80–180 MiB/s (LMDB/Sled) | ~120–300 MiB/s (BlueStore) |
+| **1 MiB PUT Throughput** | **734.3 MiB/s (734 ops/s)** | ~500–1,200 MiB/s | ~600–1,400 MiB/s | ~200–500 MiB/s | ~400–1,000 MiB/s |
+| **1 MiB / 10 GiB GET Throughput** | **1114.2 – 1106.8 MiB/s** | ~800–1,800 MiB/s | ~900–1,900 MiB/s | ~350–700 MiB/s | ~700–1,500 MiB/s |
+| **Server Peak RSS (64K–10G)** | **1199.5 MB (Bounded 16 MiB Slab Cache)** | ~250–600 MB (Go GC heap) | ~180–450 MB (Go GC heap) | ~60–150 MB (Rust) | ~1,024–4,096 MB (OSD+RGW) |
 | **Metadata Layout** | **64B `ObjectMeta` Columnar SoA** | Per-object `xl.meta` file | Needle Index map in RAM | Sled / SQLite / LMDB B-Tree | RocksDB LSM inside BlueStore |
 | **Small-File Disk Layout** | **4096B WORM Needle Volume** | 2+ files/inodes per object | Haystack Volume (O(1) seek) | Content-addressed blocks | 4 KiB min alloc in BlueStore |
-| **License** | **Permissive (Workspace / MIT / Apache-2.0)** | AGPLv3 (Archived OSS) | Apache 2.0 | AGPLv3 | LGPLv2.1 /v3 |
+| **License** | **Permissive (Workspace / MIT / Apache-2.0)** | AGPLv3 (Active Community OSS) | Apache 2.0 | AGPLv3 | LGPLv2.1 /v3 |
