@@ -222,6 +222,49 @@ impl AlignedFile {
         self.file.set_len(size)
     }
 
+    pub fn make_sparse(&self) -> io::Result<()> {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::io::AsRawHandle;
+            extern "system" {
+                fn DeviceIoControl(
+                    hDevice: *mut std::ffi::c_void,
+                    dwIoControlCode: u32,
+                    lpInBuffer: *mut std::ffi::c_void,
+                    nInBufferSize: u32,
+                    lpOutBuffer: *mut std::ffi::c_void,
+                    nOutBufferSize: u32,
+                    lpBytesReturned: *mut u32,
+                    lpOverlapped: *mut std::ffi::c_void,
+                ) -> i32;
+            }
+            const FSCTL_SET_SPARSE: u32 = 0x000900C4;
+            let mut bytes_returned: u32 = 0;
+            let handle = self.file.as_raw_handle();
+            let res = unsafe {
+                DeviceIoControl(
+                    handle as *mut _,
+                    FSCTL_SET_SPARSE,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut bytes_returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            if res == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            Ok(())
+        }
+    }
+
     pub fn metadata(&self) -> io::Result<std::fs::Metadata> {
         self.file.metadata()
     }

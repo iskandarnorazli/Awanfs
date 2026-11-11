@@ -131,10 +131,21 @@ pub struct VolumeManager {
     idx_file: Mutex<File>,
     current_offset: AtomicU64,
     mmap: RwLock<Option<Arc<Mmap>>>,
+    remap_count: AtomicU64,
+    is_sparse: bool,
 }
 
 impl VolumeManager {
     pub fn open(dir: &Path, volume_id: u32) -> Result<Self, VolumeError> {
+        let sparse = std::env::var("AWAN_SPARSE_VOLUME").ok().as_deref() == Some("1");
+        Self::open_mode(dir, volume_id, sparse)
+    }
+
+    pub fn open_sparse(dir: &Path, volume_id: u32) -> Result<Self, VolumeError> {
+        Self::open_mode(dir, volume_id, true)
+    }
+
+    pub fn open_mode(dir: &Path, volume_id: u32, mut sparse: bool) -> Result<Self, VolumeError> {
         let dat_path = dir.join(format!("volume_{:04}.dat", volume_id));
         let idx_path = dir.join(format!("volume_{:04}.idx", volume_id));
 
@@ -147,6 +158,11 @@ impl VolumeManager {
             .create(true)
             .open(&idx_path)?;
 
+        let mut file_len = aligned_file.metadata()?.len();
+        if file_len >= MAX_VOLUME_SPAN {
+            sparse = true;
+        }
+
         if !file_exists {
             // Write 4096B Superblock
             let mut super_buf = AlignedBuffer::new(SECTOR_SIZE);
@@ -157,10 +173,21 @@ impl VolumeManager {
             let crc = crc32c::crc32c(&super_buf[0..16]);
             super_buf[16..20].copy_from_slice(&crc.to_le_bytes());
             aligned_file.write_aligned_at(0, &super_buf)?;
+
+            if sparse {
+                let _ = aligned_file.make_sparse();
+                aligned_file.set_len(MAX_VOLUME_SPAN)?;
+                file_len = MAX_VOLUME_SPAN;
+            } else {
+                file_len = SECTOR_SIZE as u64;
+            }
+        } else if sparse && file_len < MAX_VOLUME_SPAN {
+            let _ = aligned_file.make_sparse();
+            aligned_file.set_len(MAX_VOLUME_SPAN)?;
+            file_len = MAX_VOLUME_SPAN;
         }
 
         // Run Crash Recovery Scan
-        let file_len = aligned_file.metadata()?.len();
         let mut scan_offset = SECTOR_SIZE as u64;
 
         if file_len < SECTOR_SIZE as u64 {
@@ -189,6 +216,12 @@ impl VolumeManager {
                 let mut header_bytes = [0u8; 64];
                 header_bytes.copy_from_slice(&read_buf[0..64]);
 
+                let magic = u32::from_le_bytes(header_bytes[0..4].try_into().unwrap());
+                if magic != NEEDLE_MAGIC {
+                    // Sparse unwritten sector or invalid magic encountered
+                    break;
+                }
+
                 match NeedleHeader::decode(&header_bytes) {
                     Ok(hdr) => {
                         let raw_len = 64 + hdr.key_len as usize + hdr.payload_size as usize;
@@ -206,12 +239,23 @@ impl VolumeManager {
                 }
             }
 
-            // Truncate torn tail bytes if any
-            if file_len != scan_offset {
+            if sparse {
+                if file_len > MAX_VOLUME_SPAN {
+                    aligned_file.set_len(MAX_VOLUME_SPAN)?;
+                    aligned_file.sync_all()?;
+                }
+            } else if file_len != scan_offset {
+                // Truncate torn tail bytes if any
                 aligned_file.set_len(scan_offset)?;
                 aligned_file.sync_all()?;
             }
         }
+
+        let initial_mmap = if sparse {
+            Some(Arc::new(unsafe { Mmap::map(aligned_file.file()) }?))
+        } else {
+            None
+        };
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -219,12 +263,26 @@ impl VolumeManager {
             file: aligned_file,
             idx_file: Mutex::new(idx_file),
             current_offset: AtomicU64::new(scan_offset),
-            mmap: RwLock::new(None),
+            mmap: RwLock::new(initial_mmap),
+            remap_count: AtomicU64::new(0),
+            is_sparse: sparse,
         })
     }
 
     pub fn file(&self) -> Arc<AlignedFile> {
         Arc::clone(&self.file)
+    }
+
+    pub fn current_offset(&self) -> u64 {
+        self.current_offset.load(Ordering::SeqCst)
+    }
+
+    pub fn remap_count(&self) -> u64 {
+        self.remap_count.load(Ordering::Relaxed)
+    }
+
+    pub fn is_sparse(&self) -> bool {
+        self.is_sparse
     }
 
     pub fn get_or_remap(&self, required_end: u64) -> Result<Arc<Mmap>, VolumeError> {
@@ -246,6 +304,7 @@ impl VolumeManager {
         if file_len < required_end && file_len == 0 {
             return Err(VolumeError::TornNeedleAtOffset(required_end));
         }
+        self.remap_count.fetch_add(1, Ordering::Relaxed);
         let mmap = unsafe { Mmap::map(self.file.file()) }?;
         let arc_m = Arc::new(mmap);
         *guard = Some(Arc::clone(&arc_m));
