@@ -258,7 +258,7 @@ impl S3ServiceState {
             tombstone_bytes: Arc::new(AtomicU64::new(0)),
             active_volume_id: Arc::new(AtomicU32::new(1)),
             engine: Arc::new(RwLock::new(AwanStorageEngine::new(100_000, 4_194_304, 65536))),
-            multipart: Arc::new(MultipartManager::new()),
+            multipart: Arc::new(MultipartManager::with_staging_dir(default_dir.join(".staging"))),
             sigv4_cache: Arc::new(SigV4KeyCache::new()),
             lifecycle: Arc::new(LifecycleManager::new()),
             single_flight: Arc::new(SingleFlight::new()),
@@ -333,7 +333,7 @@ impl S3ServiceState {
             tombstone_bytes: Arc::new(AtomicU64::new(0)),
             active_volume_id: Arc::new(AtomicU32::new(1)),
             engine: Arc::new(RwLock::new(engine)),
-            multipart: Arc::new(MultipartManager::new()),
+            multipart: Arc::new(MultipartManager::with_staging_dir(dir.join(".staging"))),
             sigv4_cache: Arc::new(SigV4KeyCache::new()),
             lifecycle: Arc::new(LifecycleManager::new()),
             single_flight: Arc::new(SingleFlight::new()),
@@ -900,7 +900,8 @@ pub async fn handle_s3_request(
                 };
 
                 let (hi, lo, hex, raw_md5) = compute_md5(&decoded_bytes);
-                let vol_offset = state.store_payload(b_id, &key, &decoded_bytes, AWAN_FLAG_ACTIVE, hi, lo);
+                let staged_path = state.multipart.write_staged_part(upload_id, part_num, &decoded_bytes).ok();
+                let vol_offset = 0;
 
                 match state.multipart.upload_part(
                     upload_id,
@@ -911,6 +912,7 @@ pub async fn handle_s3_request(
                     hi,
                     lo,
                     hex.clone(),
+                    staged_path,
                 ) {
                     Ok(_) => {
                         return Ok(Response::builder()
@@ -1295,11 +1297,23 @@ pub async fn handle_s3_request(
                                         for ext in extents {
                                             let part_end = ext.cumulative_end;
                                             if part_end > range.start && part_start <= range.end {
-                                                let chunk = state.load_payload(
-                                                    b_id,
-                                                    ext.vol_offset,
-                                                    ext.part_size as usize,
-                                                );
+                                                let chunk = if let Some(ref path) = ext.staged_path {
+                                                    if let Ok(bytes) = std::fs::read(path) {
+                                                        Bytes::from(bytes)
+                                                    } else {
+                                                        state.load_payload(
+                                                            b_id,
+                                                            ext.vol_offset,
+                                                            ext.part_size as usize,
+                                                        )
+                                                    }
+                                                } else {
+                                                    state.load_payload(
+                                                        b_id,
+                                                        ext.vol_offset,
+                                                        ext.part_size as usize,
+                                                    )
+                                                };
                                                 let slice_start = range.start.saturating_sub(part_start) as usize;
                                                 let slice_end = ((range.end + 1).min(part_end) - part_start) as usize;
                                                 if slice_start < chunk.len() {
@@ -1368,11 +1382,23 @@ pub async fn handle_s3_request(
                                     {
                                         let mut stitched = Vec::with_capacity(meta.size as usize);
                                         for ext in extents {
-                                            let chunk = state_for_read.load_payload(
-                                                b_id,
-                                                ext.vol_offset,
-                                                ext.part_size as usize,
-                                            );
+                                            let chunk = if let Some(ref path) = ext.staged_path {
+                                                if let Ok(bytes) = std::fs::read(path) {
+                                                    Bytes::from(bytes)
+                                                } else {
+                                                    state_for_read.load_payload(
+                                                        b_id,
+                                                        ext.vol_offset,
+                                                        ext.part_size as usize,
+                                                    )
+                                                }
+                                            } else {
+                                                state_for_read.load_payload(
+                                                    b_id,
+                                                    ext.vol_offset,
+                                                    ext.part_size as usize,
+                                                )
+                                            };
                                             stitched.extend_from_slice(&chunk);
                                         }
                                         Bytes::from(stitched)

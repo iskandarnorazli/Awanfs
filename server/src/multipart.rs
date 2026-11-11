@@ -5,6 +5,7 @@
 use md5::{Digest, Md5};
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::xml::xml_escape;
@@ -28,6 +29,7 @@ pub struct PartExtent {
     pub cumulative_end: u64,
     pub ref_count: u32,
     pub raw_md5: [u8; 16],
+    pub staged_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +42,7 @@ pub struct StagedPart {
     pub etag_hex: String,
     pub raw_md5: [u8; 16],
     pub uploaded_at: u64,
+    pub staged_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -58,15 +61,22 @@ pub struct MultipartManager {
     pub completed_extents: RwLock<BTreeMap<(u32, String), Vec<PartExtent>>>,
     pub next_upload_id: RwLock<u64>,
     pub enforce_min_part_size: AtomicBool,
+    pub staging_dir: PathBuf,
 }
 
 impl MultipartManager {
     pub fn new() -> Self {
+        Self::with_staging_dir(std::env::temp_dir().join(format!("awan_staging_{}", std::process::id())))
+    }
+
+    pub fn with_staging_dir(staging_dir: PathBuf) -> Self {
+        let _ = std::fs::create_dir_all(&staging_dir);
         Self {
             uploads: RwLock::new(BTreeMap::new()),
             completed_extents: RwLock::new(BTreeMap::new()),
             next_upload_id: RwLock::new(1),
             enforce_min_part_size: AtomicBool::new(false),
+            staging_dir,
         }
     }
 
@@ -80,6 +90,9 @@ impl MultipartManager {
             .unwrap_or_default()
             .as_millis() as u64;
 
+        let upload_dir = self.staging_dir.join(&upload_id);
+        let _ = std::fs::create_dir_all(&upload_dir);
+
         let upload = MultipartUpload {
             upload_id: upload_id.clone(),
             bucket: bucket.to_string(),
@@ -91,6 +104,22 @@ impl MultipartManager {
 
         self.uploads.write().insert(upload_id.clone(), upload);
         upload_id
+    }
+
+    pub fn write_staged_part(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+        data: &[u8],
+    ) -> std::io::Result<PathBuf> {
+        use std::io::Write;
+        let upload_dir = self.staging_dir.join(upload_id);
+        std::fs::create_dir_all(&upload_dir)?;
+        let part_file_path = upload_dir.join(format!("part_{:05}.dat", part_number));
+        let mut file = std::fs::File::create(&part_file_path)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok(part_file_path)
     }
 
     pub fn get_upload(&self, upload_id: &str) -> Option<MultipartUpload> {
@@ -107,6 +136,7 @@ impl MultipartManager {
         etag_hi: u64,
         etag_lo: u64,
         etag_hex: String,
+        staged_path: Option<PathBuf>,
     ) -> Result<String, &'static str> {
         if part_number < 1 || part_number > 10_000 {
             return Err("InvalidArgument");
@@ -129,6 +159,7 @@ impl MultipartManager {
             etag_hex: etag_hex.clone(),
             raw_md5,
             uploaded_at: now_ms,
+            staged_path,
         };
 
         // Atomically replace prior upload of same partNumber
@@ -138,7 +169,10 @@ impl MultipartManager {
 
     pub fn abort_upload(&self, upload_id: &str) -> Result<(), &'static str> {
         let mut uploads = self.uploads.write();
-        uploads.remove(upload_id).map(|_| ()).ok_or("NoSuchUpload")
+        let upload = uploads.remove(upload_id).ok_or("NoSuchUpload")?;
+        let upload_dir = self.staging_dir.join(&upload.upload_id);
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        Ok(())
     }
 
     pub fn complete_upload(
@@ -195,6 +229,7 @@ impl MultipartManager {
                 cumulative_end,
                 ref_count: 1,
                 raw_md5: staged.raw_md5,
+                staged_path: staged.staged_path.clone(),
             });
         }
 
