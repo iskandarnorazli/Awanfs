@@ -203,8 +203,8 @@ async fn test_s3_reactor_persists_needles_and_recovers_after_cache_eviction() {
     let file_len = fs::metadata(&vol_file).unwrap().len();
     assert!(file_len >= 8192 && file_len % SECTOR_SIZE as u64 == 0);
 
-    // 3. Evict in-memory payload_store cache to force GET to read and CRC32C-verify from disk needle
-    state.payload_store.write().clear();
+    // 3. Evict in-memory payload_cache to force GET to read and CRC32C-verify from disk needle
+    state.payload_cache.clear();
 
     let get_res = client
         .get(&format!("{}/vol-bucket/needle-obj.bin", base_url))

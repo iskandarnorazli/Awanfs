@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::aws_chunked::decode_aws_chunked;
+use crate::cache::PayloadCache;
 use crate::coalesce::SingleFlight;
 use crate::compaction::{compact_volume, CompactionReport};
 use crate::ffi_bridge::*;
@@ -236,7 +237,7 @@ pub struct S3ServiceState {
     pub active_volume_id: Arc<AtomicU32>,
     pub volume_manager: Arc<RwLock<Option<Arc<VolumeManager>>>>,
     pub needle_crc_map: Arc<RwLock<HashMap<(u32, u64), u32>>>,
-    pub payload_store: Arc<RwLock<HashMap<(u32, u64), Bytes>>>,
+    pub payload_cache: Arc<PayloadCache>,
     pub next_vol_offset: Arc<RwLock<u64>>,
 }
 
@@ -264,7 +265,7 @@ impl S3ServiceState {
             mvcc: Arc::new(MvccStore::new()),
             volume_manager: Arc::new(RwLock::new(vol_mgr)),
             needle_crc_map: Arc::new(RwLock::new(HashMap::new())),
-            payload_store: Arc::new(RwLock::new(HashMap::new())),
+            payload_cache: Arc::new(PayloadCache::default_auto_scaled()),
             next_vol_offset: Arc::new(RwLock::new(4096)),
         }
     }
@@ -339,7 +340,7 @@ impl S3ServiceState {
             mvcc: Arc::new(MvccStore::new()),
             volume_manager: Arc::new(RwLock::new(vol_mgr)),
             needle_crc_map,
-            payload_store: Arc::new(RwLock::new(HashMap::new())),
+            payload_cache: Arc::new(PayloadCache::default_auto_scaled()),
             next_vol_offset: Arc::new(RwLock::new(initial_vol_offset)),
         }
     }
@@ -391,7 +392,7 @@ impl S3ServiceState {
             }
         }
 
-        self.payload_store.write().clear();
+        self.payload_cache.clear();
         *self.volume_manager.write() = Some(new_mgr);
         self.active_volume_id.store(target_vol, Ordering::SeqCst);
         self.total_volume_bytes.store(new_vol_bytes, Ordering::Relaxed);
@@ -409,19 +410,15 @@ impl S3ServiceState {
             if let Ok(loc) = vm.write_needle(b_id as u16, key, data, flags, etag_hi, etag_lo) {
                 self.needle_crc_map.write().insert((b_id, loc.offset), loc.payload_crc32c);
                 self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                // Bound hot payload cache to objects <= 256 KiB and <= 256 entries (~16 MiB max RSS)
-                if data.len() <= 256 * 1024 {
-                    let mut pstore = self.payload_store.write();
-                    if pstore.len() >= 256 && !pstore.contains_key(&(b_id, loc.offset)) {
-                        pstore.clear();
-                    }
-                    pstore.insert((b_id, loc.offset), data.clone());
+                // Cache hot payloads up to 4 MiB in dynamic auto-scaling LRU cache
+                if data.len() <= 4 * 1024 * 1024 {
+                    self.payload_cache.insert(b_id, loc.offset, data.clone());
                 }
                 return loc.offset;
             }
         }
         let off = self.allocate_offset(data.len());
-        self.payload_store.write().insert((b_id, off), data.clone());
+        self.payload_cache.insert(b_id, off, data.clone());
         off
     }
 
@@ -429,7 +426,7 @@ impl S3ServiceState {
         if expected_size == 0 || vol_offset == 0 {
             return Bytes::new();
         }
-        if let Some(cached) = self.payload_store.read().get(&(b_id, vol_offset)).cloned() {
+        if let Some(cached) = self.payload_cache.get(b_id, vol_offset) {
             return cached;
         }
         let vm_opt = self.volume_manager.read().clone();
@@ -442,12 +439,8 @@ impl S3ServiceState {
                 .unwrap_or(0);
             if let Ok(vec) = vm.read_needle(1, vol_offset, expected_crc) {
                 let b = Bytes::from(vec);
-                if b.len() <= 256 * 1024 {
-                    let mut pstore = self.payload_store.write();
-                    if pstore.len() >= 256 && !pstore.contains_key(&(b_id, vol_offset)) {
-                        pstore.clear();
-                    }
-                    pstore.insert((b_id, vol_offset), b.clone());
+                if b.len() <= 4 * 1024 * 1024 {
+                    self.payload_cache.insert(b_id, vol_offset, b.clone());
                 }
                 return b;
             }
@@ -815,11 +808,8 @@ pub async fn handle_s3_request(
                         });
                     }
                     drop(engine);
-                    if !offsets_to_remove.is_empty() {
-                        let mut pstore = state.payload_store.write();
-                        for off in offsets_to_remove {
-                            pstore.remove(&(b_id, off));
-                        }
+                    for off in offsets_to_remove {
+                        state.payload_cache.remove(b_id, off);
                     }
 
                     let xml = delete_objects_result_xml(&deleted, &[]);
@@ -1209,7 +1199,7 @@ pub async fn handle_s3_request(
 
                     if let Some((prev_off, prev_sz)) = old_info {
                         if prev_off > 0 && prev_off != vol_offset {
-                            state.payload_store.write().remove(&(b_id, prev_off));
+                            state.payload_cache.remove(b_id, prev_off);
                             state.needle_crc_map.write().remove(&(b_id, prev_off));
                             let raw_len = 64 + key.as_bytes().len() + prev_sz as usize;
                             let dead_bytes = (((raw_len + 4095) / 4096) * 4096) as u64;
@@ -1424,7 +1414,7 @@ pub async fn handle_s3_request(
                     };
                     if let Some((off, sz)) = old_info {
                         if off > 0 {
-                            state.payload_store.write().remove(&(b_id, off));
+                            state.payload_cache.remove(b_id, off);
                             state.needle_crc_map.write().remove(&(b_id, off));
                             let raw_len = 64 + key.as_bytes().len() + sz as usize;
                             let dead_bytes = (((raw_len + 4095) / 4096) * 4096) as u64;
