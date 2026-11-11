@@ -1,17 +1,18 @@
 # Awan Storage Architecture Specification
 
-> **Engine Internals: Columnar Memory Model, Needle Volume Layout, MVCC Lifecycle, and Kernel I/O**
+> **Engine Internals: Columnar Memory Model, Sparse Virtual Volumes, Staged Multipart Extents, MVCC Lifecycle, and Kernel I/O**
 
 ---
 
 ## 1. Architectural Invariants
 
-Awan Storage is built on five non-negotiable systems engineering invariants:
-1. **Zero Dynamic Allocation on the Hot Path:** Every network packet, HTTP header, chunk buffer, and metadata record operates within preallocated `@arena` slabs initialized at startup.
+Awan Storage is built on six non-negotiable systems engineering invariants:
+1. **Zero Dynamic Allocation on the Hot Path:** Every network packet, HTTP header, chunk buffer, and metadata record operates within preallocated `@arena` slabs and bounded LRU caches (<= 16 MiB) initialized at startup.
 2. **Columnar Metadata Layout (`@flat`):** All object metadata is lowered automatically into contiguous primitive arrays (Struct-of-Arrays) paired with an append-only Key String Arena and an Adaptive Radix Tree (ART) prefix index.
-3. **WORM Needle Volume Packing with Direct I/O (`O_DIRECT`):** Objects are never stored as individual host filesystem files. Payloads pack sequentially into 32 GiB preallocated volume files (`volume_0001.dat`) using 4096-byte aligned Direct I/O, bypassing OS PageCache double-buffering and inode exhaustion.
-4. **Zero-Copy Kernel Handoff & Extent Linking:** Socket buffers are pinned and passed directly to NVMe controllers or client sockets via completion rings. Multipart uploads and server-side copies (`x-amz-copy-source`) link chunk extents by reference without copying payload bytes.
-5. **Deterministic Shard Ownership & Lock-Free MVCC Reads:** The metadata index is partitioned into $S$ cache-line-aligned shards by keyed hash. Point reads execute lock-free via optimistic epoch/seqlock pins, ensuring in-flight `GET` streams never observe torn writes during concurrent `PUT` overwrites.
+3. **32 GiB Sparse Virtual Volume Pre-Allocation (`FSCTL_SET_SPARSE`):** Volumes are initialized as 32 GiB virtual sparse files (`FSCTL_SET_SPARSE` on Windows NTFS, sparse holes on Linux) without allocating physical disk clusters upfront. They are mapped once at startup via `memmap2::Mmap` (`open_sparse`), completely eliminating runtime `remap()` latency stalls, page table invalidation, and reader lock serialization.
+4. **Staged Parallel Part Files for Multipart Uploads:** Parts upload to independent file handles under `.staging/<upload-id>/part_<num>.dat`, eliminating Windows kernel `FO_SYNCHRONOUS_IO` lock serialization across parallel multipart workers.
+5. **Zero-Copy Kernel Handoff & Direct Extent Slicing:** Range GETs directly slice memory-mapped volume and part extents via `Bytes::from_owner(MmapOwner(mmap)).slice(...)`, bypassing heap allocations and disk read syscalls.
+6. **Deterministic Shard Ownership & Lock-Free MVCC Reads:** The metadata index is partitioned into $S$ cache-line-aligned shards by keyed hash. Point reads execute lock-free via optimistic epoch/seqlock pins, ensuring in-flight `GET` streams never observe torn writes during concurrent `PUT` overwrites.
 
 ---
 
@@ -35,11 +36,11 @@ Awan Storage is built on five non-negotiable systems engineering invariants:
 │  └────────────────────────────────────┘   └────────────────────────────────────────────┘ │
 │                                                                                          │
 │  ┌─────────────────────────────────────────────────────────────────────────────────────┐ │
-│  │   4. Pinned Chunk Ring Slabs (@arena, 4096-Byte Page Aligned for O_DIRECT)          │ │
-│  │   Slot 0: [u8; 65536] │ Slot 1: [u8; 65536] │ ... │ Slot N: [u8; 65536] (Pinned)    │ │
+│  │   4. 32 GiB Sparse Virtual Mmap & Staged MPU Mmap Extent Slices                     │ │
+│  │   Direct zero-copy slicing: Bytes::from_owner(MmapOwner(mmap)).slice(start..end)   │ │
 │  └──────────────────────────────────────────┬──────────────────────────────────────────┘ │
 └─────────────────────────────────────────────┼────────────────────────────────────────────┘
-                                              │ Zero-Copy DMA (O_DIRECT / Registered Ring)
+                                              │ Zero-Copy DMA (O_DIRECT / Mmap Slice)
                                               ▼
                                ┌───────────────────────────────┐
                                │   NVMe Volume Slabs & NIC     │
@@ -76,7 +77,7 @@ AWS S3 `ListObjectsV2` mandates that keys matching `prefix` and `delimiter` be r
 - Prefix queries (`prefix="datasets/2026/"`, `delimiter="/"`) jump directly to the subtree node in $O(|prefix|)$ time, yielding lexicographically ordered keys and `CommonPrefixes` in microseconds without scanning unrelated objects.
 
 ### C. Zero-Copy Multipart & Clone Extent Table (`@flat PartExtent`)
-When a large object ($> 5\text{ MiB}$) is uploaded in $P$ parallel multipart streams, parts arrive out of order and land at non-contiguous offsets across volume slabs.
+When a large object ($> 5\text{ MiB}$) is uploaded in $P$ parallel multipart streams, parts arrive out of order and land at non-contiguous offsets across volume slabs or staging part files.
 - On `CompleteMultipartUpload`, the engine allocates $P$ contiguous rows in `@flat PartExtent`:
   ```awan
   @flat
@@ -87,8 +88,7 @@ When a large object ($> 5\text{ MiB}$) is uploaded in $P$ parallel multipart str
       ref_count: Int      // Reference count for x-amz-copy-source and MVCC reader pins
   }
   ```
-- **Zero-Copy Completion:** `CompleteMultipartUpload` links the parts in $< 5\text{ µs}$ without copying a single payload byte on disk.
-- **Fast Byte-Range Reads over Multipart Objects:** A `GET` with `Range: bytes=start-end` binary-searches `cumulative_end` in $O(\log P)$ time and streams the exact intersecting part slices directly to the socket.
+- **Zero-Copy Direct Extent Slicing:** A `GET` with `Range: bytes=start-end` binary-searches `cumulative_end` in $O(\log P)$ time and slices directly from memory-mapped parts via `Bytes::from_owner(MmapOwner(mmap)).slice(...)` without disk read syscalls or heap copies.
 
 ---
 
@@ -96,14 +96,14 @@ When a large object ($> 5\text{ MiB}$) is uploaded in $P$ parallel multipart str
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────────────┐
-│                         VOLUME SLAB FILE (volume_0001.dat - 32 GiB)                      │
+│                         VOLUME SLAB FILE (volume_0001.dat - 32 GiB Sparse)               │
 ├──────────────────────┬───────────────────────────────────────────┬───────────────────────┤
 │ Volume Superblock    │ Needle 0 (4096B Aligned)                  │ Needle 1 (4096B) ...  │
 │ (4096 Bytes)         │ [Header 64B][Key Bytes][Payload][Padding] │ [Header 64B][...]     │
 └──────────────────────┴───────────────────────────────────────────┴───────────────────────┘
 ```
 
-### A. Needle Record Format (4096-Byte Sector Aligned for `O_DIRECT`)
+### A. Needle Record Format (4096-Byte Sector Aligned for Direct I/O)
 Each object or multipart segment written to a Volume Slab is encapsulated in a self-describing **Needle**:
 - `magic: u32` (`0x41574E33` = `"AWN3"`)
 - `header_crc32c: u32` (Castagnoli CRC32C of header fields)
@@ -115,18 +115,19 @@ Each object or multipart segment written to a Volume Slab is encapsulated in a s
 - `etag_hi: u64`, `etag_lo: u64`
 - Followed by `key_bytes` (`key_len` bytes), `payload_bytes` (`payload_size` bytes), and zero-padding to the next 4096-byte boundary.
 
-### B. Crash Recovery, Writeback Modes & Persistence Lifecycle
-1. **Write Path & Durability Modes:**
-   - Payload streams into 4096-byte aligned `@arena` slots while hardware CRC32C/MD5/SHA256 computes in register.
-   - Needle is written via 4096-byte aligned positional write (`seek_write` / `write_all_at`) to the active volume slab (`volume_XXXX.dat`), and a compact 42-byte index entry is appended to the volume's `.idx` journal file.
-   - **OS Writeback Mode (Default) vs Strict Direct I/O (`AWAN_DIRECT_IO=1`):** By default, `AlignedFile::open_direct` uses 4096-byte aligned positional I/O backed by OS writeback caching (avoiding per-request synchronous NVMe controller cache flushes on every 64 KiB `PUT`), while setting `AWAN_DIRECT_IO=1` enables strict hardware `FILE_FLAG_NO_BUFFERING` (Windows) / `O_DIRECT` (Linux) bypass.
-   - **Bounded Small-Object Hot Slab Cache (`<= 16 MiB`):** Objects `<= 256 KiB` are cached in a bounded 256-slot hot ring (`<= 16 MiB` total RSS ceiling) for sub-millisecond hot reads, while larger objects and multipart extents stream directly from `volume_XXXX.dat` without growing server heap memory over uptime.
-   - Only after the write completes is the row atomically published into `@flat ObjectMeta`.
-2. **Startup & Crash Replay:**
-   - On startup, the daemon memory-maps the latest `metadata.checkpoint` snapshot into the `@flat ObjectMeta` columns and replays any subsequent entries from `.idx`.
-   - If the node suffered an unclean power loss mid-write, the tail of the active volume file is scanned: any torn needle whose `magic` or `payload_crc32c` fails verification is truncated to the last valid 4096-byte boundary. Uncommitted writes never appear in the index.
-3. **Background Compaction (Reclaiming Tombstones):**
-   - When a sealed volume's dead space (from `DELETE`, lifecycle TTL expiration, or overwritten keys) exceeds $30\%$, the background compactor copies still-live needles into a new volume, atomically CAS-updates their `vol_offset` in `@flat ObjectMeta` (waiting for any active MVCC reader epoch to drain), and unlinks the old volume file.
+### B. 32 GiB Sparse Pre-Allocation, Durability Modes & Crash Recovery
+1. **32 GiB Sparse Pre-Allocation (`FSCTL_SET_SPARSE`):**
+   - Volume `.dat` files are pre-allocated with a 32 GiB virtual size using `FSCTL_SET_SPARSE` on Windows NTFS and `fallocate` sparse holes on Linux.
+   - Physical disk blocks are allocated on-demand by the filesystem as sequential needles are written; unwritten regions consume zero physical bytes.
+   - The entire 32 GiB virtual span is mapped once into the server address space via `memmap2::Mmap` at startup (`VolumeManager::open_sparse`), eliminating `Mmap::map` remap stalls and lock contention under high-concurrency mixed traffic.
+2. **Staged Parallel Part Files for Multipart Uploads:**
+   - In-flight multipart parts are written to independent file handles under `.staging/<upload-id>/part_<num>.dat`, eliminating kernel lock serialization.
+   - Upon `CompleteMultipartUpload`, staged parts are appended sequentially into the sparse volume, journaled into `.idx`, and the staging directory is cleaned up.
+3. **Crash Recovery over Sparse Volumes:**
+   - On startup, the recovery scanner replays `.idx` journals and scans the sparse volume sequentially.
+   - When encountering unwritten sparse virtual space (where `magic != NEEDLE_MAGIC` or CRC fails), the recovery scan halts cleanly at the last verified 4096-byte boundary. Uncommitted writes never appear in the index.
+4. **Background Compaction (Reclaiming Tombstones):**
+   - When dead space from `DELETE` or overwritten keys exceeds $30\%$, the background compactor copies still-live needles into a new volume, atomically CAS-updates `vol_offset` in `@flat ObjectMeta`, and unlinks the old volume file.
 
 ---
 
@@ -138,9 +139,9 @@ stateDiagram-v2
     BucketCreated --> SlotLeased : PUT /{bucket}/{key} or UploadPart
     SlotLeased --> Aborted : Socket Disconnect / Timeout / SigV4 Fail
     Aborted --> [*] : Release @arena Slot (0 Index Side Effects)
-    SlotLeased --> NeedleWritten : Stream Payload + Hardware CRC32C/MD5 + O_DIRECT Write
+    SlotLeased --> NeedleWritten : Stream Payload + Streaming Dual Digest (MD5 + CRC32C) + Direct Write
     NeedleWritten --> ActiveObject : Atomic Publish to @flat ObjectMeta & ART Index
-    ActiveObject --> ActiveObject : GET / HEAD / Range (Epoch-Pinned Zero-Copy Read)
+    ActiveObject --> ActiveObject : GET / HEAD / Range (Zero-Copy Mmap Slice Read)
     ActiveObject --> Superseded : Overwrite PUT (New Epoch Published, Old Extent Unpinned When Readers Drain)
     ActiveObject --> Tombstoned : DELETE /{bucket}/{key} or Lifecycle TTL Sweep
     Superseded --> Reclaimed : Background Volume Compaction
@@ -154,8 +155,10 @@ stateDiagram-v2
 
 1. **Linux: `io_uring` with Registered Buffers (`IORING_REGISTER_BUFFERS`) + `O_DIRECT`:**
    - Memory slabs are registered with the kernel once at startup; socket reads and NVMe writes execute without page-table remapping.
-2. **Windows: I/O Completion Ports (IOCP) + `FILE_FLAG_NO_BUFFERING`:**
-   - Uses preallocated 4096-byte aligned slabs with asynchronous overlapped completion ports.
-3. **Hardware-Accelerated Integrity:**
-   - **AWS SigV4 & Payload SHA-256:** Intel SHA-NI / ARMv8 Crypto extensions (`> 3.5 GB/s` per core) plus per-day derived `kSigning` key cache.
-   - **ETag & Scrubbing Checksums:** SIMD MD5 and hardware SSE4.2 / ARMv8 Castagnoli `crc32c`.
+2. **Windows: I/O Completion Ports (IOCP) + `FILE_FLAG_NO_BUFFERING` & `FSCTL_SET_SPARSE`:**
+   - Sector-aligned buffers with sparse direct device controls.
+3. **Hardware-Accelerated Dual Checksum Pipeline (`StreamingDigest`):**
+   - **Real-Time Dual Hashing:** MD5 (wire ETag) and Castagnoli CRC32C (needle verification) compute concurrently in registers as TCP frames arrive over the wire.
+   - **Hardware Dispatch:** SSE4.2 CRC32C and AVX2 crypto instructions execute when supported by the CPU (`is_x86_feature_detected!("sse4.2")`).
+   - **Bit-Identical Software Fallback:** Systems without SSE4.2/AVX2 automatically use a 256-entry software Castagnoli lookup table, ensuring 100% bit-identical digests across non-SIMD hypervisors and ARM platforms.
+   - **SigV4 Acceleration:** Intel SHA-NI / ARMv8 Crypto extensions (`> 3.5 GB/s` per core) plus per-day derived `kSigning` key cache.

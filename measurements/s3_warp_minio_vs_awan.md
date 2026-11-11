@@ -16,59 +16,59 @@
 
 | Workload | Target Engine | Throughput (MiB/s) | Operations/sec | P50 (ms) | P90 (ms) | P99 (ms) | P99.9 (ms) | Peak RSS (MB) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **64 KiB PUT (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **317.9** | **5086.1** | **11.27** | **20.04** | **30.23** | **38.98** | **83.7 MB** |
-| **64 KiB PUT (Single Object)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 5.7 | 91.0 | 736.64 | 982.30 | 1081.99 | 1096.39 | 417.9 MB |
-| **64 KiB PUT (Single Object)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 9.1 | 146.4 | 432.34 | 494.39 | 560.33 | 580.44 | 106.7 MB |
-| **64 KiB GET (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **335.4** | **5366.2** | **10.79** | **19.43** | **29.37** | **39.07** | **83.7 MB** |
-| **64 KiB GET (Single Object)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 221.9 | 3549.6 | 16.47 | 27.87 | 43.69 | 115.23 | 530.7 MB |
-| **64 KiB GET (Single Object)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 273.4 | 4373.7 | 13.59 | 23.76 | 34.69 | 47.08 | 157.5 MB |
-| **64 KiB Mixed (80% GET / 20% PUT)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **316.7** | **5066.9** | **11.14** | **20.58** | **31.03** | **41.18** | **1202.6 MB** |
-| **64 KiB Mixed (80% GET / 20% PUT)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 34.6 | 553.8 | 14.82 | 474.88 | 796.85 | 841.55 | 975.4 MB |
-| **64 KiB Mixed (80% GET / 20% PUT)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 41.3 | 660.5 | 28.17 | 405.45 | 462.22 | 494.29 | 173.2 MB |
-| **64 KiB Range GET (bytes=0-4095, 206 Partial)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **22.6** | **5780.5** | **9.33** | **19.67** | **31.51** | **42.55** | **83.7 MB** |
-| **64 KiB Range GET (bytes=0-4095, 206 Partial)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 14.1 | 3615.2 | 15.68 | 28.23 | 42.48 | 57.08 | 538.5 MB |
-| **64 KiB Range GET (bytes=0-4095, 206 Partial)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 17.3 | 4419.9 | 13.36 | 24.62 | 38.62 | 48.71 | 157.6 MB |
-| **1 MiB PUT (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **642.5** | **642.5** | **46.35** | **75.18** | **115.01** | **156.76** | **249.8 MB** |
-| **1 MiB PUT (Single Object)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 67.1 | 67.1 | 390.08 | 827.46 | 1057.92 | 1153.78 | 545.7 MB |
-| **1 MiB PUT (Single Object)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 82.3 | 82.3 | 375.61 | 459.37 | 503.69 | 507.48 | 157.6 MB |
-| **1 MiB GET (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **1862.4** | **1862.4** | **16.54** | **23.88** | **30.90** | **37.71** | **249.8 MB** |
-| **1 MiB GET (Single Object)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 1355.3 | 1355.3 | 21.79 | 36.53 | 56.58 | 89.52 | 949.1 MB |
-| **1 MiB GET (Single Object)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 776.9 | 776.9 | 39.82 | 56.93 | 70.61 | 78.96 | 157.6 MB |
-| **1 MiB Mixed (80% GET / 20% PUT)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **119.4** | **119.4** | **16.84** | **29.61** | **934.76** | **1838.16** | **1207.8 MB** |
-| **1 MiB Mixed (80% GET / 20% PUT)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 498.7 | 498.7 | 33.16 | 188.88 | 311.80 | 404.07 | 975.4 MB |
-| **1 MiB Mixed (80% GET / 20% PUT)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 289.0 | 289.0 | 40.80 | 412.97 | 473.79 | 503.51 | 173.2 MB |
-| **1 MiB Multipart Upload (4x256KiB Parts + Complete)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **669.9** | **669.9** | **22.92** | **31.87** | **46.51** | **63.81** | **1201.8 MB** |
-| **1 MiB Multipart Upload (4x256KiB Parts + Complete)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | N/A (S3 $\ge$5MiB spec limit) | N/A | N/A | N/A | N/A | N/A | 949.1 MB |
-| **1 MiB Multipart Upload (4x256KiB Parts + Complete)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | N/A (S3 $\ge$5MiB spec limit) | N/A | N/A | N/A | N/A | N/A | 157.6 MB |
-| **1 GiB Multipart Upload (16x64MiB Parts + Complete)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **46.0** | **0.7** | **11215.49** | **12440.36** | **12600.80** | **12600.80** | **2147.7 MB** |
-| **1 GiB Multipart Upload (16x64MiB Parts + Complete)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 847.3 | 13.2 | 558.39 | 621.10 | 631.66 | 631.66 | 975.4 MB |
-| **1 GiB Multipart Upload (16x64MiB Parts + Complete)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 447.9 | 7.0 | 1040.55 | 1085.33 | 1113.37 | 1113.37 | 261.0 MB |
-| **1 GiB Multipart Range GET (16x64MiB Parallel Ranges)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **1074.6** | **16.8** | **430.33** | **508.54** | **548.73** | **548.73** | **2381.6 MB** |
-| **1 GiB Multipart Range GET (16x64MiB Parallel Ranges)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 1339.5 | 20.9 | 353.12 | 396.38 | 453.07 | 453.07 | 975.4 MB |
-| **1 GiB Multipart Range GET (16x64MiB Parallel Ranges)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 813.9 | 12.7 | 540.28 | 620.78 | 870.44 | 870.44 | 261.0 MB |
-| **10 GiB Volume PUT (160x64MiB Streamed Parts)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **107.1** | **1.7** | **690.09** | **12934.27** | **22657.75** | **23257.43** | **3199.2 MB** |
-| **10 GiB Volume PUT (160x64MiB Streamed Parts)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 304.8 | 4.8 | 861.33 | 4047.23 | 4753.08 | 4846.41 | 975.4 MB |
-| **10 GiB Volume PUT (160x64MiB Streamed Parts)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 147.1 | 2.4 | 954.27 | 10184.33 | 15876.63 | 15944.30 | 261.0 MB |
-| **10 GiB Volume GET (160x64MiB Parallel Ranges)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **1404.3** | **21.9** | **343.27** | **449.29** | **661.80** | **679.77** | **3199.2 MB** |
-| **10 GiB Volume GET (160x64MiB Parallel Ranges)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 1201.2 | 18.8 | 415.87 | 498.60 | 562.03 | 599.81 | 975.4 MB |
-| **10 GiB Volume GET (160x64MiB Parallel Ranges)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 847.9 | 13.2 | 591.46 | 695.15 | 787.38 | 906.87 | 261.0 MB |
+| **64 KiB PUT (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **349.4** | **5590.1** | **10.06** | **18.89** | **31.89** | **40.78** | **100.6 MB** |
+| **64 KiB PUT (Single Object)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 8.5 | 135.5 | 505.72 | 732.39 | 864.74 | 877.58 | 420.0 MB |
+| **64 KiB PUT (Single Object)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 9.4 | 149.9 | 416.51 | 514.23 | 600.80 | 627.42 | 105.7 MB |
+| **64 KiB GET (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **339.1** | **5424.8** | **10.57** | **19.02** | **29.42** | **36.93** | **100.6 MB** |
+| **64 KiB GET (Single Object)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 225.6 | 3610.1 | 15.87 | 27.38 | 41.22 | 53.29 | 530.9 MB |
+| **64 KiB GET (Single Object)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 256.4 | 4102.1 | 14.52 | 24.68 | 37.47 | 47.03 | 156.9 MB |
+| **64 KiB Mixed (80% GET / 20% PUT)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **310.1** | **4962.1** | **10.69** | **21.91** | **41.07** | **74.21** | **245.6 MB** |
+| **64 KiB Mixed (80% GET / 20% PUT)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 37.9 | 606.2 | 16.07 | 383.23 | 714.03 | 801.16 | 936.4 MB |
+| **64 KiB Mixed (80% GET / 20% PUT)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 40.0 | 640.5 | 31.82 | 423.23 | 472.16 | 482.41 | 172.5 MB |
+| **64 KiB Range GET (bytes=0-4095, 206 Partial)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **23.1** | **5907.1** | **9.13** | **19.16** | **29.96** | **39.66** | **100.6 MB** |
+| **64 KiB Range GET (bytes=0-4095, 206 Partial)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 14.1 | 3612.4 | 15.85 | 28.57 | 41.90 | 66.29 | 550.0 MB |
+| **64 KiB Range GET (bytes=0-4095, 206 Partial)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 17.1 | 4376.5 | 13.31 | 24.99 | 39.78 | 54.93 | 157.0 MB |
+| **1 MiB PUT (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **737.3** | **737.3** | **40.64** | **64.00** | **93.31** | **126.00** | **245.6 MB** |
+| **1 MiB PUT (Single Object)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 126.3 | 126.3 | 227.82 | 377.29 | 510.44 | 554.83 | 568.8 MB |
+| **1 MiB PUT (Single Object)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 65.0 | 65.0 | 508.43 | 599.85 | 627.85 | 627.86 | 157.0 MB |
+| **1 MiB GET (Single Object)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **2165.6** | **2165.6** | **14.12** | **21.00** | **27.48** | **33.60** | **245.6 MB** |
+| **1 MiB GET (Single Object)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 1307.7 | 1307.7 | 22.45 | 38.22 | 55.63 | 125.04 | 936.4 MB |
+| **1 MiB GET (Single Object)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 773.7 | 773.7 | 39.99 | 57.56 | 73.70 | 83.05 | 157.0 MB |
+| **1 MiB Mixed (80% GET / 20% PUT)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **1734.5** | **1734.5** | **17.29** | **26.27** | **41.82** | **66.97** | **245.6 MB** |
+| **1 MiB Mixed (80% GET / 20% PUT)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 481.0 | 481.0 | 35.48 | 161.00 | 500.92 | 608.41 | 936.4 MB |
+| **1 MiB Mixed (80% GET / 20% PUT)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 305.4 | 305.4 | 37.05 | 403.58 | 457.28 | 467.77 | 172.5 MB |
+| **1 MiB Multipart Upload (4x256KiB Parts + Complete)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **188.1** | **188.1** | **77.30** | **129.38** | **180.01** | **203.72** | **245.6 MB** |
+| **1 MiB Multipart Upload (4x256KiB Parts + Complete)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | N/A (S3 $\ge$5MiB spec limit) | N/A | N/A | N/A | N/A | N/A | 936.4 MB |
+| **1 MiB Multipart Upload (4x256KiB Parts + Complete)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | N/A (S3 $\ge$5MiB spec limit) | N/A | N/A | N/A | N/A | N/A | 157.0 MB |
+| **1 GiB Multipart Upload (16x64MiB Parts + Complete)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **628.2** | **9.8** | **841.92** | **914.61** | **916.68** | **916.68** | **660.3 MB** |
+| **1 GiB Multipart Upload (16x64MiB Parts + Complete)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 848.1 | 13.3 | 497.89 | 654.07 | 679.27 | 679.27 | 936.4 MB |
+| **1 GiB Multipart Upload (16x64MiB Parts + Complete)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 453.9 | 7.1 | 1021.27 | 1136.78 | 1141.16 | 1141.16 | 266.8 MB |
+| **1 GiB Multipart Range GET (16x64MiB Parallel Ranges)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **1119.3** | **17.5** | **401.12** | **456.02** | **506.68** | **506.68** | **1135.2 MB** |
+| **1 GiB Multipart Range GET (16x64MiB Parallel Ranges)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 1252.3 | 19.6 | 375.43 | 435.29 | 449.46 | 449.46 | 936.4 MB |
+| **1 GiB Multipart Range GET (16x64MiB Parallel Ranges)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 879.1 | 13.7 | 508.63 | 594.63 | 855.12 | 855.12 | 266.8 MB |
+| **10 GiB Volume PUT (160x64MiB Streamed Parts)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **140.3** | **2.2** | **1875.89** | **12159.81** | **19866.48** | **20554.22** | **2281.4 MB** |
+| **10 GiB Volume PUT (160x64MiB Streamed Parts)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 154.9 | 2.4 | 930.07 | 8853.66 | 21516.72 | 21936.33 | 936.4 MB |
+| **10 GiB Volume PUT (160x64MiB Streamed Parts)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 253.2 | 4.1 | 880.80 | 6432.06 | 6906.43 | 6961.65 | 266.8 MB |
+| **10 GiB Volume GET (160x64MiB Parallel Ranges)** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **1412.7** | **22.1** | **354.72** | **434.58** | **508.42** | **546.97** | **2281.4 MB** |
+| **10 GiB Volume GET (160x64MiB Parallel Ranges)** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 1149.2 | 18.0 | 430.59 | 552.03 | 653.67 | 781.12 | 936.4 MB |
+| **10 GiB Volume GET (160x64MiB Parallel Ranges)** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 834.8 | 13.0 | 602.91 | 683.69 | 736.30 | 801.23 | 266.8 MB |
 
 ## 3. Concurrency Scaling Sweep (64 KiB Mixed 80% GET / 20% PUT: C in {8, 32, 64, 128})
 
 | Concurrency (Workers) | Target Engine | Throughput (MiB/s) | Operations/sec | P50 (ms) | P90 (ms) | P99 (ms) | P99.9 (ms) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **C = 8** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **357.0** | **5712.2** | **1.27** | **2.16** | **3.36** | **13.64** |
-| **C = 8** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 58.5 | 936.0 | 2.24 | 25.19 | 82.05 | 141.20 |
-| **C = 8** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 40.5 | 648.4 | 2.19 | 51.72 | 59.72 | 86.52 |
-| **C = 32** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **347.9** | **5566.7** | **5.14** | **9.60** | **14.15** | **18.37** |
-| **C = 32** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 38.9 | 622.2 | 6.05 | 206.42 | 458.13 | 481.57 |
-| **C = 32** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 41.5 | 663.8 | 8.21 | 209.14 | 230.72 | 246.84 |
-| **C = 64** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **338.1** | **5408.9** | **10.36** | **19.01** | **29.38** | **39.37** |
-| **C = 64** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 33.0 | 527.4 | 15.73 | 435.28 | 956.70 | 1013.08 |
-| **C = 64** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 43.3 | 692.6 | 29.91 | 373.89 | 424.73 | 437.82 |
-| **C = 128** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **324.5** | **5191.6** | **19.12** | **38.51** | **61.57** | **82.95** |
-| **C = 128** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 34.1 | 545.2 | 35.82 | 911.74 | 1390.69 | 1417.18 |
-| **C = 128** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 43.0 | 687.7 | 82.65 | 653.89 | 872.51 | 914.24 |
+| **C = 8** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **337.3** | **5397.3** | **1.31** | **2.26** | **3.53** | **5.34** |
+| **C = 8** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 59.6 | 953.4 | 2.40 | 26.57 | 67.80 | 87.81 |
+| **C = 8** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 41.8 | 669.2 | 2.13 | 51.40 | 62.47 | 70.30 |
+| **C = 32** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **322.9** | **5165.8** | **5.50** | **10.25** | **16.84** | **31.54** |
+| **C = 32** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 39.6 | 632.9 | 9.07 | 156.34 | 421.79 | 473.88 |
+| **C = 32** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 41.0 | 656.4 | 9.27 | 211.06 | 229.85 | 236.96 |
+| **C = 64** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **325.1** | **5201.9** | **10.62** | **20.41** | **31.07** | **39.60** |
+| **C = 64** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 47.6 | 762.1 | 17.49 | 272.51 | 645.00 | 673.38 |
+| **C = 64** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 41.2 | 658.8 | 33.40 | 388.77 | 467.76 | 497.75 |
+| **C = 128** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **324.1** | **5185.8** | **19.18** | **38.38** | **60.03** | **78.86** |
+| **C = 128** | MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z) | 37.8 | 604.3 | 42.83 | 816.70 | 1239.43 | 1442.95 |
+| **C = 128** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | 39.4 | 631.1 | 81.25 | 687.60 | 958.97 | 980.89 |
 
 ## 4. Open-Source S3 Alternatives Reference Comparison (`COMPETITIVE_LANDSCAPE.md`)
 
@@ -76,11 +76,11 @@
 
 | Dimension | `s3-server` (Measured Local) | MinIO (Go, Measured Local) | RustFS (Rust, Measured Local) | SeaweedFS (Go, Published Ref) | Garage (Rust, Published Ref) | Ceph RGW (C++, Published Ref) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **64 KiB PUT Throughput** | **317.9 MiB/s (5086 ops/s)** | 5.7 MiB/s (91 ops/s) | 9.1 MiB/s (146 ops/s) | ~250–450 MiB/s (Haystack append) | ~40–110 MiB/s (LMDB/Sled) | ~60–180 MiB/s (BlueStore WAL) |
-| **64 KiB GET Throughput** | **335.4 MiB/s (5366 ops/s)** | 221.9 MiB/s (3550 ops/s) | 273.4 MiB/s (4374 ops/s) | ~400–650 MiB/s (Haystack O(1)) | ~80–180 MiB/s (LMDB/Sled) | ~120–300 MiB/s (BlueStore) |
-| **1 MiB PUT Throughput** | **642.5 MiB/s (643 ops/s)** | 67.1 MiB/s (67 ops/s) | 82.3 MiB/s (82 ops/s) | ~600–1,400 MiB/s | ~200–500 MiB/s | ~400–1,000 MiB/s |
-| **1 MiB / 10 GiB GET Throughput** | **1862.4 – 1404.3 MiB/s** | 1355.3 – 1201.2 MiB/s | 776.9 – 847.9 MiB/s | ~900–1,900 MiB/s | ~350–700 MiB/s | ~700–1,500 MiB/s |
-| **Server Peak RSS (64K–10G)** | **3199.2 MB (Bounded 16 MiB Slab Cache)** | 975.4 MB (Go GC heap) | 261.0 MB (Rust jemalloc) | ~180–450 MB (Go GC heap) | ~60–150 MB (Rust) | ~1,024–4,096 MB (OSD+RGW) |
+| **64 KiB PUT Throughput** | **349.4 MiB/s (5590 ops/s)** | 8.5 MiB/s (136 ops/s) | 9.4 MiB/s (150 ops/s) | ~250–450 MiB/s (Haystack append) | ~40–110 MiB/s (LMDB/Sled) | ~60–180 MiB/s (BlueStore WAL) |
+| **64 KiB GET Throughput** | **339.1 MiB/s (5425 ops/s)** | 225.6 MiB/s (3610 ops/s) | 256.4 MiB/s (4102 ops/s) | ~400–650 MiB/s (Haystack O(1)) | ~80–180 MiB/s (LMDB/Sled) | ~120–300 MiB/s (BlueStore) |
+| **1 MiB PUT Throughput** | **737.3 MiB/s (737 ops/s)** | 126.3 MiB/s (126 ops/s) | 65.0 MiB/s (65 ops/s) | ~600–1,400 MiB/s | ~200–500 MiB/s | ~400–1,000 MiB/s |
+| **1 MiB / 10 GiB GET Throughput** | **2165.6 – 1412.7 MiB/s** | 1307.7 – 1149.2 MiB/s | 773.7 – 834.8 MiB/s | ~900–1,900 MiB/s | ~350–700 MiB/s | ~700–1,500 MiB/s |
+| **Server Peak RSS (64K–10G)** | **2281.4 MB (Bounded 16 MiB Slab Cache)** | 936.4 MB (Go GC heap) | 266.8 MB (Rust jemalloc) | ~180–450 MB (Go GC heap) | ~60–150 MB (Rust) | ~1,024–4,096 MB (OSD+RGW) |
 | **Metadata Layout** | **64B `ObjectMeta` Columnar SoA** | Per-object `xl.meta` file | Multi-volume FS Metadata | Needle Index map in RAM | Sled / SQLite / LMDB B-Tree | RocksDB LSM inside BlueStore |
 | **Small-File Disk Layout** | **4096B WORM Needle Volume** | 2+ files/inodes per object | Multi-volume File Store | Haystack Volume (O(1) seek) | Content-addressed blocks | 4 KiB min alloc in BlueStore |
 | **License** | **Permissive (Workspace / MIT / Apache-2.0)** | AGPLv3 (Active Community OSS) | Apache 2.0 (Active Rust OSS) | Apache 2.0 | AGPLv3 | LGPLv2.1 /v3 |
