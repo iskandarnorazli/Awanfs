@@ -4,10 +4,12 @@
 
 use md5::{Digest, Md5};
 use parking_lot::RwLock;
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use memmap2::Mmap;
 use crate::xml::xml_escape;
 
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024; // 5 MiB
@@ -62,6 +64,7 @@ pub struct MultipartManager {
     pub next_upload_id: RwLock<u64>,
     pub enforce_min_part_size: AtomicBool,
     pub staging_dir: PathBuf,
+    pub staged_mmaps: RwLock<HashMap<PathBuf, Arc<Mmap>>>,
 }
 
 impl MultipartManager {
@@ -77,7 +80,25 @@ impl MultipartManager {
             next_upload_id: RwLock::new(1),
             enforce_min_part_size: AtomicBool::new(false),
             staging_dir,
+            staged_mmaps: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub fn get_or_mmap_part(&self, path: &Path) -> std::io::Result<Arc<Mmap>> {
+        {
+            let guard = self.staged_mmaps.read();
+            if let Some(m) = guard.get(path) {
+                return Ok(Arc::clone(m));
+            }
+        }
+        let mut guard = self.staged_mmaps.write();
+        if let Some(m) = guard.get(path) {
+            return Ok(Arc::clone(m));
+        }
+        let file = std::fs::File::open(path)?;
+        let mmap = Arc::new(unsafe { Mmap::map(&file)? });
+        guard.insert(path.to_path_buf(), Arc::clone(&mmap));
+        Ok(mmap)
     }
 
     pub fn create_upload(&self, bucket: &str, bucket_id: u32, key: &str) -> String {
