@@ -107,6 +107,7 @@ def format_markdown_report(
     rust_fb: Optional[Dict[str, BenchmarkMetrics]] = None,
     minio_or_baseline: Optional[Dict[str, BenchmarkMetrics]] = None,
     baseline_server_label: str = "MinIO Community Baseline",
+    concurrency_data: Optional[Dict[str, Dict[int, BenchmarkMetrics]]] = None,
 ) -> str:
     if minio_or_baseline is None and isinstance(rust_fb, dict) and "put_64k" in rust_fb:
         # Backward compatibility when invoked with 4 arguments: (cmd, hw_info, s3_metrics, minio_metrics)
@@ -141,9 +142,11 @@ def format_markdown_report(
     workloads = [
         ("64 KiB PUT (Single Object)", "put_64k"),
         ("64 KiB GET (Single Object)", "get_64k"),
+        ("64 KiB Mixed (80% GET / 20% PUT)", "mixed_64k"),
         ("64 KiB Range GET (bytes=0-4095, 206 Partial)", "range_get_4k"),
         ("1 MiB PUT (Single Object)", "put_1m"),
         ("1 MiB GET (Single Object)", "get_1m"),
+        ("1 MiB Mixed (80% GET / 20% PUT)", "mixed_1m"),
         ("1 MiB Multipart Upload (4x256KiB Parts + Complete)", "mpu_1m"),
         ("1 GiB Multipart Upload (16x64MiB Parts + Complete)", "mpu_put_1g"),
         ("1 GiB Multipart Range GET (16x64MiB Parallel Ranges)", "mpu_get_1g"),
@@ -204,9 +207,38 @@ def format_markdown_report(
     r_all_rss = [v.peak_rss_mb for v in rust_fb.values() if v.peak_rss_mb > 0]
     r_max_rss = max(r_all_rss) if r_all_rss else 0.0
 
+    if concurrency_data:
+        lines.extend([
+            "",
+            "## 3. Concurrency Scaling Sweep (64 KiB Mixed 80% GET / 20% PUT: C in {8, 32, 64, 128})",
+            "",
+            "| Concurrency (Workers) | Target Engine | Throughput (MiB/s) | Operations/sec | P50 (ms) | P90 (ms) | P99 (ms) | P99.9 (ms) |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        ])
+        for c in [8, 32, 64, 128]:
+            if "s3-server" in concurrency_data and c in concurrency_data["s3-server"]:
+                m = concurrency_data["s3-server"][c]
+                lines.append(
+                    f"| **C = {c}** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **{m.mib_per_sec:.1f}** | **{m.ops_per_sec:.1f}** | **{m.p50_ms:.2f}** | **{m.p90_ms:.2f}** | **{m.p99_ms:.2f}** | **{m.p999_ms:.2f}** |"
+                )
+            if "minio" in concurrency_data and c in concurrency_data["minio"]:
+                m = concurrency_data["minio"][c]
+                lines.append(
+                    f"| **C = {c}** | {baseline_server_label} | {m.mib_per_sec:.1f} | {m.ops_per_sec:.1f} | {m.p50_ms:.2f} | {m.p90_ms:.2f} | {m.p99_ms:.2f} | {m.p999_ms:.2f} |"
+                )
+            if "rustfs" in concurrency_data and c in concurrency_data["rustfs"]:
+                m = concurrency_data["rustfs"][c]
+                lines.append(
+                    f"| **C = {c}** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | {m.mib_per_sec:.1f} | {m.ops_per_sec:.1f} | {m.p50_ms:.2f} | {m.p90_ms:.2f} | {m.p99_ms:.2f} | {m.p999_ms:.2f} |"
+                )
+
+        section_num = "4"
+    else:
+        section_num = "3"
+
     lines.extend([
         "",
-        "## 3. Open-Source S3 Alternatives Reference Comparison (`COMPETITIVE_LANDSCAPE.md`)",
+        f"## {section_num}. Open-Source S3 Alternatives Reference Comparison (`COMPETITIVE_LANDSCAPE.md`)",
         "",
         "> **Provenance Note (Audit Rule 3):** Official standalone MinIO (`RELEASE.2025-09-07T16-13-09Z`, Go 1.24.6 windows/amd64) and RustFS (`v1.0.5`, Apache 2.0 Rust windows/x86_64) binaries were executed live on local NVMe pinned to Cores 0..3 with anonymous public access policy enabled via `mc.exe`, receiving identical persistent HTTP/1.1 keep-alive requests from client workers pinned to Cores 4..7. Peak Working Set RSS was measured live using Windows OS API `GetProcessMemoryInfo`. Note that for 1 MiB multipart upload with 256 KiB parts, both MinIO and RustFS strictly reject parts smaller than 5 MiB with HTTP 400 `EntityTooSmall` per AWS S3 RFC specification, whereas `s3-server` supports sub-5 MiB parts.",
         "",
@@ -394,6 +426,19 @@ def run_workload_phase(
                     data = resp.read()
                     if resp.status in (200, 206):
                         local_bytes += len(data)
+                elif mode == "mixed":
+                    if req_count % 5 == 0:
+                        conn.request("PUT", path, body=payload, headers=put_headers)
+                        resp = conn.getresponse()
+                        resp.read()
+                        if resp.status == 200:
+                            local_bytes += payload_size
+                    else:
+                        conn.request("GET", path, headers=get_headers)
+                        resp = conn.getresponse()
+                        data = resp.read()
+                        if resp.status == 200:
+                            local_bytes += len(data)
                 else:
                     conn.request("GET", path, headers=get_headers)
                     resp = conn.getresponse()
@@ -870,6 +915,7 @@ def main():
     )
 
     rust_results: Dict[str, BenchmarkMetrics] = {}
+    concurrency_data: Dict[str, Dict[int, BenchmarkMetrics]] = {"s3-server": {}, "minio": {}, "rustfs": {}}
 
     # Measure S3 Storage Server with Columnar SoA Metadata Index and Needle Volume
     s3_data_dir = tempfile.mkdtemp(prefix="s3_server_bench_")
@@ -911,6 +957,16 @@ def main():
 
     print(f"  [6/10] Running 1 MiB S3 Multipart Upload (4 x 256 KiB parts + CompleteMultipartUpload) phase ({dur_sec}s, 16 workers)...")
     awan_results["mpu_1m"] = run_multipart_upload_duration_phase(host, port, bucket, 256 * 1024, 4, 16, dur_sec, server_proc.pid)
+
+    print(f"  Running 64 KiB Mixed (80% GET / 20% PUT) phase ({dur_sec}s, {args.concurrent} workers)...")
+    awan_results["mixed_64k"] = run_workload_phase(host, port, bucket, 64 * 1024, args.concurrent, dur_sec, "mixed", server_proc.pid)
+
+    print(f"  Running 1 MiB Mixed (80% GET / 20% PUT) phase ({dur_sec}s, {min(args.concurrent, 32)} workers)...")
+    awan_results["mixed_1m"] = run_workload_phase(host, port, bucket, 1024 * 1024, min(args.concurrent, 32), dur_sec, "mixed", server_proc.pid)
+
+    print("  Running Concurrency Scaling Sweep (64 KiB Mixed 80/20, C in [8, 32, 64, 128])...")
+    for c in [8, 32, 64, 128]:
+        concurrency_data["s3-server"][c] = run_workload_phase(host, port, bucket, 64 * 1024, c, 1.5, "mixed", server_proc.pid)
 
     if "1GiB" in args.sizes or "10GiB" in args.sizes:
         part_sz = 64 * 1024 * 1024  # 64 MiB S3 multipart chunks
@@ -995,6 +1051,16 @@ def main():
         print(f"  [6/10] MinIO: 1 MiB Multipart Upload (4 x 256 KiB parts) -> EntityTooSmall (S3 >=5MiB spec constraint)...")
         baseline_results["mpu_1m"] = BenchmarkMetrics(0, 0, 0, 0, 0, 0, get_process_peak_rss_mb(minio_proc.pid), measured=True)
 
+        print(f"  MinIO: Running 64 KiB Mixed (80% GET / 20% PUT) phase ({dur_sec}s, {args.concurrent} workers)...")
+        baseline_results["mixed_64k"] = run_workload_phase(host, minio_port, bucket, 64 * 1024, args.concurrent, dur_sec, "mixed", minio_proc.pid)
+
+        print(f"  MinIO: Running 1 MiB Mixed (80% GET / 20% PUT) phase ({dur_sec}s, {min(args.concurrent, 32)} workers)...")
+        baseline_results["mixed_1m"] = run_workload_phase(host, minio_port, bucket, 1024 * 1024, min(args.concurrent, 32), dur_sec, "mixed", minio_proc.pid)
+
+        print("  MinIO: Running Concurrency Scaling Sweep (64 KiB Mixed 80/20, C in [8, 32, 64, 128])...")
+        for c in [8, 32, 64, 128]:
+            concurrency_data["minio"][c] = run_workload_phase(host, minio_port, bucket, 64 * 1024, c, 1.5, "mixed", minio_proc.pid)
+
         if "1GiB" in args.sizes or "10GiB" in args.sizes:
             part_sz = 64 * 1024 * 1024
             print("  [7/10] & [8/10] MinIO: Running 1 GiB Multipart Upload (16 x 64 MiB parts) & Range GET (8 workers)...")
@@ -1031,6 +1097,10 @@ def main():
         baseline_results["put_1m"] = run_workload_phase(host, base_port, bucket, 1024 * 1024, min(args.concurrent, 32), min(dur_sec, 2.5), "put", os.getpid())
         baseline_results["get_1m"] = run_workload_phase(host, base_port, bucket, 1024 * 1024, min(args.concurrent, 32), min(dur_sec, 2.5), "get", os.getpid())
         baseline_results["mpu_1m"] = run_multipart_upload_duration_phase(host, base_port, bucket, 256 * 1024, 4, 16, min(dur_sec, 2.5), os.getpid())
+        baseline_results["mixed_64k"] = run_workload_phase(host, base_port, bucket, 64 * 1024, args.concurrent, min(dur_sec, 2.5), "mixed", os.getpid())
+        baseline_results["mixed_1m"] = run_workload_phase(host, base_port, bucket, 1024 * 1024, min(args.concurrent, 32), min(dur_sec, 2.5), "mixed", os.getpid())
+        for c in [8, 32, 64, 128]:
+            concurrency_data["minio"][c] = run_workload_phase(host, base_port, bucket, 64 * 1024, c, 1.0, "mixed", os.getpid())
 
         if "1GiB" in args.sizes or "10GiB" in args.sizes:
             part_sz = 64 * 1024 * 1024
@@ -1102,6 +1172,16 @@ def main():
         print(f"  [6/10] RustFS: 1 MiB Multipart Upload (4 x 256 KiB parts) -> EntityTooSmall (S3 >=5MiB spec constraint)...")
         rustfs_results["mpu_1m"] = BenchmarkMetrics(0, 0, 0, 0, 0, 0, get_process_peak_rss_mb(rustfs_proc.pid), measured=True)
 
+        print(f"  RustFS: Running 64 KiB Mixed (80% GET / 20% PUT) phase ({dur_sec}s, {args.concurrent} workers)...")
+        rustfs_results["mixed_64k"] = run_workload_phase(host, rustfs_port, bucket, 64 * 1024, args.concurrent, dur_sec, "mixed", rustfs_proc.pid)
+
+        print(f"  RustFS: Running 1 MiB Mixed (80% GET / 20% PUT) phase ({dur_sec}s, {min(args.concurrent, 32)} workers)...")
+        rustfs_results["mixed_1m"] = run_workload_phase(host, rustfs_port, bucket, 1024 * 1024, min(args.concurrent, 32), dur_sec, "mixed", rustfs_proc.pid)
+
+        print("  RustFS: Running Concurrency Scaling Sweep (64 KiB Mixed 80/20, C in [8, 32, 64, 128])...")
+        for c in [8, 32, 64, 128]:
+            concurrency_data["rustfs"][c] = run_workload_phase(host, rustfs_port, bucket, 64 * 1024, c, 1.5, "mixed", rustfs_proc.pid)
+
         if "1GiB" in args.sizes or "10GiB" in args.sizes:
             part_sz = 64 * 1024 * 1024
             print("  [7/10] & [8/10] RustFS: Running 1 GiB Multipart Upload (16 x 64 MiB parts) & Range GET (8 workers)...")
@@ -1139,6 +1219,7 @@ def main():
         rustfs_results,
         baseline_results,
         baseline_server_label=baseline_server_label,
+        concurrency_data=concurrency_data,
     )
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
