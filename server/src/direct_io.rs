@@ -140,15 +140,27 @@ impl AlignedFile {
         self.direct_io_active
     }
 
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
     /// Positional write of a 4096-byte aligned buffer at a 4096-byte aligned offset.
-    pub fn write_aligned_at(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
+    /// Lock-free and thread-safe across concurrent callers without holding a file mutex.
+    pub fn write_aligned_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
         debug_assert_eq!(offset % SECTOR_SIZE as u64, 0, "offset must be 4096-byte aligned");
         debug_assert_eq!(buf.len() % SECTOR_SIZE, 0, "buffer size must be 4096-byte aligned");
 
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::fs::FileExt;
-            self.file.seek_write(buf, offset)?;
+            let mut total_written = 0;
+            while total_written < buf.len() {
+                let n = self.file.seek_write(&buf[total_written..], offset + total_written as u64)?;
+                if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "zero bytes written in seek_write"));
+                }
+                total_written += n;
+            }
             Ok(())
         }
 
@@ -156,28 +168,36 @@ impl AlignedFile {
         {
             use std::os::unix::fs::FileExt;
             self.file.write_all_at(buf, offset)?;
-
             Ok(())
         }
 
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
-            self.file.seek(SeekFrom::Start(offset))?;
-            self.file.write_all(buf)?;
-            self.file.sync_data()?;
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file_clone = self.file.try_clone()?;
+            file_clone.seek(SeekFrom::Start(offset))?;
+            file_clone.write_all(buf)?;
             Ok(())
         }
     }
 
     /// Positional read into a 4096-byte aligned buffer from a 4096-byte aligned offset.
-    pub fn read_aligned_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    /// Lock-free and thread-safe across concurrent callers.
+    pub fn read_aligned_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         debug_assert_eq!(offset % SECTOR_SIZE as u64, 0, "offset must be 4096-byte aligned");
         debug_assert_eq!(buf.len() % SECTOR_SIZE, 0, "buffer size must be 4096-byte aligned");
 
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::fs::FileExt;
-            self.file.seek_read(buf, offset)?;
+            let mut total_read = 0;
+            while total_read < buf.len() {
+                let n = self.file.seek_read(&mut buf[total_read..], offset + total_read as u64)?;
+                if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected eof in seek_read"));
+                }
+                total_read += n;
+            }
             Ok(())
         }
 
@@ -190,8 +210,10 @@ impl AlignedFile {
 
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
-            self.file.seek(SeekFrom::Start(offset))?;
-            self.file.read_exact(buf)?;
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file_clone = self.file.try_clone()?;
+            file_clone.seek(SeekFrom::Start(offset))?;
+            file_clone.read_exact(buf)?;
             Ok(())
         }
     }

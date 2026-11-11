@@ -5,6 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use xxhash_rust::xxh3::xxh3_64;
@@ -14,6 +15,7 @@ use crate::direct_io::{AlignedBuffer, AlignedFile};
 
 pub const NEEDLE_MAGIC: u32 = 0x41574E33; // "AWN3"
 pub const SUPERBLOCK_MAGIC: u32 = 0x53555042; // "SUPB"
+pub const MAX_VOLUME_SPAN: u64 = 32 * 1024 * 1024 * 1024; // 32 GiB WORM Needle Volume (#470)
 
 #[derive(Debug)]
 pub enum VolumeError {
@@ -115,7 +117,7 @@ impl NeedleHeader {
 pub struct VolumeManager {
     dir: PathBuf,
     volume_id: u32,
-    file: Mutex<AlignedFile>,
+    file: Arc<AlignedFile>,
     idx_file: Mutex<File>,
     current_offset: AtomicU64,
 }
@@ -126,7 +128,7 @@ impl VolumeManager {
         let idx_path = dir.join(format!("volume_{:04}.idx", volume_id));
 
         let file_exists = dat_path.exists();
-        let mut aligned_file = AlignedFile::open_direct(&dat_path, false)?;
+        let aligned_file = Arc::new(AlignedFile::open_direct(&dat_path, false)?);
 
         let idx_file = OpenOptions::new()
             .read(true)
@@ -203,10 +205,14 @@ impl VolumeManager {
         Ok(Self {
             dir: dir.to_path_buf(),
             volume_id,
-            file: Mutex::new(aligned_file),
+            file: aligned_file,
             idx_file: Mutex::new(idx_file),
             current_offset: AtomicU64::new(scan_offset),
         })
+    }
+
+    pub fn file(&self) -> Arc<AlignedFile> {
+        Arc::clone(&self.file)
     }
 
     pub fn write_needle(
@@ -248,6 +254,7 @@ impl VolumeManager {
 
         let mut hdr_bytes = [0u8; 64];
         header.encode(&mut hdr_bytes);
+
         // Compute CRC32C over offset 8..64
         let header_crc = crc32c::crc32c(&hdr_bytes[8..64]);
         header.header_crc32c = header_crc;
@@ -257,22 +264,19 @@ impl VolumeManager {
         buf[64..64 + key_bytes.len()].copy_from_slice(key_bytes);
         buf[64 + key_bytes.len()..64 + key_bytes.len() + payload.len()].copy_from_slice(payload);
 
-        const MAX_RING_SPAN: u64 = 512 * 1024 * 1024; // 512 MiB ring wrap for high-volume streaming
         let raw_off = self.current_offset.fetch_add(total_len, Ordering::SeqCst);
-        let offset = if raw_off < MAX_RING_SPAN {
+        let offset = if raw_off < MAX_VOLUME_SPAN {
             raw_off
         } else {
-            let wrapped = (raw_off - SECTOR_SIZE as u64) % (MAX_RING_SPAN - SECTOR_SIZE as u64);
+            let wrapped = (raw_off - SECTOR_SIZE as u64) % (MAX_VOLUME_SPAN - SECTOR_SIZE as u64);
             SECTOR_SIZE as u64 + ((wrapped / SECTOR_SIZE as u64) * SECTOR_SIZE as u64)
         };
 
-        {
-            let mut file_guard = self.file.lock();
-            file_guard.write_aligned_at(offset, &buf)?;
-        }
+        // Lock-free concurrent positional write directly to disjoint disk offset
+        self.file.write_aligned_at(offset, &buf)?;
 
-        // Append 46-byte record to .idx in a single write_all
-        if raw_off < MAX_RING_SPAN {
+        // Append 46-byte record to .idx under dedicated lock
+        if raw_off < MAX_VOLUME_SPAN {
             let mut idx_entry = [0u8; 46];
             idx_entry[0..8].copy_from_slice(&key_hash.to_le_bytes());
             idx_entry[8..12].copy_from_slice(&self.volume_id.to_le_bytes());
@@ -300,9 +304,8 @@ impl VolumeManager {
         offset: u64,
         expected_payload_crc: u32,
     ) -> Result<Vec<u8>, VolumeError> {
-        let mut file_guard = self.file.lock();
         let mut first_sector = AlignedBuffer::new(SECTOR_SIZE);
-        file_guard.read_aligned_at(offset, &mut first_sector)?;
+        self.file.read_aligned_at(offset, &mut first_sector)?;
 
         let mut hdr_bytes = [0u8; 64];
         hdr_bytes.copy_from_slice(&first_sector[0..64]);
@@ -317,7 +320,7 @@ impl VolumeManager {
             first_sector[p_start..p_end].to_vec()
         } else {
             let mut full_buf = AlignedBuffer::new(total_len as usize);
-            file_guard.read_aligned_at(offset, &mut full_buf)?;
+            self.file.read_aligned_at(offset, &mut full_buf)?;
             let p_start = 64 + header.key_len as usize;
             let p_end = p_start + header.payload_size as usize;
             full_buf[p_start..p_end].to_vec()
@@ -348,13 +351,12 @@ impl VolumeManager {
     where
         F: FnMut(u16, String, u64, u64, u64, u64, u16, u32),
     {
-        let mut file_guard = self.file.lock();
-        let file_len = file_guard.metadata()?.len();
+        let file_len = self.file.metadata()?.len();
         let mut scan_offset = SECTOR_SIZE as u64;
         let mut read_buf = AlignedBuffer::new(SECTOR_SIZE);
 
         while scan_offset + (SECTOR_SIZE as u64) <= file_len {
-            if file_guard.read_aligned_at(scan_offset, &mut read_buf).is_err() {
+            if self.file.read_aligned_at(scan_offset, &mut read_buf).is_err() {
                 break;
             }
 
@@ -378,7 +380,7 @@ impl VolumeManager {
                 String::from_utf8_lossy(k_bytes).to_string()
             } else {
                 let mut full_buf = AlignedBuffer::new(total_len as usize);
-                if file_guard.read_aligned_at(scan_offset, &mut full_buf).is_err() {
+                if self.file.read_aligned_at(scan_offset, &mut full_buf).is_err() {
                     break;
                 }
                 let k_bytes = &full_buf[64..64 + hdr.key_len as usize];
