@@ -215,6 +215,8 @@ impl VolumeManager {
         key: &str,
         payload: &[u8],
         flags: u16,
+        etag_hi: u64,
+        etag_lo: u64,
     ) -> Result<NeedleLocation, VolumeError> {
         let key_bytes = key.as_bytes();
         let key_len = key_bytes.len() as u16;
@@ -239,8 +241,8 @@ impl VolumeManager {
             key_hash,
             payload_size,
             created_at_ns: now,
-            etag_hi: 0,
-            etag_lo: 0,
+            etag_hi,
+            etag_lo,
             reserved2: 0,
         };
 
@@ -338,5 +340,65 @@ impl VolumeManager {
 
     pub fn offset(&self) -> u64 {
         self.current_offset.load(Ordering::SeqCst)
+    }
+
+    /// Scans the volume sequentially from superblock offset to EOF, validating headers
+    /// and invoking `visitor(bucket_id, key, offset, size, etag_hi, etag_lo, flags, payload_crc32c)`.
+    pub fn recover_needles<F>(&self, mut visitor: F) -> Result<(), VolumeError>
+    where
+        F: FnMut(u16, String, u64, u64, u64, u64, u16, u32),
+    {
+        let mut file_guard = self.file.lock();
+        let file_len = file_guard.metadata()?.len();
+        let mut scan_offset = SECTOR_SIZE as u64;
+        let mut read_buf = AlignedBuffer::new(SECTOR_SIZE);
+
+        while scan_offset + (SECTOR_SIZE as u64) <= file_len {
+            if file_guard.read_aligned_at(scan_offset, &mut read_buf).is_err() {
+                break;
+            }
+
+            let mut header_bytes = [0u8; 64];
+            header_bytes.copy_from_slice(&read_buf[0..64]);
+
+            let hdr = match NeedleHeader::decode(&header_bytes) {
+                Ok(h) => h,
+                Err(_) => break,
+            };
+
+            let raw_len = 64 + hdr.key_len as usize + hdr.payload_size as usize;
+            let total_len = (((raw_len + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE) as u64;
+
+            if scan_offset + total_len > file_len {
+                break;
+            }
+
+            let key_str = if (64 + hdr.key_len as usize) <= SECTOR_SIZE {
+                let k_bytes = &read_buf[64..64 + hdr.key_len as usize];
+                String::from_utf8_lossy(k_bytes).to_string()
+            } else {
+                let mut full_buf = AlignedBuffer::new(total_len as usize);
+                if file_guard.read_aligned_at(scan_offset, &mut full_buf).is_err() {
+                    break;
+                }
+                let k_bytes = &full_buf[64..64 + hdr.key_len as usize];
+                String::from_utf8_lossy(k_bytes).to_string()
+            };
+
+            visitor(
+                hdr.bucket_id,
+                key_str,
+                scan_offset,
+                hdr.payload_size,
+                hdr.etag_hi,
+                hdr.etag_lo,
+                hdr.flags,
+                hdr.payload_crc32c,
+            );
+
+            scan_offset += total_len;
+        }
+
+        Ok(())
     }
 }
