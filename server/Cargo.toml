@@ -30,6 +30,7 @@ parking_lot = "0.12"
 redb = "2.1"
 reed-solomon-erasure = "6.0"
 lru = "0.12"
+memmap2 = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

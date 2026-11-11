@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use parking_lot::Mutex;
+use bytes::Bytes;
+use memmap2::Mmap;
+use parking_lot::{Mutex, RwLock};
 use xxhash_rust::xxh3::xxh3_64;
 
 pub use crate::direct_io::SECTOR_SIZE;
@@ -114,12 +116,21 @@ impl NeedleHeader {
     }
 }
 
+pub struct MmapOwner(pub Arc<Mmap>);
+
+impl AsRef<[u8]> for MmapOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.0[..]
+    }
+}
+
 pub struct VolumeManager {
     dir: PathBuf,
     volume_id: u32,
     file: Arc<AlignedFile>,
     idx_file: Mutex<File>,
     current_offset: AtomicU64,
+    mmap: RwLock<Option<Arc<Mmap>>>,
 }
 
 impl VolumeManager {
@@ -208,11 +219,37 @@ impl VolumeManager {
             file: aligned_file,
             idx_file: Mutex::new(idx_file),
             current_offset: AtomicU64::new(scan_offset),
+            mmap: RwLock::new(None),
         })
     }
 
     pub fn file(&self) -> Arc<AlignedFile> {
         Arc::clone(&self.file)
+    }
+
+    pub fn get_or_remap(&self, required_end: u64) -> Result<Arc<Mmap>, VolumeError> {
+        {
+            let guard = self.mmap.read();
+            if let Some(m) = &*guard {
+                if m.len() as u64 >= required_end {
+                    return Ok(Arc::clone(m));
+                }
+            }
+        }
+        let mut guard = self.mmap.write();
+        if let Some(m) = &*guard {
+            if m.len() as u64 >= required_end {
+                return Ok(Arc::clone(m));
+            }
+        }
+        let file_len = self.file.metadata()?.len();
+        if file_len < required_end && file_len == 0 {
+            return Err(VolumeError::TornNeedleAtOffset(required_end));
+        }
+        let mmap = unsafe { Mmap::map(self.file.file()) }?;
+        let arc_m = Arc::new(mmap);
+        *guard = Some(Arc::clone(&arc_m));
+        Ok(arc_m)
     }
 
     pub fn write_needle(
@@ -298,35 +335,39 @@ impl VolumeManager {
         })
     }
 
-    pub fn read_needle(
+    /// Reads a needle payload as a zero-copy Bytes slice directly from the memory map.
+    pub fn read_needle_bytes(
         &self,
         _volume_id: u32,
         offset: u64,
         expected_payload_crc: u32,
-    ) -> Result<Vec<u8>, VolumeError> {
-        let mut first_sector = AlignedBuffer::new(SECTOR_SIZE);
-        self.file.read_aligned_at(offset, &mut first_sector)?;
+    ) -> Result<Bytes, VolumeError> {
+        let mmap = self.get_or_remap(offset + SECTOR_SIZE as u64)?;
+        if (offset as usize + 64) > mmap.len() {
+            return Err(VolumeError::TornNeedleAtOffset(offset));
+        }
 
         let mut hdr_bytes = [0u8; 64];
-        hdr_bytes.copy_from_slice(&first_sector[0..64]);
+        hdr_bytes.copy_from_slice(&mmap[offset as usize..offset as usize + 64]);
         let header = NeedleHeader::decode(&hdr_bytes)?;
 
         let raw_len = 64 + header.key_len as usize + header.payload_size as usize;
         let total_len = (((raw_len + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE) as u64;
 
-        let payload = if total_len <= SECTOR_SIZE as u64 {
-            let p_start = 64 + header.key_len as usize;
-            let p_end = p_start + header.payload_size as usize;
-            first_sector[p_start..p_end].to_vec()
+        let mmap = if (offset + total_len) as usize > mmap.len() {
+            self.get_or_remap(offset + total_len)?
         } else {
-            let mut full_buf = AlignedBuffer::new(total_len as usize);
-            self.file.read_aligned_at(offset, &mut full_buf)?;
-            let p_start = 64 + header.key_len as usize;
-            let p_end = p_start + header.payload_size as usize;
-            full_buf[p_start..p_end].to_vec()
+            mmap
         };
 
-        let actual_crc = crc32c::crc32c(&payload);
+        let p_start = offset as usize + 64 + header.key_len as usize;
+        let p_end = p_start + header.payload_size as usize;
+        if p_end > mmap.len() {
+            return Err(VolumeError::TornNeedleAtOffset(offset));
+        }
+
+        let payload_slice = &mmap[p_start..p_end];
+        let actual_crc = crc32c::crc32c(payload_slice);
         if actual_crc != expected_payload_crc {
             return Err(VolumeError::CrcMismatch {
                 expected: expected_payload_crc,
@@ -334,7 +375,18 @@ impl VolumeManager {
             });
         }
 
-        Ok(payload)
+        let full_bytes = Bytes::from_owner(MmapOwner(mmap));
+        Ok(full_bytes.slice(p_start..p_end))
+    }
+
+    pub fn read_needle(
+        &self,
+        volume_id: u32,
+        offset: u64,
+        expected_payload_crc: u32,
+    ) -> Result<Vec<u8>, VolumeError> {
+        self.read_needle_bytes(volume_id, offset, expected_payload_crc)
+            .map(|b| b.to_vec())
     }
 
     pub fn dir(&self) -> &Path {
