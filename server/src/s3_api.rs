@@ -1308,38 +1308,64 @@ pub async fn handle_s3_request(
                                     Bytes::new()
                                 } else if is_multipart {
                                     if let Some(extents) = state.multipart.get_completed_extents(b_id, &key) {
-                                        let req_len = (range.end - range.start + 1) as usize;
-                                        let mut out = Vec::with_capacity(req_len);
+                                        // 1. Fast Path: Pure Zero-Copy single-extent slicing
                                         let mut part_start = 0u64;
-                                        for ext in extents {
+                                        let mut single_extent_slice = None;
+                                        for ext in &extents {
                                             let part_end = ext.cumulative_end;
-                                            if part_end > range.start && part_start <= range.end {
-                                                let chunk = if let Some(ref path) = ext.staged_path {
-                                                    if let Ok(bytes) = std::fs::read(path) {
-                                                        Bytes::from(bytes)
+                                            if range.start >= part_start && range.end < part_end {
+                                                let offset_in_part = (range.start - part_start) as usize;
+                                                let slice_len = (range.end - range.start + 1) as usize;
+                                                if let Some(ref path) = ext.staged_path {
+                                                    if let Ok(mmap) = state.multipart.get_or_mmap_part(path) {
+                                                        if offset_in_part + slice_len <= mmap.len() {
+                                                            let full_bytes = Bytes::from_owner(crate::volume::MmapOwner(mmap));
+                                                            single_extent_slice = Some(full_bytes.slice(offset_in_part..offset_in_part + slice_len));
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            part_start = part_end;
+                                        }
+
+                                        if let Some(slice) = single_extent_slice {
+                                            slice
+                                        } else {
+                                            // 2. Multi-extent boundary crossing: stitch only the cross-boundary slice
+                                            let req_len = (range.end - range.start + 1) as usize;
+                                            let mut out = Vec::with_capacity(req_len);
+                                            let mut p_start = 0u64;
+                                            for ext in extents {
+                                                let p_end = ext.cumulative_end;
+                                                if p_end > range.start && p_start <= range.end {
+                                                    let chunk = if let Some(ref path) = ext.staged_path {
+                                                        if let Ok(mmap) = state.multipart.get_or_mmap_part(path) {
+                                                            Bytes::from_owner(crate::volume::MmapOwner(mmap))
+                                                        } else {
+                                                            state.load_payload(
+                                                                b_id,
+                                                                ext.vol_offset,
+                                                                ext.part_size as usize,
+                                                            )
+                                                        }
                                                     } else {
                                                         state.load_payload(
                                                             b_id,
                                                             ext.vol_offset,
                                                             ext.part_size as usize,
                                                         )
+                                                    };
+                                                    let s_start = range.start.saturating_sub(p_start) as usize;
+                                                    let s_end = ((range.end + 1).min(p_end) - p_start) as usize;
+                                                    if s_start < chunk.len() {
+                                                        out.extend_from_slice(&chunk[s_start..s_end.min(chunk.len())]);
                                                     }
-                                                } else {
-                                                    state.load_payload(
-                                                        b_id,
-                                                        ext.vol_offset,
-                                                        ext.part_size as usize,
-                                                    )
-                                                };
-                                                let slice_start = range.start.saturating_sub(part_start) as usize;
-                                                let slice_end = ((range.end + 1).min(part_end) - part_start) as usize;
-                                                if slice_start < chunk.len() {
-                                                    out.extend_from_slice(&chunk[slice_start..slice_end.min(chunk.len())]);
                                                 }
+                                                p_start = p_end;
                                             }
-                                            part_start = part_end;
+                                            Bytes::from(out)
                                         }
-                                        Bytes::from(out)
                                     } else {
                                         Bytes::from(vec![0u8; (range.end - range.start + 1) as usize])
                                     }
@@ -1400,8 +1426,8 @@ pub async fn handle_s3_request(
                                         let mut stitched = Vec::with_capacity(meta.size as usize);
                                         for ext in extents {
                                             let chunk = if let Some(ref path) = ext.staged_path {
-                                                if let Ok(bytes) = std::fs::read(path) {
-                                                    Bytes::from(bytes)
+                                                if let Ok(mmap) = state_for_read.multipart.get_or_mmap_part(path) {
+                                                    Bytes::from_owner(crate::volume::MmapOwner(mmap))
                                                 } else {
                                                     state_for_read.load_payload(
                                                         b_id,
