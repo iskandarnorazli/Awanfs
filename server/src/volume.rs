@@ -299,7 +299,10 @@ impl VolumeManager {
 
         buf[0..64].copy_from_slice(&hdr_bytes);
         buf[64..64 + key_bytes.len()].copy_from_slice(key_bytes);
-        buf[64 + key_bytes.len()..64 + key_bytes.len() + payload.len()].copy_from_slice(payload);
+        buf[64 + key_bytes.len()..raw_len].copy_from_slice(payload);
+        if total_len as usize > raw_len {
+            buf[raw_len..total_len as usize].fill(0);
+        }
 
         let raw_off = self.current_offset.fetch_add(total_len, Ordering::SeqCst);
         let offset = if raw_off < MAX_VOLUME_SPAN {
