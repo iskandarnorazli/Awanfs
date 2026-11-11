@@ -8,22 +8,22 @@ use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, 
 use hyper::{Method, Request, Response, StatusCode};
 use md5::{Digest, Md5};
 use parking_lot::RwLock;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::aws_chunked::decode_aws_chunked;
 use crate::coalesce::SingleFlight;
+use crate::compaction::{compact_volume, CompactionReport};
 use crate::ffi_bridge::*;
 use crate::lifecycle::*;
 use crate::multipart::*;
 use crate::mvcc::MvccStore;
 use crate::sigv4::*;
-use crate::volume::VolumeManager;
+use crate::volume::{VolumeError, VolumeManager};
 use crate::xml::*;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
 
 pub type ResponseBody = BoxBody<Bytes, std::convert::Infallible>;
 
@@ -231,7 +231,10 @@ pub struct S3ServiceState {
     pub single_flight: Arc<SingleFlight>,
     pub mvcc: Arc<MvccStore>,
     pub data_dir: Option<PathBuf>,
-    pub volume_manager: Option<Arc<VolumeManager>>,
+    pub total_volume_bytes: Arc<AtomicU64>,
+    pub tombstone_bytes: Arc<AtomicU64>,
+    pub active_volume_id: Arc<AtomicU32>,
+    pub volume_manager: Arc<RwLock<Option<Arc<VolumeManager>>>>,
     pub needle_crc_map: Arc<RwLock<HashMap<(u32, u64), u32>>>,
     pub payload_store: Arc<RwLock<HashMap<(u32, u64), Bytes>>>,
     pub next_vol_offset: Arc<RwLock<u64>>,
@@ -247,15 +250,19 @@ impl S3ServiceState {
         ));
         let _ = std::fs::create_dir_all(&default_dir);
         let vol_mgr = VolumeManager::open(&default_dir, 1).ok().map(Arc::new);
+        let initial_bytes = if let Some(ref vm) = vol_mgr { vm.offset() } else { 0 };
         Self {
             data_dir: None,
+            total_volume_bytes: Arc::new(AtomicU64::new(initial_bytes)),
+            tombstone_bytes: Arc::new(AtomicU64::new(0)),
+            active_volume_id: Arc::new(AtomicU32::new(1)),
             engine: Arc::new(RwLock::new(AwanStorageEngine::new(100_000, 4_194_304, 65536))),
             multipart: Arc::new(MultipartManager::new()),
             sigv4_cache: Arc::new(SigV4KeyCache::new()),
             lifecycle: Arc::new(LifecycleManager::new()),
             single_flight: Arc::new(SingleFlight::new()),
             mvcc: Arc::new(MvccStore::new()),
-            volume_manager: vol_mgr,
+            volume_manager: Arc::new(RwLock::new(vol_mgr)),
             needle_crc_map: Arc::new(RwLock::new(HashMap::new())),
             payload_store: Arc::new(RwLock::new(HashMap::new())),
             next_vol_offset: Arc::new(RwLock::new(4096)),
@@ -313,28 +320,91 @@ impl S3ServiceState {
             });
         }
 
+        let initial_bytes = if let Some(ref vm) = vol_mgr { vm.offset() } else { 0 };
+
         Self {
             data_dir: Some(dir.to_path_buf()),
+            total_volume_bytes: Arc::new(AtomicU64::new(initial_bytes)),
+            tombstone_bytes: Arc::new(AtomicU64::new(0)),
+            active_volume_id: Arc::new(AtomicU32::new(1)),
             engine: Arc::new(RwLock::new(engine)),
             multipart: Arc::new(MultipartManager::new()),
             sigv4_cache: Arc::new(SigV4KeyCache::new()),
             lifecycle: Arc::new(LifecycleManager::new()),
             single_flight: Arc::new(SingleFlight::new()),
             mvcc: Arc::new(MvccStore::new()),
-            volume_manager: vol_mgr,
+            volume_manager: Arc::new(RwLock::new(vol_mgr)),
             needle_crc_map,
             payload_store: Arc::new(RwLock::new(HashMap::new())),
             next_vol_offset: Arc::new(RwLock::new(initial_vol_offset)),
         }
     }
 
+    pub fn fragmentation_ratio(&self) -> f64 {
+        let tot = self.total_volume_bytes.load(Ordering::Relaxed);
+        let dead = self.tombstone_bytes.load(Ordering::Relaxed);
+        if tot == 0 {
+            0.0
+        } else {
+            (dead as f64) / (tot as f64)
+        }
+    }
+
+    pub fn perform_online_compaction(&self) -> Result<CompactionReport, VolumeError> {
+        let dir = match self.data_dir {
+            Some(ref d) => d.clone(),
+            None => return Ok(CompactionReport::default()),
+        };
+        let cur_vol = self.active_volume_id.load(Ordering::SeqCst);
+        let target_vol = cur_vol + 1;
+
+        let (live_keys, key_buckets) = {
+            let engine = self.engine.read();
+            let mut keys = HashSet::new();
+            let mut kb = HashMap::new();
+            for bucket in engine.buckets.values() {
+                for k_vec in bucket.key_index.keys() {
+                    let k_str = String::from_utf8_lossy(k_vec).to_string();
+                    keys.insert(k_str.clone());
+                    kb.insert(k_str, bucket.id);
+                }
+            }
+            (keys, kb)
+        };
+
+        let report = compact_volume(&dir, cur_vol, target_vol, &live_keys)?;
+        let new_mgr = Arc::new(VolumeManager::open(&dir, target_vol)?);
+        let new_vol_bytes = new_mgr.offset();
+
+        {
+            let mut engine = self.engine.write();
+            let mut crc_map = self.needle_crc_map.write();
+            for (k_str, loc) in &report.new_locations {
+                if let Some(&b_id) = key_buckets.get(k_str) {
+                    let _ = engine.update_object_offset(b_id, k_str.as_bytes(), loc.offset);
+                    crc_map.insert((b_id, loc.offset), loc.payload_crc32c);
+                }
+            }
+        }
+
+        self.payload_store.write().clear();
+        *self.volume_manager.write() = Some(new_mgr);
+        self.active_volume_id.store(target_vol, Ordering::SeqCst);
+        self.total_volume_bytes.store(new_vol_bytes, Ordering::Relaxed);
+        self.tombstone_bytes.store(0, Ordering::Relaxed);
+
+        Ok(report)
+    }
+
     pub fn store_payload(&self, b_id: u32, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64) -> u64 {
         if data.is_empty() {
             return 0;
         }
-        if let Some(ref vm) = self.volume_manager {
+        let vm_opt = self.volume_manager.read().clone();
+        if let Some(ref vm) = vm_opt {
             if let Ok(loc) = vm.write_needle(b_id as u16, key, data, flags, etag_hi, etag_lo) {
                 self.needle_crc_map.write().insert((b_id, loc.offset), loc.payload_crc32c);
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                 // Bound hot payload cache to objects <= 256 KiB and <= 256 entries (~16 MiB max RSS)
                 if data.len() <= 256 * 1024 {
                     let mut pstore = self.payload_store.write();
@@ -358,7 +428,8 @@ impl S3ServiceState {
         if let Some(cached) = self.payload_store.read().get(&(b_id, vol_offset)).cloned() {
             return cached;
         }
-        if let Some(ref vm) = self.volume_manager {
+        let vm_opt = self.volume_manager.read().clone();
+        if let Some(ref vm) = vm_opt {
             let expected_crc = self
                 .needle_crc_map
                 .read()
@@ -1121,9 +1192,9 @@ pub async fn handle_s3_request(
                         AWAN_FLAG_ACTIVE
                     };
 
-                    let old_offset = {
+                    let old_info = {
                         let engine = state.engine.read();
-                        engine.get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset)
+                        engine.get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size))
                     };
 
                     let vol_offset = if decoded_bytes.is_empty() {
@@ -1132,10 +1203,13 @@ pub async fn handle_s3_request(
                         state.store_payload(b_id, &key, &decoded_bytes, flags, etag_hi, etag_lo)
                     };
 
-                    if let Some(prev_off) = old_offset {
+                    if let Some((prev_off, prev_sz)) = old_info {
                         if prev_off > 0 && prev_off != vol_offset {
                             state.payload_store.write().remove(&(b_id, prev_off));
                             state.needle_crc_map.write().remove(&(b_id, prev_off));
+                            let raw_len = 64 + key.as_bytes().len() + prev_sz as usize;
+                            let dead_bytes = (((raw_len + 4095) / 4096) * 4096) as u64;
+                            state.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
                         }
                     }
 
@@ -1338,19 +1412,27 @@ pub async fn handle_s3_request(
 
                 Method::DELETE => {
                     state.mvcc.tombstone(b_id, &key);
-                    let old_offset = {
+                    let old_info = {
                         let mut engine = state.engine.write();
-                        let off = engine.get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset);
+                        let info = engine.get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size));
                         let _ = engine.delete_object(b_id, key.as_bytes());
-                        off
+                        info
                     };
-                    if let Some(off) = old_offset {
+                    if let Some((off, sz)) = old_info {
                         if off > 0 {
                             state.payload_store.write().remove(&(b_id, off));
+                            state.needle_crc_map.write().remove(&(b_id, off));
+                            let raw_len = 64 + key.as_bytes().len() + sz as usize;
+                            let dead_bytes = (((raw_len + 4095) / 4096) * 4096) as u64;
+                            state.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
                         }
                     }
-                    if let Some(ref vm) = state.volume_manager {
-                        let _ = vm.write_needle(b_id as u16, &key, &[], AWAN_FLAG_TOMBSTONE, 0, 0);
+                    let vm_opt = state.volume_manager.read().clone();
+                    if let Some(ref vm) = vm_opt {
+                        if let Ok(loc) = vm.write_needle(b_id as u16, &key, &[], AWAN_FLAG_TOMBSTONE, 0, 0) {
+                            state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                            state.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                        }
                     }
                     Ok(Response::builder()
                         .status(StatusCode::NO_CONTENT)

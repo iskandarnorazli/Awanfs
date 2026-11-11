@@ -243,6 +243,16 @@ impl StorageEngine {
         Ok(())
     }
 
+    pub fn update_object_offset(&mut self, bucket_id: u32, key: &[u8], new_offset: u64) -> Result<(), i32> {
+        let bucket = self.buckets.get_mut(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
+        if let Some(&row_idx) = bucket.key_index.get(key) {
+            self.table.vol_offsets[row_idx] = new_offset;
+            Ok(())
+        } else {
+            Err(ERR_NOT_FOUND)
+        }
+    }
+
     pub fn put_object(
         &mut self,
         bucket_id: u32,
