@@ -2,6 +2,7 @@
 //! High-Performance S3 Storage Server — Columnar SoA Index & Needle Storage Substrate
 
 pub mod aws_chunked;
+pub mod cache;
 pub mod cluster;
 pub mod coalesce;
 pub mod compaction;
@@ -21,6 +22,7 @@ pub mod volume;
 pub mod xml;
 
 pub use aws_chunked::*;
+pub use cache::*;
 pub use cluster::*;
 pub use coalesce::*;
 pub use compaction::*;
