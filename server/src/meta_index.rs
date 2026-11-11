@@ -3,11 +3,12 @@
 //! Zero-allocation in-memory metadata substrate with 64-byte packed records,
 //! arena-backed key indexing, and O(1) hash table lookup.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::catch_unwind;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
+use crate::spill::SpillIndex;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -177,6 +178,8 @@ pub struct StorageEngine {
     /// Open addressing / hash table: (bucket_id, key_hash) -> Vec of SoA row indices
     pub hash_slots: HashMap<(u32, u64), Vec<usize>>,
     pub slab_bytes: usize,
+    pub spill_index: Option<SpillIndex>,
+    pub spilled_keys: HashMap<u32, BTreeSet<Vec<u8>>>,
 }
 
 pub type AwanStorageEngine = StorageEngine;
@@ -192,7 +195,13 @@ impl StorageEngine {
             next_bucket_id: 1,
             hash_slots: HashMap::with_capacity(max_objects.min(1_000_000)),
             slab_bytes,
+            spill_index: None,
+            spilled_keys: HashMap::new(),
         }
+    }
+
+    pub fn attach_spill_index(&mut self, spill: SpillIndex) {
+        self.spill_index = Some(spill);
     }
 
     pub fn create_bucket(&mut self, name: &str) -> Result<u32, i32> {
@@ -247,10 +256,16 @@ impl StorageEngine {
         let bucket = self.buckets.get_mut(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
         if let Some(&row_idx) = bucket.key_index.get(key) {
             self.table.vol_offsets[row_idx] = new_offset;
-            Ok(())
-        } else {
-            Err(ERR_NOT_FOUND)
+            return Ok(());
         }
+        if let Some(ref spill) = self.spill_index {
+            if let Ok(Some(mut meta)) = spill.get(bucket_id, key) {
+                meta.vol_offset = new_offset;
+                let _ = spill.put(bucket_id, key, &meta);
+                return Ok(());
+            }
+        }
+        Err(ERR_NOT_FOUND)
     }
 
     pub fn put_object(
@@ -309,6 +324,30 @@ impl StorageEngine {
             return Ok(());
         }
 
+        // Check if object is already spilled or in-memory capacity is reached
+        if let Some(ref spill) = self.spill_index {
+            let is_spilled = self.spilled_keys.get(&bucket_id).map_or(false, |set| set.contains(key));
+            if is_spilled || self.table.key_hashes.len() >= self.max_objects {
+                let meta = ObjectMeta {
+                    key_hash,
+                    bucket_flags,
+                    vol_offset,
+                    size,
+                    etag_hi,
+                    etag_lo,
+                    created_at: now_ms,
+                    key_slice: 0,
+                };
+                let _ = spill.put(bucket_id, key, &meta);
+                self.spilled_keys.entry(bucket_id).or_default().insert(key.to_vec());
+                return Ok(());
+            }
+        }
+
+        if self.table.key_hashes.len() >= self.max_objects {
+            return Err(ERR_CAPACITY);
+        }
+
         let arena_offset = self.key_arena.len();
         self.key_arena.extend_from_slice(key);
         let key_slice = pack_key_slice(arena_offset, key.len() as u16);
@@ -338,24 +377,33 @@ impl StorageEngine {
     pub fn get_object_with_hash(&self, bucket_id: u32, key: &[u8], key_hash: u64) -> Result<ObjectMeta, i32> {
         let _ = self.buckets.get(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
 
-        let slots = self.hash_slots.get(&(bucket_id, key_hash)).ok_or(ERR_NOT_FOUND)?;
-
         let disable_verify = FAULT_DISABLE_KEY_VERIFICATION.load(Ordering::Relaxed);
 
-        for &row_idx in slots.iter().rev() {
-            let meta = self.table.get(row_idx);
-            let flags = unpack_flags(meta.bucket_flags);
-            if flags & FLAG_TOMBSTONE != 0 || flags & FLAG_ACTIVE == 0 {
-                continue;
-            }
+        if let Some(slots) = self.hash_slots.get(&(bucket_id, key_hash)) {
+            for &row_idx in slots.iter().rev() {
+                let meta = self.table.get(row_idx);
+                let flags = unpack_flags(meta.bucket_flags);
+                if flags & FLAG_TOMBSTONE != 0 || flags & FLAG_ACTIVE == 0 {
+                    continue;
+                }
 
-            if disable_verify {
-                return Ok(meta);
-            }
+                if disable_verify {
+                    return Ok(meta);
+                }
 
-            let (offset, len) = unpack_key_slice(meta.key_slice);
-            if offset + len <= self.key_arena.len() && &self.key_arena[offset..offset + len] == key {
-                return Ok(meta);
+                let (offset, len) = unpack_key_slice(meta.key_slice);
+                if offset + len <= self.key_arena.len() && &self.key_arena[offset..offset + len] == key {
+                    return Ok(meta);
+                }
+            }
+        }
+
+        if let Some(ref spill) = self.spill_index {
+            if let Ok(Some(meta)) = spill.get(bucket_id, key) {
+                let flags = unpack_flags(meta.bucket_flags);
+                if flags & FLAG_ACTIVE != 0 && flags & FLAG_TOMBSTONE == 0 {
+                    return Ok(meta);
+                }
             }
         }
 
@@ -364,13 +412,32 @@ impl StorageEngine {
 
     pub fn delete_object(&mut self, bucket_id: u32, key: &[u8]) -> Result<(), i32> {
         let bucket = self.buckets.get_mut(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
-        let row_idx = bucket.key_index.remove(key).ok_or(ERR_NOT_FOUND)?;
+        let row_idx_opt = bucket.key_index.remove(key);
 
-        let mut meta = self.table.get(row_idx);
-        let part_count = unpack_part_count(meta.bucket_flags);
-        meta.bucket_flags = pack_bucket_flags(bucket_id, part_count, FLAG_TOMBSTONE);
-        self.table.update(row_idx, &meta);
-        Ok(())
+        let mut in_memory_deleted = false;
+        if let Some(row_idx) = row_idx_opt {
+            let mut meta = self.table.get(row_idx);
+            let part_count = unpack_part_count(meta.bucket_flags);
+            meta.bucket_flags = pack_bucket_flags(bucket_id, part_count, FLAG_TOMBSTONE);
+            self.table.update(row_idx, &meta);
+            in_memory_deleted = true;
+        }
+
+        let mut spilled_deleted = false;
+        if let Some(ref spill) = self.spill_index {
+            if let Some(set) = self.spilled_keys.get_mut(&bucket_id) {
+                if set.remove(key) {
+                    let _ = spill.delete(bucket_id, key);
+                    spilled_deleted = true;
+                }
+            }
+        }
+
+        if in_memory_deleted || spilled_deleted {
+            Ok(())
+        } else {
+            Err(ERR_NOT_FOUND)
+        }
     }
 
     pub fn scan_objects(
@@ -386,33 +453,73 @@ impl StorageEngine {
             None => return 0,
         };
 
-        let mut count = 0;
-        let range: Box<dyn Iterator<Item = (&Vec<u8>, &usize)> + '_> = if !start_after.is_empty() {
-            use std::ops::Bound;
-            Box::new(bucket.key_index.range::<Vec<u8>, _>((Bound::Excluded(start_after.to_vec()), Bound::Unbounded)))
-        } else if !prefix.is_empty() {
-            use std::ops::Bound;
-            Box::new(bucket.key_index.range::<Vec<u8>, _>((Bound::Included(prefix.to_vec()), Bound::Unbounded)))
-        } else {
-            Box::new(bucket.key_index.iter())
-        };
+        if self.spill_index.is_none() {
+            let mut count = 0;
+            let range: Box<dyn Iterator<Item = (&Vec<u8>, &usize)> + '_> = if !start_after.is_empty() {
+                use std::ops::Bound;
+                Box::new(bucket.key_index.range::<Vec<u8>, _>((Bound::Excluded(start_after.to_vec()), Bound::Unbounded)))
+            } else if !prefix.is_empty() {
+                use std::ops::Bound;
+                Box::new(bucket.key_index.range::<Vec<u8>, _>((Bound::Included(prefix.to_vec()), Bound::Unbounded)))
+            } else {
+                Box::new(bucket.key_index.iter())
+            };
 
-        for (k, &row_idx) in range {
+            for (k, &row_idx) in range {
+                if count >= max_keys || count >= out_records.len() {
+                    break;
+                }
+                if !prefix.is_empty() && !k.starts_with(prefix) {
+                    if k.as_slice() > prefix {
+                        break;
+                    }
+                    continue;
+                }
+
+                let flags = unpack_flags(self.table.bucket_flags[row_idx]);
+                if flags & FLAG_ACTIVE != 0 && flags & FLAG_TOMBSTONE == 0 {
+                    out_records[count] = self.table.get(row_idx);
+                    count += 1;
+                }
+            }
+            return count;
+        }
+
+        // When spill index is attached, merge sorted in-memory keys and spilled keys
+        let mut merged: BTreeMap<Vec<u8>, ObjectMeta> = BTreeMap::new();
+
+        for (k, &row_idx) in &bucket.key_index {
+            if !start_after.is_empty() && k.as_slice() <= start_after {
+                continue;
+            }
+            if !prefix.is_empty() && !k.starts_with(prefix) {
+                continue;
+            }
+            let flags = unpack_flags(self.table.bucket_flags[row_idx]);
+            if flags & FLAG_ACTIVE != 0 && flags & FLAG_TOMBSTONE == 0 {
+                merged.insert(k.clone(), self.table.get(row_idx));
+            }
+        }
+
+        if let Some(ref spill) = self.spill_index {
+            let sa_opt = if start_after.is_empty() { None } else { Some(start_after) };
+            if let Ok(spilled_items) = spill.scan_prefix(bucket_id, prefix, sa_opt, max_keys) {
+                for (k, meta) in spilled_items {
+                    let flags = unpack_flags(meta.bucket_flags);
+                    if flags & FLAG_ACTIVE != 0 && flags & FLAG_TOMBSTONE == 0 {
+                        merged.insert(k, meta);
+                    }
+                }
+            }
+        }
+
+        let mut count = 0;
+        for (_k, meta) in merged {
             if count >= max_keys || count >= out_records.len() {
                 break;
             }
-            if !prefix.is_empty() && !k.starts_with(prefix) {
-                if k.as_slice() > prefix {
-                    break;
-                }
-                continue;
-            }
-
-            let flags = unpack_flags(self.table.bucket_flags[row_idx]);
-            if flags & FLAG_ACTIVE != 0 && flags & FLAG_TOMBSTONE == 0 {
-                out_records[count] = self.table.get(row_idx);
-                count += 1;
-            }
+            out_records[count] = meta;
+            count += 1;
         }
 
         count
