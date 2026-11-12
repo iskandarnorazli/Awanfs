@@ -30,7 +30,7 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 #[test]
 fn full_volume_refuses_writes_instead_of_overwriting_earlier_needles() {
     let dir = temp_dir("wrap");
-    let mut vm = VolumeManager::open(&dir, 1).unwrap();
+    let vm = VolumeManager::open(&dir, 1).unwrap();
     vm.set_max_span(64 * 1024);
 
     let first = pattern(16 * 1024, 3);
@@ -56,7 +56,7 @@ async fn put_that_cannot_be_written_is_an_error_not_a_200() {
     let state = Arc::new(S3ServiceState::with_data_dir(&dir));
     let small_dir = dir.join("small");
     std::fs::create_dir_all(&small_dir).unwrap();
-    let mut vm = VolumeManager::open(&small_dir, 1).unwrap();
+    let vm = VolumeManager::open(&small_dir, 1).unwrap();
     vm.set_max_span(64 * 1024);
     *state.volume_manager.write() = Some(Arc::new(vm));
 
