@@ -59,10 +59,11 @@ pub async fn start_s3_reactor(
             tokio::select! {
                 accept_res = listener.accept() => {
                     match accept_res {
-                        Ok((stream, _remote_addr)) => {
+                        Ok((stream, remote_addr)) => {
                             let io = TokioIo::new(stream);
                             let state_clone = Arc::clone(&state);
-                            let service = service_fn(move |req| {
+                            let service = service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+                                req.extensions_mut().insert(crate::s3_api::RemoteAddr(remote_addr));
                                 handle_s3_request(Arc::clone(&state_clone), req)
                             });
                             let conn = auto_builder.serve_connection_with_upgrades(io, service).into_owned();
