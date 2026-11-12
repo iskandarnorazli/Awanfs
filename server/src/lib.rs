@@ -19,6 +19,7 @@ pub mod mvcc;
 pub mod reactor;
 pub mod iam;
 pub mod request_log;
+pub mod tls;
 pub mod s3_api;
 pub mod sigv4;
 pub mod spill;

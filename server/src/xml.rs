@@ -73,6 +73,35 @@ pub struct S3ObjectEntry<'a> {
     pub size: u64,
 }
 
+/// ListObjectVersions for a bucket without versioning: each object is its only version, id
+/// "null", as S3 answers for unversioned buckets (#31). Versioned buckets come with #31.
+pub fn list_object_versions_xml(bucket: &str, prefix: &str, key_marker: &str, max_keys: u32, is_truncated: bool, contents: &[S3ObjectEntry]) -> String {
+    let mut out = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+        <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  \
+          <Name>{}</Name>\n  <Prefix>{}</Prefix>\n  <KeyMarker>{}</KeyMarker>\n  <VersionIdMarker></VersionIdMarker>\n  \
+          <MaxKeys>{}</MaxKeys>\n  <IsTruncated>{}</IsTruncated>\n",
+        xml_escape(bucket),
+        xml_escape(prefix),
+        xml_escape(key_marker),
+        max_keys,
+        is_truncated
+    );
+    for obj in contents {
+        out.push_str("  <Version>\n");
+        out.push_str(&format!("    <Key>{}</Key>\n", xml_escape(obj.key)));
+        out.push_str("    <VersionId>null</VersionId>\n    <IsLatest>true</IsLatest>\n");
+        out.push_str(&format!("    <LastModified>{}</LastModified>\n", obj.last_modified));
+        out.push_str(&format!("    <ETag>\"{}\"</ETag>\n", obj.etag));
+        out.push_str(&format!("    <Size>{}</Size>\n", obj.size));
+        out.push_str("    <StorageClass>STANDARD</StorageClass>\n");
+        out.push_str("    <Owner><ID>awanfs</ID><DisplayName>awanfs</DisplayName></Owner>\n");
+        out.push_str("  </Version>\n");
+    }
+    out.push_str("</ListVersionsResult>");
+    out
+}
+
 pub fn list_objects_v2_xml(
     bucket: &str,
     prefix: &str,

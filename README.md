@@ -12,7 +12,7 @@ Split from `awan-lang/awan-storage` on 2026-11-12, with its git history. Measure
 
 Read this before you run it anywhere that matters. Plan of record: the Phase 1-4 milestones and [`ROADMAP_AND_DEPENDENCIES.md`](ROADMAP_AND_DEPENDENCIES.md); decisions in [`ARCHITECTURE.md`](ARCHITECTURE.md#0-decisions-2026-11-12).
 
-- **One access key, no TLS.** Requests are checked with SigV4 against one key pair and the server listens on 127.0.0.1 by default (#35). There are no per-user policies (#53) and no TLS (#30): put a TLS proxy in front before opening it to a network.
+- **One access key.** Requests are checked with SigV4 against one key pair and the server listens on 127.0.0.1 by default (#35). There are no per-user policies yet (#53).
 - **Writes are synced before the 200 by default** (`group` durability, #29). The measurements below were taken before that change, when a PUT was acknowledged without a sync; they will be re-run.
 - **Volumes of 32 GiB, rolled over when full** (#37). Every 10 minutes the server compacts the oldest volume when at least 20 % of it is dead (overwritten or deleted objects): its live objects move to the active volume and it is deleted, safely while requests run (#14). A lone volume is sealed for this only once it holds 1 GiB. `--auto-compaction off` (or `AWANFS_AUTO_COMPACTION=off`) turns it off; `S3ServiceState::compact_oldest_volume` still compacts on demand.
 - A PUT body above 4 MiB with a `Content-Length` is written to disk as it arrives, in 1 MiB pieces, and so is an UploadPart above 4 MiB, into its staged part file. Smaller bodies and `aws-chunked` bodies are still held in memory before they are written. Declared bodies above the S3 limit of 5 GiB get 400 `EntityTooLarge` before they are read; XML bodies are capped at 16 MiB. Multipart GETs stream part by part (#36).
@@ -96,7 +96,8 @@ cargo build --release
 AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
   ./target/release/s3-server --port 9000 --data-dir ./s3_data
 ```
-- The server listens on `127.0.0.1` only. `--listen 0.0.0.0` (or `AWANFS_LISTEN`) opens it to the network; there is no TLS yet (#30), so put it behind a TLS proxy first.
+- The server listens on `127.0.0.1` only. `--listen 0.0.0.0` (or `AWANFS_LISTEN`) opens it to the network.
+- HTTPS: `--cert cert.pem --key key.pem` (or `AWANFS_TLS_CERT`/`AWANFS_TLS_KEY`) serves TLS with HTTP/1.1 and HTTP/2 on the port, and no plain HTTP unless `--http-port <port>` adds a plain listener. A renewed certificate is picked up within 60 s of the files changing, or at once on SIGHUP (Unix); a broken file keeps the old certificate.
 - Requests are checked with AWS Signature Version 4, in the `Authorization` header or as a presigned URL, against `AWANFS_ACCESS_KEY`/`AWANFS_SECRET_KEY`. A body whose SHA-256 differs from `x-amz-content-sha256` is refused. More users with policies: `--config` below.
 - `--durability group|fast|strict` (or `AWANFS_DURABILITY`) sets when a write is acknowledged. After a power cut:
   - `group` (default): every acknowledged PUT, DELETE and multipart completion is kept. Writers wait for a shared sync of the volume and its journal; concurrent writers share one.

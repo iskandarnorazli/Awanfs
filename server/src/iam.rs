@@ -307,7 +307,7 @@ pub fn requirements(method: &str, bucket: Option<&str>, key: Option<&str>, query
             let mut out = vec![(action, arn_o(b, k))];
             if method == "PUT" {
                 if let Some(src) = copy_source {
-                    let src = crate::s3_api::percent_decode(src.split('?').next().unwrap_or(src));
+                    let src = crate::s3_api::percent_decode_path(src.split('?').next().unwrap_or(src));
                     out.push(("s3:GetObject", format!("arn:aws:s3:::{}", src.trim_start_matches('/'))));
                 }
             }

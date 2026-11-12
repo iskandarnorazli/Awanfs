@@ -200,6 +200,8 @@ fn new_volume_superblock_holds_no_stale_heap_bytes() {
     drop(vm);
     let mut sb = vec![0u8; 4096];
     std::fs::File::open(dir.join("volume_0001.dat")).unwrap().read_exact(&mut sb).unwrap();
-    let stale = sb[20..].iter().filter(|b| **b != 0).count();
+    // Bytes 20..24 hold the format version since #50 (owner decision 20); the rest is unused.
+    assert_eq!(u32::from_le_bytes(sb[20..24].try_into().unwrap()), s3_server::FORMAT_VERSION);
+    let stale = sb[24..].iter().filter(|b| **b != 0).count();
     assert_eq!(stale, 0, "the superblock's unused bytes must be zero, found {} non-zero bytes", stale);
 }
