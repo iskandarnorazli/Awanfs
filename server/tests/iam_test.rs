@@ -191,3 +191,64 @@ fn a_config_readable_by_others_is_refused() {
     let err = Iam::load(&p).err().expect("refused");
     assert!(err.contains("chmod 600"), "{}", err);
 }
+
+/// A config user's large chunked upload is streamed (#36) and its chunk signatures are checked
+/// with that user's secret: one byte changed after signing is refused and nothing is stored.
+#[tokio::test]
+async fn a_config_users_streamed_chunked_upload_is_checked_with_its_own_secret() {
+    let dir = temp_dir("chunked");
+    let iam = ReloadingIam::open(&write_config(&dir, CONFIG)).unwrap();
+    let mut st = S3ServiceState::new();
+    st.auth = AuthConfig { credentials: None, allow_anonymous: false };
+    *st.iam.write() = Some(iam);
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let handle = start_s3_reactor(addr, Arc::new(st)).await.unwrap();
+    let host = handle.local_addr.to_string();
+    let c = reqwest::Client::new();
+    assert_eq!(signed(&c, "AKSCOPED", "scoped-secret", Method::PUT, &host, "/team-a", b"").send().await.unwrap().status(), StatusCode::OK);
+    let chunks: Vec<Vec<u8>> = (0..3).map(|i| vec![b'a' + i as u8; 2 << 20]).collect();
+    for (key, tamper, want) in [("good", false, StatusCode::OK), ("bad", true, StatusCode::FORBIDDEN)] {
+        let res = chunked(&c, "AKSCOPED", "scoped-secret", &host, &format!("/team-a/{}", key), &chunks, tamper).send().await.unwrap();
+        assert_eq!(res.status(), want, "{}: {}", key, res.text().await.unwrap());
+    }
+    let res = signed(&c, "AKSCOPED", "scoped-secret", Method::GET, &host, "/team-a/bad", b"").send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "the tampered upload stored nothing");
+    let res = signed(&c, "AKSCOPED", "scoped-secret", Method::GET, &host, "/team-a/good", b"").send().await.unwrap();
+    assert_eq!(res.bytes().await.unwrap().len(), 6 << 20);
+}
+
+/// A signed aws-chunked PUT (STREAMING-AWS4-HMAC-SHA256-PAYLOAD); `tamper` flips a byte of
+/// chunk 0 after signing.
+fn chunked(c: &reqwest::Client, ak: &str, sk: &str, host: &str, path: &str, chunks: &[Vec<u8>], tamper: bool) -> reqwest::RequestBuilder {
+    let date = amz_date(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
+    let decoded: usize = chunks.iter().map(|c| c.len()).sum();
+    let canonical = format!(
+        "PUT\n{}\n\nhost:{}\nx-amz-content-sha256:STREAMING-AWS4-HMAC-SHA256-PAYLOAD\nx-amz-date:{}\nx-amz-decoded-content-length:{}\n\nhost;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length\nSTREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        path, host, date, decoded
+    );
+    let scope = format!("{}/us-east-1/s3/aws4_request", &date[..8]);
+    let cache = SigV4KeyCache::new();
+    let sign = |sts: &str| compute_sigv4_signature(&cache, sk, &date[..8], "us-east-1", "s3", sts);
+    let seed = sign(&format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", date, scope, sha256_hex(canonical.as_bytes())));
+    let mut prev = seed.clone();
+    let mut body = Vec::new();
+    let empty = sha256_hex(b"");
+    for (i, chunk) in chunks.iter().chain(std::iter::once(&Vec::new())).enumerate() {
+        let sig = sign(&format!("AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}", date, scope, prev, empty, sha256_hex(chunk)));
+        body.extend_from_slice(format!("{:x};chunk-signature={}\r\n", chunk.len(), sig).as_bytes());
+        let mut data = chunk.clone();
+        if tamper && i == 0 {
+            data[0] ^= 1;
+        }
+        body.extend_from_slice(&data);
+        body.extend_from_slice(b"\r\n");
+        prev = sig;
+    }
+    c.put(format!("http://{}{}", host, path))
+        .header("x-amz-date", date)
+        .header("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+        .header("x-amz-decoded-content-length", decoded.to_string())
+        .header("content-encoding", "aws-chunked")
+        .header("authorization", format!("AWS4-HMAC-SHA256 Credential={}/{},SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,Signature={}", ak, scope, seed))
+        .body(body)
+}
