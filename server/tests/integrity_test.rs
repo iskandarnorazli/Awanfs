@@ -3,7 +3,7 @@
 
 use reqwest::header::ETAG;
 use reqwest::StatusCode;
-use s3_server::{start_s3_reactor, S3ServiceState, VolumeManager};
+use s3_server::{start_s3_reactor, AlignedBuffer, S3ServiceState, VolumeManager};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -88,10 +88,12 @@ async fn get_of_a_corrupted_payload_is_an_error_not_zeros() {
     let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&dat).unwrap();
     let mut head = vec![0u8; 1 << 20];
     f.read_exact(&mut head).unwrap();
-    let pos = head
-        .windows(64)
-        .position(|w| w == &payload[1000..1064])
-        .expect("payload bytes are in the first MiB of the volume");
+    // Search after the 4 KiB superblock: needles start at offset 4096.
+    let pos = 4096
+        + head[4096..]
+            .windows(64)
+            .position(|w| w == &payload[1000..1064])
+            .expect("payload bytes are in the first MiB of the volume");
     f.seek(SeekFrom::Start(pos as u64)).unwrap();
     f.write_all(&[head[pos] ^ 0xFF]).unwrap();
     f.sync_all().unwrap();
@@ -183,4 +185,21 @@ async fn completed_multipart_object_survives_restart() {
     let body = res.bytes().await.unwrap();
     assert_eq!(body.len(), whole.len());
     assert!(&body[..] == &whole[..], "the multipart object's bytes changed across a restart");
+}
+
+#[test]
+fn new_volume_superblock_holds_no_stale_heap_bytes() {
+    // Leave a freed, filled sector-aligned block on the heap, as an earlier request would.
+    for _ in 0..8 {
+        let mut stale = AlignedBuffer::new(4096);
+        stale.iter_mut().for_each(|b| *b = 0xAB);
+        drop(stale);
+    }
+    let dir = temp_dir("superblock");
+    let vm = VolumeManager::open(&dir, 1).unwrap();
+    drop(vm);
+    let mut sb = vec![0u8; 4096];
+    std::fs::File::open(dir.join("volume_0001.dat")).unwrap().read_exact(&mut sb).unwrap();
+    let stale = sb[20..].iter().filter(|b| **b != 0).count();
+    assert_eq!(stale, 0, "the superblock's unused bytes must be zero, found {} non-zero bytes", stale);
 }
