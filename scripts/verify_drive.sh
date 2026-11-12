@@ -16,7 +16,7 @@ URL="http://127.0.0.1:$PORT"
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-verifykey}" AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-verifysecret}" AWS_DEFAULT_REGION=us-east-1 AWS_PAGER=""
 S3() { aws --endpoint-url "$URL" s3api "$@"; }
 PID=""
-start() { "$BIN" --port "$PORT" --data-dir "$DATA" >>"$EVID/server.log" 2>&1 & PID=$!;
+start() { AWANFS_ACCESS_KEY="$AWS_ACCESS_KEY_ID" AWANFS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" "$BIN" --port "$PORT" --data-dir "$DATA" >>"$EVID/server.log" 2>&1 & PID=$!;
   for _ in $(seq 1 100); do curl -s -o /dev/null "$URL/" && return 0; sleep 0.1; done; echo "server did not start"; return 1; }
 stop() { [ -n "$PID" ] && kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; PID=""; }
 cleanup() { stop; rm -rf "$DATA"; }

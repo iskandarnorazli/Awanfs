@@ -36,7 +36,7 @@ def main():
         manifest = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "server", "Cargo.toml"))
         subprocess.run(["cargo", "build", "--bin", "awan-storage-server", "--manifest-path", manifest], check=True)
 
-    proc = subprocess.Popen([server_bin, "--port", str(port)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen([server_bin, "--port", str(port), "--allow-anonymous"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     time.sleep(1.0)
 
     endpoint = f"http://127.0.0.1:{port}"

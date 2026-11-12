@@ -266,6 +266,8 @@ pub struct S3ServiceState {
     /// volume write until the engine row is updated, so log order equals index order
     /// (`verification/tla/ObjectVersions.tla`, `UseKeyLock`).
     pub key_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
+    /// Who may call; `AuthConfig::open()` by default, the binary sets it from flags and env.
+    pub auth: crate::auth::AuthConfig,
 }
 
 impl S3ServiceState {
@@ -303,6 +305,7 @@ impl S3ServiceState {
             work,
             test_hook: Arc::new(RwLock::new(None)),
             key_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
+            auth: crate::auth::AuthConfig::open(),
         }
     }
 
@@ -412,6 +415,7 @@ impl S3ServiceState {
             work,
             test_hook: Arc::new(RwLock::new(None)),
             key_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
+            auth: crate::auth::AuthConfig::open(),
         }
     }
 
@@ -602,11 +606,22 @@ pub async fn handle_s3_request(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let auth_header = req.headers().get("Authorization").and_then(|v| v.to_str().ok());
-    if let Err(code) = validate_sigv4_auth(auth_header, &query_map, now_sec) {
+    if let Err(code) = crate::auth::authenticate(
+        &state.auth,
+        &state.sigv4_cache,
+        req.method().as_str(),
+        req.uri().path(),
+        req.uri().query().unwrap_or(""),
+        req.headers(),
+        now_sec,
+    ) {
+        let status = match code {
+            "AuthorizationHeaderMalformed" | "AuthorizationQueryParametersError" => StatusCode::BAD_REQUEST,
+            _ => StatusCode::FORBIDDEN,
+        };
         let xml = s3_error_xml(code, "Authentication failed", path, "req-auth");
         return Ok(Response::builder()
-            .status(StatusCode::FORBIDDEN)
+            .status(status)
             .header(CONTENT_TYPE, "application/xml")
             .body(full_body(Bytes::from(xml)))
             .unwrap());
@@ -993,7 +1008,16 @@ pub async fn handle_s3_request(
                 };
 
                 let is_chunked = req.headers().get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
+                let signed_headers = req.headers().clone();
                 let raw_bytes = req.into_body().collect().await?.to_bytes();
+                if !crate::auth::payload_hash_ok(&signed_headers, &raw_bytes) {
+                    let xml = s3_error_xml("XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.", &key, "req-sha256");
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header(CONTENT_TYPE, "application/xml")
+                        .body(full_body(Bytes::from(xml)))
+                        .unwrap());
+                }
                 let decoded_bytes = if is_chunked {
                     match decode_aws_chunked(&raw_bytes) {
                         Ok(b) => b,
@@ -1310,7 +1334,16 @@ pub async fn handle_s3_request(
                     let expected_len = req.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok());
                     let is_chunked = req.headers().get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
                     let content_md5_hdr = req.headers().get("content-md5").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+                    let signed_headers = req.headers().clone();
                     let raw_bytes = req.into_body().collect().await?.to_bytes();
+                    if !crate::auth::payload_hash_ok(&signed_headers, &raw_bytes) {
+                        let xml = s3_error_xml("XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.", &key, "req-sha256");
+                        return Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header(CONTENT_TYPE, "application/xml")
+                            .body(full_body(Bytes::from(xml)))
+                            .unwrap());
+                    }
 
                     if let Some(exp) = expected_len {
                         if raw_bytes.len() < exp {
