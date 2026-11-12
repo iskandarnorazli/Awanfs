@@ -1370,6 +1370,74 @@ pub async fn handle_s3_request(
 
                 let is_chunked = req.headers().get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
                 let signed_headers = req.headers().clone();
+                let declared_len = signed_headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+                if let Some(len) = declared_len.filter(|&n| !is_chunked && n > STREAM_PUT_MIN) {
+                    // Large part: write it to its staged file as it arrives (#36).
+                    if state.multipart.get_upload(upload_id).is_none() {
+                        let xml = s3_error_xml("NoSuchUpload", "The specified upload does not exist.", &key, "req-up-part");
+                        return Ok(Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .header(CONTENT_TYPE, "application/xml")
+                            .body(full_body(Bytes::from(xml)))
+                            .unwrap());
+                    }
+                    let mut writer = match state.multipart.begin_part(upload_id, part_num) {
+                        Ok(w) => w,
+                        Err(e) => return Ok(internal_error_response(&key, &format!("could not store the part: {}", e))),
+                    };
+                    let declared_sha = signed_headers
+                        .get("x-amz-content-sha256")
+                        .and_then(|v| v.to_str().ok())
+                        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                        .map(|h| h.to_ascii_lowercase());
+                    let mut sha = declared_sha.as_ref().map(|_| sha2::Sha256::new());
+                    let mut md5 = Md5::new();
+                    let mut body = req.into_body();
+                    while let Some(frame) = body.frame().await {
+                        if let Ok(data) = frame?.into_data() {
+                            if let Some(h) = sha.as_mut() {
+                                h.update(&data);
+                            }
+                            md5.update(&data);
+                            if let Err(e) = writer.write(&data) {
+                                return Ok(internal_error_response(&key, &format!("could not store the part: {}", e)));
+                            }
+                        }
+                    }
+                    if writer.written() != len {
+                        return Ok(bad_request("IncompleteBody", "You did not provide the number of bytes specified by the Content-Length HTTP header.", &key));
+                    }
+                    if let (Some(h), Some(want)) = (sha, declared_sha) {
+                        let got: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+                        if got != want {
+                            return Ok(bad_request("XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.", &key));
+                        }
+                    }
+                    let raw_md5: [u8; 16] = md5.finalize().into();
+                    let hi = u64::from_be_bytes(raw_md5[0..8].try_into().unwrap());
+                    let lo = u64::from_be_bytes(raw_md5[8..16].try_into().unwrap());
+                    let hex: String = raw_md5.iter().map(|b| format!("{:02x}", b)).collect();
+                    let staged_path = match writer.finish() {
+                        Ok(p) => p,
+                        Err(e) => return Ok(internal_error_response(&key, &format!("could not store the part: {}", e))),
+                    };
+                    return Ok(match state.multipart.upload_part(upload_id, part_num, 0, len, raw_md5, hi, lo, hex.clone(), Some(staged_path)) {
+                        Ok(_) => Response::builder()
+                            .status(StatusCode::OK)
+                            .header(ETAG, format!("\"{}\"", hex))
+                            .header(CONTENT_LENGTH, "0")
+                            .body(empty_body())
+                            .unwrap(),
+                        Err(err) => {
+                            let status = if err == "NoSuchUpload" { StatusCode::NOT_FOUND } else { StatusCode::BAD_REQUEST };
+                            Response::builder()
+                                .status(status)
+                                .header(CONTENT_TYPE, "application/xml")
+                                .body(full_body(Bytes::from(s3_error_xml(err, "Failed to upload part", &key, "req-up-part"))))
+                                .unwrap()
+                        }
+                    });
+                }
                 let raw_bytes = match read_body(req.into_body(), MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, path).await? {
                     Ok(b) => b,
                     Err(resp) => return Ok(resp),
