@@ -51,16 +51,21 @@ Measured live on physical AMD64 NVMe storage (16 logical cores, 32 GB RAM, Windo
 
 | Workload | `s3-server` (`--release`) | MinIO Reference (`RELEASE.2025-09-07`) | RustFS Reference (`v1.0.5`) | Speedup vs MinIO |
 | :--- | :---: | :---: | :---: | :---: |
-| **64 KiB PUT (Single Object)** | **349.4 MiB/s (5,590 ops/s)** | 8.5 MiB/s (136 ops/s) | 9.4 MiB/s (150 ops/s) | **41.1x faster** (P50 = 10.1 ms) |
+| **64 KiB PUT (Single Object)** | **349.4 MiB/s (5,590 ops/s)** | 8.5 MiB/s (136 ops/s) | 9.4 MiB/s (150 ops/s) | **41.1x faster** (P50 = 10.1 ms) (not durable, see note) |
 | **64 KiB GET (Single Object)** | **339.1 MiB/s (5,425 ops/s)** | 225.6 MiB/s (3,610 ops/s) | 256.4 MiB/s (4,102 ops/s) | **1.50x faster** (P50 = 10.6 ms) |
-| **64 KiB Mixed (80% GET / 20% PUT)** | **310.1 MiB/s (4,962 ops/s)** | 37.9 MiB/s (606 ops/s) | 40.0 MiB/s (641 ops/s) | **8.18x faster** (P99 = 41.1 ms) |
+| **64 KiB Mixed (80% GET / 20% PUT)** | **310.1 MiB/s (4,962 ops/s)** | 37.9 MiB/s (606 ops/s) | 40.0 MiB/s (641 ops/s) | **8.18x faster** (P99 = 41.1 ms) (not durable, see note) |
 | **64 KiB Range GET (bytes=0-4095)** | **23.1 MiB/s (5,907 ops/s)** | 14.1 MiB/s (3,612 ops/s) | 17.1 MiB/s (4,377 ops/s) | **1.64x faster** (P50 = 9.1 ms) |
-| **1 MiB PUT (Single Object)** | **737.3 MiB/s (737 ops/s)** | 126.3 MiB/s (126 ops/s) | 65.0 MiB/s (65 ops/s) | **5.84x faster** (P50 = 40.6 ms) |
+| **1 MiB PUT (Single Object)** | **737.3 MiB/s (737 ops/s)** | 126.3 MiB/s (126 ops/s) | 65.0 MiB/s (65 ops/s) | **5.84x faster** (P50 = 40.6 ms) (not durable, see note) |
 | **1 MiB GET (Single Object)** | **2,165.6 MiB/s** | 1,307.7 MiB/s | 773.7 MiB/s | **1.65x faster** (P50 = 14.1 ms) |
-| **1 MiB Mixed (80% GET / 20% PUT)** | **1,734.5 MiB/s** | 481.0 MiB/s | 305.4 MiB/s | **3.61x faster** (P50 = 17.3 ms) |
+| **1 MiB Mixed (80% GET / 20% PUT)** | **1,734.5 MiB/s** | 481.0 MiB/s | 305.4 MiB/s | **3.61x faster** (P50 = 17.3 ms) (not durable, see note) |
+| **1 GiB Multipart Upload (16 x 64 MiB parts)** | 628.2 MiB/s | **848.1 MiB/s** | 453.9 MiB/s | **0.74x (slower)** (P50 = 841.9 ms) |
+| **1 GiB Multipart Range GET (16 parallel ranges)** | 1,119.3 MiB/s | **1,252.3 MiB/s** | 879.1 MiB/s | **0.89x (slower)** (P50 = 401.1 ms) |
+| **10 GiB Volume PUT (160 x 64 MiB parts)** | 140.3 MiB/s | 154.9 MiB/s | **253.2 MiB/s** | **0.91x (slower)** (P50 = 1,875.9 ms) |
 | **10 GiB Volume Parallel GET** | **1,412.7 MiB/s** | 1,149.2 MiB/s | 834.8 MiB/s | **1.23x faster** (P50 = 354.7 ms) |
-| **Concurrency Scaling (C = 128)** | **324.1 MiB/s** (P99 = 60.0 ms) | 37.8 MiB/s (P99 = 1,239.4 ms) | 39.4 MiB/s (P99 = 959.0 ms) | **8.57x faster (20x lower P99)** |
+| **Concurrency Scaling (C = 128)** | **324.1 MiB/s** (P99 = 60.0 ms) | 37.8 MiB/s (P99 = 1,239.4 ms) | 39.4 MiB/s (P99 = 959.0 ms) | **8.57x faster (20x lower P99)** (not durable, see note) |
 | **Server Peak RAM (Working Set)** | **Bounded ~245 MB (64K-1M)** | ~936 MB (Go GC Heap) | ~172 MB (Rust jemalloc) | **3.8x lower RAM vs MinIO** |
+
+The table lists every workload in the report, including the three where `s3-server` is slower. **Durability:** `s3-server` acknowledges a PUT before it is flushed to disk (no fsync on the write path; group commit is #490), while MinIO and RustFS fsync each PUT. Rows marked "not durable" compare a non-durable write with durable ones, so their speedups are not like for like. Each workload ran once for 2 seconds on one Windows laptop; the full report with its command is [`measurements/s3_warp_minio_vs_awan.md`](measurements/s3_warp_minio_vs_awan.md).
 
 ---
 
