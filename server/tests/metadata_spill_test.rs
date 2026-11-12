@@ -209,6 +209,9 @@ fn spill_holds_1_2_million_keys_in_bounded_memory() {
     for i in 0..n {
         let key = format!("obj-{:07}", i);
         engine.put_object(b_id, key.as_bytes(), 4096 * (i + 1), i, i, !i, 0, 0).expect("put");
+        if i % 200_000 == 0 {
+            println!("{} keys written", i);
+        }
     }
     for i in 0..n {
         let key = format!("obj-{:07}", i);
