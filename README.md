@@ -109,6 +109,13 @@ AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
 - Stopping: Ctrl-C or SIGTERM (Ctrl-Break, console close or system shutdown on Windows) marks the server not ready, stops accepting connections, lets requests in flight finish (up to 30 s), syncs every volume and exits 0.
 - `--allow-anonymous` (or `AWANFS_ALLOW_ANONYMOUS=1`) also accepts unsigned requests, for local tests and benchmarks. Without keys and without that flag the server refuses to start (exit code 2).
 
+### Docker and systemd
+```bash
+docker build -t awanfs .
+docker run -p 9000:9000 -v awanfs-data:/data -e AWANFS_ACCESS_KEY=mykey -e AWANFS_SECRET_KEY=mysecret awanfs
+```
+`deploy/systemd/awanfs.service` runs the binary as a hardened service with the keys in `/etc/awanfs/awanfs.env`. Both stop with SIGTERM, which finishes requests in flight and syncs before exit.
+
 ### Run the Test Suite
 ```bash
 cargo test --locked --manifest-path server/Cargo.toml
