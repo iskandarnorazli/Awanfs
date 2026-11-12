@@ -102,6 +102,104 @@ pub fn list_object_versions_xml(bucket: &str, prefix: &str, key_marker: &str, ma
     out
 }
 
+/// Everything a ListObjectsV2 answer carries.
+pub struct ListV2<'a> {
+    pub bucket: &'a str,
+    pub prefix: &'a str,
+    pub delimiter: &'a str,
+    pub start_after: &'a str,
+    pub continuation_token: Option<&'a str>,
+    pub max_keys: u32,
+    pub truncated: bool,
+    pub next_token: Option<&'a str>,
+    pub encoding_url: bool,
+    pub contents: &'a [S3ObjectEntry<'a>],
+    pub prefixes: &'a [&'a str],
+}
+
+fn contents_and_prefixes(out: &mut String, contents: &[S3ObjectEntry], prefixes: &[&str]) {
+    for obj in contents {
+        out.push_str("  <Contents>\n");
+        out.push_str(&format!("    <Key>{}</Key>\n", xml_escape(obj.key)));
+        out.push_str(&format!("    <LastModified>{}</LastModified>\n", obj.last_modified));
+        out.push_str(&format!("    <ETag>\"{}\"</ETag>\n", obj.etag));
+        out.push_str(&format!("    <Size>{}</Size>\n", obj.size));
+        out.push_str("    <StorageClass>STANDARD</StorageClass>\n");
+        out.push_str("  </Contents>\n");
+    }
+    for cp in prefixes {
+        out.push_str(&format!("  <CommonPrefixes>\n    <Prefix>{}</Prefix>\n  </CommonPrefixes>\n", xml_escape(cp)));
+    }
+}
+
+pub fn list_objects_v2_xml_full(l: &ListV2) -> String {
+    let mut out = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Name>{}</Name>\n  <Prefix>{}</Prefix>\n",
+        xml_escape(l.bucket),
+        xml_escape(l.prefix)
+    );
+    if !l.delimiter.is_empty() {
+        out.push_str(&format!("  <Delimiter>{}</Delimiter>\n", xml_escape(l.delimiter)));
+    }
+    if !l.start_after.is_empty() {
+        out.push_str(&format!("  <StartAfter>{}</StartAfter>\n", xml_escape(l.start_after)));
+    }
+    if let Some(t) = l.continuation_token {
+        out.push_str(&format!("  <ContinuationToken>{}</ContinuationToken>\n", xml_escape(t)));
+    }
+    if l.encoding_url {
+        out.push_str("  <EncodingType>url</EncodingType>\n");
+    }
+    out.push_str(&format!(
+        "  <MaxKeys>{}</MaxKeys>\n  <KeyCount>{}</KeyCount>\n  <IsTruncated>{}</IsTruncated>\n",
+        l.max_keys,
+        l.contents.len() + l.prefixes.len(),
+        l.truncated
+    ));
+    if let Some(t) = l.next_token {
+        out.push_str(&format!("  <NextContinuationToken>{}</NextContinuationToken>\n", xml_escape(t)));
+    }
+    contents_and_prefixes(&mut out, l.contents, l.prefixes);
+    out.push_str("</ListBucketResult>");
+    out
+}
+
+/// ListObjects version 1 (no list-type=2): Marker and NextMarker instead of tokens.
+#[allow(clippy::too_many_arguments)]
+pub fn list_objects_v1_xml(
+    bucket: &str,
+    prefix: &str,
+    delimiter: &str,
+    marker: &str,
+    max_keys: u32,
+    truncated: bool,
+    next_marker: Option<&str>,
+    encoding_url: bool,
+    contents: &[S3ObjectEntry],
+    prefixes: &[&str],
+) -> String {
+    let mut out = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Name>{}</Name>\n  <Prefix>{}</Prefix>\n  <Marker>{}</Marker>\n  <MaxKeys>{}</MaxKeys>\n",
+        xml_escape(bucket),
+        xml_escape(prefix),
+        xml_escape(marker),
+        max_keys
+    );
+    if !delimiter.is_empty() {
+        out.push_str(&format!("  <Delimiter>{}</Delimiter>\n", xml_escape(delimiter)));
+    }
+    if encoding_url {
+        out.push_str("  <EncodingType>url</EncodingType>\n");
+    }
+    out.push_str(&format!("  <IsTruncated>{}</IsTruncated>\n", truncated));
+    if let Some(m) = next_marker {
+        out.push_str(&format!("  <NextMarker>{}</NextMarker>\n", xml_escape(m)));
+    }
+    contents_and_prefixes(&mut out, contents, prefixes);
+    out.push_str("</ListBucketResult>");
+    out
+}
+
 pub fn list_objects_v2_xml(
     bucket: &str,
     prefix: &str,
