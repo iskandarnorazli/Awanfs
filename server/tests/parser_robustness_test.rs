@@ -153,7 +153,8 @@ fn authenticate_never_panics_on_generated_headers() {
         }
         h.insert(HeaderName::from_static("host"), HeaderValue::from_static("localhost"));
         let q = r.pick(&queries).to_string();
-        let res = catch_unwind(|| authenticate(&cfg, &cache, "GET", "/b/k", &q, &h, 1_794_441_600));
+        // The key cache has a lock inside; a panic would fail the test anyway.
+        let res = catch_unwind(std::panic::AssertUnwindSafe(|| authenticate(&cfg, &cache, "GET", "/b/k", &q, &h, 1_794_441_600)));
         assert!(res.is_ok(), "panic on Authorization {:?}, query {:?}", auth, q);
     }
 }
