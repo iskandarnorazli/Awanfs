@@ -29,7 +29,7 @@ same() { cmp -s "$1" "$2"; }
 
 doctor() { curl -s -o /dev/null -w '%{http_code}\n' "$URL/" | grep -q 200 && echo "server up on $PORT, pid $PID, data $DATA"; }
 
-j_buckets() { S3 create-bucket --bucket verify-bkt && S3 list-buckets | grep -q '"vb"' && S3 head-bucket --bucket vb; }
+j_buckets() { S3 create-bucket --bucket verify-bkt && S3 list-buckets | grep -q '"verify-bkt"' && S3 head-bucket --bucket verify-bkt; }
 j_objects() { head -c 70000 /dev/urandom >"$EVID/obj.bin"; S3 put-object --bucket verify-bkt --key a/obj --body "$EVID/obj.bin" >/dev/null &&
   S3 get-object --bucket verify-bkt --key a/obj "$EVID/obj.out" >/dev/null && same "$EVID/obj.bin" "$EVID/obj.out" &&
   S3 head-object --bucket verify-bkt --key a/obj | grep -q '"ContentLength": 70000' &&
