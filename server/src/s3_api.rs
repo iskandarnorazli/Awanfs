@@ -140,6 +140,17 @@ impl hyper::body::Body for ChunksBody {
 /// in memory (#36). Smaller ones are collected, and cached after the write.
 pub const STREAM_PUT_MIN: u64 = 4 * 1024 * 1024;
 
+/// Reads and drops what is left of a request body, at most `limit` bytes.
+async fn drain_body(body: &mut hyper::body::Incoming, limit: u64) {
+    let mut seen = 0u64;
+    while seen < limit {
+        match body.frame().await {
+            Some(Ok(f)) => seen += f.data_ref().map_or(0, |d| d.len() as u64),
+            _ => break,
+        }
+    }
+}
+
 /// The end of a PutObject once the needle is durable: index row, bookkeeping, answer.
 #[allow(clippy::too_many_arguments)]
 fn finish_put(
@@ -1701,8 +1712,12 @@ async fn handle_s3_inner(
 
                 let is_chunked = crate::auth::is_aws_chunked(req.headers());
                 let signed_headers = req.headers().clone();
-                let declared_len = signed_headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
-                if let Some(len) = declared_len.filter(|&n| !is_chunked && n > STREAM_PUT_MIN) {
+                // The length of what is stored: the decoded length for an aws-chunked body.
+                let declared_len = signed_headers
+                    .get(if is_chunked { "x-amz-decoded-content-length" } else { "content-length" })
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok());
+                if let Some(len) = declared_len.filter(|&n| n > STREAM_PUT_MIN) {
                     // Large part: write it to its staged file as it arrives (#36).
                     if state.multipart.get_upload(upload_id).is_none() {
                         let xml = s3_error_xml("NoSuchUpload", "The specified upload does not exist.", &key, "req-up-part");
@@ -1724,18 +1739,48 @@ async fn handle_s3_inner(
                     let mut sha = declared_sha.as_ref().map(|_| sha2::Sha256::new());
                     let mut md5 = Md5::new();
                     let mut body = req.into_body();
+                    let mut verifier = crate::auth::ChunkVerifier::for_request(&state.auth, &signed_headers);
+                    let cache = &state.sigv4_cache;
+                    let mut decoder = is_chunked.then(|| crate::aws_chunked::ChunkedDecoder::new(move |sha: &str, sig: Option<&str>| verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))));
                     while let Some(frame) = body.frame().await {
                         if let Ok(data) = frame?.into_data() {
                             if let Some(h) = sha.as_mut() {
                                 h.update(&data);
                             }
-                            md5.update(&data);
-                            if let Err(e) = writer.write(&data) {
-                                return Ok(internal_error_response(&key, &format!("could not store the part: {}", e)));
+                            let mut sink = |d: &[u8]| -> Result<(), String> {
+                                if writer.written() + d.len() as u64 > len {
+                                    return Err("more bytes than the declared length".to_string());
+                                }
+                                md5.update(d);
+                                writer.write(d).map_err(|e| e.to_string())
+                            };
+                            let fed = match decoder.as_mut() {
+                                Some(dec) => dec.push(&data, &mut sink),
+                                None => sink(&data).map_err(crate::aws_chunked::PushError::Sink),
+                            };
+                            match fed {
+                                Ok(()) => {}
+                                Err(crate::aws_chunked::PushError::Decode(e)) => {
+                                    // Read the rest of the body (up to 64 MiB) before answering, so the client
+                                    // gets the error instead of a reset connection (seen on Windows).
+                                    drain_body(&mut body, 64 << 20).await;
+                                    let status = if e == "SignatureDoesNotMatch" { StatusCode::FORBIDDEN } else { StatusCode::BAD_REQUEST };
+                                    return Ok(Response::builder()
+                                        .status(status)
+                                        .header(CONTENT_TYPE, "application/xml")
+                                        .body(full_body(Bytes::from(s3_error_xml(e, "Error decoding chunked body", &key, "req-up-part"))))
+                                        .unwrap());
+                                }
+                                Err(crate::aws_chunked::PushError::Sink(e)) if e.starts_with("more bytes") => {
+                                    return Ok(bad_request("IncompleteBody", "The body is longer than its declared length.", &key));
+                                }
+                                Err(crate::aws_chunked::PushError::Sink(e)) => {
+                                    return Ok(internal_error_response(&key, &format!("could not store the part: {}", e)));
+                                }
                             }
                         }
                     }
-                    if writer.written() != len {
+                    if decoder.as_ref().is_some_and(|d| d.finish().is_err()) || writer.written() != len {
                         return Ok(bad_request("IncompleteBody", "You did not provide the number of bytes specified by the Content-Length HTTP header.", &key));
                     }
                     if let (Some(h), Some(want)) = (sha, declared_sha) {
@@ -1784,7 +1829,7 @@ async fn handle_s3_inner(
                 let decoded_bytes = if is_chunked {
                     let mut verifier = crate::auth::ChunkVerifier::for_request(&state.auth, &signed_headers);
                     let cache = &state.sigv4_cache;
-                    match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |data, sig| verifier.as_mut().map_or(true, |v| v.check(cache, data, sig))) {
+                    match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |sha, sig| verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))) {
                         Ok(b) => b,
                         Err(e) => {
                             let xml = s3_error_xml(e, "Error decoding chunked body", &key, "req-up-part");
@@ -2116,7 +2161,12 @@ async fn handle_s3_inner(
                     let is_chunked = crate::auth::is_aws_chunked(req.headers());
                     let content_md5_hdr = req.headers().get("content-md5").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
                     let signed_headers = req.headers().clone();
-                    if let Some(len) = expected_len.map(|n| n as u64).filter(|&n| !is_chunked && n > STREAM_PUT_MIN) {
+                    let stream_len = if is_chunked {
+                        signed_headers.get("x-amz-decoded-content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok())
+                    } else {
+                        expected_len.map(|n| n as u64)
+                    };
+                    if let Some(len) = stream_len.filter(|&n| n > STREAM_PUT_MIN) {
                         // Large body: write it to the volume as it arrives (#36). The key lock is
                         // held from the reservation to the index update, so log order stays
                         // index order for this key.
@@ -2146,18 +2196,48 @@ async fn handle_s3_inner(
                         let mut sha = declared_sha.as_ref().map(|_| sha2::Sha256::new());
                         let mut digest = crate::digest::StreamingDigest::new();
                         let mut body = req.into_body();
+                        let mut verifier = crate::auth::ChunkVerifier::for_request(&state.auth, &signed_headers);
+                        let cache = &state.sigv4_cache;
+                        let mut decoder = is_chunked.then(|| crate::aws_chunked::ChunkedDecoder::new(move |sha: &str, sig: Option<&str>| verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))));
                         while let Some(frame) = body.frame().await {
                             if let Ok(data) = frame?.into_data() {
                                 if let Some(h) = sha.as_mut() {
                                     h.update(&data);
                                 }
-                                digest.update(&data);
-                                if let Err(e) = writer.write(&data) {
-                                    return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e)));
+                                let mut sink = |d: &[u8]| -> Result<(), String> {
+                                    if writer.written() + d.len() as u64 > len {
+                                        return Err("more bytes than the declared length".to_string());
+                                    }
+                                    digest.update(d);
+                                    writer.write(d).map_err(|e| format!("{:?}", e))
+                                };
+                                let fed = match decoder.as_mut() {
+                                    Some(dec) => dec.push(&data, &mut sink),
+                                    None => sink(&data).map_err(crate::aws_chunked::PushError::Sink),
+                                };
+                                match fed {
+                                    Ok(()) => {}
+                                    Err(crate::aws_chunked::PushError::Decode(e)) => {
+                                        // Read the rest of the body (up to 64 MiB) before answering, so the client
+                                        // gets the error instead of a reset connection (seen on Windows).
+                                        drain_body(&mut body, 64 << 20).await;
+                                        let status = if e == "SignatureDoesNotMatch" { StatusCode::FORBIDDEN } else { StatusCode::BAD_REQUEST };
+                                        return Ok(Response::builder()
+                                            .status(status)
+                                            .header(CONTENT_TYPE, "application/xml")
+                                            .body(full_body(Bytes::from(s3_error_xml(e, "Error decoding chunked body", &key, "req-put-obj"))))
+                                            .unwrap());
+                                    }
+                                    Err(crate::aws_chunked::PushError::Sink(e)) if e.starts_with("more bytes") => {
+                                        return Ok(bad_request("IncompleteBody", "The body is longer than its declared length.", &key));
+                                    }
+                                    Err(crate::aws_chunked::PushError::Sink(e)) => {
+                                        return Ok(internal_error_response(&key, &format!("could not store the object: {}", e)));
+                                    }
                                 }
                             }
                         }
-                        if writer.written() != len {
+                        if decoder.as_ref().is_some_and(|d| d.finish().is_err()) || writer.written() != len {
                             return Ok(bad_request("IncompleteBody", "You did not provide the number of bytes specified by the Content-Length HTTP header.", &key));
                         }
                         if let (Some(h), Some(want)) = (sha, declared_sha) {
@@ -2213,7 +2293,7 @@ async fn handle_s3_inner(
                     let decoded_bytes = if is_chunked {
                         let mut verifier = crate::auth::ChunkVerifier::for_request(&state.auth, &signed_headers);
                         let cache = &state.sigv4_cache;
-                        match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |data, sig| verifier.as_mut().map_or(true, |v| v.check(cache, data, sig))) {
+                        match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |sha, sig| verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))) {
                             Ok(b) => b,
                             Err(e) => {
                                 let xml = s3_error_xml(e, "Error decoding chunked body", &key, "req-put-obj");
