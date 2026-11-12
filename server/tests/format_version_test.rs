@@ -67,12 +67,28 @@ fn a_newer_volume_format_is_refused_naming_both_versions() {
 fn the_binary_exits_2_on_a_newer_format() {
     let dir = temp_dir("binary");
     write_legacy_volume(&dir, FORMAT_VERSION + 1, "k", b"v");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_s3-server"))
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_s3-server"))
         .args(["--port", "0", "--allow-anonymous", "--data-dir", dir.to_str().unwrap()])
-        .output()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("newer"));
+    // A server that starts instead of refusing would never exit: give it 20 s, then fail.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the server started on a newer on-disk format instead of refusing it");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let mut err = String::new();
+    std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut err).unwrap();
+    assert_eq!(status.code(), Some(2));
+    assert!(err.contains("newer"), "{}", err);
 }
 
 #[test]
