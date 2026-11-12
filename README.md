@@ -13,7 +13,7 @@ Split from `awan-lang/awan-storage` on 2026-11-12, with its git history. Measure
 Read this before you run it anywhere that matters. Plan of record: the Phase 1-4 milestones and [`ROADMAP_AND_DEPENDENCIES.md`](ROADMAP_AND_DEPENDENCIES.md); decisions in [`ARCHITECTURE.md`](ARCHITECTURE.md#0-decisions-2026-11-12).
 
 - **One access key, no TLS.** Requests are checked with SigV4 against one key pair and the server listens on 127.0.0.1 by default (#35). There are no per-user policies (#53) and no TLS (#30): put a TLS proxy in front before opening it to a network.
-- **PUTs are not synced to disk before the 200 yet.** A power cut can lose acknowledged writes; a process crash does not (the page cache survives, `process_restart_test.rs`). Fix: #29 makes group commit the default, with `fast` and `strict` as opt-in modes.
+- **Writes are synced before the 200 by default** (`group` durability, #29). The measurements below were taken before that change, when a PUT was acknowledged without a sync; they will be re-run.
 - **One 32 GiB volume.** When it is full, writes fail with 500 (they used to overwrite old data). Fix: #37.
 - Whole request bodies are held in memory, with no size limit (#36).
 
@@ -78,7 +78,7 @@ Measured live on physical AMD64 NVMe storage (16 logical cores, 32 GB RAM, Windo
 | **Concurrency Scaling (C = 128)** | **324.1 MiB/s** (P99 = 60.0 ms) | 37.8 MiB/s (P99 = 1,239.4 ms) | 39.4 MiB/s (P99 = 959.0 ms) | **8.57x faster (20x lower P99)** (not durable, see note) |
 | **Server Peak RAM (Working Set)** | **Bounded ~245 MB (64K-1M)** | ~936 MB (Go GC Heap) | ~172 MB (Rust jemalloc) | **3.8x lower RAM vs MinIO** |
 
-The table lists every workload in the report, including the three where `s3-server` is slower. **Durability:** `s3-server` acknowledges a PUT before it is flushed to disk (no fsync on the write path; group commit is #490), while MinIO and RustFS fsync each PUT. Rows marked "not durable" compare a non-durable write with durable ones, so their speedups are not like for like. Each workload ran once for 2 seconds on one Windows laptop; the full report with its command is [`measurements/s3_warp_minio_vs_awan.md`](measurements/s3_warp_minio_vs_awan.md).
+The table lists every workload in the report, including the three where `s3-server` is slower.  **Durability:** when this report was made, `s3-server` acknowledged a PUT before it was flushed to disk, while MinIO and RustFS fsync each PUT; `group` durability (#29) is now the default. Rows marked "not durable" compare a non-durable write with durable ones, so their speedups are not like for like. Each workload ran once for 2 seconds on one Windows laptop; the full report with its command is [`measurements/s3_warp_minio_vs_awan.md`](measurements/s3_warp_minio_vs_awan.md).
 
 ---
 
@@ -98,6 +98,11 @@ AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
 ```
 - The server listens on `127.0.0.1` only. `--listen 0.0.0.0` (or `AWANFS_LISTEN`) opens it to the network; there is no TLS yet (#30), so put it behind a TLS proxy first.
 - Requests are checked with AWS Signature Version 4, in the `Authorization` header or as a presigned URL, against `AWANFS_ACCESS_KEY`/`AWANFS_SECRET_KEY`. A body whose SHA-256 differs from `x-amz-content-sha256` is refused. One key pair for now; IAM-style users and policies are #53.
+- `--durability group|fast|strict` (or `AWANFS_DURABILITY`) sets when a write is acknowledged. After a power cut:
+  - `group` (default): every acknowledged PUT, DELETE and multipart completion is kept. Writers wait for a shared sync of the volume and its journal; concurrent writers share one.
+  - `fast`: writes are acknowledged before they reach the disk and a background thread syncs once a second, so about the last second of acknowledged writes can be lost. For caches and data you can fetch again.
+  - `strict`: each write is synced on its own before the answer. Slowest; no batching.
+  A killed process (no power cut) loses nothing acknowledged in any mode.
 - `--allow-anonymous` (or `AWANFS_ALLOW_ANONYMOUS=1`) also accepts unsigned requests, for local tests and benchmarks. Without keys and without that flag the server refuses to start (exit code 2).
 
 ### Run the Test Suite

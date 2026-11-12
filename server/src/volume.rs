@@ -47,6 +47,56 @@ pub struct NeedleLocation {
     pub total_len: u64,
     pub payload_size: u64,
     pub payload_crc32c: u32,
+    /// Write sequence number; `VolumeManager::make_durable(seq)` waits until it is on disk.
+    pub seq: u64,
+}
+
+/// When an acknowledged write reaches stable storage (#29, owner decision 2026-11-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    /// The default. Writers wait for a shared sync: one sync of the volume and one of the
+    /// journal cover every write that finished while the previous sync ran.
+    Group,
+    /// Acknowledge after the write; `flush_if_dirty` (a background thread, once a second)
+    /// syncs later. A power cut loses about the last second.
+    Fast,
+    /// Sync after each write before answering.
+    Strict,
+}
+
+impl Durability {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "group" => Some(Durability::Group),
+            "fast" => Some(Durability::Fast),
+            "strict" => Some(Durability::Strict),
+            _ => None,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Durability::Group => 0,
+            Durability::Fast => 1,
+            Durability::Strict => 2,
+        }
+    }
+
+    fn from_code(c: u8) -> Self {
+        match c {
+            1 => Durability::Fast,
+            2 => Durability::Strict,
+            _ => Durability::Group,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SyncState {
+    /// Every write with a sequence number up to this one is on stable storage.
+    synced: u64,
+    /// A writer is running the shared sync.
+    syncing: bool,
 }
 
 /// 64-byte Header of a Needle on disk.
@@ -152,6 +202,13 @@ pub struct VolumeManager {
     fail_next_write: std::sync::atomic::AtomicBool,
     /// Needle offsets from the `.idx` journal at open time.
     indexed: BTreeSet<u64>,
+    /// A second handle on the journal, so a sync does not hold the append lock.
+    idx_sync: File,
+    durability: std::sync::atomic::AtomicU8,
+    /// Sequence number of the last write whose needle and journal record are written.
+    written_seq: AtomicU64,
+    sync_state: std::sync::Mutex<SyncState>,
+    sync_done: std::sync::Condvar,
 }
 
 impl VolumeManager {
@@ -303,11 +360,17 @@ impl VolumeManager {
             None
         };
 
+        let idx_sync = idx_file.try_clone()?;
         Ok(Self {
             dir: dir.to_path_buf(),
             volume_id,
             file: aligned_file,
             idx_file: Mutex::new(idx_file),
+            idx_sync,
+            durability: std::sync::atomic::AtomicU8::new(Durability::Group.code()),
+            written_seq: AtomicU64::new(0),
+            sync_state: std::sync::Mutex::new(SyncState::default()),
+            sync_done: std::sync::Condvar::new(),
             current_offset: AtomicU64::new(scan_offset),
             mmap: RwLock::new(initial_mmap),
             remap_count: AtomicU64::new(0),
@@ -332,6 +395,83 @@ impl VolumeManager {
     }
 
     /// Counts this volume's disk writes, reads and payload copies into `work`.
+    pub fn durability(&self) -> Durability {
+        Durability::from_code(self.durability.load(Ordering::Relaxed))
+    }
+
+    pub fn set_durability(&self, mode: Durability) {
+        self.durability.store(mode.code(), Ordering::Relaxed);
+    }
+
+    /// Syncs the volume, then the journal (two counted syncs), and marks every write that had
+    /// finished before the sync started as durable.
+    fn sync_files(&self) -> Result<(), VolumeError> {
+        let target = self.written_seq.load(Ordering::SeqCst);
+        self.file.sync_data()?;
+        self.work.disk_sync();
+        self.idx_sync.sync_data()?;
+        self.work.disk_sync();
+        let mut st = self.sync_state.lock().unwrap_or_else(|e| e.into_inner());
+        st.synced = st.synced.max(target);
+        Ok(())
+    }
+
+    /// Returns once the write numbered `seq` is as durable as the mode promises: on disk for
+    /// `Group` and `Strict`, immediately for `Fast`. Blocking; call it off the async executor.
+    pub fn make_durable(&self, seq: u64) -> Result<(), VolumeError> {
+        match self.durability() {
+            Durability::Fast => Ok(()),
+            Durability::Strict => self.sync_files(),
+            Durability::Group => {
+                let mut st = self.sync_state.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if st.synced >= seq {
+                        return Ok(());
+                    }
+                    if !st.syncing {
+                        break;
+                    }
+                    st = self.sync_done.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                st.syncing = true;
+                drop(st);
+                let r = self.sync_files();
+                let mut st = self.sync_state.lock().unwrap_or_else(|e| e.into_inner());
+                st.syncing = false;
+                drop(st);
+                self.sync_done.notify_all();
+                r
+            }
+        }
+    }
+
+    /// Syncs when a write is not yet durable. Returns whether it synced. The `Fast` mode's
+    /// background flusher calls this; it is harmless in the other modes.
+    pub fn flush_if_dirty(&self) -> Result<bool, VolumeError> {
+        let synced = self.sync_state.lock().unwrap_or_else(|e| e.into_inner()).synced;
+        if self.written_seq.load(Ordering::SeqCst) <= synced {
+            return Ok(false);
+        }
+        self.sync_files()?;
+        Ok(true)
+    }
+
+    /// Starts a thread that calls `flush_if_dirty` every `every` while the volume is alive.
+    pub fn start_flusher(self: &Arc<Self>, every: std::time::Duration) {
+        let weak = Arc::downgrade(self);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(every);
+            match weak.upgrade() {
+                Some(vm) => {
+                    if vm.durability() == Durability::Fast {
+                        let _ = vm.flush_if_dirty();
+                    }
+                }
+                None => return,
+            }
+        });
+    }
+
     pub fn attach_work_counters(&mut self, work: Arc<WorkCounters>) {
         self.work = work;
     }
@@ -462,6 +602,7 @@ impl VolumeManager {
             let mut idx = self.idx_file.lock();
             idx.write_all(&idx_entry[..42])?;
         }
+        let seq = self.written_seq.fetch_add(1, Ordering::SeqCst) + 1;
 
         Ok(NeedleLocation {
             volume_id: self.volume_id,
@@ -469,6 +610,7 @@ impl VolumeManager {
             total_len,
             payload_size,
             payload_crc32c,
+            seq,
         })
     }
 

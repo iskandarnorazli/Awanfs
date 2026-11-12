@@ -11,8 +11,9 @@ A workload fails when its ratio drops more than `tolerance` (default 20%) below 
 Throughput counts bytes from successful responses only (`BenchmarkMetrics.mib_per_sec`); the
 harness's ops/s also counts failed requests.
 
-PUT rows are not like for like until group commit lands (AwanFS #29): AwanFS acknowledges a PUT
-before fsync, MinIO fsyncs each PUT. The ratio still catches AwanFS getting slower.
+Both servers sync before acknowledging a PUT: AwanFS in its default `group` durability mode
+(#29), MinIO per object. Baselines recorded before #29 compared a non-durable AwanFS PUT and
+must be re-recorded for the PUT rows.
 
 Usage:
   python benchmarks/ratio_check.py --server-bin server/target/release/s3-server \\
@@ -102,7 +103,7 @@ def render(rows: List[tuple], awanfs: Dict[str, List[float]], minio: Dict[str, L
         a_med = statistics.median(awanfs[name]) if awanfs.get(name) else None
         m_med = statistics.median(minio[name]) if minio.get(name) else None
         lines.append(f"| `{name}` | {f(a_med)} | {f(m_med)} | {f(r)} | {f(b)} | {verdict} |")
-    lines += ["", "PUT rows compare a non-durable AwanFS write with a durable MinIO write (AwanFS #29).", ""]
+    lines += ["", "AwanFS runs in its default `group` durability mode: PUTs are synced before the answer, as in MinIO.", ""]
     return "\n".join(lines)
 
 

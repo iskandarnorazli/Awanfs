@@ -274,4 +274,9 @@ impl AlignedFile {
     pub fn sync_all(&self) -> io::Result<()> {
         self.file.sync_all()
     }
+
+    /// `fdatasync` on Unix, `FlushFileBuffers` on Windows: the data and the size are durable.
+    pub fn sync_data(&self) -> io::Result<()> {
+        self.file.sync_data()
+    }
 }
