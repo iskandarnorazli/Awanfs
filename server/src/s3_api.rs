@@ -1618,7 +1618,11 @@ async fn handle_s3_inner(
                     };
 
                     let prefix = query_map.get("prefix").map(|s| s.as_str()).unwrap_or("");
-                    let start_after = query_map.get("start-after").map(|s| s.as_str()).unwrap_or("");
+                    let versions = query_map.contains_key("versions");
+                    let start_after = query_map
+                        .get(if versions { "key-marker" } else { "start-after" })
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
                     let max_keys = query_map.get("max-keys").and_then(|s| s.parse().ok()).unwrap_or(1000u32);
 
                     let mut records = vec![AwanObjectMeta::default(); max_keys as usize];
@@ -1651,7 +1655,11 @@ async fn handle_s3_inner(
                         });
                     }
 
-                    let xml = list_objects_v2_xml(&bucket, prefix, start_after, max_keys, false, None, &contents, &[]);
+                    let xml = if versions {
+                        list_object_versions_xml(&bucket, prefix, start_after, max_keys, false, &contents)
+                    } else {
+                        list_objects_v2_xml(&bucket, prefix, start_after, max_keys, false, None, &contents, &[])
+                    };
                     Ok(Response::builder()
                         .status(StatusCode::OK)
                         .header(CONTENT_TYPE, "application/xml")
