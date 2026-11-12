@@ -301,7 +301,7 @@ pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarge
                     } else {
                         return ParsedTarget::Object {
                             bucket,
-                            key: trimmed_path.to_string(),
+                            key: percent_decode_path(trimmed_path),
                         };
                     }
                 }
@@ -318,11 +318,32 @@ pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarge
     if let Some(key) = parts.next() {
         ParsedTarget::Object {
             bucket,
-            key: key.to_string(),
+            key: percent_decode_path(key),
         }
     } else {
         ParsedTarget::Bucket { bucket }
     }
+}
+
+/// Decodes %XX in a URL path. Unlike query decoding, `+` stays `+`. S3 object keys are the
+/// decoded path: a client sends "my%20file.txt" for the key "my file.txt". Keys used to be
+/// stored as sent, encoded.
+pub fn percent_decode_path(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex_digit(b[i + 1]), hex_digit(b[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub fn hex_digit(b: u8) -> Option<u8> {
@@ -2034,7 +2055,9 @@ async fn handle_s3_inner(
                 Method::PUT => {
                     // Check copy source
                     if let Some(copy_source) = req.headers().get("x-amz-copy-source") {
-                        let copy_src_str = copy_source.to_str().unwrap_or("").trim_start_matches('/');
+                        // x-amz-copy-source is URL-encoded and may end in ?versionId=.
+                        let copy_src_owned = percent_decode_path(copy_source.to_str().unwrap_or("").split('?').next().unwrap_or(""));
+                        let copy_src_str = copy_src_owned.trim_start_matches('/');
                         let (src_bucket, src_key) = match copy_src_str.split_once('/') {
                             Some((b, k)) => (b, k),
                             None => {
