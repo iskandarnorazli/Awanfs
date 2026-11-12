@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-s3-server = { path = "../server" }
+s3-server = { path = ".." }
 hyper = "1"
 
 [workspace]

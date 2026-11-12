@@ -2,7 +2,8 @@ name: Fuzz
 
 # cargo-fuzz targets for the request parsers (#48): 60 s each on pull requests that touch a
 # parser, 10 minutes each nightly. A crash fails the job and its input is uploaded; add it to
-# fuzz/corpus/<target>/ with the fix. fuzz/ has no Cargo.lock: libfuzzer-sys is resolved here.
+# server/fuzz/corpus/<target>/ with the fix. server/fuzz has no Cargo.lock: libfuzzer-sys is
+# resolved here.
 
 on:
   pull_request:
@@ -12,7 +13,7 @@ on:
       - "server/src/aws_chunked.rs"
       - "server/src/lifecycle.rs"
       - "server/src/s3_api.rs"
-      - "fuzz/**"
+      - "server/fuzz/**"
       - ".github/workflows/fuzz.yml"
   schedule:
     - cron: "47 19 * * *"
@@ -35,15 +36,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: fuzz
+          workspaces: server/fuzz
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Run
         run: |
           secs=60; [ "${{ github.event_name }}" = "schedule" ] && secs=600
-          cd fuzz && cargo fuzz run ${{ matrix.target }} corpus/${{ matrix.target }} -- -max_total_time=$secs -max_len=4096
+          cd server && cargo fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} -- -max_total_time=$secs -max_len=4096
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: crash-${{ matrix.target }}
-          path: fuzz/artifacts/${{ matrix.target }}/
+          path: server/fuzz/artifacts/${{ matrix.target }}/
