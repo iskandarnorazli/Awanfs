@@ -4,8 +4,7 @@
 //!
 //! A count that goes up is a regression: find the new copy, write or sync before changing the
 //! expected value. A count that goes down is an improvement: lower the expected value in the
-//! same change. Two counts describe known costs that should go down:
-//! - a full GET of a multipart object copies every part into one buffer (`full_multipart_get`).
+//! same change.
 //!
 //! Syncs: in the default `group` durability mode (#29) a lone write waits for one sync of the
 //! volume and one of its journal (2); concurrent writers share them (`durability_test.rs`).
@@ -150,7 +149,15 @@ async fn multipart_upload_and_reads() {
     let body = res.bytes().await.unwrap();
     assert_eq!(body.len() as u64, 2 * part);
     assert_eq!(&body[..part as usize], &p1[..]);
-    // full_multipart_get: every part is copied into one buffer. Known cost: lower this when the
-    // GET streams the parts instead.
-    assert_eq!(s.since(&before), work(0, 0, 0, 2, 2 * part), "full_multipart_get");
+    assert_eq!(&body[part as usize..], &p2[..]);
+    // full_multipart_get: the parts are sent one after the other from their mmaps (#36).
+    assert_eq!(s.since(&before), WorkSnapshot::default(), "full_multipart_get");
+
+    let before = s.snap();
+    let res = s.client.get(format!("{}/bkt/m", s.url)).header(RANGE, format!("bytes={}-{}", part - 100, part + 99)).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    let body = res.bytes().await.unwrap();
+    assert_eq!(&body[..100], &p1[part as usize - 100..]);
+    assert_eq!(&body[100..], &p2[..100]);
+    assert_eq!(s.since(&before), WorkSnapshot::default(), "range_get across two parts: two slices, no copy");
 }
