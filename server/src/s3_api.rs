@@ -244,7 +244,7 @@ pub fn parse_range_header(header: &str, object_size: u64) -> Result<Option<ByteR
     let disable_clamping = FAULT_DISABLE_RANGE_CLAMPING.load(Ordering::Relaxed);
 
     if let Some(suffix_str) = spec.strip_prefix('-') {
-        let suffix_len: u64 = suffix_str.parse().map_err(|_| ())?;
+        let suffix_len: u64 = range_number(suffix_str).ok_or(())?;
         if suffix_len == 0 {
             return Err(());
         }
@@ -255,7 +255,7 @@ pub fn parse_range_header(header: &str, object_size: u64) -> Result<Option<ByteR
     }
 
     if let Some((start_str, end_str)) = spec.split_once('-') {
-        let start: u64 = start_str.parse().map_err(|_| ())?;
+        let start: u64 = range_number(start_str).ok_or(())?;
         if start >= object_size {
             return Err(());
         }
@@ -265,7 +265,7 @@ pub fn parse_range_header(header: &str, object_size: u64) -> Result<Option<ByteR
                 end: object_size - 1,
             }));
         }
-        let parsed_end: u64 = end_str.parse().map_err(|_| ())?;
+        let parsed_end: u64 = range_number(end_str).ok_or(())?;
         if start > parsed_end {
             return Err(());
         }
@@ -326,14 +326,33 @@ pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarge
     }
 }
 
+pub fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// RFC 9110 `1*DIGIT`: digits only, saturating at u64::MAX (a last-pos past the end of any
+/// object is still a valid range).
+fn range_number(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(s.bytes().fold(0u64, |n, d| n.saturating_mul(10).saturating_add((d - b'0') as u64)))
+}
+
 pub fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(hex_val) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(hex_val);
+            // Bytes, not a str slice: a slice inside a multi-byte character would panic.
+            if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                out.push(h << 4 | l);
                 i += 3;
                 continue;
             }
