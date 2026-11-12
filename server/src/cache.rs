@@ -10,6 +10,8 @@ use std::num::NonZeroUsize;
 pub struct PayloadCache {
     max_bytes: usize,
     inner: Mutex<CacheState>,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
 }
 
 struct CacheState {
@@ -28,6 +30,8 @@ impl PayloadCache {
                 lru: LruCache::new(cap),
                 current_bytes: 0,
             }),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -40,7 +44,15 @@ impl PayloadCache {
 
     pub fn get(&self, b_id: u32, offset: u64) -> Option<Bytes> {
         let mut guard = self.inner.lock();
-        guard.lru.get(&(b_id, offset)).map(|(b, _)| b.clone())
+        let hit = guard.lru.get(&(b_id, offset)).map(|(b, _)| b.clone());
+        let counter = if hit.is_some() { &self.hits } else { &self.misses };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        hit
+    }
+
+    /// (hits, misses) of `get` since the cache was made.
+    pub fn hit_counts(&self) -> (u64, u64) {
+        (self.hits.load(std::sync::atomic::Ordering::Relaxed), self.misses.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     pub fn insert(&self, b_id: u32, offset: u64, payload: Bytes) {

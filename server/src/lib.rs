@@ -13,6 +13,7 @@ pub mod error;
 pub mod ffi_bridge;
 pub mod lifecycle;
 pub mod meta_index;
+pub mod metrics;
 pub mod multipart;
 pub mod mvcc;
 pub mod reactor;
