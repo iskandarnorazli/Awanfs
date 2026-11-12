@@ -8,6 +8,15 @@ Split from `awan-lang/awan-storage` on 2026-11-12, with its git history. Measure
 
 ---
 
+## Status (2026-11-12): not production-ready yet
+
+Read this before you run it anywhere that matters. Plan of record: the Phase 1-4 milestones and [`ROADMAP_AND_DEPENDENCIES.md`](ROADMAP_AND_DEPENDENCIES.md); decisions in [`ARCHITECTURE.md`](ARCHITECTURE.md#0-decisions-2026-11-12).
+
+- **No authentication yet.** Signatures are not verified and no access keys exist, and the server listens on all interfaces: anyone who can reach the port can read, write and delete. Fix: #35 (localhost by default, SigV4 checked against configured keys).
+- **PUTs are not synced to disk before the 200 yet.** A power cut can lose acknowledged writes; a process crash does not (the page cache survives, `process_restart_test.rs`). Fix: #29 makes group commit the default, with `fast` and `strict` as opt-in modes.
+- **One 32 GiB volume.** When it is full, writes fail with 500 (they used to overwrite old data). Fix: #37.
+- Whole request bodies are held in memory, with no size limit (#36).
+
 ## 1. Executive Summary
 
 `s3-server` is a standalone, drop-in AWS S3-compatible object storage server implemented 100% in pure Rust. It combines:
@@ -24,15 +33,15 @@ Split from `awan-lang/awan-storage` on 2026-11-12, with its git history. Measure
 3. **4096-Byte Sector-Aligned WORM Needle Volume Storage:**
    - Sequential append-only write path eliminating filesystem inode exhaustion.
    - Castagnoli CRC32C checksum verification on every needle header for silent bitrot scrubbing.
-   - Background copy-on-write compaction to reclaim tombstoned storage.
+   - A compactor exists (`compaction.rs`) but is not wired into the server and is not yet safe to run (#14).
 
 4. **Staged Parallel Part Files for Multipart Uploads:**
    - Multipart parts stream in parallel to independent file handles under `.staging/<upload-id>/part_<num>.dat`.
    - Completely eliminates Windows kernel `FO_SYNCHRONOUS_IO` lock contention on shared volume handles during high-concurrency uploads.
-   - Atomic volume append upon `CompleteMultipartUpload` and recursive cleanup on `AbortMultipartUpload`.
+   - Parts stay in their staged files; `CompleteMultipartUpload` writes the part list to the volume as a manifest needle, so recovery rebuilds the object. `AbortMultipartUpload` removes the staged files.
 
 5. **Streaming Hardware-Accelerated MD5 & CRC32C Dual Checksum Pipeline:**
-   - `StreamingDigest` dual-hasher pipeline processes incoming TCP frames in real time as the HTTP body streams.
+   - `StreamingDigest` computes MD5 and CRC32C in one pass. The PUT path collects the whole body first, so the digest is not yet computed while the body streams in (#36).
    - Automatic CPU runtime detection (SSE4.2, AVX2, ARMv8 CRC) with a 256-entry software Castagnoli lookup table fallback, ensuring 100% bit-identical digests on hypervisors or non-AVX machines.
    - Full `Content-MD5` header verification and composite multipart ETag calculation (`"<md5>-<parts>"`).
 
@@ -43,7 +52,7 @@ Split from `awan-lang/awan-storage` on 2026-11-12, with its git history. Measure
 7. **High-Concurrency Async Reactor:**
    - Powered by Tokio, Hyper 1.0, and HTTP/1.1 persistent keep-alive connections.
    - Single-flight read coalescing barrier protecting disk storage from thundering-herd traffic.
-   - Auto-scaling bounded LRU slab cache (16 MiB) ensuring constant bounded memory usage.
+   - Byte-bounded LRU payload cache (1 GiB default) for objects up to 4 MiB.
 
 ---
 
@@ -85,15 +94,15 @@ cargo build --release
 ./target/release/s3-server --port 9000 --data-dir ./s3_data
 ```
 
-### Run Pure Rust Test Suite (58 Tests)
+### Run the Test Suite
 ```bash
-cd server
-cargo test
+cargo test --locked --manifest-path server/Cargo.toml
 ```
+CI runs it on ubuntu-latest and windows-latest. `work_count_test.rs` pins the disk writes, syncs, reads and copies of each request type; the nightly MinIO ratio check is `benchmarks/ratio_check.py`.
 
 ### Run Live Head-to-Head Benchmark Suite
 ```bash
-python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB,10GiB --concurrent 64 --duration 2 --output docs/measurements/s3_warp_minio_vs_awan.md
+python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB,10GiB --concurrent 64 --duration 2 --output measurements/s3_warp_minio_vs_awan.md
 ```
 
 ---
