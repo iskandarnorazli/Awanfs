@@ -44,6 +44,21 @@ fn internal_error_response(resource: &str, detail: &str) -> Response<ResponseBod
         .unwrap()
 }
 
+/// The answer for an index error from `put_object` or `has_room_for`.
+fn engine_error_response(code: i32, resource: &str) -> Response<ResponseBody> {
+    let (status, s3_code, msg) = match code {
+        ERR_CAPACITY => (StatusCode::SERVICE_UNAVAILABLE, "SlowDown", "The object index is full."),
+        ERR_BUCKET_NOT_FOUND => (StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist."),
+        ERR_INVALID_ARG => (StatusCode::BAD_REQUEST, "KeyTooLongError", "The key is empty or longer than 1024 bytes."),
+        _ => return internal_error_response(resource, &format!("index error {}", code)),
+    };
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/xml")
+        .body(full_body(Bytes::from(s3_error_xml(s3_code, msg, resource, "req-index"))))
+        .unwrap()
+}
+
 fn no_volume_error() -> VolumeError {
     VolumeError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "no volume is open"))
 }
@@ -1137,6 +1152,9 @@ pub async fn handle_s3_request(
                         // Store object in @flat ObjectMeta
                         let (hi, lo, _, _) = compute_md5(composite_etag.as_bytes());
                         let _key_guard = state.lock_key(b_id, &key).await;
+                        if let Err(code) = state.engine.read().has_room_for(b_id, key.as_bytes()) {
+                            return Ok(engine_error_response(code, &key));
+                        }
                         // Log the part list as a manifest needle, so recovery rebuilds the object.
                         let manifest = Bytes::from(encode_extents_manifest(&state.multipart.staging_dir, total_size, &extents));
                         let manifest_offset = match state.store_payload(
@@ -1161,7 +1179,7 @@ pub async fn handle_s3_request(
                                 .unwrap());
                         }
                         let mut engine = state.engine.write();
-                        engine.put_object(
+                        if let Err(code) = engine.put_object(
                             b_id,
                             key.as_bytes(),
                             manifest_offset,
@@ -1170,7 +1188,9 @@ pub async fn handle_s3_request(
                             lo,
                             extents.len() as u16,
                             AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART,
-                        ).unwrap();
+                        ) {
+                            return Ok(engine_error_response(code, &key));
+                        }
 
                         let location = format!("http://127.0.0.1:9000/{}/{}", bucket, key);
                         let xml = complete_multipart_upload_result_xml(&bucket, &key, &composite_etag, &location);
@@ -1301,6 +1321,9 @@ pub async fn handle_s3_request(
                         };
                         let flags = if bytes.is_empty() { AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE } else { AWAN_FLAG_ACTIVE };
                         let _key_guard = state.lock_key(b_id, &key).await;
+                        if let Err(code) = state.engine.read().has_room_for(b_id, key.as_bytes()) {
+                            return Ok(engine_error_response(code, &key));
+                        }
                         let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset);
                         let vol_offset = match state.store_payload(b_id, &key, &bytes, flags, src_meta.etag_hi, src_meta.etag_lo).await {
                             Ok(off) => off,
@@ -1312,7 +1335,7 @@ pub async fn handle_s3_request(
                                 state.needle_crc_map.write().remove(&(b_id, prev_off));
                             }
                         }
-                        state.engine.write().put_object(
+                        if let Err(code) = state.engine.write().put_object(
                             b_id,
                             key.as_bytes(),
                             vol_offset,
@@ -1321,7 +1344,9 @@ pub async fn handle_s3_request(
                             src_meta.etag_lo,
                             0,
                             flags,
-                        ).unwrap();
+                        ) {
+                            return Ok(engine_error_response(code, &key));
+                        }
 
                         let etag_hex = md5_to_etag_hex(src_meta.etag_hi, src_meta.etag_lo);
                         let xml = copy_object_result_xml(&etag_hex, "2026-11-10T00:00:00.000Z");
@@ -1435,6 +1460,9 @@ pub async fn handle_s3_request(
                             .body(full_body(Bytes::from(xml)))
                             .unwrap());
                     }
+                    if let Err(code) = state.engine.read().has_room_for(b_id, key.as_bytes()) {
+                        return Ok(engine_error_response(code, &key));
+                    }
                     let old_info = {
                         let engine = state.engine.read();
                         engine.get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size))
@@ -1458,7 +1486,7 @@ pub async fn handle_s3_request(
                     }
 
                     let mut engine = state.engine.write();
-                    engine.put_object(
+                    if let Err(code) = engine.put_object(
                         b_id,
                         key.as_bytes(),
                         vol_offset,
@@ -1467,7 +1495,9 @@ pub async fn handle_s3_request(
                         etag_lo,
                         0,
                         flags,
-                    ).unwrap();
+                    ) {
+                        return Ok(engine_error_response(code, &key));
+                    }
 
                     let resp = Response::builder()
                         .status(StatusCode::OK)
