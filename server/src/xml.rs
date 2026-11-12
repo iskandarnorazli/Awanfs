@@ -19,6 +19,7 @@ pub fn xml_escape(s: &str) -> String {
 
 /// `request_id` is used only outside a request; inside one, the request's own ID is written.
 pub fn s3_error_xml(code: &str, message: &str, resource: &str, request_id: &str) -> String {
+    crate::request_log::note_error_code(code);
     let current = crate::request_log::current_request_id();
     let request_id = current.as_deref().unwrap_or(request_id);
     format!(
