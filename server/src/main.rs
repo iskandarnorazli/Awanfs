@@ -21,6 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut listen = std::env::var("AWANFS_LISTEN").unwrap_or_else(|_| "127.0.0.1".to_string());
     let mut allow_anonymous = std::env::var("AWANFS_ALLOW_ANONYMOUS").ok().as_deref() == Some("1");
     let mut access_log: Option<String> = None;
+    let mut auto_compaction = std::env::var("AWANFS_AUTO_COMPACTION").ok().as_deref() != Some("off");
     let mut durability = std::env::var("AWANFS_DURABILITY").unwrap_or_else(|_| "group".to_string());
 
     let mut args = std::env::args().skip(1);
@@ -39,6 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if let Some(d) = args.next() {
                 durability = d;
             }
+        } else if arg == "--auto-compaction" {
+            auto_compaction = args.next().as_deref() != Some("off");
         } else if arg == "--access-log" {
             access_log = args.next();
         } else if arg == "--allow-anonymous" {
@@ -95,6 +98,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     let state = Arc::new(state);
     let state_for_stop = Arc::clone(&state);
+    // Automatic compaction (owner decision 15): on unless --auto-compaction off.
+    if auto_compaction {
+        state.start_auto_compaction(std::time::Duration::from_secs(600), 0.20, 1 << 30);
+    }
 
     println!("S3 Storage Server listening on http://{}", addr);
     let handle = start_s3_reactor(addr, state).await?;
