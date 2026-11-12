@@ -1,0 +1,1 @@
+<LifecycleConfiguration><Rule><ID>r</ID><Status>Enabled</Status><Prefix>logs/</Prefix><Expiration><Days>7</Days></Expiration></Rule></LifecycleConfiguration>
