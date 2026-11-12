@@ -959,6 +959,19 @@ impl S3ServiceState {
         None
     }
 
+    /// Syncs every open volume, whatever the durability mode: the last step of a graceful
+    /// shutdown, so `fast` mode loses nothing on a clean stop (#49).
+    pub fn sync_all_volumes(&self) -> Result<(), VolumeError> {
+        let vols: Vec<_> = self.volumes.read().values().cloned().collect();
+        for vm in vols {
+            vm.sync_now()?;
+        }
+        if let Some(vm) = self.volume_manager.read().clone() {
+            vm.sync_now()?;
+        }
+        Ok(())
+    }
+
     /// Marks the server not ready (for example while recovering), or ready again with `None`.
     pub fn set_not_ready(&self, reason: Option<&'static str>) {
         *self.not_ready.write() = reason;
