@@ -102,7 +102,12 @@ jobs:
       - name: Report to the job summary
         if: always()
         run: |
-          [ -f measurements/s3_warp_minio_vs_awan.md ] && cat measurements/s3_warp_minio_vs_awan.md >> "$GITHUB_STEP_SUMMARY" || echo "no report" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f measurements/s3_warp_minio_vs_awan.md ]; then
+            cat measurements/s3_warp_minio_vs_awan.md >> "$GITHUB_STEP_SUMMARY"
+            cat measurements/s3_warp_minio_vs_awan.md   # also in the log, readable without the web UI
+          else
+            echo "no report" >> "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
