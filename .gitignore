@@ -7,3 +7,7 @@ __pycache__/
 dist/*.exe
 .tmp/
 bench_smoke.md
+
+# TLC trace dumps
+verification/tla/*_TTrace_*
+verification/tla/states/
