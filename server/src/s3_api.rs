@@ -686,6 +686,7 @@ impl S3ServiceState {
                 report.dead_needles_reclaimed += 1;
                 continue;
             }
+            self.hook("compact_copy", &key);
             let bytes = if size == 0 { Bytes::new() } else { old.read_needle_bytes(old_id, local, crc)? };
             let (vm, loc, g_new) = self.write_to_active(b_id, &key, &bytes, flags, etag_hi, etag_lo)?;
             written.insert(vm.id(), Arc::clone(&vm));
