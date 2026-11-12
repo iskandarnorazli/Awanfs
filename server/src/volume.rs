@@ -19,6 +19,20 @@ use crate::work::WorkCounters;
 
 pub const NEEDLE_MAGIC: u32 = 0x41574E33; // "AWN3"
 pub const SUPERBLOCK_MAGIC: u32 = 0x53555042; // "SUPB"
+
+/// On-disk format of volumes, journals and manifests (#50, owner decision 20), stored in the
+/// superblock at bytes 20..24. Volumes written before the field existed hold 0 there and are
+/// format 1. A newer version is refused, an older one read as it is; nothing is upgraded in
+/// place. Layout: FORMAT.md.
+pub const FORMAT_VERSION: u32 = 1;
+
+/// The format a superblock records (0 = written before the field, i.e. format 1).
+pub fn superblock_format(super_buf: &[u8]) -> u32 {
+    match u32::from_le_bytes(super_buf[20..24].try_into().unwrap()) {
+        0 => 1,
+        v => v,
+    }
+}
 pub const MAX_VOLUME_SPAN: u64 = 32 * 1024 * 1024 * 1024; // 32 GiB WORM Needle Volume (#470)
 
 /// Object locations in the index are global: the volume number in the bits above
@@ -46,6 +60,21 @@ pub enum VolumeError {
     CorruptIndex,
     /// The needle would end past the volume span; nothing was written.
     VolumeFull { offset: u64, len: u64 },
+    /// Written by a newer AwanFS; this one reads formats up to `supported` (#50).
+    UnsupportedFormat { found: u32, supported: u32 },
+}
+
+impl std::fmt::Display for VolumeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VolumeError::UnsupportedFormat { found, supported } => write!(
+                f,
+                "on-disk format {} was written by a newer AwanFS; this version reads formats up to {}",
+                found, supported
+            ),
+            other => write!(f, "{:?}", other),
+        }
+    }
 }
 
 impl From<io::Error> for VolumeError {
@@ -389,6 +418,7 @@ impl VolumeManager {
             super_buf[8..16].copy_from_slice(&now.to_le_bytes());
             let crc = crc32c::crc32c(&super_buf[0..16]);
             super_buf[16..20].copy_from_slice(&crc.to_le_bytes());
+            super_buf[20..24].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
             aligned_file.write_aligned_at(0, &super_buf)?;
 
             if sparse {
@@ -412,6 +442,7 @@ impl VolumeManager {
             let mut super_buf = AlignedBuffer::new(SECTOR_SIZE);
             super_buf[0..4].copy_from_slice(&SUPERBLOCK_MAGIC.to_le_bytes());
             super_buf[4..8].copy_from_slice(&volume_id.to_le_bytes());
+            super_buf[20..24].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
             aligned_file.write_aligned_at(0, &super_buf)?;
             scan_offset = SECTOR_SIZE as u64;
         } else {
@@ -421,6 +452,10 @@ impl VolumeManager {
             let magic = u32::from_le_bytes(super_buf[0..4].try_into().unwrap());
             if magic != SUPERBLOCK_MAGIC {
                 return Err(VolumeError::InvalidSuperblock);
+            }
+            let found = superblock_format(&super_buf);
+            if found > FORMAT_VERSION {
+                return Err(VolumeError::UnsupportedFormat { found, supported: FORMAT_VERSION });
             }
 
             // Scan valid needles

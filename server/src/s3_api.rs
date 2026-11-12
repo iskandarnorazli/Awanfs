@@ -502,7 +502,14 @@ impl S3ServiceState {
         }
     }
 
+    /// Opens a data directory, panicking when it cannot be served; see `try_with_data_dir`.
     pub fn with_data_dir(dir: &Path) -> Self {
+        Self::try_with_data_dir(dir).unwrap_or_else(|e| panic!("cannot open {}: {}", dir.display(), e))
+    }
+
+    /// Opens a data directory and replays it. Fails, instead of serving a subset, when a volume
+    /// cannot be opened or was written in a newer on-disk format (#50).
+    pub fn try_with_data_dir(dir: &Path) -> Result<Self, String> {
         let _ = std::fs::create_dir_all(dir);
         let work = Arc::new(WorkCounters::default());
         // Every volume in id order; writes go to the last one (#37).
@@ -512,10 +519,11 @@ impl S3ServiceState {
             ids.push(1);
         }
         for id in ids {
-            if let Ok(mut vm) = VolumeManager::open_sparse(dir, id) {
-                vm.attach_work_counters(Arc::clone(&work));
-                volumes.insert(id, Arc::new(vm));
-            }
+            // Only a brand-new volume 1 is created sparse; volumes from rollover stay as they are.
+            let new_volume = !dir.join(format!("volume_{:04}.dat", id)).exists();
+            let mut vm = VolumeManager::open_mode(dir, id, new_volume && id == 1).map_err(|e| format!("volume {}: {}", id, e))?;
+            vm.attach_work_counters(Arc::clone(&work));
+            volumes.insert(id, Arc::new(vm));
         }
         let vol_mgr = volumes.values().next_back().cloned();
         let multipart = Arc::new(
@@ -567,10 +575,19 @@ impl S3ServiceState {
                 if flags & AWAN_FLAG_TOMBSTONE != 0 {
                     let _ = engine.delete_object(b_id as u32, key.as_bytes());
                 } else if flags & AWAN_FLAG_MULTIPART != 0 {
-                    let manifest = vm
-                        .read_needle_bytes(vm.id(), local, crc32c)
-                        .ok()
-                        .and_then(|b| decode_extents_manifest(&multipart.staging_dir, &b));
+                    let manifest = match vm.read_needle_bytes(vm.id(), local, crc32c) {
+                        Ok(b) => match decode_extents_manifest(&multipart.staging_dir, &b) {
+                            Ok(m) => Some(m),
+                            Err(crate::multipart::ManifestError::NewerVersion { found, supported }) => {
+                                return Err(format!(
+                                    "the multipart manifest of {} was written in format {} by a newer AwanFS; this version reads up to {}",
+                                    key, found, supported
+                                ))
+                            }
+                            Err(crate::multipart::ManifestError::Malformed) => None,
+                        },
+                        Err(_) => None,
+                    };
                     if let Some((total, extents)) = manifest {
                         let _ = engine.put_object(
                             b_id as u32,
@@ -602,7 +619,7 @@ impl S3ServiceState {
         let initial_bytes = volumes.values().map(|vm| vm.offset()).sum();
         let active_id = vol_mgr.as_ref().map(|vm| vm.id()).unwrap_or(1);
 
-        Self {
+        Ok(Self {
             data_dir: Some(dir.to_path_buf()),
             total_volume_bytes: Arc::new(AtomicU64::new(initial_bytes)),
             tombstone_bytes: Arc::new(AtomicU64::new(0)),
@@ -627,7 +644,7 @@ impl S3ServiceState {
             metrics: Arc::new(crate::metrics::Metrics::default()),
             access_log: Arc::new(RwLock::new(None)),
             audit_log: Arc::new(RwLock::new(None)),
-        }
+        })
     }
 
     pub fn fragmentation_ratio(&self) -> f64 {
