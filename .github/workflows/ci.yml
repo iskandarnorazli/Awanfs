@@ -50,3 +50,21 @@ jobs:
       - name: TLC on verification/tla (fixed design must pass; each broken variant must fail)
         run: bash verification/run_tlc.sh
 
+  drive:
+    name: Drive the server (aws CLI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - run: cargo build --locked --release --manifest-path server/Cargo.toml
+      - name: Journeys (scripts/verify_drive.sh)
+        run: bash scripts/verify_drive.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: drive-evidence
+          path: verification/evidence/
+

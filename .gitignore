@@ -11,3 +11,4 @@ bench_smoke.md
 # TLC trace dumps
 verification/tla/*_TTrace_*
 verification/tla/states/
+verification/evidence/
