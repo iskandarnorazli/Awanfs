@@ -1,7 +1,7 @@
 //! awan-storage/server/src/main.rs
 //! S3 Storage Server binary entry point
 
-use s3_server::{start_s3_reactor, AuthConfig, Durability, S3ServiceState};
+use s3_server::{start_s3_reactor_with, AuthConfig, Durability, S3ServiceState};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +21,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut listen = std::env::var("AWANFS_LISTEN").unwrap_or_else(|_| "127.0.0.1".to_string());
     let mut allow_anonymous = std::env::var("AWANFS_ALLOW_ANONYMOUS").ok().as_deref() == Some("1");
     let mut access_log: Option<String> = None;
+    let mut tls_cert: Option<PathBuf> = std::env::var("AWANFS_TLS_CERT").ok().filter(|s| !s.is_empty()).map(PathBuf::from);
+    let mut tls_key: Option<PathBuf> = std::env::var("AWANFS_TLS_KEY").ok().filter(|s| !s.is_empty()).map(PathBuf::from);
+    let mut http_port: Option<u16> = None;
     let mut auto_compaction = std::env::var("AWANFS_AUTO_COMPACTION").ok().as_deref() != Some("off");
     let mut durability = std::env::var("AWANFS_DURABILITY").unwrap_or_else(|_| "group".to_string());
 
@@ -40,6 +43,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if let Some(d) = args.next() {
                 durability = d;
             }
+        } else if arg == "--cert" {
+            tls_cert = args.next().map(PathBuf::from);
+        } else if arg == "--key" {
+            tls_key = args.next().map(PathBuf::from);
+        } else if arg == "--http-port" {
+            http_port = args.next().and_then(|p| p.parse().ok());
         } else if arg == "--auto-compaction" {
             auto_compaction = args.next().as_deref() != Some("off");
         } else if arg == "--access-log" {
@@ -67,7 +76,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let addr: SocketAddr = format!("{}:{}", listen, port).parse()?;
     let mut state = match data_dir {
-        Some(ref dir) => S3ServiceState::with_data_dir(dir),
+        Some(ref dir) => match S3ServiceState::try_with_data_dir(dir) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cannot serve {}: {}", dir.display(), e);
+                std::process::exit(2);
+            }
+        },
         None => S3ServiceState::new(),
     };
     state.auth = auth;
@@ -103,13 +118,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         state.start_auto_compaction(std::time::Duration::from_secs(600), 0.20, 1 << 30);
     }
 
-    println!("S3 Storage Server listening on http://{}", addr);
-    let handle = start_s3_reactor(addr, state).await?;
+    // TLS (#30, owner decision 18): with --cert and --key the port serves HTTPS only; plain
+    // HTTP needs --http-port.
+    let tls = match (&tls_cert, &tls_key) {
+        (Some(c), Some(k)) => match s3_server::tls::ReloadingCert::open(c, k) {
+            Ok(rc) => {
+                rc.watch(std::time::Duration::from_secs(60));
+                Some(s3_server::tls::server_config(rc))
+            }
+            Err(e) => {
+                eprintln!("cannot load the TLS certificate: {}", e);
+                std::process::exit(2);
+            }
+        },
+        (None, None) => None,
+        _ => {
+            eprintln!("--cert and --key go together");
+            std::process::exit(2);
+        }
+    };
+    let https = tls.is_some();
+    let handle = start_s3_reactor_with(addr, Arc::clone(&state), tls).await?;
+    let plain = match (https, http_port) {
+        (true, Some(p)) => Some(start_s3_reactor_with(format!("{}:{}", listen, p).parse()?, Arc::clone(&state), None).await?),
+        _ => None,
+    };
+    println!("S3 Storage Server listening on {}://{}", if https { "https" } else { "http" }, addr);
 
     wait_for_stop_signal().await;
     eprintln!("stop signal received: finishing requests in flight");
     // Readiness goes false first, so a load balancer stops sending new requests.
     state_for_stop.set_not_ready(Some("shutting down"));
+    if let Some(p) = plain {
+        let _ = p.shutdown_gracefully(std::time::Duration::from_secs(30)).await;
+    }
     let finished = handle.shutdown_gracefully(std::time::Duration::from_secs(30)).await;
     if !finished {
         eprintln!("some connections were still open after 30 s");

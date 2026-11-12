@@ -313,6 +313,11 @@ impl ChunkVerifier {
     /// Checks the next chunk: its signature must be the HMAC of
     /// `AWS4-HMAC-SHA256-PAYLOAD\n<date>\n<scope>\n<previous signature>\n<sha256("")>\n<sha256(data)>`.
     pub fn check(&mut self, cache: &SigV4KeyCache, data: &[u8], signature: Option<&str>) -> bool {
+        self.check_digest(cache, &sha256_hex(data), signature)
+    }
+
+    /// `check` for a chunk whose SHA-256 (hex) was computed as it arrived.
+    pub fn check_digest(&mut self, cache: &SigV4KeyCache, data_sha256: &str, signature: Option<&str>) -> bool {
         let Some(signature) = signature else { return false };
         let sts = format!(
             "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}/{}/{}/aws4_request\n{}\n{}\n{}",
@@ -322,7 +327,7 @@ impl ChunkVerifier {
             self.service,
             self.previous,
             EMPTY_SHA256,
-            sha256_hex(data)
+            data_sha256
         );
         let expected = compute_sigv4_signature(cache, &self.secret, &self.date8, &self.region, &self.service, &sts);
         if constant_time_eq(&expected, &signature.to_ascii_lowercase()) {

@@ -2,7 +2,7 @@
 # Run: docker run -p 9000:9000 -v awanfs-data:/data \
 #        -e AWANFS_ACCESS_KEY=... -e AWANFS_SECRET_KEY=... awanfs
 # The container listens on 0.0.0.0 inside its network namespace; publish the port to choose
-# who can reach it. There is no TLS yet (#30): put a TLS proxy in front on any shared network.
+# who can reach it. For HTTPS, mount a certificate and set AWANFS_TLS_CERT and AWANFS_TLS_KEY.
 
 FROM rust:1-bookworm AS build
 WORKDIR /src
