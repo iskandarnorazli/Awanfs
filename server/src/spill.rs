@@ -4,10 +4,13 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use redb::{Database, TableDefinition};
+use redb::{Database, Durability, TableDefinition};
 use crate::meta_index::ObjectMeta;
 
 const META_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("object_metadata");
+
+/// Page cache of the spill database (#13).
+pub const SPILL_CACHE_BYTES: usize = 64 << 20;
 
 #[derive(Clone)]
 pub struct SpillIndex {
@@ -52,11 +55,9 @@ fn decode_meta(buf: &[u8]) -> Option<ObjectMeta> {
 
 impl SpillIndex {
     pub fn open(path: &Path) -> Result<Self, redb::Error> {
-        let db = if path.exists() {
-            Database::open(path)?
-        } else {
-            Database::create(path)?
-        };
+        // A bounded page cache: the spill exists to keep memory bounded (#13). redb's default
+        // is about 1 GiB.
+        let db = Database::builder().set_cache_size(SPILL_CACHE_BYTES).create(path)?;
 
         // Initialize table if needed
         let write_txn = db.begin_write()?;
@@ -68,10 +69,25 @@ impl SpillIndex {
         Ok(Self { db: Arc::new(db) })
     }
 
+    /// Empties the index. The server does this at boot and rebuilds it from the volume
+    /// replay, so its non-durable commits never decide what exists.
+    pub fn clear(&self) -> Result<(), redb::Error> {
+        let mut write_txn = self.db.begin_write()?;
+        write_txn.set_durability(Durability::None);
+        write_txn.delete_table(META_TABLE)?;
+        {
+            let _ = write_txn.open_table(META_TABLE)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     pub fn put(&self, bucket_id: u32, key: &[u8], meta: &ObjectMeta) -> Result<(), redb::Error> {
         let db_key = make_db_key(bucket_id, key);
         let encoded = encode_meta(meta);
-        let write_txn = self.db.begin_write()?;
+        let mut write_txn = self.db.begin_write()?;
+        // Not fsynced: the volumes are the record, and boot rebuilds this index from them.
+        write_txn.set_durability(Durability::None);
         {
             let mut table = write_txn.open_table(META_TABLE)?;
             table.insert(&db_key[..], &encoded[..])?;
@@ -93,7 +109,8 @@ impl SpillIndex {
 
     pub fn delete(&self, bucket_id: u32, key: &[u8]) -> Result<bool, redb::Error> {
         let db_key = make_db_key(bucket_id, key);
-        let write_txn = self.db.begin_write()?;
+        let mut write_txn = self.db.begin_write()?;
+        write_txn.set_durability(Durability::None);
         let existed = {
             let mut table = write_txn.open_table(META_TABLE)?;
             let rem = table.remove(&db_key[..])?;

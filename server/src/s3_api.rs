@@ -524,6 +524,8 @@ impl S3ServiceState {
         let mut engine = AwanStorageEngine::new(100_000, 4_194_304, 65536);
         let db_path = dir.join("metadata.db");
         if let Ok(spill) = crate::spill::SpillIndex::open(&db_path) {
+            // Rebuilt from the volume replay below: its commits are not durable (#13).
+            let _ = spill.clear();
             engine.attach_spill_index(spill);
         }
         let needle_crc_map = Arc::new(RwLock::new(HashMap::new()));
