@@ -454,6 +454,8 @@ pub struct S3ServiceState {
     pub metrics: Arc<crate::metrics::Metrics>,
     /// Where the per-request JSON log lines go; `None` logs nothing (#41).
     pub access_log: Arc<RwLock<Option<crate::request_log::LogSink>>>,
+    /// Where S3-format server access log lines go; `None` (the default) writes none (#46).
+    pub audit_log: Arc<RwLock<Option<crate::request_log::LogSink>>>,
 }
 
 impl S3ServiceState {
@@ -497,6 +499,7 @@ impl S3ServiceState {
             not_ready: Arc::new(RwLock::new(None)),
             metrics: Arc::new(crate::metrics::Metrics::default()),
             access_log: Arc::new(RwLock::new(None)),
+            audit_log: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -624,6 +627,7 @@ impl S3ServiceState {
             not_ready: Arc::new(RwLock::new(None)),
             metrics: Arc::new(crate::metrics::Metrics::default()),
             access_log: Arc::new(RwLock::new(None)),
+            audit_log: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -949,6 +953,10 @@ impl Default for S3ServiceState {
     }
 }
 
+/// The client's address, put into the request's extensions by the reactor.
+#[derive(Clone, Copy, Debug)]
+pub struct RemoteAddr(pub std::net::SocketAddr);
+
 /// Reserved prefix for the server's own endpoints. `_` is not allowed in bucket names, so
 /// nothing here can shadow a bucket (#44).
 pub const ADMIN_PREFIX: &str = "/_awanfs/";
@@ -1107,7 +1115,18 @@ pub async fn handle_s3_request(
         ParsedTarget::Object { bucket, key } => (bucket, key),
     };
     let request_id = crate::request_log::new_request_id();
-    let mut resp = crate::request_log::with_request_id(request_id.clone(), handle_s3_inner(Arc::clone(&state), req)).await?;
+    let audit = state.audit_log.read().clone().map(|sink| {
+        let h = req.headers();
+        let get = |n: &str| h.get(n).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let query = req.uri().query().unwrap_or("");
+        let presigned = query.contains("X-Amz-Signature=");
+        let signed = h.contains_key("authorization") || presigned;
+        let remote = req.extensions().get::<RemoteAddr>().map(|r| r.0.ip().to_string()).unwrap_or_default();
+        let uri = format!("{} {} {:?}", req.method(), req.uri(), req.version());
+        (sink, crate::request_log::claimed_access_key(h.get("authorization").and_then(|v| v.to_str().ok()), query), remote, uri, get("user-agent"), get("host"), signed, presigned)
+    });
+    let (resp, error_code) = crate::request_log::with_request_id(request_id.clone(), handle_s3_inner(Arc::clone(&state), req)).await;
+    let mut resp = resp?;
     if let Ok(v) = hyper::header::HeaderValue::from_str(&request_id) {
         resp.headers_mut().insert("x-amz-request-id", v);
     }
@@ -1128,6 +1147,40 @@ pub async fn handle_s3_request(
             duration_us: elapsed.as_micros() as u64,
         };
         sink(&rec.to_json());
+    }
+    if let Some((sink, requester, remote, uri, ua, host_hdr, signed, presigned)) = audit {
+        let op_name = format!(
+            "REST.{}.{}",
+            method.as_str(),
+            match op {
+                "PutObject" | "GetObject" | "HeadObject" | "DeleteObject" | "CopyObject" => "OBJECT",
+                "UploadPart" => "PART",
+                "CreateMultipartUpload" | "CompleteMultipartUpload" | "AbortMultipartUpload" => "UPLOAD",
+                "ListObjects" => "BUCKET",
+                "ListBuckets" => "SERVICE",
+                "DeleteObjects" => "MULTI_OBJECT_DELETE",
+                "PutBucketLifecycle" | "GetBucketLifecycle" => "LIFECYCLE",
+                _ => "BUCKET",
+            }
+        );
+        let line = crate::request_log::s3_access_log_line(
+            &bucket,
+            &remote,
+            &requester,
+            &request_id,
+            &op_name,
+            &key,
+            &uri,
+            resp.status().as_u16(),
+            error_code.as_deref(),
+            bytes_out,
+            elapsed.as_millis() as u64,
+            &ua,
+            &host_hdr,
+            if signed { "SigV4" } else { "" },
+            if presigned { "QueryString" } else if signed { "AuthHeader" } else { "" },
+        );
+        sink(&line);
     }
     Ok(resp)
 }
