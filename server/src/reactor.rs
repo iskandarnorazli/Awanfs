@@ -46,10 +46,20 @@ pub async fn start_s3_reactor(
     addr: SocketAddr,
     state: Arc<S3ServiceState>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
+    start_s3_reactor_with(addr, state, None).await
+}
+
+/// `start_s3_reactor`, serving HTTPS with `tls` when it is given (#30).
+pub async fn start_s3_reactor_with(
+    addr: SocketAddr,
+    state: Arc<S3ServiceState>,
+    tls: Option<Arc<rustls::ServerConfig>>,
+) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let (done_tx, done_rx) = oneshot::channel();
+    let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
 
     let auto_builder = AutoConnBuilder::new(TokioExecutor::new());
 
@@ -60,16 +70,29 @@ pub async fn start_s3_reactor(
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((stream, remote_addr)) => {
-                            let io = TokioIo::new(stream);
                             let state_clone = Arc::clone(&state);
                             let service = service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
                                 req.extensions_mut().insert(crate::s3_api::RemoteAddr(remote_addr));
                                 handle_s3_request(Arc::clone(&state_clone), req)
                             });
-                            let conn = auto_builder.serve_connection_with_upgrades(io, service).into_owned();
-                            let conn = graceful.watch(conn);
+                            let builder = auto_builder.clone();
+                            let watcher = graceful.watcher();
+                            let acceptor = acceptor.clone();
                             tokio::spawn(async move {
-                                let _ = conn.await;
+                                match acceptor {
+                                    Some(acc) => {
+                                        // A failed handshake (untrusted client, plain HTTP on the
+                                        // TLS port) closes just that connection.
+                                        let handshake = tokio::time::timeout(std::time::Duration::from_secs(10), acc.accept(stream));
+                                        let Ok(Ok(tls_stream)) = handshake.await else { return };
+                                        let conn = builder.serve_connection_with_upgrades(TokioIo::new(tls_stream), service).into_owned();
+                                        let _ = watcher.watch(conn).await;
+                                    }
+                                    None => {
+                                        let conn = builder.serve_connection_with_upgrades(TokioIo::new(stream), service).into_owned();
+                                        let _ = watcher.watch(conn).await;
+                                    }
+                                }
                             });
                         }
                         Err(err) => {
