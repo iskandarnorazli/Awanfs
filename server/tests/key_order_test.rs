@@ -27,10 +27,21 @@ async fn spawn(state: Arc<S3ServiceState>) -> (String, s3_server::ServerHandle) 
     (format!("http://{}", handle.local_addr), handle)
 }
 
+/// Status and body of a GET. An error body's <RequestId> differs per request (#41), so it is
+/// blanked: the comparison is about the object's state, not which request asked.
 async fn get(c: &reqwest::Client, url: &str, key: &str) -> (StatusCode, Vec<u8>) {
     let res = c.get(format!("{}/bkt/{}", url, key)).send().await.unwrap();
     let status = res.status();
-    (status, res.bytes().await.unwrap().to_vec())
+    let body = res.bytes().await.unwrap().to_vec();
+    if status.is_success() {
+        return (status, body);
+    }
+    let text = String::from_utf8_lossy(&body).into_owned();
+    let blanked = match (text.find("<RequestId>"), text.find("</RequestId>")) {
+        (Some(a), Some(b)) if a < b => format!("{}<RequestId/>{}", &text[..a], &text[b + "</RequestId>".len()..]),
+        _ => text,
+    };
+    (status, blanked.into_bytes())
 }
 
 #[derive(Default)]
