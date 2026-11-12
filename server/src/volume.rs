@@ -65,6 +65,124 @@ pub struct NeedleLocation {
     pub seq: u64,
 }
 
+/// Size of the pieces a streamed needle is written in.
+pub const STREAM_CHUNK: usize = 1 << 20;
+
+/// A needle being written as its payload arrives; see `VolumeManager::begin_needle`.
+pub struct NeedleWriter {
+    vm: Arc<VolumeManager>,
+    bucket_id: u16,
+    key: String,
+    flags: u16,
+    offset: u64,
+    total_len: u64,
+    payload_size: u64,
+    written: u64,
+    crc: u32,
+    /// Sector 0 of the needle: header, key, start of the payload. Written last.
+    first: AlignedBuffer,
+    /// The piece of the needle image starting at `chunk_start`.
+    chunk: AlignedBuffer,
+    chunk_start: u64,
+    chunk_fill: usize,
+}
+
+impl NeedleWriter {
+    pub fn volume(&self) -> &Arc<VolumeManager> {
+        &self.vm
+    }
+
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    pub fn write(&mut self, mut data: &[u8]) -> Result<(), VolumeError> {
+        if self.written + data.len() as u64 > self.payload_size {
+            return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "more bytes than the declared length")));
+        }
+        self.crc = crc32c::crc32c_append(self.crc, data);
+        let mut pos = 64 + self.key.len() as u64 + self.written;
+        self.written += data.len() as u64;
+        // Bytes that land in sector 0.
+        if pos < SECTOR_SIZE as u64 {
+            let n = ((SECTOR_SIZE as u64 - pos) as usize).min(data.len());
+            self.first[pos as usize..pos as usize + n].copy_from_slice(&data[..n]);
+            data = &data[n..];
+            pos += n as u64;
+        }
+        while !data.is_empty() {
+            debug_assert_eq!(pos, self.chunk_start + self.chunk_fill as u64);
+            let n = (STREAM_CHUNK - self.chunk_fill).min(data.len());
+            self.chunk[self.chunk_fill..self.chunk_fill + n].copy_from_slice(&data[..n]);
+            self.chunk_fill += n;
+            data = &data[n..];
+            pos += n as u64;
+            if self.chunk_fill == STREAM_CHUNK {
+                self.flush_chunk()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_chunk(&mut self) -> Result<(), VolumeError> {
+        let end = (self.chunk_start + self.chunk_fill as u64).div_ceil(SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
+        let len = (end - self.chunk_start) as usize;
+        if len == 0 {
+            return Ok(());
+        }
+        self.chunk[self.chunk_fill..len].fill(0);
+        self.vm.file.write_aligned_at(self.offset + self.chunk_start, &self.chunk[..len])?;
+        self.vm.work.disk_write(len as u64);
+        self.chunk_start += len as u64;
+        self.chunk_fill = 0;
+        Ok(())
+    }
+
+    /// Writes what is left and then the header; the needle is complete and journaled.
+    pub fn finish(mut self, etag_hi: u64, etag_lo: u64) -> Result<NeedleLocation, VolumeError> {
+        if self.written != self.payload_size {
+            return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "fewer bytes than the declared length")));
+        }
+        self.flush_chunk()?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let key_bytes = self.key.as_bytes();
+        let mut header = NeedleHeader {
+            magic: NEEDLE_MAGIC,
+            header_crc32c: 0,
+            payload_crc32c: self.crc,
+            flags: self.flags,
+            bucket_id: self.bucket_id,
+            key_len: key_bytes.len() as u16,
+            reserved: 0,
+            key_hash: xxh3_64(key_bytes),
+            payload_size: self.payload_size,
+            created_at_ns: now,
+            etag_hi,
+            etag_lo,
+            reserved2: 0,
+        };
+        let mut hdr_bytes = [0u8; 64];
+        header.encode(&mut hdr_bytes);
+        header.header_crc32c = crc32c::crc32c(&hdr_bytes[8..64]);
+        header.encode(&mut hdr_bytes);
+        self.first[0..64].copy_from_slice(&hdr_bytes);
+        self.first[64..64 + key_bytes.len()].copy_from_slice(key_bytes);
+        self.vm.file.write_aligned_at(self.offset, &self.first)?;
+        self.vm.work.disk_write(SECTOR_SIZE as u64);
+        self.vm.work.payload_copy(self.payload_size);
+        self.vm.append_index(header.key_hash, self.offset, self.total_len, self.payload_size, self.flags, self.crc)?;
+        let seq = self.vm.written_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(NeedleLocation {
+            volume_id: self.vm.volume_id,
+            offset: self.offset,
+            total_len: self.total_len,
+            payload_size: self.payload_size,
+            payload_crc32c: self.crc,
+            seq,
+        })
+    }
+}
+
 /// When an acknowledged write reaches stable storage (#29, owner decision 2026-11-12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
@@ -438,6 +556,20 @@ impl VolumeManager {
         Ok(())
     }
 
+    /// Appends one record to the `.idx` journal.
+    fn append_index(&self, key_hash: u64, offset: u64, total_len: u64, payload_size: u64, flags: u16, crc: u32) -> Result<(), VolumeError> {
+        let mut rec = [0u8; IDX_RECORD];
+        rec[0..8].copy_from_slice(&key_hash.to_le_bytes());
+        rec[8..12].copy_from_slice(&self.volume_id.to_le_bytes());
+        rec[12..20].copy_from_slice(&offset.to_le_bytes());
+        rec[20..28].copy_from_slice(&total_len.to_le_bytes());
+        rec[28..36].copy_from_slice(&payload_size.to_le_bytes());
+        rec[36..38].copy_from_slice(&flags.to_le_bytes());
+        rec[38..42].copy_from_slice(&crc.to_le_bytes());
+        self.idx_file.lock().write_all(&rec)?;
+        Ok(())
+    }
+
     /// Syncs the volume and its journal now, whatever the durability mode.
     pub fn sync_now(&self) -> Result<(), VolumeError> {
         self.sync_files()
@@ -616,19 +748,7 @@ impl VolumeManager {
         self.file.write_aligned_at(offset, &buf)?;
         self.work.disk_write(total_len);
 
-        // Append 46-byte record to .idx under dedicated lock
-        {
-            let mut idx_entry = [0u8; 46];
-            idx_entry[0..8].copy_from_slice(&key_hash.to_le_bytes());
-            idx_entry[8..12].copy_from_slice(&self.volume_id.to_le_bytes());
-            idx_entry[12..20].copy_from_slice(&offset.to_le_bytes());
-            idx_entry[20..28].copy_from_slice(&total_len.to_le_bytes());
-            idx_entry[28..36].copy_from_slice(&payload_size.to_le_bytes());
-            idx_entry[36..38].copy_from_slice(&flags.to_le_bytes());
-            idx_entry[38..42].copy_from_slice(&payload_crc32c.to_le_bytes());
-            let mut idx = self.idx_file.lock();
-            idx.write_all(&idx_entry[..42])?;
-        }
+        self.append_index(key_hash, offset, total_len, payload_size, flags, payload_crc32c)?;
         let seq = self.written_seq.fetch_add(1, Ordering::SeqCst) + 1;
 
         Ok(NeedleLocation {
@@ -638,6 +758,39 @@ impl VolumeManager {
             payload_size,
             payload_crc32c,
             seq,
+        })
+    }
+
+    /// Starts a needle whose payload arrives in pieces (#36). The space is reserved now; the
+    /// payload is written in `STREAM_CHUNK` pieces as it arrives, and the first sector, which
+    /// holds the header with the payload CRC, is written last by `NeedleWriter::finish`.
+    /// A writer dropped before `finish` leaves a gap that recovery steps over (#38).
+    pub fn begin_needle(self: &Arc<Self>, bucket_id: u16, key: &str, payload_size: u64, flags: u16) -> Result<NeedleWriter, VolumeError> {
+        let key_len = key.len();
+        let total_len = (64 + key_len as u64 + payload_size).div_ceil(SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
+        let offset = self.current_offset.fetch_add(total_len, Ordering::SeqCst);
+        if offset + total_len > self.max_span() {
+            return Err(VolumeError::VolumeFull { offset, len: total_len });
+        }
+        if self.fail_next_write.swap(false, Ordering::SeqCst) {
+            return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected write failure")));
+        }
+        let mut first = AlignedBuffer::new(SECTOR_SIZE);
+        first.fill(0);
+        Ok(NeedleWriter {
+            vm: Arc::clone(self),
+            bucket_id,
+            key: key.to_string(),
+            flags,
+            offset,
+            total_len,
+            payload_size,
+            written: 0,
+            crc: 0,
+            first,
+            chunk: AlignedBuffer::new(STREAM_CHUNK),
+            chunk_start: SECTOR_SIZE as u64,
+            chunk_fill: 0,
         })
     }
 

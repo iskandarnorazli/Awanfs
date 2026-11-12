@@ -137,6 +137,52 @@ impl hyper::body::Body for ChunksBody {
     }
 }
 
+/// PUT bodies above this size are written to the volume as they arrive instead of being held
+/// in memory (#36). Smaller ones are collected, and cached after the write.
+pub const STREAM_PUT_MIN: u64 = 4 * 1024 * 1024;
+
+/// The end of a PutObject once the needle is durable: index row, bookkeeping, answer.
+#[allow(clippy::too_many_arguments)]
+fn finish_put(
+    state: &S3ServiceState,
+    b_id: u32,
+    key: &str,
+    old_info: Option<(u64, u64)>,
+    vol_offset: u64,
+    payload_len: u64,
+    etag_hi: u64,
+    etag_lo: u64,
+    flags: u16,
+    etag_hex: &str,
+) -> Response<ResponseBody> {
+    if let Some((prev_off, prev_sz)) = old_info {
+        if prev_off > 0 && prev_off != vol_offset {
+            state.payload_cache.remove(b_id, prev_off);
+            state.needle_crc_map.write().remove(&(b_id, prev_off));
+            let raw_len = 64 + key.len() + prev_sz as usize;
+            let dead_bytes = raw_len.div_ceil(4096) as u64 * 4096;
+            state.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
+        }
+    }
+    if let Err(code) = state.engine.write().put_object(b_id, key.as_bytes(), vol_offset, payload_len, etag_hi, etag_lo, 0, flags) {
+        return engine_error_response(code, key);
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(ETAG, format!("\"{}\"", etag_hex))
+        .header(CONTENT_LENGTH, "0")
+        .body(empty_body())
+        .unwrap()
+}
+
+fn bad_request(code: &str, msg: &str, resource: &str) -> Response<ResponseBody> {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(CONTENT_TYPE, "application/xml")
+        .body(full_body(Bytes::from(s3_error_xml(code, msg, resource, "req-put"))))
+        .unwrap()
+}
+
 /// Ids of the `volume_NNNN.dat` files in `dir`, ascending.
 fn volume_ids(dir: &Path) -> Vec<u32> {
     let mut ids: Vec<u32> = std::fs::read_dir(dir)
@@ -747,6 +793,25 @@ impl S3ServiceState {
                     return Ok((vm, loc, g));
                 }
                 // A needle bigger than a whole volume would roll forever: refuse it.
+                Err(VolumeError::VolumeFull { len, .. }) if len + crate::direct_io::SECTOR_SIZE as u64 > vm.max_span() => {
+                    return Err(VolumeError::VolumeFull { offset: 0, len })
+                }
+                Err(VolumeError::VolumeFull { .. }) if attempts < 8 => {
+                    attempts += 1;
+                    self.roll_volume(&vm)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Starts a streamed needle on the active volume, rolling over when it is full (#36, #37).
+    pub fn begin_needle_on_active(&self, b_id: u32, key: &str, len: u64, flags: u16) -> Result<crate::volume::NeedleWriter, VolumeError> {
+        let mut attempts = 0;
+        loop {
+            let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+            match vm.begin_needle(b_id as u16, key, len, flags) {
+                Ok(w) => return Ok(w),
                 Err(VolumeError::VolumeFull { len, .. }) if len + crate::direct_io::SECTOR_SIZE as u64 > vm.max_span() => {
                     return Err(VolumeError::VolumeFull { offset: 0, len })
                 }
@@ -1647,6 +1712,76 @@ pub async fn handle_s3_request(
                     let is_chunked = req.headers().get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
                     let content_md5_hdr = req.headers().get("content-md5").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
                     let signed_headers = req.headers().clone();
+                    if let Some(len) = expected_len.map(|n| n as u64).filter(|&n| !is_chunked && n > STREAM_PUT_MIN) {
+                        // Large body: write it to the volume as it arrives (#36). The key lock is
+                        // held from the reservation to the index update, so log order stays
+                        // index order for this key.
+                        let flags = if key.ends_with('/') { AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE } else { AWAN_FLAG_ACTIVE };
+                        let _key_guard = state.lock_key(b_id, &key).await;
+                        if if_none_match_star && state.engine.read().get_object(b_id, key.as_bytes()).is_ok() {
+                            let xml = s3_error_xml("PreconditionFailed", "At least one of the pre-conditions you specified did not hold.", &key, "req-inm");
+                            return Ok(Response::builder()
+                                .status(StatusCode::PRECONDITION_FAILED)
+                                .header(CONTENT_TYPE, "application/xml")
+                                .body(full_body(Bytes::from(xml)))
+                                .unwrap());
+                        }
+                        if let Err(code) = state.engine.read().has_room_for(b_id, key.as_bytes()) {
+                            return Ok(engine_error_response(code, &key));
+                        }
+                        let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size));
+                        let mut writer = match state.begin_needle_on_active(b_id, &key, len, flags) {
+                            Ok(w) => w,
+                            Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
+                        };
+                        let declared_sha = signed_headers
+                            .get("x-amz-content-sha256")
+                            .and_then(|v| v.to_str().ok())
+                            .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                            .map(|h| h.to_ascii_lowercase());
+                        let mut sha = declared_sha.as_ref().map(|_| sha2::Sha256::new());
+                        let mut digest = crate::digest::StreamingDigest::new();
+                        let mut body = req.into_body();
+                        while let Some(frame) = body.frame().await {
+                            if let Ok(data) = frame?.into_data() {
+                                if let Some(h) = sha.as_mut() {
+                                    h.update(&data);
+                                }
+                                digest.update(&data);
+                                if let Err(e) = writer.write(&data) {
+                                    return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e)));
+                                }
+                            }
+                        }
+                        if writer.written() != len {
+                            return Ok(bad_request("IncompleteBody", "You did not provide the number of bytes specified by the Content-Length HTTP header.", &key));
+                        }
+                        if let (Some(h), Some(want)) = (sha, declared_sha) {
+                            let got: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+                            if got != want {
+                                return Ok(bad_request("XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.", &key));
+                            }
+                        }
+                        let (etag_hi, etag_lo, etag_hex, raw_md5, _) = digest.finalize();
+                        if let Some(ref content_md5) = content_md5_hdr {
+                            if content_md5 != &crate::digest::base64_encode(&raw_md5) {
+                                return Ok(bad_request("BadDigest", "The Content-MD5 you specified did not match what we received.", &key));
+                            }
+                        }
+                        let vm = Arc::clone(writer.volume());
+                        let loc = match writer.finish(etag_hi, etag_lo) {
+                            Ok(l) => l,
+                            Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
+                        };
+                        if let Err(e) = state.make_durable(&vm, loc.seq).await {
+                            return Ok(internal_error_response(&key, &format!("could not sync the object: {:?}", e)));
+                        }
+                        let vol_offset = global_offset(vm.id(), loc.offset);
+                        state.needle_crc_map.write().insert((b_id, vol_offset), loc.payload_crc32c);
+                        state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                        state.hook("put_stored", &key);
+                        return Ok(finish_put(&state, b_id, &key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex));
+                    }
                     let raw_bytes = match read_body(req.into_body(), MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, path).await? {
                         Ok(b) => b,
                         Err(resp) => return Ok(resp),
@@ -1740,38 +1875,7 @@ pub async fn handle_s3_request(
                         Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                     };
                     state.hook("put_stored", &key);
-
-                    if let Some((prev_off, prev_sz)) = old_info {
-                        if prev_off > 0 && prev_off != vol_offset {
-                            state.payload_cache.remove(b_id, prev_off);
-                            state.needle_crc_map.write().remove(&(b_id, prev_off));
-                            let raw_len = 64 + key.as_bytes().len() + prev_sz as usize;
-                            let dead_bytes = (((raw_len + 4095) / 4096) * 4096) as u64;
-                            state.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
-                        }
-                    }
-
-                    let mut engine = state.engine.write();
-                    if let Err(code) = engine.put_object(
-                        b_id,
-                        key.as_bytes(),
-                        vol_offset,
-                        payload_len,
-                        etag_hi,
-                        etag_lo,
-                        0,
-                        flags,
-                    ) {
-                        return Ok(engine_error_response(code, &key));
-                    }
-
-                    let resp = Response::builder()
-                        .status(StatusCode::OK)
-                        .header(ETAG, format!("\"{}\"", final_etag_hex))
-                        .header(CONTENT_LENGTH, "0")
-                        .body(empty_body())
-                        .unwrap();
-                    Ok(resp)
+                    Ok(finish_put(&state, b_id, &key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex))
                 }
 
                 Method::GET | Method::HEAD => {
