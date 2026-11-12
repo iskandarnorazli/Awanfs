@@ -1,0 +1,40 @@
+# Alert rules for AwanFS (#45). Metric names come from /_awanfs/metrics; the test
+# server/tests/deploy_metrics_test.rs checks that every name used here exists.
+# Disk space: AwanFS rolls over to a new volume when one is full (#37), so the limit is the
+# filesystem's free space; alert on it with node_exporter (node_filesystem_avail_bytes).
+groups:
+  - name: awanfs
+    rules:
+      - alert: AwanFSNotReady
+        expr: awanfs_ready == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "AwanFS {{ $labels.instance }} is not ready"
+          description: "/_awanfs/health/ready has answered 503 for 2 minutes (recovering, shutting down or no usable volume)."
+      - alert: AwanFSServerErrors
+        expr: |
+          sum by (instance) (rate(awanfs_requests_total{status="5xx"}[5m]))
+            / sum by (instance) (rate(awanfs_requests_total[5m])) > 0.01
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "More than 1% of AwanFS requests fail with 5xx on {{ $labels.instance }}"
+      - alert: AwanFSSlowRequests
+        expr: |
+          histogram_quantile(0.99, sum by (instance, operation, le) (rate(awanfs_request_duration_seconds_bucket[5m]))) > 2
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "p99 of {{ $labels.operation }} above 2 s on {{ $labels.instance }}"
+      - alert: AwanFSNoSyncs
+        expr: |
+          rate(awanfs_disk_writes_total[10m]) > 0 and rate(awanfs_disk_syncs_total[10m]) == 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Writes without syncs on {{ $labels.instance }}: is it running with --durability fast?"
