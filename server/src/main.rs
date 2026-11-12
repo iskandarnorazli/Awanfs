@@ -67,7 +67,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let addr: SocketAddr = format!("{}:{}", listen, port).parse()?;
     let mut state = match data_dir {
-        Some(ref dir) => S3ServiceState::with_data_dir(dir),
+        Some(ref dir) => match S3ServiceState::try_with_data_dir(dir) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cannot serve {}: {}", dir.display(), e);
+                std::process::exit(2);
+            }
+        },
         None => S3ServiceState::new(),
     };
     state.auth = auth;
