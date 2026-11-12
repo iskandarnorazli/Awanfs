@@ -1152,6 +1152,9 @@ pub async fn handle_s3_request(
             // 4. Multipart DELETE /{bucket}/{key}?uploadId=ID -> AbortMultipartUpload
             if method == Method::DELETE && query_map.contains_key("uploadId") {
                 let upload_id = &query_map["uploadId"];
+                // Same key lock as CompleteMultipartUpload, so an abort cannot land between its
+                // manifest write and its commit.
+                let _key_guard = state.lock_key(b_id, &key).await;
                 match state.multipart.abort_upload(upload_id) {
                     Ok(()) => {
                         return Ok(Response::builder()
