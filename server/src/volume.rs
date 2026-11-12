@@ -14,6 +14,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 pub use crate::direct_io::SECTOR_SIZE;
 use crate::direct_io::{AlignedBuffer, AlignedFile};
+use crate::work::WorkCounters;
 
 pub const NEEDLE_MAGIC: u32 = 0x41574E33; // "AWN3"
 pub const SUPERBLOCK_MAGIC: u32 = 0x53555042; // "SUPB"
@@ -28,6 +29,8 @@ pub enum VolumeError {
     InvalidSuperblock,
     TornNeedleAtOffset(u64),
     CorruptIndex,
+    /// The needle would end past the volume span; nothing was written.
+    VolumeFull { offset: u64, len: u64 },
 }
 
 impl From<io::Error> for VolumeError {
@@ -134,6 +137,7 @@ pub struct VolumeManager {
     remap_count: AtomicU64,
     is_sparse: bool,
     max_span: u64,
+    work: Arc<WorkCounters>,
 }
 
 impl VolumeManager {
@@ -268,6 +272,7 @@ impl VolumeManager {
             remap_count: AtomicU64::new(0),
             is_sparse: sparse,
             max_span: MAX_VOLUME_SPAN,
+            work: Arc::new(WorkCounters::default()),
         })
     }
 
@@ -275,6 +280,15 @@ impl VolumeManager {
     /// Smaller spans are for tests and small deployments.
     pub fn set_max_span(&mut self, span: u64) {
         self.max_span = span;
+    }
+
+    /// Counts this volume's disk writes, reads and payload copies into `work`.
+    pub fn attach_work_counters(&mut self, work: Arc<WorkCounters>) {
+        self.work = work;
+    }
+
+    pub fn work_counters(&self) -> Arc<WorkCounters> {
+        Arc::clone(&self.work)
     }
 
     pub fn file(&self) -> Arc<AlignedFile> {
@@ -367,23 +381,24 @@ impl VolumeManager {
         buf[0..64].copy_from_slice(&hdr_bytes);
         buf[64..64 + key_bytes.len()].copy_from_slice(key_bytes);
         buf[64 + key_bytes.len()..raw_len].copy_from_slice(payload);
+        self.work.payload_copy(payload.len() as u64);
         if total_len as usize > raw_len {
             buf[raw_len..total_len as usize].fill(0);
         }
 
-        let raw_off = self.current_offset.fetch_add(total_len, Ordering::SeqCst);
-        let offset = if raw_off < self.max_span {
-            raw_off
-        } else {
-            let wrapped = (raw_off - SECTOR_SIZE as u64) % (self.max_span - SECTOR_SIZE as u64);
-            SECTOR_SIZE as u64 + ((wrapped / SECTOR_SIZE as u64) * SECTOR_SIZE as u64)
-        };
+        // A WORM volume never reuses space: a needle that would end past the span is refused,
+        // and the reserved range stays unused, so later writes are refused too.
+        let offset = self.current_offset.fetch_add(total_len, Ordering::SeqCst);
+        if offset + total_len > self.max_span {
+            return Err(VolumeError::VolumeFull { offset, len: total_len });
+        }
 
         // Lock-free concurrent positional write directly to disjoint disk offset
         self.file.write_aligned_at(offset, &buf)?;
+        self.work.disk_write(total_len);
 
         // Append 46-byte record to .idx under dedicated lock
-        if raw_off < self.max_span {
+        {
             let mut idx_entry = [0u8; 46];
             idx_entry[0..8].copy_from_slice(&key_hash.to_le_bytes());
             idx_entry[8..12].copy_from_slice(&self.volume_id.to_le_bytes());
@@ -455,8 +470,9 @@ impl VolumeManager {
         offset: u64,
         expected_payload_crc: u32,
     ) -> Result<Vec<u8>, VolumeError> {
-        self.read_needle_bytes(volume_id, offset, expected_payload_crc)
-            .map(|b| b.to_vec())
+        let bytes = self.read_needle_bytes(volume_id, offset, expected_payload_crc)?;
+        self.work.payload_copy(bytes.len() as u64);
+        Ok(bytes.to_vec())
     }
 
     pub fn dir(&self) -> &Path {
@@ -478,6 +494,7 @@ impl VolumeManager {
         let mut read_buf = AlignedBuffer::new(SECTOR_SIZE);
 
         while scan_offset + (SECTOR_SIZE as u64) <= file_len {
+            self.work.disk_read();
             if self.file.read_aligned_at(scan_offset, &mut read_buf).is_err() {
                 break;
             }
@@ -502,6 +519,7 @@ impl VolumeManager {
                 String::from_utf8_lossy(k_bytes).to_string()
             } else {
                 let mut full_buf = AlignedBuffer::new(total_len as usize);
+                self.work.disk_read();
                 if self.file.read_aligned_at(scan_offset, &mut full_buf).is_err() {
                     break;
                 }
