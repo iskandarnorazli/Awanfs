@@ -1,7 +1,7 @@
 //! awan-storage/server/src/direct_io.rs
 //! 4096-Byte Sector-Aligned Direct I/O Buffer Allocation and Positional I/O
 
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::ops::{Deref, DerefMut};
@@ -31,7 +31,9 @@ impl AlignedBuffer {
         let layout = Layout::from_size_align(len, SECTOR_SIZE)
             .expect("Valid layout with 4096-byte alignment");
 
-        let ptr = unsafe { alloc(layout) };
+        // Zeroed: every byte of the buffer may reach the disk (superblock tail, needle padding), and
+        // handing out a slice of uninitialised memory is undefined behaviour.
+        let ptr = unsafe { alloc_zeroed(layout) };
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
