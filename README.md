@@ -14,7 +14,7 @@ Read this before you run it anywhere that matters. Plan of record: the Phase 1-4
 
 - **One access key, no TLS.** Requests are checked with SigV4 against one key pair and the server listens on 127.0.0.1 by default (#35). There are no per-user policies (#53) and no TLS (#30): put a TLS proxy in front before opening it to a network.
 - **Writes are synced before the 200 by default** (`group` durability, #29). The measurements below were taken before that change, when a PUT was acknowledged without a sync; they will be re-run.
-- **One 32 GiB volume.** When it is full, writes fail with 500 (they used to overwrite old data). Fix: #37.
+- **Volumes of 32 GiB, rolled over when full** (#37). Space from overwrites and deletes is not reclaimed yet: online compaction handles one volume only and refuses to run once there are several (#14).
 - Whole request bodies are held in memory, with no size limit (#36).
 
 ## 1. Executive Summary

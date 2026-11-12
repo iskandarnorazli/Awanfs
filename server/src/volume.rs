@@ -21,6 +21,20 @@ pub const NEEDLE_MAGIC: u32 = 0x41574E33; // "AWN3"
 pub const SUPERBLOCK_MAGIC: u32 = 0x53555042; // "SUPB"
 pub const MAX_VOLUME_SPAN: u64 = 32 * 1024 * 1024 * 1024; // 32 GiB WORM Needle Volume (#470)
 
+/// Object locations in the index are global: the volume number in the bits above
+/// `VOLUME_SHIFT`, the offset inside the volume below. Volume 1's global offsets equal its
+/// local ones. 2^40 bytes per slot is far more than `MAX_VOLUME_SPAN` (#37).
+pub const VOLUME_SHIFT: u32 = 40;
+
+pub fn global_offset(volume_id: u32, offset: u64) -> u64 {
+    ((volume_id.saturating_sub(1) as u64) << VOLUME_SHIFT) | offset
+}
+
+/// (volume id, offset inside the volume) of a global offset.
+pub fn split_offset(global: u64) -> (u32, u64) {
+    ((global >> VOLUME_SHIFT) as u32 + 1, global & ((1u64 << VOLUME_SHIFT) - 1))
+}
+
 #[derive(Debug)]
 pub enum VolumeError {
     Io(io::Error),
@@ -197,7 +211,7 @@ pub struct VolumeManager {
     mmap: RwLock<Option<Arc<Mmap>>>,
     remap_count: AtomicU64,
     is_sparse: bool,
-    max_span: u64,
+    max_span: AtomicU64,
     work: Arc<WorkCounters>,
     fail_next_write: std::sync::atomic::AtomicBool,
     /// Needle offsets from the `.idx` journal at open time.
@@ -375,7 +389,7 @@ impl VolumeManager {
             mmap: RwLock::new(initial_mmap),
             remap_count: AtomicU64::new(0),
             is_sparse: sparse,
-            max_span: MAX_VOLUME_SPAN,
+            max_span: AtomicU64::new(MAX_VOLUME_SPAN),
             work: Arc::new(WorkCounters::default()),
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
             indexed,
@@ -390,8 +404,16 @@ impl VolumeManager {
 
     /// Largest byte offset a needle may reach in this volume (default `MAX_VOLUME_SPAN`).
     /// Smaller spans are for tests and small deployments.
-    pub fn set_max_span(&mut self, span: u64) {
-        self.max_span = span;
+    pub fn set_max_span(&self, span: u64) {
+        self.max_span.store(span, Ordering::SeqCst);
+    }
+
+    pub fn max_span(&self) -> u64 {
+        self.max_span.load(Ordering::SeqCst)
+    }
+
+    pub fn id(&self) -> u32 {
+        self.volume_id
     }
 
     /// Counts this volume's disk writes, reads and payload copies into `work`.
@@ -578,7 +600,7 @@ impl VolumeManager {
         // A WORM volume never reuses space: a needle that would end past the span is refused,
         // and the reserved range stays unused, so later writes are refused too.
         let offset = self.current_offset.fetch_add(total_len, Ordering::SeqCst);
-        if offset + total_len > self.max_span {
+        if offset + total_len > self.max_span() {
             return Err(VolumeError::VolumeFull { offset, len: total_len });
         }
         if self.fail_next_write.swap(false, Ordering::SeqCst) {
