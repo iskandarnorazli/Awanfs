@@ -34,25 +34,37 @@ jobs:
       - name: Build s3-server
         run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
 
+      - uses: actions/cache@v4
+        id: minio-cache
+        with:
+          path: .tmp/minio
+          key: minio-${{ env.MINIO_RELEASE }}-mc-v1-${{ runner.os }}
+      - uses: actions/setup-go@v5
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        with:
+          go-version: stable
+          cache: false
       - name: Fetch MinIO and mc
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        # dl.min.io answers 410 for the archived binaries and Docker Hub no longer has minio/minio
+        # (checked 2026-11-12), so try quay.io, then build the pinned release from source.
         run: |
           mkdir -p .tmp/minio
-          # Archived release binary first; the published Docker image as a fallback.
-          if ! curl -fsSL -o .tmp/minio/minio "https://dl.min.io/server/minio/release/linux-amd64/archive/minio.${MINIO_RELEASE}"; then
-            docker pull "minio/minio:${MINIO_RELEASE}"
-            id=$(docker create "minio/minio:${MINIO_RELEASE}")
-            docker cp "$id:/usr/bin/minio" .tmp/minio/minio
-            docker rm "$id"
+          from_image() { # image, path in image, output
+            docker pull "$1" >/dev/null 2>&1 || return 1
+            id=$(docker create "$1") && docker cp "$id:$2" "$3" && docker rm "$id" >/dev/null
+          }
+          if ! from_image "quay.io/minio/minio:${MINIO_RELEASE}" /usr/bin/minio .tmp/minio/minio; then
+            git clone -q --depth 1 --branch "${MINIO_RELEASE}" https://github.com/minio/minio /tmp/minio-src
+            (cd /tmp/minio-src && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/minio" .)
           fi
-          if ! curl -fsSL -o .tmp/minio/mc "https://dl.min.io/client/mc/release/linux-amd64/mc"; then
-            docker pull minio/mc:latest
-            id=$(docker create minio/mc:latest)
-            docker cp "$id:/usr/bin/mc" .tmp/minio/mc
-            docker rm "$id"
+          if ! from_image quay.io/minio/mc:latest /usr/bin/mc .tmp/minio/mc; then
+            git clone -q --depth 1 https://github.com/minio/mc /tmp/mc-src
+            (cd /tmp/mc-src && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/mc" .)
           fi
           chmod +x .tmp/minio/minio .tmp/minio/mc
-          .tmp/minio/minio --version
-          .tmp/minio/mc --version
+      - name: MinIO versions
+        run: .tmp/minio/minio --version && .tmp/minio/mc --version
 
       - name: Ratio check self-tests
         run: python benchmarks/test_ratio_check.py
