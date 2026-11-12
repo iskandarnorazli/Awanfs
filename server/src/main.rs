@@ -72,12 +72,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         *state.access_log.write() = Some(sink);
     }
     let state = Arc::new(state);
+    let state_for_stop = Arc::clone(&state);
 
     println!("S3 Storage Server listening on http://{}", addr);
     let handle = start_s3_reactor(addr, state).await?;
 
-    tokio::signal::ctrl_c().await?;
-    println!("Shutdown signal received, exiting...");
-    handle.shutdown();
+    wait_for_stop_signal().await;
+    eprintln!("stop signal received: finishing requests in flight");
+    // Readiness goes false first, so a load balancer stops sending new requests.
+    state_for_stop.set_not_ready(Some("shutting down"));
+    let finished = handle.shutdown_gracefully(std::time::Duration::from_secs(30)).await;
+    if !finished {
+        eprintln!("some connections were still open after 30 s");
+    }
+    if let Err(e) = state_for_stop.sync_all_volumes() {
+        eprintln!("final sync failed: {:?}", e);
+        std::process::exit(1);
+    }
+    eprintln!("stopped");
     Ok(())
+}
+
+/// Ctrl-C everywhere; SIGTERM on Unix; Ctrl-Break, console close and system shutdown on Windows.
+async fn wait_for_stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        let mut brk = windows::ctrl_break().expect("Ctrl-Break handler");
+        let mut close = windows::ctrl_close().expect("console close handler");
+        let mut shut = windows::ctrl_shutdown().expect("shutdown handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = brk.recv() => {}
+            _ = close.recv() => {}
+            _ = shut.recv() => {}
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

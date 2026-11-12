@@ -105,6 +105,7 @@ AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
   A killed process (no power cut) loses nothing acknowledged in any mode.
 - Health probes, without authentication: `GET /_awanfs/health/live` (200 while the process serves) and `GET /_awanfs/health/ready` (200, or 503 with the reason). `_` cannot appear in a bucket name, so these paths never shadow a bucket.
 - Prometheus metrics, without authentication: `GET /_awanfs/metrics` (requests and latency per S3 operation, bytes in and out, volume use, payload cache hits, and the disk and copy counters from `server/src/work.rs`).
+- Stopping: Ctrl-C or SIGTERM (Ctrl-Break, console close or system shutdown on Windows) marks the server not ready, stops accepting connections, lets requests in flight finish (up to 30 s), syncs every volume and exits 0.
 - `--allow-anonymous` (or `AWANFS_ALLOW_ANONYMOUS=1`) also accepts unsigned requests, for local tests and benchmarks. Without keys and without that flag the server refuses to start (exit code 2).
 
 ### Run the Test Suite
