@@ -135,3 +135,32 @@ async fn an_unsigned_trailer_body_is_decoded_not_stored_with_its_framing() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(c.get(format!("{}/tr-bkt/k", url)).send().await.unwrap().text().await.unwrap(), "hello world");
 }
+
+/// Above 4 MiB the chunked body is decoded and written as it arrives (#36); the signature
+/// chain is checked the same way, and a tampered chunk stores nothing.
+#[tokio::test]
+async fn a_large_signed_chunked_put_is_streamed_and_still_checked() {
+    let mut st = S3ServiceState::new();
+    st.auth = AuthConfig { credentials: Some((AK.into(), SK.into())), allow_anonymous: true };
+    let state = Arc::new(st);
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let handle = start_s3_reactor(addr, Arc::clone(&state)).await.unwrap();
+    let host = handle.local_addr.to_string();
+    let c = reqwest::Client::new();
+    assert_eq!(c.put(format!("http://{}/big-bkt", host)).send().await.unwrap().status(), StatusCode::OK);
+    let chunks: Vec<Vec<u8>> = (0..3).map(|i| (0..(2 << 20)).map(|j| ((j * 7 + i * 13) % 251) as u8).collect()).collect();
+    let want: Vec<u8> = chunks.concat();
+
+    let before = state.work.snapshot();
+    let res = chunked_put(&c, &host, "/big-bkt/good", &chunks, false).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "{}", res.text().await.unwrap());
+    let d = state.work.snapshot().since(&before);
+    assert!(d.disk_writes > 2, "written in pieces as it arrived: {:?}", d);
+    assert_eq!((d.payload_copies, d.payload_copy_bytes), (1, want.len() as u64), "one copy: no collected body, no decode buffer");
+    let got = c.get(format!("http://{}/big-bkt/good", host)).send().await.unwrap().bytes().await.unwrap();
+    assert!(&got[..] == &want[..]);
+
+    let res = chunked_put(&c, &host, "/big-bkt/bad", &chunks, true).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(c.get(format!("http://{}/big-bkt/bad", host)).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+}

@@ -519,13 +519,23 @@ pub fn list_multipart_uploads_result_xml(
     out
 }
 
-const EXTENTS_MANIFEST_MAGIC: &str = "AWNMPU1";
+/// `AWNMPU<version>` on the first line; this build writes and reads version 1 (#50).
+const EXTENTS_MANIFEST_PREFIX: &str = "AWNMPU";
+const EXTENTS_MANIFEST_VERSION: u32 = 1;
+
+/// Why a manifest could not be read.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ManifestError {
+    /// Written by a newer AwanFS.
+    NewerVersion { found: u32, supported: u32 },
+    Malformed,
+}
 
 /// Serialises a completed multipart object's extents. The manifest is written to the volume as
 /// a needle flagged multipart, so boot recovery rebuilds the object in log order. Staged part
 /// paths are stored relative to `staging_dir`, with `/` separators.
 pub fn encode_extents_manifest(staging_dir: &Path, total_size: u64, extents: &[PartExtent]) -> Vec<u8> {
-    let mut out = format!("{}\n{}\n", EXTENTS_MANIFEST_MAGIC, total_size);
+    let mut out = format!("{}{}\n{}\n", EXTENTS_MANIFEST_PREFIX, EXTENTS_MANIFEST_VERSION, total_size);
     for e in extents {
         let rel = e
             .staged_path
@@ -548,12 +558,19 @@ pub fn encode_extents_manifest(staging_dir: &Path, total_size: u64, extents: &[P
 }
 
 /// Parses a manifest written by `encode_extents_manifest`: (total size, extents).
-pub fn decode_extents_manifest(staging_dir: &Path, bytes: &[u8]) -> Option<(u64, Vec<PartExtent>)> {
+pub fn decode_extents_manifest(staging_dir: &Path, bytes: &[u8]) -> Result<(u64, Vec<PartExtent>), ManifestError> {
+    let first = std::str::from_utf8(bytes).ok().and_then(|t| t.lines().next()).ok_or(ManifestError::Malformed)?;
+    let version: u32 = first.strip_prefix(EXTENTS_MANIFEST_PREFIX).and_then(|v| v.parse().ok()).ok_or(ManifestError::Malformed)?;
+    if version > EXTENTS_MANIFEST_VERSION {
+        return Err(ManifestError::NewerVersion { found: version, supported: EXTENTS_MANIFEST_VERSION });
+    }
+    decode_manifest_v1(staging_dir, bytes).ok_or(ManifestError::Malformed)
+}
+
+fn decode_manifest_v1(staging_dir: &Path, bytes: &[u8]) -> Option<(u64, Vec<PartExtent>)> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut lines = text.lines();
-    if lines.next()? != EXTENTS_MANIFEST_MAGIC {
-        return None;
-    }
+    lines.next()?;
     let total: u64 = lines.next()?.parse().ok()?;
     let mut extents = Vec::new();
     for line in lines {
