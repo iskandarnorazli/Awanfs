@@ -53,5 +53,15 @@ class TestRunWarpBenchmark(unittest.TestCase):
         self.assertIn("MinIO Community Baseline", report)
         self.assertIn("Peak RSS", report)
 
+    def test_report_states_put_durability(self):
+        report = format_markdown_report("cmd", {}, {}, {})
+        self.assertIn("Durability per PUT", report)
+        self.assertIn("#490", report)
+
+    def test_report_has_no_unsourced_reference_ranges(self):
+        report = format_markdown_report("cmd", {}, {}, {})
+        self.assertNotIn("Published Ref", report)
+        self.assertNotRegex(report, r"~[0-9]")
+
 if __name__ == "__main__":
     unittest.main()
