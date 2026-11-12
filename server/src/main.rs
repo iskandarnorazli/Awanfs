@@ -21,6 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut listen = std::env::var("AWANFS_LISTEN").unwrap_or_else(|_| "127.0.0.1".to_string());
     let mut allow_anonymous = std::env::var("AWANFS_ALLOW_ANONYMOUS").ok().as_deref() == Some("1");
     let mut access_log: Option<String> = None;
+    let mut otlp: Option<String> = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().filter(|s| !s.is_empty());
     let mut auto_compaction = std::env::var("AWANFS_AUTO_COMPACTION").ok().as_deref() != Some("off");
     let mut durability = std::env::var("AWANFS_DURABILITY").unwrap_or_else(|_| "group".to_string());
 
@@ -40,6 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if let Some(d) = args.next() {
                 durability = d;
             }
+        } else if arg == "--otlp-endpoint" {
+            otlp = args.next();
         } else if arg == "--auto-compaction" {
             auto_compaction = args.next().as_deref() != Some("off");
         } else if arg == "--access-log" {
@@ -72,6 +75,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     state.auth = auth;
     state.set_durability(durability);
+    // Traces (#43): off unless an OTLP endpoint is given.
+    if let Some(ref endpoint) = otlp {
+        if let Err(e) = s3_server::trace::init(endpoint, "awanfs") {
+            eprintln!("cannot start OTLP export: {}", e);
+            std::process::exit(2);
+        }
+    }
     // S3 server access log (#46): --access-log <file> or -, or AWANFS_ACCESS_LOG; off by default.
     if let Some(target) = access_log.or_else(|| std::env::var("AWANFS_ACCESS_LOG").ok()).filter(|t| !t.is_empty()) {
         let sink: s3_server::request_log::LogSink = if target == "-" {
