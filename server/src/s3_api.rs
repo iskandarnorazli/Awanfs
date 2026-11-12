@@ -1084,7 +1084,7 @@ pub async fn handle_s3_request(
                     declared_parts.push((p_num, etag));
                 }
 
-                match state.multipart.complete_upload(upload_id, &declared_parts) {
+                match state.multipart.prepare_complete(upload_id, &declared_parts) {
                     Ok((composite_etag, total_size, extents)) => {
                         // Store object in @flat ObjectMeta
                         let (hi, lo, _, _) = compute_md5(composite_etag.as_bytes());
@@ -1104,6 +1104,14 @@ pub async fn handle_s3_request(
                         };
                         // The manifest is metadata, not object bytes: keep it out of the payload cache.
                         state.payload_cache.remove(b_id, manifest_offset);
+                        if let Err(code) = state.multipart.commit_complete(upload_id, extents.clone()) {
+                            let xml = s3_error_xml(code, "The upload was aborted or completed while this request ran.", &key, "req-complete");
+                            return Ok(Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .header(CONTENT_TYPE, "application/xml")
+                                .body(full_body(Bytes::from(xml)))
+                                .unwrap());
+                        }
                         let mut engine = state.engine.write();
                         engine.put_object(
                             b_id,

@@ -206,7 +206,20 @@ impl MultipartManager {
         Ok(())
     }
 
+    /// Validates and completes in one step (prepare, then commit).
     pub fn complete_upload(
+        &self,
+        upload_id: &str,
+        declared_parts: &[(u32, String)], // (part_number, etag)
+    ) -> Result<(String, u64, Vec<PartExtent>), &'static str> {
+        let (etag, total, extents) = self.prepare_complete(upload_id, declared_parts)?;
+        self.commit_complete(upload_id, extents.clone())?;
+        Ok((etag, total, extents))
+    }
+
+    /// Checks the part list and computes the object's extents and ETag without changing
+    /// anything, so a failure after this (the manifest write) leaves the upload in place.
+    pub fn prepare_complete(
         &self,
         upload_id: &str,
         declared_parts: &[(u32, String)], // (part_number, etag)
@@ -215,7 +228,7 @@ impl MultipartManager {
             return Err("MalformedXML");
         }
 
-        let mut uploads = self.uploads.write();
+        let uploads = self.uploads.read();
         let upload = uploads.get(upload_id).ok_or("NoSuchUpload")?;
 
         // 1. Verify strictly ascending part order (InvalidPartOrder)
@@ -271,15 +284,15 @@ impl MultipartManager {
         }
         let composite_etag = format!("{}-{}", composite_hex, staged_selected.len());
 
-        // Successfully validated: now remove upload from in-progress manifest
-        let upload = uploads.remove(upload_id).unwrap();
-
-        // Store completed extents for fast zero-copy range queries
-        self.completed_extents
-            .write()
-            .insert((upload.bucket_id, upload.key.clone()), extents.clone());
-
         Ok((composite_etag, cumulative_end, extents))
+    }
+
+    /// Ends the upload and registers the object's extents. Call it after the manifest needle
+    /// is written. `NoSuchUpload` if the upload was aborted or completed meanwhile.
+    pub fn commit_complete(&self, upload_id: &str, extents: Vec<PartExtent>) -> Result<(), &'static str> {
+        let upload = self.uploads.write().remove(upload_id).ok_or("NoSuchUpload")?;
+        self.completed_extents.write().insert((upload.bucket_id, upload.key.clone()), extents);
+        Ok(())
     }
 
     pub fn get_completed_extents(&self, bucket_id: u32, key: &str) -> Option<Vec<PartExtent>> {
