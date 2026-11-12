@@ -120,7 +120,7 @@ def wait_port(port: int, timeout: float = 20.0) -> bool:
 def start_awanfs(server_bin: str) -> Tuple[subprocess.Popen, int, str]:
     data = tempfile.mkdtemp(prefix="ratio_awanfs_")
     port = get_free_port()
-    proc = subprocess.Popen([server_bin, "--port", str(port), "--data-dir", data],
+    proc = subprocess.Popen([server_bin, "--port", str(port), "--data-dir", data, "--allow-anonymous"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if not wait_port(port):
         proc.kill()

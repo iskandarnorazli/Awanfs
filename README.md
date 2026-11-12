@@ -92,9 +92,13 @@ cargo build --release
 
 ### Run Server
 ```bash
-# Start listening on port 9000 with custom data directory
-./target/release/s3-server --port 9000 --data-dir ./s3_data
+# Port 9000, data in ./s3_data, requests must carry a SigV4 signature made with these keys
+AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
+  ./target/release/s3-server --port 9000 --data-dir ./s3_data
 ```
+- The server listens on `127.0.0.1` only. `--listen 0.0.0.0` (or `AWANFS_LISTEN`) opens it to the network; there is no TLS yet (#30), so put it behind a TLS proxy first.
+- Requests are checked with AWS Signature Version 4, in the `Authorization` header or as a presigned URL, against `AWANFS_ACCESS_KEY`/`AWANFS_SECRET_KEY`. A body whose SHA-256 differs from `x-amz-content-sha256` is refused. One key pair for now; IAM-style users and policies are #53.
+- `--allow-anonymous` (or `AWANFS_ALLOW_ANONYMOUS=1`) also accepts unsigned requests, for local tests and benchmarks. Without keys and without that flag the server refuses to start (exit code 2).
 
 ### Run the Test Suite
 ```bash
