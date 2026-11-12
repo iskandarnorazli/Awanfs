@@ -12,7 +12,7 @@ Split from `awan-lang/awan-storage` on 2026-11-12, with its git history. Measure
 
 Read this before you run it anywhere that matters. Plan of record: the Phase 1-4 milestones and [`ROADMAP_AND_DEPENDENCIES.md`](ROADMAP_AND_DEPENDENCIES.md); decisions in [`ARCHITECTURE.md`](ARCHITECTURE.md#0-decisions-2026-11-12).
 
-- **No authentication yet.** Signatures are not verified and no access keys exist, and the server listens on all interfaces: anyone who can reach the port can read, write and delete. Fix: #35 (localhost by default, SigV4 checked against configured keys).
+- **One access key, no TLS.** Requests are checked with SigV4 against one key pair and the server listens on 127.0.0.1 by default (#35). There are no per-user policies (#53) and no TLS (#30): put a TLS proxy in front before opening it to a network.
 - **PUTs are not synced to disk before the 200 yet.** A power cut can lose acknowledged writes; a process crash does not (the page cache survives, `process_restart_test.rs`). Fix: #29 makes group commit the default, with `fast` and `strict` as opt-in modes.
 - **One 32 GiB volume.** When it is full, writes fail with 500 (they used to overwrite old data). Fix: #37.
 - Whole request bodies are held in memory, with no size limit (#36).
