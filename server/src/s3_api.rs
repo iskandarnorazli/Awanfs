@@ -653,6 +653,67 @@ impl S3ServiceState {
         self.compact_oldest_volume().await
     }
 
+    /// (dead bytes, used bytes) of a volume: a needle is live when an index row points at it.
+    /// Reads every needle header of the volume, so it costs about one read per needle.
+    pub fn volume_usage(&self, vol_id: u32) -> Result<(u64, u64), VolumeError> {
+        let vm = self.volumes.read().get(&vol_id).cloned().ok_or(VolumeError::CorruptIndex)?;
+        let mut needles = Vec::new();
+        vm.recover_needles(|b_id, key, offset, size, _, _, _, _| needles.push((b_id as u32, key, offset, size)))?;
+        let engine = self.engine.read();
+        let mut dead = 0;
+        for (b_id, key, offset, size) in needles {
+            let total = (64 + key.len() as u64 + size).div_ceil(crate::direct_io::SECTOR_SIZE as u64) * crate::direct_io::SECTOR_SIZE as u64;
+            let live = engine.get_object(b_id, key.as_bytes()).map(|m| m.vol_offset == global_offset(vol_id, offset)).unwrap_or(false);
+            if !live {
+                dead += total;
+            }
+        }
+        Ok((dead, vm.offset().saturating_sub(crate::direct_io::SECTOR_SIZE as u64)))
+    }
+
+    /// One step of automatic compaction (#14, owner decision 15): compacts the oldest volume
+    /// when at least `threshold` of its used bytes are dead. A lone active volume is sealed and
+    /// compacted only once it holds at least `min_bytes`, so a small server does not roll over
+    /// a fresh volume on every pass. Returns the report when it compacted.
+    pub async fn auto_compact_once(&self, threshold: f64, min_bytes: u64) -> Result<Option<CompactionReport>, VolumeError> {
+        if self.data_dir.is_none() {
+            return Ok(None);
+        }
+        let active = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+        let oldest = match self.volumes.read().keys().next().copied() {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        if oldest == active.id() && active.offset() < min_bytes {
+            return Ok(None);
+        }
+        let (dead, used) = self.volume_usage(oldest)?;
+        if used == 0 || (dead as f64) < threshold * used as f64 {
+            return Ok(None);
+        }
+        Ok(Some(self.perform_online_compaction().await?))
+    }
+
+    /// Runs `auto_compact_once` every `every` while the state is alive. The binary starts this
+    /// unless `--auto-compaction off`; the library never starts it by itself.
+    pub fn start_auto_compaction(self: &Arc<Self>, every: std::time::Duration, threshold: f64, min_bytes: u64) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let Some(state) = weak.upgrade() else { return };
+                match state.auto_compact_once(threshold, min_bytes).await {
+                    Ok(Some(r)) => eprintln!(
+                        "auto-compaction: moved {} live needles, reclaimed {} dead ones",
+                        r.live_needles_copied, r.dead_needles_reclaimed
+                    ),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("auto-compaction failed: {:?}", e),
+                }
+            }
+        });
+    }
+
     /// Moves the live needles of the oldest sealed volume to the active volume and deletes
     /// the old volume (#14). Safe while requests run:
     /// - each live needle is copied under its key lock, and the index row moves only if it
@@ -704,6 +765,9 @@ impl S3ServiceState {
             self.payload_cache.remove(b_id, g_old);
             report.live_needles_copied += 1;
             report.new_locations.insert(key, loc);
+            drop(_guard);
+            // Let requests run between copies: compaction is background work.
+            tokio::task::yield_now().await;
         }
 
         // The copies must be on disk before the only other copy goes, in every durability mode.
