@@ -1,9 +1,10 @@
 //! Request authentication: AWS Signature Version 4, in the Authorization header or as a
 //! presigned URL, checked against the configured access key (owner decision 2A, #35).
 //!
-//! Not checked yet: the per-chunk signatures of `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` bodies (the
-//! seed signature over the headers is checked). Plain HTTP is open to tampering anyway until TLS
-//! (#30).
+//! Signed `aws-chunked` bodies (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`): the seed
+//! signature over the headers is checked by `authenticate`, and every chunk's signature, chained
+//! from it, by `ChunkVerifier` (owner decision 14). The trailer signature of the `-TRAILER` form
+//! is not checked; AwanFS does not use the trailing checksum it protects.
 
 use crate::sigv4::{compute_sigv4_signature, parse_iso8601_epoch, SigV4KeyCache};
 use hyper::HeaderMap;
@@ -263,4 +264,82 @@ pub fn payload_hash_ok(headers: &HeaderMap, body: &[u8]) -> bool {
         Some(h) if h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()) => sha256_hex(body).eq_ignore_ascii_case(h),
         _ => true,
     }
+}
+
+/// Hex SHA-256 of the empty string, part of every chunk's string to sign.
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// Checks the chain of chunk signatures of one signed `aws-chunked` body.
+pub struct ChunkVerifier {
+    secret: String,
+    date8: String,
+    region: String,
+    service: String,
+    amz_date: String,
+    previous: String,
+}
+
+impl ChunkVerifier {
+    /// For a request `authenticate` accepted: `Some` when its body is a signed `aws-chunked`
+    /// stream and keys are configured, else `None` (nothing to check).
+    pub fn for_request(cfg: &AuthConfig, headers: &HeaderMap) -> Option<Self> {
+        let (_, secret) = cfg.credentials.as_ref()?;
+        let content = headers.get("x-amz-content-sha256")?.to_str().ok()?;
+        if !content.starts_with("STREAMING-AWS4-HMAC-SHA256-PAYLOAD") {
+            return None;
+        }
+        let auth = headers.get("authorization")?.to_str().ok()?.strip_prefix("AWS4-HMAC-SHA256")?.trim();
+        let mut cred = None;
+        let mut sig = None;
+        for part in auth.split(',') {
+            let part = part.trim();
+            if let Some(v) = part.strip_prefix("Credential=") {
+                cred = Some(v);
+            } else if let Some(v) = part.strip_prefix("Signature=") {
+                sig = Some(v);
+            }
+        }
+        let (_, date8, region, service) = parse_credential(cred?).ok()?;
+        Some(ChunkVerifier {
+            secret: secret.clone(),
+            date8: date8.to_string(),
+            region: region.to_string(),
+            service: service.to_string(),
+            amz_date: headers.get("x-amz-date")?.to_str().ok()?.to_string(),
+            previous: sig?.to_ascii_lowercase(),
+        })
+    }
+
+    /// Checks the next chunk: its signature must be the HMAC of
+    /// `AWS4-HMAC-SHA256-PAYLOAD\n<date>\n<scope>\n<previous signature>\n<sha256("")>\n<sha256(data)>`.
+    pub fn check(&mut self, cache: &SigV4KeyCache, data: &[u8], signature: Option<&str>) -> bool {
+        let Some(signature) = signature else { return false };
+        let sts = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}/{}/{}/aws4_request\n{}\n{}\n{}",
+            self.amz_date,
+            self.date8,
+            self.region,
+            self.service,
+            self.previous,
+            EMPTY_SHA256,
+            sha256_hex(data)
+        );
+        let expected = compute_sigv4_signature(cache, &self.secret, &self.date8, &self.region, &self.service, &sts);
+        if constant_time_eq(&expected, &signature.to_ascii_lowercase()) {
+            self.previous = expected;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Is this body `aws-chunked` framed? Any `STREAMING-*` content hash, or
+/// `Content-Encoding: aws-chunked`.
+pub fn is_aws_chunked(headers: &HeaderMap) -> bool {
+    headers.get("x-amz-content-sha256").and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("STREAMING-"))
+        || headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.split(',').any(|e| e.trim().eq_ignore_ascii_case("aws-chunked")))
 }
