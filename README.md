@@ -1,4 +1,6 @@
-# S3 Storage Server (`s3-server`)
+# AwanFS (`s3-server`)
+
+Split from `awan-lang/awan-storage` on 2026-11-12, with its git history. Measurement files keep the commands they were produced with, which use the old `benchmarks/s3_warp/` path.
 
 > **High-Performance, S3-Compatible Object Storage Daemon in Pure Rust**  
 > Engineered for microsecond-latency compute, AI agent sandboxes, and high-throughput checkpointing.  
@@ -47,7 +49,7 @@
 
 ## 2. Live Measured 3-Way Benchmark Results (Awan vs MinIO vs RustFS)
 
-Measured live on physical AMD64 NVMe storage (16 logical cores, 32 GB RAM, Windows 11) using persistent HTTP/1.1 keep-alive connections across 64 concurrent client workers (`python benchmarks/s3_warp/run_warp_benchmark.py`):
+Measured live on physical AMD64 NVMe storage (16 logical cores, 32 GB RAM, Windows 11) using persistent HTTP/1.1 keep-alive connections across 64 concurrent client workers (`python benchmarks/run_warp_benchmark.py`):
 
 | Workload | `s3-server` (`--release`) | MinIO Reference (`RELEASE.2025-09-07`) | RustFS Reference (`v1.0.5`) | Speedup vs MinIO |
 | :--- | :---: | :---: | :---: | :---: |
@@ -73,7 +75,7 @@ The table lists every workload in the report, including the three where `s3-serv
 
 ### Build from Source
 ```bash
-cd awan-storage/server
+cd server
 cargo build --release
 ```
 
@@ -85,13 +87,13 @@ cargo build --release
 
 ### Run Pure Rust Test Suite (58 Tests)
 ```bash
-cd awan-storage/server
+cd server
 cargo test
 ```
 
 ### Run Live Head-to-Head Benchmark Suite
 ```bash
-python benchmarks/s3_warp/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB,10GiB --concurrent 64 --duration 2 --output docs/measurements/s3_warp_minio_vs_awan.md
+python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB,10GiB --concurrent 64 --duration 2 --output docs/measurements/s3_warp_minio_vs_awan.md
 ```
 
 ---
@@ -116,4 +118,4 @@ Pre-compiled standalone binaries with SHA-256 integrity verification:
 - `dist/s3-server-x86_64-windows.exe` (Windows x86_64 Release Binary)
 - `dist/SHA256SUMS.txt` (SHA-256 Checksum Manifest)
 
-The entire `awan-storage/` folder can be copied or shared standalone as a complete, independent Rust project.
+The repository can be copied or shared standalone as a complete, independent Rust project.
