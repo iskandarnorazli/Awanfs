@@ -1,0 +1,92 @@
+name: Nightly MinIO ratio
+
+# Layer 2 performance regression check (benchmarks/ratio_check.py): AwanFS throughput divided by
+# MinIO's on the same GitHub-hosted runner, median of 5 runs. A ratio more than 20% below
+# benchmarks/ratio_baseline.json fails the run and opens (or comments on) a perf-regression issue.
+# It never gates a pull request; PRs that change the check itself run it once.
+
+on:
+  schedule:
+    - cron: "17 19 * * *" # 03:17 in Malaysia
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "benchmarks/ratio_check.py"
+      - "benchmarks/ratio_baseline.json"
+      - ".github/workflows/bench-ratio.yml"
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+
+jobs:
+  ratio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Build s3-server
+        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+
+      - name: Fetch MinIO and mc
+        run: |
+          mkdir -p .tmp/minio
+          # Archived release binary first; the published Docker image as a fallback.
+          if ! curl -fsSL -o .tmp/minio/minio "https://dl.min.io/server/minio/release/linux-amd64/archive/minio.${MINIO_RELEASE}"; then
+            docker pull "minio/minio:${MINIO_RELEASE}"
+            id=$(docker create "minio/minio:${MINIO_RELEASE}")
+            docker cp "$id:/usr/bin/minio" .tmp/minio/minio
+            docker rm "$id"
+          fi
+          if ! curl -fsSL -o .tmp/minio/mc "https://dl.min.io/client/mc/release/linux-amd64/mc"; then
+            docker pull minio/mc:latest
+            id=$(docker create minio/mc:latest)
+            docker cp "$id:/usr/bin/mc" .tmp/minio/mc
+            docker rm "$id"
+          fi
+          chmod +x .tmp/minio/minio .tmp/minio/mc
+          .tmp/minio/minio --version
+          .tmp/minio/mc --version
+
+      - name: Ratio check self-tests
+        run: python benchmarks/test_ratio_check.py
+
+      - name: Run the ratio check
+        id: ratio
+        run: |
+          set +e
+          python benchmarks/ratio_check.py --server-bin server/target/release/s3-server \
+            --minio-bin .tmp/minio/minio --mc-bin .tmp/minio/mc --runs 5 --duration 3 \
+            --report ratio_report.md
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          [ -f ratio_report.md ] && cat ratio_report.md >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ratio-report
+          path: ratio_report.md
+          if-no-files-found: ignore
+
+      - name: Open or update a perf-regression issue
+        if: failure() && steps.ratio.outputs.code == '1' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create perf-regression --color B60205 --description "Nightly MinIO ratio dropped" 2>/dev/null || true
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          body="$(printf 'Nightly ratio check failed: %s\n\n' "$run_url"; cat ratio_report.md)"
+          n=$(gh issue list --label perf-regression --state open --json number --jq '.[0].number')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body "$body"
+          else
+            gh issue create --title "Nightly MinIO ratio regression" --label perf-regression --body "$body"
+          fi
