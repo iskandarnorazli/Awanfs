@@ -103,6 +103,7 @@ AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
   - `fast`: writes are acknowledged before they reach the disk and a background thread syncs once a second, so about the last second of acknowledged writes can be lost. For caches and data you can fetch again.
   - `strict`: each write is synced on its own before the answer. Slowest; no batching.
   A killed process (no power cut) loses nothing acknowledged in any mode.
+- Health probes, without authentication: `GET /_awanfs/health/live` (200 while the process serves) and `GET /_awanfs/health/ready` (200, or 503 with the reason). `_` cannot appear in a bucket name, so these paths never shadow a bucket.
 - `--allow-anonymous` (or `AWANFS_ALLOW_ANONYMOUS=1`) also accepts unsigned requests, for local tests and benchmarks. Without keys and without that flag the server refuses to start (exit code 2).
 
 ### Run the Test Suite

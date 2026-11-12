@@ -429,6 +429,8 @@ pub struct S3ServiceState {
     pub key_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
     /// Who may call; `AuthConfig::open()` by default, the binary sets it from flags and env.
     pub auth: crate::auth::AuthConfig,
+    /// Why the server is not ready yet (`None` when it is); see `/_awanfs/health/ready` (#44).
+    pub not_ready: Arc<RwLock<Option<&'static str>>>,
 }
 
 impl S3ServiceState {
@@ -469,6 +471,7 @@ impl S3ServiceState {
             test_hook: Arc::new(RwLock::new(None)),
             key_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
             auth: crate::auth::AuthConfig::open(),
+            not_ready: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -593,6 +596,7 @@ impl S3ServiceState {
             test_hook: Arc::new(RwLock::new(None)),
             key_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
             auth: crate::auth::AuthConfig::open(),
+            not_ready: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -917,10 +921,64 @@ impl Default for S3ServiceState {
     }
 }
 
+/// Reserved prefix for the server's own endpoints. `_` is not allowed in bucket names, so
+/// nothing here can shadow a bucket (#44).
+pub const ADMIN_PREFIX: &str = "/_awanfs/";
+
+fn plain(status: StatusCode, text: &str) -> Response<ResponseBody> {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(full_body(Bytes::from(format!("{}\n", text))))
+        .unwrap()
+}
+
+impl S3ServiceState {
+    /// `None` when the server can take writes, else the reason it cannot.
+    pub fn readiness(&self) -> Option<String> {
+        if let Some(r) = *self.not_ready.read() {
+            return Some(r.to_string());
+        }
+        let vm = match self.volume_manager.read().clone() {
+            Some(vm) => vm,
+            None => return Some("no volume is open".to_string()),
+        };
+        // A full volume rolls over on the next write (#37); it is only "not ready" when even
+        // the smallest needle cannot fit in a fresh volume of this span.
+        if vm.max_span() < 2 * crate::direct_io::SECTOR_SIZE as u64 {
+            return Some(format!("volume span {} leaves no room for a needle", vm.max_span()));
+        }
+        None
+    }
+
+    /// Marks the server not ready (for example while recovering), or ready again with `None`.
+    pub fn set_not_ready(&self, reason: Option<&'static str>) {
+        *self.not_ready.write() = reason;
+    }
+}
+
+/// `/_awanfs/health/live` and `/_awanfs/health/ready`, answered without authentication.
+fn admin_response(state: &S3ServiceState, method: &Method, path: &str) -> Response<ResponseBody> {
+    if method != Method::GET && method != Method::HEAD {
+        return plain(StatusCode::METHOD_NOT_ALLOWED, "GET or HEAD");
+    }
+    match path {
+        "/_awanfs/health/live" => plain(StatusCode::OK, "live"),
+        "/_awanfs/health/ready" => match state.readiness() {
+            None => plain(StatusCode::OK, "ready"),
+            Some(reason) => plain(StatusCode::SERVICE_UNAVAILABLE, &format!("not ready: {}", reason)),
+        },
+        _ => plain(StatusCode::NOT_FOUND, "no such endpoint"),
+    }
+}
+
 pub async fn handle_s3_request(
     state: Arc<S3ServiceState>,
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
+    if req.uri().path().starts_with(ADMIN_PREFIX) {
+        return Ok(admin_response(&state, req.method(), req.uri().path()));
+    }
     let method = req.method().clone();
     let uri = req.uri().clone();
     let path = uri.path();
