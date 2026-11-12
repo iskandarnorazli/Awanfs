@@ -58,19 +58,18 @@ async fn a_chunked_xml_body_past_the_cap_is_refused() {
     let addr = server().await;
     let c = reqwest::Client::new();
     assert!(c.put(format!("http://{}/lim-bkt", addr)).send().await.unwrap().status().is_success());
-    // No Content-Length: the cap applies while the body is read.
+    // No Content-Length: the cap applies while the body is read. Send 16 MiB and one byte
+    // more, and nothing after it: the server has read everything sent when it answers, so
+    // its close is not a reset that could drop the answer (seen on Windows).
     let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
     s.write_all(format!("POST /lim-bkt?delete HTTP/1.1\r\nHost: {}\r\nTransfer-Encoding: chunked\r\n\r\n", addr).as_bytes()).await.unwrap();
     let chunk = vec![b'a'; 1 << 20];
-    for _ in 0..20 {
-        if s.write_all(format!("{:x}\r\n", chunk.len()).as_bytes()).await.is_err()
-            || s.write_all(&chunk).await.is_err()
-            || s.write_all(b"\r\n").await.is_err()
-        {
-            break; // the server answered and closed
-        }
+    for _ in 0..16 {
+        s.write_all(format!("{:x}\r\n", chunk.len()).as_bytes()).await.unwrap();
+        s.write_all(&chunk).await.unwrap();
+        s.write_all(b"\r\n").await.unwrap();
     }
-    let _ = s.write_all(b"0\r\n\r\n").await;
+    s.write_all(b"1\r\na").await.unwrap();
     let mut buf = vec![0u8; 4096];
     let n = tokio::time::timeout(Duration::from_secs(10), s.read(&mut buf)).await.expect("an answer").unwrap();
     let r = String::from_utf8_lossy(&buf[..n]);
