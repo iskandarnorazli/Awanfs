@@ -97,7 +97,7 @@ AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
   ./target/release/s3-server --port 9000 --data-dir ./s3_data
 ```
 - The server listens on `127.0.0.1` only. `--listen 0.0.0.0` (or `AWANFS_LISTEN`) opens it to the network; there is no TLS yet (#30), so put it behind a TLS proxy first.
-- Requests are checked with AWS Signature Version 4, in the `Authorization` header or as a presigned URL, against `AWANFS_ACCESS_KEY`/`AWANFS_SECRET_KEY`. A body whose SHA-256 differs from `x-amz-content-sha256` is refused. One key pair for now; IAM-style users and policies are #53.
+- Requests are checked with AWS Signature Version 4, in the `Authorization` header or as a presigned URL, against `AWANFS_ACCESS_KEY`/`AWANFS_SECRET_KEY`. A body whose SHA-256 differs from `x-amz-content-sha256` is refused. More users with policies: `--config` below.
 - `--durability group|fast|strict` (or `AWANFS_DURABILITY`) sets when a write is acknowledged. After a power cut:
   - `group` (default): every acknowledged PUT, DELETE and multipart completion is kept. Writers wait for a shared sync of the volume and its journal; concurrent writers share one.
   - `fast`: writes are acknowledged before they reach the disk and a background thread syncs once a second, so about the last second of acknowledged writes can be lost. For caches and data you can fetch again.
@@ -108,6 +108,15 @@ AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
 - Dashboards and alerts: `deploy/grafana/awanfs-dashboard.json` (Grafana) and `deploy/prometheus/alerts.yml` (Prometheus rules), both built on `/_awanfs/metrics`.
 - Access log (off by default): `--access-log <file>` or `--access-log -` for stdout (or `AWANFS_ACCESS_LOG`) writes one line per request in the Amazon S3 server access log format: requester access key, operation, bucket, key, status, error code, bytes, time, request ID.
 - Stopping: Ctrl-C or SIGTERM (Ctrl-Break, console close or system shutdown on Windows) marks the server not ready, stops accepting connections, lets requests in flight finish (up to 30 s), syncs every volume and exits 0.
+- Several users with policies: `--config awanfs.toml` (or `AWANFS_CONFIG`). The file holds secrets, so on Unix the server refuses it unless only its owner can read it (`chmod 600`). Each user has an AWS-style policy (Effect Allow/Deny, Action and Resource with `*` and `?`; Condition, Principal and NotAction are refused rather than ignored). Explicit Deny wins. The file reloads within 60 s of a change, or on SIGHUP. The `AWANFS_ACCESS_KEY` pair, if set, keeps full access.
+  ```toml
+  [[users]]
+  name = "reader"
+  access_key = "AKREADER"
+  secret_key = "change-me"
+  policy = '''{"Statement": [{"Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"],
+                              "Resource": ["arn:aws:s3:::photos", "arn:aws:s3:::photos/*"]}]}'''
+  ```
 - `--allow-anonymous` (or `AWANFS_ALLOW_ANONYMOUS=1`) also accepts unsigned requests, for local tests and benchmarks. Without keys and without that flag the server refuses to start (exit code 2).
 
 ### Docker and systemd

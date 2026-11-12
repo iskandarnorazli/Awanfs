@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod multipart;
 pub mod mvcc;
 pub mod reactor;
+pub mod iam;
 pub mod request_log;
 pub mod s3_api;
 pub mod sigv4;
