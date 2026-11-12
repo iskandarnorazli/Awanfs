@@ -239,6 +239,10 @@ pub fn validate_s3_key(key: &str) -> Result<(), crate::error::S3ErrorCode> {
 
 static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Called at named points of a request, with the object key; tests use it to force an order
+/// of steps between concurrent requests. `None` (the default) costs one read-lock per point.
+pub type TestHook = Arc<dyn Fn(&'static str, &str) + Send + Sync>;
+
 pub struct S3ServiceState {
     pub engine: Arc<RwLock<AwanStorageEngine>>,
     pub multipart: Arc<MultipartManager>,
@@ -256,6 +260,7 @@ pub struct S3ServiceState {
     pub next_vol_offset: Arc<RwLock<u64>>,
     /// Disk writes, syncs, reads and payload copies, for the work-count tests.
     pub work: Arc<WorkCounters>,
+    pub test_hook: Arc<RwLock<Option<TestHook>>>,
 }
 
 impl S3ServiceState {
@@ -291,6 +296,7 @@ impl S3ServiceState {
             payload_cache: Arc::new(PayloadCache::default_auto_scaled()),
             next_vol_offset: Arc::new(RwLock::new(4096)),
             work,
+            test_hook: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -398,6 +404,7 @@ impl S3ServiceState {
             payload_cache: Arc::new(PayloadCache::default_auto_scaled()),
             next_vol_offset: Arc::new(RwLock::new(initial_vol_offset)),
             work,
+            test_hook: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -455,6 +462,13 @@ impl S3ServiceState {
         self.tombstone_bytes.store(0, Ordering::Relaxed);
 
         Ok(report)
+    }
+
+    pub fn hook(&self, point: &'static str, key: &str) {
+        let hook = self.test_hook.read().clone();
+        if let Some(h) = hook {
+            h(point, key);
+        }
     }
 
     /// Writes the payload to the volume. An error means nothing was stored.
@@ -1286,6 +1300,7 @@ pub async fn handle_s3_request(
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                         }
                     };
+                    state.hook("put_stored", &key);
 
                     if let Some((prev_off, prev_sz)) = old_info {
                         if prev_off > 0 && prev_off != vol_offset {
@@ -1546,6 +1561,7 @@ pub async fn handle_s3_request(
                 }
 
                 Method::DELETE => {
+                    state.hook("delete_start", &key);
                     state.mvcc.tombstone(b_id, &key);
                     let old_info = {
                         let mut engine = state.engine.write();
