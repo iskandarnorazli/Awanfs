@@ -312,7 +312,7 @@ pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarge
                     } else {
                         return ParsedTarget::Object {
                             bucket,
-                            key: trimmed_path.to_string(),
+                            key: percent_decode_path(trimmed_path),
                         };
                     }
                 }
@@ -329,11 +329,32 @@ pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarge
     if let Some(key) = parts.next() {
         ParsedTarget::Object {
             bucket,
-            key: key.to_string(),
+            key: percent_decode_path(key),
         }
     } else {
         ParsedTarget::Bucket { bucket }
     }
+}
+
+/// Decodes %XX in a URL path. Unlike query decoding, `+` stays `+`. S3 object keys are the
+/// decoded path: a client sends "my%20file.txt" for the key "my file.txt". Keys used to be
+/// stored as sent, encoded.
+pub fn percent_decode_path(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex_digit(b[i + 1]), hex_digit(b[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub fn hex_digit(b: u8) -> Option<u8> {
@@ -666,6 +687,41 @@ impl S3ServiceState {
         } else {
             (dead as f64) / (tot as f64)
         }
+    }
+
+    /// Deletes one key the way DeleteObject does: under its key lock, the tombstone is logged
+    /// and synced first, and only then is the index row removed. An error means the object is
+    /// still there.
+    pub async fn delete_key(&self, b_id: u32, key: &str) -> Result<(), String> {
+        let _key_guard = self.lock_key(b_id, key).await;
+        self.hook("delete_start", key);
+        // Log the tombstone first; only a logged delete removes the row, so a failed write is
+        // an error and the object stays (verification/tla, DeleteLogsFirst).
+        match self.write_to_active(b_id, key, &[], AWAN_FLAG_TOMBSTONE, 0, 0) {
+            Ok((vm, loc, _)) => {
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                self.make_durable(&vm, loc.seq).await.map_err(|e| format!("could not sync the delete: {:?}", e))?;
+            }
+            Err(e) => return Err(format!("could not record the delete: {:?}", e)),
+        }
+        self.mvcc.tombstone(b_id, key);
+        let old_info = {
+            let mut engine = self.engine.write();
+            let info = engine.get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size));
+            let _ = engine.delete_object(b_id, key.as_bytes());
+            info
+        };
+        if let Some((off, sz)) = old_info {
+            if off > 0 {
+                self.payload_cache.remove(b_id, off);
+                self.needle_crc_map.write().remove(&(b_id, off));
+                let raw_len = 64 + key.len() + sz as usize;
+                let dead_bytes = raw_len.div_ceil(4096) as u64 * 4096;
+                self.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
+            }
+        }
+        Ok(())
     }
 
     /// Compacts the oldest volume. With a single volume, seals it first (the next writes go
@@ -1615,15 +1671,17 @@ async fn handle_s3_inner(
                     while let Some(start) = cursor.find("<Key>") {
                         let rest = &cursor[start + 5..];
                         if let Some(end) = rest.find("</Key>") {
-                            keys_to_delete.push(rest[..end].to_string());
+                            // Keys are XML text: "&amp;" is "&" (it was used escaped before).
+                            let raw = &rest[..end];
+                            keys_to_delete.push(quick_xml::escape::unescape(raw).map(|k| k.into_owned()).unwrap_or_else(|_| raw.to_string()));
                             cursor = &rest[end + 6..];
                         } else {
                             break;
                         }
                     }
 
-                    let mut engine = state.engine.write();
-                    let b_id = match engine.lookup_bucket(&bucket) {
+                    let looked_up = state.engine.read().lookup_bucket(&bucket);
+                    let b_id = match looked_up {
                         Ok(id) => id,
                         Err(_) => {
                             let xml = s3_error_xml("NoSuchBucket", "The specified bucket does not exist", &bucket, "req-del-batch");
@@ -1635,26 +1693,20 @@ async fn handle_s3_inner(
                         }
                     };
 
-                    let mut deleted = Vec::new();
-                    let mut offsets_to_remove = Vec::new();
+                    // Each key goes through delete_key: tombstone logged and synced, under its key
+                    // lock. Before, the rows were dropped with no tombstone, and every deleted
+                    // object came back at the next restart.
+                    let mut ok_keys = Vec::new();
+                    let mut failed: Vec<(String, String)> = Vec::new();
                     for k in &keys_to_delete {
-                        if let Ok(m) = engine.get_object(b_id, k.as_bytes()) {
-                            if m.vol_offset > 0 {
-                                offsets_to_remove.push(m.vol_offset);
-                            }
+                        match state.delete_key(b_id, k).await {
+                            Ok(()) => ok_keys.push(k.as_str()),
+                            Err(e) => failed.push((k.clone(), e)),
                         }
-                        let _ = engine.delete_object(b_id, k.as_bytes());
-                        deleted.push(DeleteItemResult {
-                            key: k.as_str(),
-                            version_id: None,
-                        });
                     }
-                    drop(engine);
-                    for off in offsets_to_remove {
-                        state.payload_cache.remove(b_id, off);
-                    }
-
-                    let xml = delete_objects_result_xml(&deleted, &[]);
+                    let deleted: Vec<DeleteItemResult> = ok_keys.into_iter().map(|key| DeleteItemResult { key, version_id: None }).collect();
+                    let errors: Vec<DeleteErrorItem> = failed.iter().map(|(k, e)| DeleteErrorItem { key: k, code: "InternalError", message: e }).collect();
+                    let xml = delete_objects_result_xml(&deleted, &errors);
                     Ok(Response::builder()
                         .status(StatusCode::OK)
                         .header(CONTENT_TYPE, "application/xml")
@@ -2065,7 +2117,9 @@ async fn handle_s3_inner(
                 Method::PUT => {
                     // Check copy source
                     if let Some(copy_source) = req.headers().get("x-amz-copy-source") {
-                        let copy_src_str = copy_source.to_str().unwrap_or("").trim_start_matches('/');
+                        // x-amz-copy-source is URL-encoded and may end in ?versionId=.
+                        let copy_src_owned = percent_decode_path(copy_source.to_str().unwrap_or("").split('?').next().unwrap_or(""));
+                        let copy_src_str = copy_src_owned.trim_start_matches('/');
                         let (src_bucket, src_key) = match copy_src_str.split_once('/') {
                             Some((b, k)) => (b, k),
                             None => {
@@ -2606,35 +2660,8 @@ async fn handle_s3_inner(
                 }
 
                 Method::DELETE => {
-                    let _key_guard = state.lock_key(b_id, &key).await;
-                    state.hook("delete_start", &key);
-                    // Log the tombstone first; only a logged delete removes the row, so a failed
-                    // write is a 500 and the object stays (verification/tla, DeleteLogsFirst).
-                    match state.write_to_active(b_id, &key, &[], AWAN_FLAG_TOMBSTONE, 0, 0) {
-                        Ok((vm, loc, _)) => {
-                            state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                            state.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                            if let Err(e) = state.make_durable(&vm, loc.seq).await {
-                                return Ok(internal_error_response(&key, &format!("could not sync the delete: {:?}", e)));
-                            }
-                        }
-                        Err(e) => return Ok(internal_error_response(&key, &format!("could not record the delete: {:?}", e))),
-                    }
-                    state.mvcc.tombstone(b_id, &key);
-                    let old_info = {
-                        let mut engine = state.engine.write();
-                        let info = engine.get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size));
-                        let _ = engine.delete_object(b_id, key.as_bytes());
-                        info
-                    };
-                    if let Some((off, sz)) = old_info {
-                        if off > 0 {
-                            state.payload_cache.remove(b_id, off);
-                            state.needle_crc_map.write().remove(&(b_id, off));
-                            let raw_len = 64 + key.as_bytes().len() + sz as usize;
-                            let dead_bytes = (((raw_len + 4095) / 4096) * 4096) as u64;
-                            state.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
-                        }
+                    if let Err(e) = state.delete_key(b_id, &key).await {
+                        return Ok(internal_error_response(&key, &e));
                     }
                     Ok(Response::builder()
                         .status(StatusCode::NO_CONTENT)
