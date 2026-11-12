@@ -150,3 +150,63 @@ async fn a_multipart_object_moved_by_compaction_survives_a_restart() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(&res.bytes().await.unwrap()[..], &part[..]);
 }
+
+/// A PUT of a key that compaction is copying, forced into the copy's window with the
+/// `compact_copy` hook. The PUT must wait for the key lock and end up the current version,
+/// live and after a restart; without the lock, compaction would write the older bytes after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_put_during_the_copy_of_its_key_wins() {
+    use std::io::{Read, Write};
+    use std::sync::Mutex;
+    let dir = temp_dir("window");
+    let c = reqwest::Client::new();
+    let (state, url, handle) = start(&dir, 64 * 1024).await;
+    let host = url.trim_start_matches("http://").to_string();
+    assert_eq!(c.put(format!("{}/cs-bkt", url)).send().await.unwrap().status(), StatusCode::OK);
+    for k in 0..20 {
+        assert_eq!(c.put(format!("{}/cs-bkt/k{}", url, k)).body(body(k, 0)).send().await.unwrap().status(), StatusCode::OK);
+    }
+
+    let put_thread: Arc<Mutex<Option<std::thread::JoinHandle<String>>>> = Arc::new(Mutex::new(None));
+    {
+        let put_thread = Arc::clone(&put_thread);
+        let host = host.clone();
+        let hook: s3_server::TestHook = Arc::new(move |point, key| {
+            if point != "compact_copy" || key != "k0" {
+                return;
+            }
+            let mut slot = put_thread.lock().unwrap();
+            if slot.is_some() {
+                return;
+            }
+            let host = host.clone();
+            *slot = Some(std::thread::spawn(move || {
+                let b = body(0, 7);
+                let mut s = std::net::TcpStream::connect(&host).unwrap();
+                s.write_all(format!("PUT /cs-bkt/k0 HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", host, b.len()).as_bytes()).unwrap();
+                s.write_all(&b).unwrap();
+                let mut out = String::new();
+                let _ = s.read_to_string(&mut out);
+                out
+            }));
+            drop(slot);
+            // Give the PUT time to run if nothing stops it; with the key lock held it waits.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+        *state.test_hook.write() = Some(hook);
+    }
+    state.compact_oldest_volume().await.expect("compaction");
+    *state.test_hook.write() = None;
+    let t = put_thread.lock().unwrap().take().expect("the hook ran for k0");
+    let answer = tokio::task::spawn_blocking(move || t.join().unwrap()).await.unwrap();
+    assert!(answer.starts_with("HTTP/1.1 200"), "{}", answer);
+
+    state.payload_cache.clear();
+    let got = c.get(format!("{}/cs-bkt/k0", url)).send().await.unwrap().bytes().await.unwrap();
+    assert!(&got[..] == &body(0, 7)[..], "live: the PUT's version, not the compacted copy");
+    handle.shutdown();
+    drop(state);
+    let (_s, url, _h) = start(&dir, 64 * 1024).await;
+    let got = c.get(format!("{}/cs-bkt/k0", url)).send().await.unwrap().bytes().await.unwrap();
+    assert!(&got[..] == &body(0, 7)[..], "after the restart: the PUT's version");
+}
