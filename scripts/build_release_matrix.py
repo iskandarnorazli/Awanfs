@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-awan-storage/scripts/build_release_matrix.py
+scripts/build_release_matrix.py
 Multi-OS and Multi-Architecture Release Binary Matrix Packaging Script
-Packages a 100% self-contained compiled-binary distribution inside `awan-storage/dist/`
+Packages a 100% self-contained compiled-binary distribution inside `dist/`
 for the standalone S3 Server (`s3-server`):
   1. `s3-server-x86_64-windows.exe` (Drop-in S3-compatible server daemon)
   2. Multi-target cross-compilation verification (`x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`)
@@ -33,7 +33,7 @@ def main():
     os.makedirs(dist_dir, exist_ok=True)
     os.makedirs(meas_dir, exist_ok=True)
 
-    producing_cmd = "python awan-storage/scripts/build_release_matrix.py"
+    producing_cmd = "python scripts/build_release_matrix.py"
     print(f"Building Standalone Self-Contained S3 Server Release Matrix under {dist_dir}...")
 
     server_manifest = os.path.join(server_dir, "Cargo.toml")
@@ -87,8 +87,8 @@ def main():
 
 # S3 Server Standalone Release Binary Matrix Report
 
-- **Distribution Directory:** `awan-storage/dist/` (100% self-contained compiled Rust binary; zero external dependencies)
-- **Integrity Manifest:** `awan-storage/dist/SHA256SUMS.txt`
+- **Distribution Directory:** `dist/` (100% self-contained compiled Rust binary; zero external dependencies)
+- **Integrity Manifest:** `dist/SHA256SUMS.txt`
 - **Host Environment:** Windows x86_64 (`x86_64-pc-windows-msvc`)
 - **Release Profile:** Optimized (`--release`), Pure Rust S3 Server (`s3-server`).
 
@@ -102,7 +102,7 @@ def main():
 | `s3-server-aarch64-linux-gnu` | `aarch64-unknown-linux-gnu` | **`cargo check --target aarch64-unknown-linux-gnu` PASS** | Built in Linux CI | Built in Linux CI |
 
 ## 2. Release Binary Smoke Test & Checksum Verification
-- S3 Server binary tested: `awan-storage/dist/s3-server-x86_64-windows.exe --port 9999`
+- S3 Server binary tested: `dist/s3-server-x86_64-windows.exe --port 9999`
 - Full `SHA256SUMS.txt` entry:
   `{server_sha}  s3-server-x86_64-windows.exe`
 """
