@@ -140,6 +140,17 @@ impl hyper::body::Body for ChunksBody {
 /// in memory (#36). Smaller ones are collected, and cached after the write.
 pub const STREAM_PUT_MIN: u64 = 4 * 1024 * 1024;
 
+/// Reads and drops what is left of a request body, at most `limit` bytes.
+async fn drain_body(body: &mut hyper::body::Incoming, limit: u64) {
+    let mut seen = 0u64;
+    while seen < limit {
+        match body.frame().await {
+            Some(Ok(f)) => seen += f.data_ref().map_or(0, |d| d.len() as u64),
+            _ => break,
+        }
+    }
+}
+
 /// The end of a PutObject once the needle is durable: index row, bookkeeping, answer.
 #[allow(clippy::too_many_arguments)]
 fn finish_put(
@@ -1750,6 +1761,9 @@ async fn handle_s3_inner(
                             match fed {
                                 Ok(()) => {}
                                 Err(crate::aws_chunked::PushError::Decode(e)) => {
+                                    // Read the rest of the body (up to 64 MiB) before answering, so the client
+                                    // gets the error instead of a reset connection (seen on Windows).
+                                    drain_body(&mut body, 64 << 20).await;
                                     let status = if e == "SignatureDoesNotMatch" { StatusCode::FORBIDDEN } else { StatusCode::BAD_REQUEST };
                                     return Ok(Response::builder()
                                         .status(status)
@@ -2204,6 +2218,9 @@ async fn handle_s3_inner(
                                 match fed {
                                     Ok(()) => {}
                                     Err(crate::aws_chunked::PushError::Decode(e)) => {
+                                        // Read the rest of the body (up to 64 MiB) before answering, so the client
+                                        // gets the error instead of a reset connection (seen on Windows).
+                                        drain_body(&mut body, 64 << 20).await;
                                         let status = if e == "SignatureDoesNotMatch" { StatusCode::FORBIDDEN } else { StatusCode::BAD_REQUEST };
                                         return Ok(Response::builder()
                                             .status(status)
