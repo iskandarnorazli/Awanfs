@@ -24,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut tls_cert: Option<PathBuf> = std::env::var("AWANFS_TLS_CERT").ok().filter(|s| !s.is_empty()).map(PathBuf::from);
     let mut tls_key: Option<PathBuf> = std::env::var("AWANFS_TLS_KEY").ok().filter(|s| !s.is_empty()).map(PathBuf::from);
     let mut http_port: Option<u16> = None;
+    let mut compaction_mb: Option<u64> = std::env::var("AWANFS_COMPACTION_RATE_MB").ok().and_then(|v| v.parse().ok());
     let mut auto_compaction = std::env::var("AWANFS_AUTO_COMPACTION").ok().as_deref() != Some("off");
     let mut durability = std::env::var("AWANFS_DURABILITY").unwrap_or_else(|_| "group".to_string());
 
@@ -49,6 +50,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tls_key = args.next().map(PathBuf::from);
         } else if arg == "--http-port" {
             http_port = args.next().and_then(|p| p.parse().ok());
+        } else if arg == "--compaction-rate" {
+            compaction_mb = args.next().and_then(|v| v.parse::<u64>().ok());
         } else if arg == "--auto-compaction" {
             auto_compaction = args.next().as_deref() != Some("off");
         } else if arg == "--access-log" {
@@ -87,6 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     state.auth = auth;
     state.set_durability(durability);
+    // Compaction copies at most this many MB/s (#28, decision 24); 0 = no limit.
+    state.compaction_rate.store(compaction_mb.unwrap_or(50) * 1_000_000, std::sync::atomic::Ordering::Relaxed);
     // S3 server access log (#46): --access-log <file> or -, or AWANFS_ACCESS_LOG; off by default.
     if let Some(target) = access_log.or_else(|| std::env::var("AWANFS_ACCESS_LOG").ok()).filter(|t| !t.is_empty()) {
         let sink: s3_server::request_log::LogSink = if target == "-" {
