@@ -8,7 +8,7 @@ use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, 
 use hyper::{Method, Request, Response, StatusCode};
 use md5::{Digest, Md5};
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::aws_chunked::decode_aws_chunked;
 use crate::cache::PayloadCache;
 use crate::coalesce::SingleFlight;
-use crate::compaction::{compact_volume, CompactionReport};
+use crate::compaction::CompactionReport;
 use crate::ffi_bridge::*;
 use crate::lifecycle::*;
 use crate::multipart::*;
@@ -560,59 +560,85 @@ impl S3ServiceState {
         }
     }
 
-    pub fn perform_online_compaction(&self) -> Result<CompactionReport, VolumeError> {
-        let dir = match self.data_dir {
-            Some(ref d) => d.clone(),
-            None => return Ok(CompactionReport::default()),
-        };
-        if self.volumes.read().len() > 1 {
-            // Compaction moves one volume's live needles; with several volumes it would drop
-            // the objects in the others. Safe multi-volume compaction is #14.
-            return Err(VolumeError::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "compaction of more than one volume is not supported yet (#14)",
-            )));
+    /// Compacts the oldest volume. With a single volume, seals it first (the next writes go
+    /// to a new one). See `compact_oldest_volume`.
+    pub async fn perform_online_compaction(&self) -> Result<CompactionReport, VolumeError> {
+        if self.data_dir.is_none() {
+            return Ok(CompactionReport::default());
         }
-        let cur_vol = self.active_volume_id.load(Ordering::SeqCst);
-        let target_vol = cur_vol + 1;
+        let active = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+        if self.volumes.read().keys().next() == Some(&active.id()) {
+            self.roll_volume(&active)?;
+        }
+        self.compact_oldest_volume().await
+    }
 
-        let (live_keys, key_buckets) = {
-            let engine = self.engine.read();
-            let mut keys = HashSet::new();
-            let mut kb = HashMap::new();
-            for bucket in engine.buckets.values() {
-                for k_vec in bucket.key_index.keys() {
-                    let k_str = String::from_utf8_lossy(k_vec).to_string();
-                    keys.insert(k_str.clone());
-                    kb.insert(k_str, bucket.id);
-                }
-            }
-            (keys, kb)
+    /// Moves the live needles of the oldest sealed volume to the active volume and deletes
+    /// the old volume (#14). Safe while requests run:
+    /// - each live needle is copied under its key lock, and the index row moves only if it
+    ///   still points at the old needle, so a concurrent PUT or DELETE wins and is never
+    ///   followed in the log by an older copy;
+    /// - the copies are synced before the old files are removed;
+    /// - only the oldest volume is compacted: a tombstone there can only hide needles in the
+    ///   same volume, so dropping it cannot bring a deleted object back after a restart.
+    /// A volume file that cannot be removed (Windows, while a read still maps it) stays on
+    /// disk; replaying it on boot is harmless because every copy is newer.
+    pub async fn compact_oldest_volume(&self) -> Result<CompactionReport, VolumeError> {
+        let active = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+        let old = match self.volumes.read().values().next().cloned() {
+            Some(v) if v.id() != active.id() => v,
+            _ => return Ok(CompactionReport::default()),
         };
+        let old_id = old.id();
+        let mut needles = Vec::new();
+        old.recover_needles(|b_id, key, offset, size, etag_hi, etag_lo, flags, crc| {
+            needles.push((b_id as u32, key, offset, size, etag_hi, etag_lo, flags, crc));
+        })?;
 
-        let report = compact_volume(&dir, cur_vol, target_vol, &live_keys)?;
-        let new_mgr = Arc::new(VolumeManager::open(&dir, target_vol)?);
-        let new_vol_bytes = new_mgr.offset();
-
-        {
-            let mut engine = self.engine.write();
-            let mut crc_map = self.needle_crc_map.write();
-            for (k_str, loc) in &report.new_locations {
-                if let Some(&b_id) = key_buckets.get(k_str) {
-                    let g = global_offset(target_vol, loc.offset);
-                    let _ = engine.update_object_offset(b_id, k_str.as_bytes(), g);
-                    crc_map.insert((b_id, g), loc.payload_crc32c);
-                }
+        let mut report = CompactionReport::default();
+        let mut written: BTreeMap<u32, Arc<VolumeManager>> = BTreeMap::new();
+        for (b_id, key, local, size, etag_hi, etag_lo, flags, crc) in needles {
+            let g_old = global_offset(old_id, local);
+            if flags & AWAN_FLAG_TOMBSTONE != 0 {
+                report.dead_needles_reclaimed += 1;
+                continue;
             }
+            let _guard = self.lock_key(b_id, &key).await;
+            let live = self.engine.read().get_object(b_id, key.as_bytes()).map(|m| m.vol_offset == g_old).unwrap_or(false);
+            if !live {
+                report.dead_needles_reclaimed += 1;
+                continue;
+            }
+            let bytes = if size == 0 { Bytes::new() } else { old.read_needle_bytes(old_id, local, crc)? };
+            let (vm, loc, g_new) = self.write_to_active(b_id, &key, &bytes, flags, etag_hi, etag_lo)?;
+            written.insert(vm.id(), Arc::clone(&vm));
+            if let Err(code) = self.engine.write().update_object_offset(b_id, key.as_bytes(), g_new) {
+                return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("index error {} while moving {}", code, key))));
+            }
+            {
+                let mut crcs = self.needle_crc_map.write();
+                crcs.remove(&(b_id, g_old));
+                crcs.insert((b_id, g_new), loc.payload_crc32c);
+            }
+            self.payload_cache.remove(b_id, g_old);
+            report.live_needles_copied += 1;
+            report.new_locations.insert(key, loc);
         }
 
-        self.payload_cache.clear();
-        *self.volumes.write() = std::iter::once((target_vol, Arc::clone(&new_mgr))).collect();
-        *self.volume_manager.write() = Some(new_mgr);
-        self.active_volume_id.store(target_vol, Ordering::SeqCst);
-        self.total_volume_bytes.store(new_vol_bytes, Ordering::Relaxed);
+        // The copies must be on disk before the only other copy goes, in every durability mode.
+        for vm in written.into_values() {
+            tokio::task::spawn_blocking(move || vm.sync_now())
+                .await
+                .map_err(|e| VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))??;
+        }
+        self.volumes.write().remove(&old_id);
+        let reclaimed = old.offset();
+        let dir = old.dir().to_path_buf();
+        drop(old);
+        report.volume_removed = std::fs::remove_file(dir.join(format!("volume_{:04}.dat", old_id))).is_ok();
+        let _ = std::fs::remove_file(dir.join(format!("volume_{:04}.idx", old_id)));
+        let _ = self.total_volume_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| Some(t.saturating_sub(reclaimed)));
         self.tombstone_bytes.store(0, Ordering::Relaxed);
-
         Ok(report)
     }
 
@@ -742,7 +768,8 @@ impl S3ServiceState {
             return Ok(());
         }
         let next_id = self.volumes.read().keys().next_back().copied().unwrap_or(full.id()).max(full.id()) + 1;
-        let mut vm = VolumeManager::open_sparse(full.dir(), next_id)?;
+        // New volumes grow as they are written (not 32 GiB sparse files).
+        let mut vm = VolumeManager::open_mode(full.dir(), next_id, false)?;
         vm.attach_work_counters(full.work_counters());
         vm.set_max_span(full.max_span());
         vm.set_durability(full.durability());

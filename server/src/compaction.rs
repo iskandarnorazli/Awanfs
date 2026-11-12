@@ -12,6 +12,8 @@ pub struct CompactionReport {
     pub live_needles_copied: usize,
     pub dead_needles_reclaimed: usize,
     pub new_locations: HashMap<String, NeedleLocation>,
+    /// The compacted volume's data file was deleted.
+    pub volume_removed: bool,
 }
 
 pub fn compact_volume(
@@ -85,6 +87,8 @@ pub fn compact_volume(
         scan_offset += total_len;
     }
 
+    // The copies must be on disk before the source goes.
+    target_mgr.sync_now()?;
     // Drop source file handle before unlinking
     drop(src_file);
 

@@ -438,6 +438,11 @@ impl VolumeManager {
         Ok(())
     }
 
+    /// Syncs the volume and its journal now, whatever the durability mode.
+    pub fn sync_now(&self) -> Result<(), VolumeError> {
+        self.sync_files()
+    }
+
     /// Returns once the write numbered `seq` is as durable as the mode promises: on disk for
     /// `Group` and `Strict`, immediately for `Fast`. Blocking; call it off the async executor.
     pub fn make_durable(&self, seq: u64) -> Result<(), VolumeError> {
