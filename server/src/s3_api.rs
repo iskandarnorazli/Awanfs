@@ -1358,7 +1358,6 @@ pub async fn handle_s3_request(
                         AWAN_FLAG_ACTIVE
                     };
 
-                    let _key_guard = state.lock_key(b_id, &key).await;
                     if if_none_match_star && state.engine.read().get_object(b_id, key.as_bytes()).is_ok() {
                         let xml = s3_error_xml("PreconditionFailed", "At least one of the pre-conditions you specified did not hold.", &key, "req-inm");
                         return Ok(Response::builder()
