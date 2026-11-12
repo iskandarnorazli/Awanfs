@@ -859,7 +859,7 @@ def run_fixed_volume_phase(
 
 
 def find_minio_binaries() -> Tuple[Optional[str], Optional[str]]:
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     candidates_minio = [
         os.path.join(repo_root, ".tmp", "minio", "minio.exe"),
         os.path.join(repo_root, ".tmp", "minio", "minio"),
@@ -878,7 +878,7 @@ def find_minio_binaries() -> Tuple[Optional[str], Optional[str]]:
 
 
 def find_rustfs_binary() -> Optional[str]:
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     candidates = [
         os.path.join(repo_root, ".tmp", "rustfs", "rustfs.exe"),
         os.path.join(repo_root, ".tmp", "rustfs", "rustfs"),
@@ -893,11 +893,11 @@ def main():
     parser.add_argument("--sizes", type=str, default="64KiB,1MiB,1GiB,10GiB", help="Payload sizes")
     parser.add_argument("--concurrent", type=int, default=64, help="Client concurrency")
     parser.add_argument("--duration", type=str, default="3s", help="Duration per phase (e.g. 3s or 5s)")
-    parser.add_argument("--output", type=str, default="docs/measurements/s3_warp_minio_vs_awan.md", help="Report path")
+    parser.add_argument("--output", type=str, default="measurements/s3_warp_minio_vs_awan.md", help="Report path")
     args = parser.parse_args()
 
     dur_sec = float(args.duration.rstrip("s"))
-    cmd = f"python benchmarks/s3_warp/run_warp_benchmark.py --sizes {args.sizes} --concurrent {args.concurrent} --duration {args.duration} --output {args.output}"
+    cmd = f"python benchmarks/run_warp_benchmark.py --sizes {args.sizes} --concurrent {args.concurrent} --duration {args.duration} --output {args.output}"
 
     # Pin benchmark client to cores 4..7 (mask 0xF0)
     set_affinity_mask(None, 0xF0)
