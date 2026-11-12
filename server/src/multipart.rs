@@ -65,6 +65,7 @@ pub struct MultipartManager {
     pub enforce_min_part_size: AtomicBool,
     pub staging_dir: PathBuf,
     pub staged_mmaps: RwLock<HashMap<PathBuf, Arc<Mmap>>>,
+    pub work: Arc<crate::work::WorkCounters>,
 }
 
 impl MultipartManager {
@@ -81,7 +82,14 @@ impl MultipartManager {
             enforce_min_part_size: AtomicBool::new(false),
             staging_dir,
             staged_mmaps: RwLock::new(HashMap::new()),
+            work: Arc::new(crate::work::WorkCounters::default()),
         }
+    }
+
+    /// Counts staged part writes and syncs into `work`.
+    pub fn with_work_counters(mut self, work: Arc<crate::work::WorkCounters>) -> Self {
+        self.work = work;
+        self
     }
 
     pub fn get_or_mmap_part(&self, path: &Path) -> std::io::Result<Arc<Mmap>> {
@@ -139,7 +147,9 @@ impl MultipartManager {
         let part_file_path = upload_dir.join(format!("part_{:05}.dat", part_number));
         let mut file = std::fs::File::create(&part_file_path)?;
         file.write_all(data)?;
+        self.work.disk_write(data.len() as u64);
         file.sync_all()?;
+        self.work.disk_sync();
         Ok(part_file_path)
     }
 
@@ -275,6 +285,11 @@ impl MultipartManager {
     pub fn get_completed_extents(&self, bucket_id: u32, key: &str) -> Option<Vec<PartExtent>> {
         self.completed_extents.read().get(&(bucket_id, key.to_string())).cloned()
     }
+
+    /// Re-registers a completed object's extents (used when recovery replays its manifest needle).
+    pub fn restore_completed(&self, bucket_id: u32, key: &str, extents: Vec<PartExtent>) {
+        self.completed_extents.write().insert((bucket_id, key.to_string()), extents);
+    }
 }
 
 impl Default for MultipartManager {
@@ -383,4 +398,71 @@ pub fn list_multipart_uploads_result_xml(
 
     out.push_str("</ListMultipartUploadsResult>");
     out
+}
+
+const EXTENTS_MANIFEST_MAGIC: &str = "AWNMPU1";
+
+/// Serialises a completed multipart object's extents. The manifest is written to the volume as
+/// a needle flagged multipart, so boot recovery rebuilds the object in log order. Staged part
+/// paths are stored relative to `staging_dir`, with `/` separators.
+pub fn encode_extents_manifest(staging_dir: &Path, total_size: u64, extents: &[PartExtent]) -> Vec<u8> {
+    let mut out = format!("{}\n{}\n", EXTENTS_MANIFEST_MAGIC, total_size);
+    for e in extents {
+        let rel = e
+            .staged_path
+            .as_ref()
+            .and_then(|p| p.strip_prefix(staging_dir).ok())
+            .map(|r| {
+                r.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .unwrap_or_default();
+        let md5: String = e.raw_md5.iter().map(|b| format!("{:02x}", b)).collect();
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            e.part_size, e.cumulative_end, e.vol_offset, md5, rel
+        ));
+    }
+    out.into_bytes()
+}
+
+/// Parses a manifest written by `encode_extents_manifest`: (total size, extents).
+pub fn decode_extents_manifest(staging_dir: &Path, bytes: &[u8]) -> Option<(u64, Vec<PartExtent>)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != EXTENTS_MANIFEST_MAGIC {
+        return None;
+    }
+    let total: u64 = lines.next()?.parse().ok()?;
+    let mut extents = Vec::new();
+    for line in lines {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() != 5 || f[3].len() != 32 {
+            return None;
+        }
+        let mut raw_md5 = [0u8; 16];
+        for (i, byte) in raw_md5.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&f[3][2 * i..2 * i + 2], 16).ok()?;
+        }
+        let staged_path = if f[4].is_empty() {
+            None
+        } else {
+            let mut p = staging_dir.to_path_buf();
+            for c in f[4].split('/') {
+                p.push(c);
+            }
+            Some(p)
+        };
+        extents.push(PartExtent {
+            vol_offset: f[2].parse().ok()?,
+            part_size: f[0].parse().ok()?,
+            cumulative_end: f[1].parse().ok()?,
+            ref_count: 1,
+            raw_md5,
+            staged_path,
+        });
+    }
+    Some((total, extents))
 }

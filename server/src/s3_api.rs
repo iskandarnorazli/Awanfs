@@ -23,6 +23,7 @@ use crate::multipart::*;
 use crate::mvcc::MvccStore;
 use crate::sigv4::*;
 use crate::volume::{VolumeError, VolumeManager};
+use crate::work::WorkCounters;
 use crate::xml::*;
 use std::path::{Path, PathBuf};
 
@@ -30,6 +31,20 @@ pub type ResponseBody = BoxBody<Bytes, std::convert::Infallible>;
 
 fn full_body(bytes: Bytes) -> ResponseBody {
     Full::new(bytes).boxed()
+}
+
+/// 500 InternalError: the server could not read or write the object's bytes.
+fn internal_error_response(resource: &str, detail: &str) -> Response<ResponseBody> {
+    let xml = s3_error_xml("InternalError", detail, resource, "req-internal");
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header(CONTENT_TYPE, "application/xml")
+        .body(full_body(Bytes::from(xml)))
+        .unwrap()
+}
+
+fn no_volume_error() -> VolumeError {
+    VolumeError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "no volume is open"))
 }
 
 fn empty_body() -> ResponseBody {
@@ -239,6 +254,8 @@ pub struct S3ServiceState {
     pub needle_crc_map: Arc<RwLock<HashMap<(u32, u64), u32>>>,
     pub payload_cache: Arc<PayloadCache>,
     pub next_vol_offset: Arc<RwLock<u64>>,
+    /// Disk writes, syncs, reads and payload copies, for the work-count tests.
+    pub work: Arc<WorkCounters>,
 }
 
 impl S3ServiceState {
@@ -250,7 +267,11 @@ impl S3ServiceState {
             id
         ));
         let _ = std::fs::create_dir_all(&default_dir);
-        let vol_mgr = VolumeManager::open_sparse(&default_dir, 1).ok().map(Arc::new);
+        let work = Arc::new(WorkCounters::default());
+        let vol_mgr = VolumeManager::open_sparse(&default_dir, 1).ok().map(|mut vm| {
+            vm.attach_work_counters(Arc::clone(&work));
+            Arc::new(vm)
+        });
         let initial_bytes = if let Some(ref vm) = vol_mgr { vm.offset() } else { 0 };
         Self {
             data_dir: None,
@@ -258,7 +279,9 @@ impl S3ServiceState {
             tombstone_bytes: Arc::new(AtomicU64::new(0)),
             active_volume_id: Arc::new(AtomicU32::new(1)),
             engine: Arc::new(RwLock::new(AwanStorageEngine::new(100_000, 4_194_304, 65536))),
-            multipart: Arc::new(MultipartManager::with_staging_dir(default_dir.join(".staging"))),
+            multipart: Arc::new(
+                MultipartManager::with_staging_dir(default_dir.join(".staging")).with_work_counters(Arc::clone(&work)),
+            ),
             sigv4_cache: Arc::new(SigV4KeyCache::new()),
             lifecycle: Arc::new(LifecycleManager::new()),
             single_flight: Arc::new(SingleFlight::new()),
@@ -267,12 +290,20 @@ impl S3ServiceState {
             needle_crc_map: Arc::new(RwLock::new(HashMap::new())),
             payload_cache: Arc::new(PayloadCache::default_auto_scaled()),
             next_vol_offset: Arc::new(RwLock::new(4096)),
+            work,
         }
     }
 
     pub fn with_data_dir(dir: &Path) -> Self {
         let _ = std::fs::create_dir_all(dir);
-        let vol_mgr = VolumeManager::open_sparse(dir, 1).ok().map(Arc::new);
+        let work = Arc::new(WorkCounters::default());
+        let vol_mgr = VolumeManager::open_sparse(dir, 1).ok().map(|mut vm| {
+            vm.attach_work_counters(Arc::clone(&work));
+            Arc::new(vm)
+        });
+        let multipart = Arc::new(
+            MultipartManager::with_staging_dir(dir.join(".staging")).with_work_counters(Arc::clone(&work)),
+        );
         let mut engine = AwanStorageEngine::new(100_000, 4_194_304, 65536);
         let db_path = dir.join("metadata.db");
         if let Ok(spill) = crate::spill::SpillIndex::open(&db_path) {
@@ -306,10 +337,34 @@ impl S3ServiceState {
         if let Some(ref vm) = vol_mgr {
             initial_vol_offset = vm.offset().max(4096);
             let mut crcs = needle_crc_map.write();
+            // Collect the log first: a multipart manifest needle is read back from the volume,
+            // and the events are applied in log order so later writes win.
+            let mut events = Vec::new();
             let _ = vm.recover_needles(|b_id, key, offset, size, etag_hi, etag_lo, flags, crc32c| {
+                events.push((b_id, key, offset, size, etag_hi, etag_lo, flags, crc32c));
+            });
+            for (b_id, key, offset, size, etag_hi, etag_lo, flags, crc32c) in events {
                 crcs.insert((b_id as u32, offset), crc32c);
                 if flags & AWAN_FLAG_TOMBSTONE != 0 {
                     let _ = engine.delete_object(b_id as u32, key.as_bytes());
+                } else if flags & AWAN_FLAG_MULTIPART != 0 {
+                    let manifest = vm
+                        .read_needle_bytes(1, offset, crc32c)
+                        .ok()
+                        .and_then(|b| decode_extents_manifest(&multipart.staging_dir, &b));
+                    if let Some((total, extents)) = manifest {
+                        let _ = engine.put_object(
+                            b_id as u32,
+                            key.as_bytes(),
+                            offset,
+                            total,
+                            etag_hi,
+                            etag_lo,
+                            extents.len() as u16,
+                            flags,
+                        );
+                        multipart.restore_completed(b_id as u32, &key, extents);
+                    }
                 } else {
                     let _ = engine.put_object(
                         b_id as u32,
@@ -322,7 +377,7 @@ impl S3ServiceState {
                         flags,
                     );
                 }
-            });
+            }
         }
 
         let initial_bytes = if let Some(ref vm) = vol_mgr { vm.offset() } else { 0 };
@@ -333,7 +388,7 @@ impl S3ServiceState {
             tombstone_bytes: Arc::new(AtomicU64::new(0)),
             active_volume_id: Arc::new(AtomicU32::new(1)),
             engine: Arc::new(RwLock::new(engine)),
-            multipart: Arc::new(MultipartManager::with_staging_dir(dir.join(".staging"))),
+            multipart,
             sigv4_cache: Arc::new(SigV4KeyCache::new()),
             lifecycle: Arc::new(LifecycleManager::new()),
             single_flight: Arc::new(SingleFlight::new()),
@@ -342,6 +397,7 @@ impl S3ServiceState {
             needle_crc_map,
             payload_cache: Arc::new(PayloadCache::default_auto_scaled()),
             next_vol_offset: Arc::new(RwLock::new(initial_vol_offset)),
+            work,
         }
     }
 
@@ -401,50 +457,49 @@ impl S3ServiceState {
         Ok(report)
     }
 
-    pub fn store_payload(&self, b_id: u32, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64) -> u64 {
+    /// Writes the payload to the volume. An error means nothing was stored.
+    pub fn store_payload(&self, b_id: u32, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64) -> Result<u64, VolumeError> {
         if data.is_empty() {
-            return 0;
+            return Ok(0);
         }
-        let vm_opt = self.volume_manager.read().clone();
-        if let Some(ref vm) = vm_opt {
-            if let Ok(loc) = vm.write_needle(b_id as u16, key, data, flags, etag_hi, etag_lo) {
-                self.needle_crc_map.write().insert((b_id, loc.offset), loc.payload_crc32c);
-                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                // Cache hot payloads up to 4 MiB in dynamic auto-scaling LRU cache
-                if data.len() <= 4 * 1024 * 1024 {
-                    self.payload_cache.insert(b_id, loc.offset, data.clone());
-                }
-                return loc.offset;
-            }
+        let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+        let loc = vm.write_needle(b_id as u16, key, data, flags, etag_hi, etag_lo)?;
+        self.needle_crc_map.write().insert((b_id, loc.offset), loc.payload_crc32c);
+        self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+        // Cache hot payloads up to 4 MiB in dynamic auto-scaling LRU cache
+        if data.len() <= 4 * 1024 * 1024 {
+            self.payload_cache.insert(b_id, loc.offset, data.clone());
         }
-        let off = self.allocate_offset(data.len());
-        self.payload_cache.insert(b_id, off, data.clone());
-        off
+        Ok(loc.offset)
     }
 
-    pub fn load_payload(&self, b_id: u32, vol_offset: u64, expected_size: usize) -> Bytes {
-        if expected_size == 0 || vol_offset == 0 {
-            return Bytes::new();
+    /// Reads and verifies a payload. An error means the bytes could not be read or failed
+    /// their CRC; callers answer 500, never a body of zeros.
+    pub fn load_payload(&self, b_id: u32, vol_offset: u64, expected_size: usize) -> Result<Bytes, VolumeError> {
+        if expected_size == 0 {
+            return Ok(Bytes::new());
+        }
+        if vol_offset == 0 {
+            return Err(VolumeError::CorruptIndex);
         }
         if let Some(cached) = self.payload_cache.get(b_id, vol_offset) {
-            return cached;
+            return Ok(cached);
         }
-        let vm_opt = self.volume_manager.read().clone();
-        if let Some(ref vm) = vm_opt {
-            let expected_crc = self
-                .needle_crc_map
-                .read()
-                .get(&(b_id, vol_offset))
-                .copied()
-                .unwrap_or(0);
-            if let Ok(bytes) = vm.read_needle_bytes(1, vol_offset, expected_crc) {
-                if bytes.len() <= 4 * 1024 * 1024 {
-                    self.payload_cache.insert(b_id, vol_offset, bytes.clone());
-                }
-                return bytes;
-            }
+        let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+        let expected_crc = self
+            .needle_crc_map
+            .read()
+            .get(&(b_id, vol_offset))
+            .copied()
+            .ok_or(VolumeError::CorruptIndex)?;
+        let bytes = vm.read_needle_bytes(1, vol_offset, expected_crc)?;
+        if bytes.len() != expected_size {
+            return Err(VolumeError::CorruptIndex);
         }
-        Bytes::from(vec![0u8; expected_size])
+        if bytes.len() <= 4 * 1024 * 1024 {
+            self.payload_cache.insert(b_id, vol_offset, bytes.clone());
+        }
+        Ok(bytes)
     }
 
     pub fn allocate_offset(&self, size: usize) -> u64 {
@@ -977,12 +1032,26 @@ pub async fn handle_s3_request(
                     Ok((composite_etag, total_size, extents)) => {
                         // Store object in @flat ObjectMeta
                         let (hi, lo, _, _) = compute_md5(composite_etag.as_bytes());
-                        let first_vol_offset = extents.first().map(|e| e.vol_offset).unwrap_or(0);
+                        // Log the part list as a manifest needle, so recovery rebuilds the object.
+                        let manifest = Bytes::from(encode_extents_manifest(&state.multipart.staging_dir, total_size, &extents));
+                        let manifest_offset = match state.store_payload(
+                            b_id,
+                            &key,
+                            &manifest,
+                            AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART,
+                            hi,
+                            lo,
+                        ) {
+                            Ok(off) => off,
+                            Err(e) => return Ok(internal_error_response(&key, &format!("could not record the multipart object: {:?}", e))),
+                        };
+                        // The manifest is metadata, not object bytes: keep it out of the payload cache.
+                        state.payload_cache.remove(b_id, manifest_offset);
                         let mut engine = state.engine.write();
                         engine.put_object(
                             b_id,
                             key.as_bytes(),
-                            first_vol_offset,
+                            manifest_offset,
                             total_size,
                             hi,
                             lo,
@@ -1212,7 +1281,10 @@ pub async fn handle_s3_request(
                     let vol_offset = if decoded_bytes.is_empty() {
                         0
                     } else {
-                        state.store_payload(b_id, &key, &decoded_bytes, flags, etag_hi, etag_lo)
+                        match state.store_payload(b_id, &key, &decoded_bytes, flags, etag_hi, etag_lo) {
+                            Ok(off) => off,
+                            Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
+                        }
                     };
 
                     if let Some((prev_off, prev_sz)) = old_info {
@@ -1339,38 +1411,40 @@ pub async fn handle_s3_request(
                                             for ext in extents {
                                                 let p_end = ext.cumulative_end;
                                                 if p_end > range.start && p_start <= range.end {
-                                                    let chunk = if let Some(ref path) = ext.staged_path {
-                                                        if let Ok(mmap) = state.multipart.get_or_mmap_part(path) {
-                                                            Bytes::from_owner(crate::volume::MmapOwner(mmap))
-                                                        } else {
-                                                            state.load_payload(
-                                                                b_id,
-                                                                ext.vol_offset,
-                                                                ext.part_size as usize,
-                                                            )
-                                                        }
-                                                    } else {
-                                                        state.load_payload(
-                                                            b_id,
-                                                            ext.vol_offset,
-                                                            ext.part_size as usize,
-                                                        )
+                                                    let mapped = ext
+                                                        .staged_path
+                                                        .as_ref()
+                                                        .and_then(|path| state.multipart.get_or_mmap_part(path).ok());
+                                                    let chunk = match mapped {
+                                                        Some(mmap) => Bytes::from_owner(crate::volume::MmapOwner(mmap)),
+                                                        None => match state.load_payload(b_id, ext.vol_offset, ext.part_size as usize) {
+                                                            Ok(b) => b,
+                                                            Err(e) => return Ok(internal_error_response(&key, &format!("could not read a part: {:?}", e))),
+                                                        },
                                                     };
                                                     let s_start = range.start.saturating_sub(p_start) as usize;
                                                     let s_end = ((range.end + 1).min(p_end) - p_start) as usize;
                                                     if s_start < chunk.len() {
-                                                        out.extend_from_slice(&chunk[s_start..s_end.min(chunk.len())]);
+                                                        let piece = &chunk[s_start..s_end.min(chunk.len())];
+                                                        state.work.payload_copy(piece.len() as u64);
+                                                        out.extend_from_slice(piece);
                                                     }
                                                 }
                                                 p_start = p_end;
                                             }
+                                            if out.len() as u64 != range.end - range.start + 1 {
+                                                return Ok(internal_error_response(&key, "a part of the object is missing"));
+                                            }
                                             Bytes::from(out)
                                         }
                                     } else {
-                                        Bytes::from(vec![0u8; (range.end - range.start + 1) as usize])
+                                        return Ok(internal_error_response(&key, "the multipart object's part list is missing"));
                                     }
                                 } else {
-                                    let full = state.load_payload(b_id, meta.vol_offset, meta.size as usize);
+                                    let full = match state.load_payload(b_id, meta.vol_offset, meta.size as usize) {
+                                        Ok(b) => b,
+                                        Err(e) => return Ok(internal_error_response(&key, &format!("could not read the object: {:?}", e))),
+                                    };
                                     let start = range.start as usize;
                                     let end = range.end as usize;
                                     if start < full.len() {
@@ -1423,42 +1497,41 @@ pub async fn handle_s3_request(
                                     if let Some(extents) =
                                         state_for_read.multipart.get_completed_extents(b_id, &key_for_read)
                                     {
+                                        // An unreadable part yields an empty body; the length check
+                                        // after the single-flight turns that into a 500.
                                         let mut stitched = Vec::with_capacity(meta.size as usize);
                                         for ext in extents {
-                                            let chunk = if let Some(ref path) = ext.staged_path {
-                                                if let Ok(mmap) = state_for_read.multipart.get_or_mmap_part(path) {
-                                                    Bytes::from_owner(crate::volume::MmapOwner(mmap))
-                                                } else {
-                                                    state_for_read.load_payload(
-                                                        b_id,
-                                                        ext.vol_offset,
-                                                        ext.part_size as usize,
-                                                    )
-                                                }
-                                            } else {
-                                                state_for_read.load_payload(
-                                                    b_id,
-                                                    ext.vol_offset,
-                                                    ext.part_size as usize,
-                                                )
+                                            let mapped = ext
+                                                .staged_path
+                                                .as_ref()
+                                                .and_then(|path| state_for_read.multipart.get_or_mmap_part(path).ok());
+                                            let chunk = match mapped {
+                                                Some(mmap) => Bytes::from_owner(crate::volume::MmapOwner(mmap)),
+                                                None => match state_for_read.load_payload(b_id, ext.vol_offset, ext.part_size as usize) {
+                                                    Ok(b) => b,
+                                                    Err(_) => return Bytes::new(),
+                                                },
                                             };
-                                            stitched.extend_from_slice(&chunk);
+                                            let part_len = (ext.part_size as usize).min(chunk.len());
+                                            state_for_read.work.payload_copy(part_len as u64);
+                                            stitched.extend_from_slice(&chunk[..part_len]);
                                         }
                                         Bytes::from(stitched)
                                     } else {
-                                        Bytes::from(vec![0u8; meta.size as usize])
+                                        Bytes::new()
                                     }
                                 } else {
-                                    state_for_read.load_payload(
-                                        b_id,
-                                        meta.vol_offset,
-                                        meta.size as usize,
-                                    )
+                                    state_for_read
+                                        .load_payload(b_id, meta.vol_offset, meta.size as usize)
+                                        .unwrap_or_default()
                                 }
                             })
                             .await
                     };
 
+                    if !is_head && payload.len() as u64 != meta.size {
+                        return Ok(internal_error_response(&key, "the object's bytes could not be read or failed verification"));
+                    }
                     let body = if is_head { empty_body() } else { full_body(payload) };
                     let resp = Response::builder()
                         .status(StatusCode::OK)
