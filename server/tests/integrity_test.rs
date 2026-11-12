@@ -98,15 +98,32 @@ async fn get_of_a_corrupted_payload_is_an_error_not_zeros() {
     drop(f);
     state.payload_cache.clear();
 
+    // Diagnostics for the assertion message: what the file and the volume manager see now.
+    let mut check = std::fs::File::open(&dat).unwrap();
+    let mut now = vec![0u8; pos + 1];
+    check.read_exact(&mut now).unwrap();
+    let entries: Vec<((u32, u64), u32)> = state.needle_crc_map.read().iter().map(|(k, v)| (*k, *v)).collect();
+    let direct = entries.first().map(|&((_, off), crc)| {
+        let vm = state.volume_manager.read().clone().unwrap();
+        (off, vm.read_needle_bytes(1, off, crc).map(|b| b.len()).map_err(|e| format!("{:?}", e)))
+    });
+
     let res = c.get(format!("{}/bkt/obj", url)).send().await.unwrap();
     let status = res.status();
     let body = res.bytes().await.unwrap_or_default();
     assert_eq!(
         status,
         StatusCode::INTERNAL_SERVER_ERROR,
-        "a payload that fails its CRC was served ({} bytes, all zero: {})",
+        "a payload that fails its CRC was served ({} bytes, all zero: {}, equal to the original: {}); \
+         flipped file offset {} (byte now {:#x}, was {:#x}); crc map {:?}; direct volume read {:?}",
         body.len(),
-        body.iter().all(|b| *b == 0)
+        body.iter().all(|b| *b == 0),
+        &body[..] == &payload[..],
+        pos,
+        now[pos],
+        head[pos],
+        entries,
+        direct
     );
 }
 
