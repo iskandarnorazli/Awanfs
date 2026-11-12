@@ -1205,6 +1205,8 @@ pub async fn handle_s3_request(
                             }
                         };
 
+                        // Scoped so the engine read guard (not Send) is gone before the awaits below.
+                        let (src_b_id, src_meta) = {
                         let engine = state.engine.read();
                         let src_b_id = match engine.lookup_bucket(src_bucket) {
                             Ok(id) => id,
@@ -1228,7 +1230,8 @@ pub async fn handle_s3_request(
                                     .unwrap());
                             }
                         };
-                        drop(engine);
+                        (src_b_id, src_meta)
+                        };
 
                         // The copy gets a needle of its own: it must survive a restart and an
                         // overwrite or delete of its source.
