@@ -433,6 +433,8 @@ pub struct S3ServiceState {
     pub not_ready: Arc<RwLock<Option<&'static str>>>,
     /// Request counts, latencies and bytes for `/_awanfs/metrics` (#42).
     pub metrics: Arc<crate::metrics::Metrics>,
+    /// Where the per-request JSON log lines go; `None` logs nothing (#41).
+    pub access_log: Arc<RwLock<Option<crate::request_log::LogSink>>>,
 }
 
 impl S3ServiceState {
@@ -475,6 +477,7 @@ impl S3ServiceState {
             auth: crate::auth::AuthConfig::open(),
             not_ready: Arc::new(RwLock::new(None)),
             metrics: Arc::new(crate::metrics::Metrics::default()),
+            access_log: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -601,6 +604,7 @@ impl S3ServiceState {
             auth: crate::auth::AuthConfig::open(),
             not_ready: Arc::new(RwLock::new(None)),
             metrics: Arc::new(crate::metrics::Metrics::default()),
+            access_log: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -1063,9 +1067,35 @@ pub async fn handle_s3_request(
     }
     let bytes_in = content_length(req.headers());
     let is_head = req.method() == Method::HEAD;
-    let resp = handle_s3_inner(Arc::clone(&state), req).await?;
+    let method = req.method().clone();
+    let (bucket, key) = match parse_s3_target(req.uri().path(), host) {
+        ParsedTarget::Service => (String::new(), String::new()),
+        ParsedTarget::Bucket { bucket } => (bucket, String::new()),
+        ParsedTarget::Object { bucket, key } => (bucket, key),
+    };
+    let request_id = crate::request_log::new_request_id();
+    let mut resp = crate::request_log::with_request_id(request_id.clone(), handle_s3_inner(Arc::clone(&state), req)).await?;
+    if let Ok(v) = hyper::header::HeaderValue::from_str(&request_id) {
+        resp.headers_mut().insert("x-amz-request-id", v);
+    }
     let bytes_out = if is_head { 0 } else { content_length(resp.headers()) };
-    state.metrics.record(op, resp.status().as_u16(), started.elapsed().as_secs_f64(), bytes_in, bytes_out);
+    let elapsed = started.elapsed();
+    state.metrics.record(op, resp.status().as_u16(), elapsed.as_secs_f64(), bytes_in, bytes_out);
+    let sink = state.access_log.read().clone();
+    if let Some(sink) = sink {
+        let rec = crate::request_log::RequestRecord {
+            request_id: &request_id,
+            method: method.as_str(),
+            operation: op,
+            bucket: &bucket,
+            key: &key,
+            status: resp.status().as_u16(),
+            bytes_in,
+            bytes_out,
+            duration_us: elapsed.as_micros() as u64,
+        };
+        sink(&rec.to_json());
+    }
     Ok(resp)
 }
 
