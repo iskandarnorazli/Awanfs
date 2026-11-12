@@ -29,6 +29,8 @@ hmac = "0.12"
 crc32c = "0.6"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 quick-xml = "0.36"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 parking_lot = "0.12"
 redb = "2.1"
 reed-solomon-erasure = "6.0"
