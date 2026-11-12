@@ -1,0 +1,3 @@
+# ceph s3-tests that pass against AwanFS (#47). The nightly job fails when one of these stops
+# passing. Add tests from the job's "Passing but not listed" list; remove one only with a
+# reason in the commit message.

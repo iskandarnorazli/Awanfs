@@ -140,6 +140,17 @@ impl hyper::body::Body for ChunksBody {
 /// in memory (#36). Smaller ones are collected, and cached after the write.
 pub const STREAM_PUT_MIN: u64 = 4 * 1024 * 1024;
 
+/// Reads and drops what is left of a request body, at most `limit` bytes.
+async fn drain_body(body: &mut hyper::body::Incoming, limit: u64) {
+    let mut seen = 0u64;
+    while seen < limit {
+        match body.frame().await {
+            Some(Ok(f)) => seen += f.data_ref().map_or(0, |d| d.len() as u64),
+            _ => break,
+        }
+    }
+}
+
 /// The end of a PutObject once the needle is durable: index row, bookkeeping, answer.
 #[allow(clippy::too_many_arguments)]
 fn finish_put(
@@ -384,7 +395,7 @@ pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarge
                     } else {
                         return ParsedTarget::Object {
                             bucket,
-                            key: trimmed_path.to_string(),
+                            key: percent_decode_path(trimmed_path),
                         };
                     }
                 }
@@ -401,11 +412,32 @@ pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarge
     if let Some(key) = parts.next() {
         ParsedTarget::Object {
             bucket,
-            key: key.to_string(),
+            key: percent_decode_path(key),
         }
     } else {
         ParsedTarget::Bucket { bucket }
     }
+}
+
+/// Decodes %XX in a URL path. Unlike query decoding, `+` stays `+`. S3 object keys are the
+/// decoded path: a client sends "my%20file.txt" for the key "my file.txt". Keys used to be
+/// stored as sent, encoded.
+pub fn percent_decode_path(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex_digit(b[i + 1]), hex_digit(b[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub fn hex_digit(b: u8) -> Option<u8> {
@@ -585,7 +617,14 @@ impl S3ServiceState {
         }
     }
 
+    /// Opens a data directory, panicking when it cannot be served; see `try_with_data_dir`.
     pub fn with_data_dir(dir: &Path) -> Self {
+        Self::try_with_data_dir(dir).unwrap_or_else(|e| panic!("cannot open {}: {}", dir.display(), e))
+    }
+
+    /// Opens a data directory and replays it. Fails, instead of serving a subset, when a volume
+    /// cannot be opened or was written in a newer on-disk format (#50).
+    pub fn try_with_data_dir(dir: &Path) -> Result<Self, String> {
         let _ = std::fs::create_dir_all(dir);
         let work = Arc::new(WorkCounters::default());
         // Every volume in id order; writes go to the last one (#37).
@@ -595,10 +634,11 @@ impl S3ServiceState {
             ids.push(1);
         }
         for id in ids {
-            if let Ok(mut vm) = VolumeManager::open_sparse(dir, id) {
-                vm.attach_work_counters(Arc::clone(&work));
-                volumes.insert(id, Arc::new(vm));
-            }
+            // Only a brand-new volume 1 is created sparse; volumes from rollover stay as they are.
+            let new_volume = !dir.join(format!("volume_{:04}.dat", id)).exists();
+            let mut vm = VolumeManager::open_mode(dir, id, new_volume && id == 1).map_err(|e| format!("volume {}: {}", id, e))?;
+            vm.attach_work_counters(Arc::clone(&work));
+            volumes.insert(id, Arc::new(vm));
         }
         let vol_mgr = volumes.values().next_back().cloned();
         let multipart = Arc::new(
@@ -650,10 +690,19 @@ impl S3ServiceState {
                 if flags & AWAN_FLAG_TOMBSTONE != 0 {
                     let _ = engine.delete_object(b_id as u32, key.as_bytes());
                 } else if flags & AWAN_FLAG_MULTIPART != 0 {
-                    let manifest = vm
-                        .read_needle_bytes(vm.id(), local, crc32c)
-                        .ok()
-                        .and_then(|b| decode_extents_manifest(&multipart.staging_dir, &b));
+                    let manifest = match vm.read_needle_bytes(vm.id(), local, crc32c) {
+                        Ok(b) => match decode_extents_manifest(&multipart.staging_dir, &b) {
+                            Ok(m) => Some(m),
+                            Err(crate::multipart::ManifestError::NewerVersion { found, supported }) => {
+                                return Err(format!(
+                                    "the multipart manifest of {} was written in format {} by a newer AwanFS; this version reads up to {}",
+                                    key, found, supported
+                                ))
+                            }
+                            Err(crate::multipart::ManifestError::Malformed) => None,
+                        },
+                        Err(_) => None,
+                    };
                     if let Some((total, extents)) = manifest {
                         let _ = engine.put_object(
                             b_id as u32,
@@ -685,7 +734,7 @@ impl S3ServiceState {
         let initial_bytes = volumes.values().map(|vm| vm.offset()).sum();
         let active_id = vol_mgr.as_ref().map(|vm| vm.id()).unwrap_or(1);
 
-        Self {
+        Ok(Self {
             data_dir: Some(dir.to_path_buf()),
             total_volume_bytes: Arc::new(AtomicU64::new(initial_bytes)),
             tombstone_bytes: Arc::new(AtomicU64::new(0)),
@@ -710,7 +759,7 @@ impl S3ServiceState {
             metrics: Arc::new(crate::metrics::Metrics::default()),
             access_log: Arc::new(RwLock::new(None)),
             audit_log: Arc::new(RwLock::new(None)),
-        }
+        })
     }
 
     pub fn fragmentation_ratio(&self) -> f64 {
@@ -721,6 +770,41 @@ impl S3ServiceState {
         } else {
             (dead as f64) / (tot as f64)
         }
+    }
+
+    /// Deletes one key the way DeleteObject does: under its key lock, the tombstone is logged
+    /// and synced first, and only then is the index row removed. An error means the object is
+    /// still there.
+    pub async fn delete_key(&self, b_id: u32, key: &str) -> Result<(), String> {
+        let _key_guard = self.lock_key(b_id, key).await;
+        self.hook("delete_start", key);
+        // Log the tombstone first; only a logged delete removes the row, so a failed write is
+        // an error and the object stays (verification/tla, DeleteLogsFirst).
+        match self.write_to_active(b_id, key, &[], AWAN_FLAG_TOMBSTONE, 0, 0) {
+            Ok((vm, loc, _)) => {
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                self.make_durable(&vm, loc.seq).await.map_err(|e| format!("could not sync the delete: {:?}", e))?;
+            }
+            Err(e) => return Err(format!("could not record the delete: {:?}", e)),
+        }
+        self.mvcc.tombstone(b_id, key);
+        let old_info = {
+            let mut engine = self.engine.write();
+            let info = engine.get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size));
+            let _ = engine.delete_object(b_id, key.as_bytes());
+            info
+        };
+        if let Some((off, sz)) = old_info {
+            if off > 0 {
+                self.payload_cache.remove(b_id, off);
+                self.needle_crc_map.write().remove(&(b_id, off));
+                let raw_len = 64 + key.len() + sz as usize;
+                let dead_bytes = raw_len.div_ceil(4096) as u64 * 4096;
+                self.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
+            }
+        }
+        Ok(())
     }
 
     /// Compacts the oldest volume. With a single volume, seals it first (the next writes go
@@ -1697,15 +1781,17 @@ async fn handle_s3_inner(
                     while let Some(start) = cursor.find("<Key>") {
                         let rest = &cursor[start + 5..];
                         if let Some(end) = rest.find("</Key>") {
-                            keys_to_delete.push(rest[..end].to_string());
+                            // Keys are XML text: "&amp;" is "&" (it was used escaped before).
+                            let raw = &rest[..end];
+                            keys_to_delete.push(quick_xml::escape::unescape(raw).map(|k| k.into_owned()).unwrap_or_else(|_| raw.to_string()));
                             cursor = &rest[end + 6..];
                         } else {
                             break;
                         }
                     }
 
-                    let mut engine = state.engine.write();
-                    let b_id = match engine.lookup_bucket(&bucket) {
+                    let looked_up = state.engine.read().lookup_bucket(&bucket);
+                    let b_id = match looked_up {
                         Ok(id) => id,
                         Err(_) => {
                             let xml = s3_error_xml("NoSuchBucket", "The specified bucket does not exist", &bucket, "req-del-batch");
@@ -1717,26 +1803,20 @@ async fn handle_s3_inner(
                         }
                     };
 
-                    let mut deleted = Vec::new();
-                    let mut offsets_to_remove = Vec::new();
+                    // Each key goes through delete_key: tombstone logged and synced, under its key
+                    // lock. Before, the rows were dropped with no tombstone, and every deleted
+                    // object came back at the next restart.
+                    let mut ok_keys = Vec::new();
+                    let mut failed: Vec<(String, String)> = Vec::new();
                     for k in &keys_to_delete {
-                        if let Ok(m) = engine.get_object(b_id, k.as_bytes()) {
-                            if m.vol_offset > 0 {
-                                offsets_to_remove.push(m.vol_offset);
-                            }
+                        match state.delete_key(b_id, k).await {
+                            Ok(()) => ok_keys.push(k.as_str()),
+                            Err(e) => failed.push((k.clone(), e)),
                         }
-                        let _ = engine.delete_object(b_id, k.as_bytes());
-                        deleted.push(DeleteItemResult {
-                            key: k.as_str(),
-                            version_id: None,
-                        });
                     }
-                    drop(engine);
-                    for off in offsets_to_remove {
-                        state.payload_cache.remove(b_id, off);
-                    }
-
-                    let xml = delete_objects_result_xml(&deleted, &[]);
+                    let deleted: Vec<DeleteItemResult> = ok_keys.into_iter().map(|key| DeleteItemResult { key, version_id: None }).collect();
+                    let errors: Vec<DeleteErrorItem> = failed.iter().map(|(k, e)| DeleteErrorItem { key: k, code: "InternalError", message: e }).collect();
+                    let xml = delete_objects_result_xml(&deleted, &errors);
                     Ok(Response::builder()
                         .status(StatusCode::OK)
                         .header(CONTENT_TYPE, "application/xml")
@@ -1811,8 +1891,12 @@ async fn handle_s3_inner(
 
                 let is_chunked = crate::auth::is_aws_chunked(req.headers());
                 let signed_headers = req.headers().clone();
-                let declared_len = signed_headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
-                if let Some(len) = declared_len.filter(|&n| !is_chunked && n > STREAM_PUT_MIN) {
+                // The length of what is stored: the decoded length for an aws-chunked body.
+                let declared_len = signed_headers
+                    .get(if is_chunked { "x-amz-decoded-content-length" } else { "content-length" })
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok());
+                if let Some(len) = declared_len.filter(|&n| n > STREAM_PUT_MIN) {
                     // Large part: write it to its staged file as it arrives (#36).
                     if state.multipart.get_upload(upload_id).is_none() {
                         let xml = s3_error_xml("NoSuchUpload", "The specified upload does not exist.", &key, "req-up-part");
@@ -1834,18 +1918,48 @@ async fn handle_s3_inner(
                     let mut sha = declared_sha.as_ref().map(|_| sha2::Sha256::new());
                     let mut md5 = Md5::new();
                     let mut body = req.into_body();
+                    let mut verifier = crate::auth::ChunkVerifier::for_request(&state.auth, &signed_headers);
+                    let cache = &state.sigv4_cache;
+                    let mut decoder = is_chunked.then(|| crate::aws_chunked::ChunkedDecoder::new(move |sha: &str, sig: Option<&str>| verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))));
                     while let Some(frame) = body.frame().await {
                         if let Ok(data) = frame?.into_data() {
                             if let Some(h) = sha.as_mut() {
                                 h.update(&data);
                             }
-                            md5.update(&data);
-                            if let Err(e) = writer.write(&data) {
-                                return Ok(internal_error_response(&key, &format!("could not store the part: {}", e)));
+                            let mut sink = |d: &[u8]| -> Result<(), String> {
+                                if writer.written() + d.len() as u64 > len {
+                                    return Err("more bytes than the declared length".to_string());
+                                }
+                                md5.update(d);
+                                writer.write(d).map_err(|e| e.to_string())
+                            };
+                            let fed = match decoder.as_mut() {
+                                Some(dec) => dec.push(&data, &mut sink),
+                                None => sink(&data).map_err(crate::aws_chunked::PushError::Sink),
+                            };
+                            match fed {
+                                Ok(()) => {}
+                                Err(crate::aws_chunked::PushError::Decode(e)) => {
+                                    // Read the rest of the body (up to 64 MiB) before answering, so the client
+                                    // gets the error instead of a reset connection (seen on Windows).
+                                    drain_body(&mut body, 64 << 20).await;
+                                    let status = if e == "SignatureDoesNotMatch" { StatusCode::FORBIDDEN } else { StatusCode::BAD_REQUEST };
+                                    return Ok(Response::builder()
+                                        .status(status)
+                                        .header(CONTENT_TYPE, "application/xml")
+                                        .body(full_body(Bytes::from(s3_error_xml(e, "Error decoding chunked body", &key, "req-up-part"))))
+                                        .unwrap());
+                                }
+                                Err(crate::aws_chunked::PushError::Sink(e)) if e.starts_with("more bytes") => {
+                                    return Ok(bad_request("IncompleteBody", "The body is longer than its declared length.", &key));
+                                }
+                                Err(crate::aws_chunked::PushError::Sink(e)) => {
+                                    return Ok(internal_error_response(&key, &format!("could not store the part: {}", e)));
+                                }
                             }
                         }
                     }
-                    if writer.written() != len {
+                    if decoder.as_ref().is_some_and(|d| d.finish().is_err()) || writer.written() != len {
                         return Ok(bad_request("IncompleteBody", "You did not provide the number of bytes specified by the Content-Length HTTP header.", &key));
                     }
                     if let (Some(h), Some(want)) = (sha, declared_sha) {
@@ -1894,7 +2008,7 @@ async fn handle_s3_inner(
                 let decoded_bytes = if is_chunked {
                     let mut verifier = crate::auth::ChunkVerifier::for_request(&state.auth, &signed_headers);
                     let cache = &state.sigv4_cache;
-                    match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |data, sig| verifier.as_mut().map_or(true, |v| v.check(cache, data, sig))) {
+                    match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |sha, sig| verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))) {
                         Ok(b) => b,
                         Err(e) => {
                             let xml = s3_error_xml(e, "Error decoding chunked body", &key, "req-up-part");
@@ -2113,7 +2227,9 @@ async fn handle_s3_inner(
                 Method::PUT => {
                     // Check copy source
                     if let Some(copy_source) = req.headers().get("x-amz-copy-source") {
-                        let copy_src_str = copy_source.to_str().unwrap_or("").trim_start_matches('/');
+                        // x-amz-copy-source is URL-encoded and may end in ?versionId=.
+                        let copy_src_owned = percent_decode_path(copy_source.to_str().unwrap_or("").split('?').next().unwrap_or(""));
+                        let copy_src_str = copy_src_owned.trim_start_matches('/');
                         let (src_bucket, src_key) = match copy_src_str.split_once('/') {
                             Some((b, k)) => (b, k),
                             None => {
@@ -2226,7 +2342,12 @@ async fn handle_s3_inner(
                     let is_chunked = crate::auth::is_aws_chunked(req.headers());
                     let content_md5_hdr = req.headers().get("content-md5").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
                     let signed_headers = req.headers().clone();
-                    if let Some(len) = expected_len.map(|n| n as u64).filter(|&n| !is_chunked && n > STREAM_PUT_MIN) {
+                    let stream_len = if is_chunked {
+                        signed_headers.get("x-amz-decoded-content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok())
+                    } else {
+                        expected_len.map(|n| n as u64)
+                    };
+                    if let Some(len) = stream_len.filter(|&n| n > STREAM_PUT_MIN) {
                         // Large body: write it to the volume as it arrives (#36). The key lock is
                         // held from the reservation to the index update, so log order stays
                         // index order for this key.
@@ -2256,18 +2377,48 @@ async fn handle_s3_inner(
                         let mut sha = declared_sha.as_ref().map(|_| sha2::Sha256::new());
                         let mut digest = crate::digest::StreamingDigest::new();
                         let mut body = req.into_body();
+                        let mut verifier = crate::auth::ChunkVerifier::for_request(&state.auth, &signed_headers);
+                        let cache = &state.sigv4_cache;
+                        let mut decoder = is_chunked.then(|| crate::aws_chunked::ChunkedDecoder::new(move |sha: &str, sig: Option<&str>| verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))));
                         while let Some(frame) = body.frame().await {
                             if let Ok(data) = frame?.into_data() {
                                 if let Some(h) = sha.as_mut() {
                                     h.update(&data);
                                 }
-                                digest.update(&data);
-                                if let Err(e) = writer.write(&data) {
-                                    return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e)));
+                                let mut sink = |d: &[u8]| -> Result<(), String> {
+                                    if writer.written() + d.len() as u64 > len {
+                                        return Err("more bytes than the declared length".to_string());
+                                    }
+                                    digest.update(d);
+                                    writer.write(d).map_err(|e| format!("{:?}", e))
+                                };
+                                let fed = match decoder.as_mut() {
+                                    Some(dec) => dec.push(&data, &mut sink),
+                                    None => sink(&data).map_err(crate::aws_chunked::PushError::Sink),
+                                };
+                                match fed {
+                                    Ok(()) => {}
+                                    Err(crate::aws_chunked::PushError::Decode(e)) => {
+                                        // Read the rest of the body (up to 64 MiB) before answering, so the client
+                                        // gets the error instead of a reset connection (seen on Windows).
+                                        drain_body(&mut body, 64 << 20).await;
+                                        let status = if e == "SignatureDoesNotMatch" { StatusCode::FORBIDDEN } else { StatusCode::BAD_REQUEST };
+                                        return Ok(Response::builder()
+                                            .status(status)
+                                            .header(CONTENT_TYPE, "application/xml")
+                                            .body(full_body(Bytes::from(s3_error_xml(e, "Error decoding chunked body", &key, "req-put-obj"))))
+                                            .unwrap());
+                                    }
+                                    Err(crate::aws_chunked::PushError::Sink(e)) if e.starts_with("more bytes") => {
+                                        return Ok(bad_request("IncompleteBody", "The body is longer than its declared length.", &key));
+                                    }
+                                    Err(crate::aws_chunked::PushError::Sink(e)) => {
+                                        return Ok(internal_error_response(&key, &format!("could not store the object: {}", e)));
+                                    }
                                 }
                             }
                         }
-                        if writer.written() != len {
+                        if decoder.as_ref().is_some_and(|d| d.finish().is_err()) || writer.written() != len {
                             return Ok(bad_request("IncompleteBody", "You did not provide the number of bytes specified by the Content-Length HTTP header.", &key));
                         }
                         if let (Some(h), Some(want)) = (sha, declared_sha) {
@@ -2323,7 +2474,7 @@ async fn handle_s3_inner(
                     let decoded_bytes = if is_chunked {
                         let mut verifier = crate::auth::ChunkVerifier::for_request(&state.auth, &signed_headers);
                         let cache = &state.sigv4_cache;
-                        match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |data, sig| verifier.as_mut().map_or(true, |v| v.check(cache, data, sig))) {
+                        match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |sha, sig| verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))) {
                             Ok(b) => b,
                             Err(e) => {
                                 let xml = s3_error_xml(e, "Error decoding chunked body", &key, "req-put-obj");
@@ -2619,35 +2770,8 @@ async fn handle_s3_inner(
                 }
 
                 Method::DELETE => {
-                    let _key_guard = state.lock_key(b_id, &key).await;
-                    state.hook("delete_start", &key);
-                    // Log the tombstone first; only a logged delete removes the row, so a failed
-                    // write is a 500 and the object stays (verification/tla, DeleteLogsFirst).
-                    match state.write_to_active(b_id, &key, &[], AWAN_FLAG_TOMBSTONE, 0, 0) {
-                        Ok((vm, loc, _)) => {
-                            state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                            state.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                            if let Err(e) = state.make_durable(&vm, loc.seq).await {
-                                return Ok(internal_error_response(&key, &format!("could not sync the delete: {:?}", e)));
-                            }
-                        }
-                        Err(e) => return Ok(internal_error_response(&key, &format!("could not record the delete: {:?}", e))),
-                    }
-                    state.mvcc.tombstone(b_id, &key);
-                    let old_info = {
-                        let mut engine = state.engine.write();
-                        let info = engine.get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size));
-                        let _ = engine.delete_object(b_id, key.as_bytes());
-                        info
-                    };
-                    if let Some((off, sz)) = old_info {
-                        if off > 0 {
-                            state.payload_cache.remove(b_id, off);
-                            state.needle_crc_map.write().remove(&(b_id, off));
-                            let raw_len = 64 + key.as_bytes().len() + sz as usize;
-                            let dead_bytes = (((raw_len + 4095) / 4096) * 4096) as u64;
-                            state.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
-                        }
+                    if let Err(e) = state.delete_key(b_id, &key).await {
+                        return Ok(internal_error_response(&key, &e));
                     }
                     Ok(Response::builder()
                         .status(StatusCode::NO_CONTENT)
