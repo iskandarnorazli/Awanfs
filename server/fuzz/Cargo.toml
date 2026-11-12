@@ -1,0 +1,39 @@
+[package]
+name = "awanfs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+s3-server = { path = ".." }
+hyper = "1"
+
+[workspace]
+
+[[bin]]
+name = "range"
+path = "fuzz_targets/range.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "aws_chunked"
+path = "fuzz_targets/aws_chunked.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sigv4"
+path = "fuzz_targets/sigv4.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "lifecycle_xml"
+path = "fuzz_targets/lifecycle_xml.rs"
+test = false
+doc = false
