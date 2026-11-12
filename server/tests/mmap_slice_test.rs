@@ -72,17 +72,24 @@ fn test_concurrent_multi_worker_range_slicing_under_active_appends() {
     }
 
     let stop_signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Readers and the writer start together, and each reader keeps reading until the writer is
+    // done AND it has made MIN_READS reads, so the read count no longer depends on scheduling.
+    const READERS: usize = 8;
+    const MIN_READS: usize = 16;
+    let start = Arc::new(std::sync::Barrier::new(READERS + 1));
 
     // Spawn 8 reader threads continuously reading random sub-slices via mmap
     let mut reader_handles = Vec::new();
-    for r_id in 0..8 {
+    for r_id in 0..READERS {
         let mgr = Arc::clone(&vol_mgr);
         let locs = initial_locs.clone();
         let stop = Arc::clone(&stop_signal);
+        let start = Arc::clone(&start);
 
         reader_handles.push(thread::spawn(move || {
             let mut read_ops = 0;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            start.wait();
+            while !stop.load(std::sync::atomic::Ordering::Acquire) || read_ops < MIN_READS {
                 let target_idx = (r_id + read_ops) % locs.len();
                 let (loc, ref expected_payload) = locs[target_idx];
 
@@ -99,19 +106,20 @@ fn test_concurrent_multi_worker_range_slicing_under_active_appends() {
     }
 
     // Simultaneously, main thread appends 32 new needles to grow the volume file
+    start.wait();
     for i in 0..32 {
         let key = format!("active_append_{}", i);
         let payload = vec![0xEEu8; 128 * 1024]; // 128 KiB
         vol_mgr.write_needle(1, &key, &payload, 1, 0, 0).expect("active append write_needle");
     }
 
-    stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+    stop_signal.store(true, std::sync::atomic::Ordering::Release);
 
     let mut total_reads = 0;
     for h in reader_handles {
         total_reads += h.join().expect("reader thread join");
     }
-    assert!(total_reads > 50, "Multi-worker mmap range slicing achieved {} reads", total_reads);
+    assert!(total_reads >= READERS * MIN_READS, "Multi-worker mmap range slicing achieved {} reads", total_reads);
 }
 
 #[test]
