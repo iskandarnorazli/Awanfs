@@ -23,7 +23,7 @@ use crate::lifecycle::*;
 use crate::multipart::*;
 use crate::mvcc::MvccStore;
 use crate::sigv4::*;
-use crate::volume::{VolumeError, VolumeManager};
+use crate::volume::{Durability, VolumeError, VolumeManager};
 use crate::work::WorkCounters;
 use crate::xml::*;
 use std::path::{Path, PathBuf};
@@ -520,10 +520,34 @@ impl S3ServiceState {
         }
     }
 
-    /// Writes the payload to the volume. An error means nothing was stored.
-    pub fn store_payload(&self, b_id: u32, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64) -> Result<u64, VolumeError> {
+    /// Waits until the volume write numbered `seq` is as durable as the volume's mode
+    /// promises (#29). The sync runs on the blocking pool, not on the executor.
+    pub async fn make_durable(&self, vm: &Arc<VolumeManager>, seq: u64) -> Result<(), VolumeError> {
+        if vm.durability() == Durability::Fast {
+            return Ok(());
+        }
+        let vm = Arc::clone(vm);
+        tokio::task::spawn_blocking(move || vm.make_durable(seq))
+            .await
+            .map_err(|e| VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?
+    }
+
+    /// Sets the durability mode of the open volume; `Fast` also starts its flusher.
+    pub fn set_durability(&self, mode: Durability) {
+        if let Some(vm) = self.volume_manager.read().clone() {
+            vm.set_durability(mode);
+            if mode == Durability::Fast {
+                vm.start_flusher(std::time::Duration::from_secs(1));
+            }
+        }
+    }
+
+    /// Writes the payload to the volume and waits until it is durable. An error means the
+    /// write is not acknowledged.
+    pub async fn store_payload(&self, b_id: u32, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64) -> Result<u64, VolumeError> {
         let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
         let loc = vm.write_needle(b_id as u16, key, data, flags, etag_hi, etag_lo)?;
+        self.make_durable(&vm, loc.seq).await?;
         self.needle_crc_map.write().insert((b_id, loc.offset), loc.payload_crc32c);
         self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
         // Cache hot payloads up to 4 MiB in dynamic auto-scaling LRU cache
@@ -1122,7 +1146,7 @@ pub async fn handle_s3_request(
                             AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART,
                             hi,
                             lo,
-                        ) {
+                        ).await {
                             Ok(off) => off,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not record the multipart object: {:?}", e))),
                         };
@@ -1278,7 +1302,7 @@ pub async fn handle_s3_request(
                         let flags = if bytes.is_empty() { AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE } else { AWAN_FLAG_ACTIVE };
                         let _key_guard = state.lock_key(b_id, &key).await;
                         let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset);
-                        let vol_offset = match state.store_payload(b_id, &key, &bytes, flags, src_meta.etag_hi, src_meta.etag_lo) {
+                        let vol_offset = match state.store_payload(b_id, &key, &bytes, flags, src_meta.etag_hi, src_meta.etag_lo).await {
                             Ok(off) => off,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not store the copy: {:?}", e))),
                         };
@@ -1417,7 +1441,7 @@ pub async fn handle_s3_request(
                     };
 
                     // Zero-byte objects get a needle too, so they and empty overwrites survive a restart.
-                    let vol_offset = match state.store_payload(b_id, &key, &decoded_bytes, flags, etag_hi, etag_lo) {
+                    let vol_offset = match state.store_payload(b_id, &key, &decoded_bytes, flags, etag_hi, etag_lo).await {
                         Ok(off) => off,
                         Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                     };
@@ -1694,6 +1718,9 @@ pub async fn handle_s3_request(
                         Ok(loc) => {
                             state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                             state.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                            if let Err(e) = state.make_durable(&vm, loc.seq).await {
+                                return Ok(internal_error_response(&key, &format!("could not sync the delete: {:?}", e)));
+                            }
                         }
                         Err(e) => return Ok(internal_error_response(&key, &format!("could not record the delete: {:?}", e))),
                     }
