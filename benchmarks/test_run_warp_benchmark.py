@@ -56,12 +56,32 @@ class TestRunWarpBenchmark(unittest.TestCase):
     def test_report_states_put_durability(self):
         report = format_markdown_report("cmd", {}, {}, {})
         self.assertIn("Durability per PUT", report)
-        self.assertIn("#490", report)
+        self.assertIn("#29", report)  # AwanFS issue number (was awan-lang #490 before the split)
 
     def test_report_has_no_unsourced_reference_ranges(self):
         report = format_markdown_report("cmd", {}, {}, {})
         self.assertNotIn("Published Ref", report)
         self.assertNotRegex(report, r"~[0-9]")
+
+class TestMachineFacts(unittest.TestCase):
+    def test_report_names_what_ran_not_the_original_laptop(self):
+        hw = {"os": "Linux 6.8 (x86_64)", "cores": "2", "ram_gb": "7.8",
+              "minio_status": "Measured Live (minio version RELEASE.2025-09-07T16-13-09Z)",
+              "rustfs_status": "not measured", "affinity_server": "not pinned (2 logical cores; pinning needs 8)"}
+        report = format_markdown_report("cmd", hw, {}, {})
+        self.assertNotIn("windows/amd64", report)
+        self.assertNotIn("32.0 GB", report)
+        self.assertNotIn("MinIO and RustFS fsync", report)
+        self.assertIn("minio version RELEASE.2025-09-07T16-13-09Z", report)
+        self.assertIn("not pinned (2 logical cores", report)
+
+    def test_ram_and_pinning_come_from_the_machine(self):
+        import run_warp_benchmark as r
+        self.assertNotEqual(r.host_ram_gb(), "32.0" if (os.cpu_count() or 0) < 8 else "never")
+        server, client = r.affinity_labels()
+        if (os.cpu_count() or 0) < 8:
+            self.assertTrue(server.startswith("not pinned"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,116 @@
+name: Nightly full benchmark matrix
+
+# The full three-way report (AwanFS, MinIO, RustFS; 64 KiB to 10 GiB; latency percentiles,
+# peak RSS, concurrency sweep), produced by exactly the command used for
+# measurements/s3_warp_minio_vs_awan.md, on GitHub-hosted Linux and Windows runners.
+# Report only: it does not fail on slow numbers (the ratio check in bench-ratio.yml does that).
+# Results: the job summary and the "full-matrix-<os>" artifact of each run.
+
+on:
+  schedule:
+    - cron: "17 20 * * *" # 04:17 in Malaysia, an hour after the ratio check
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "benchmarks/run_warp_benchmark.py"
+      - ".github/workflows/bench-full.yml"
+
+permissions:
+  contents: read
+
+env:
+  MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+  RUSTFS_TAG: 1.0.5
+
+jobs:
+  matrix:
+    name: Full matrix (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Free disk space (Linux; the 1 GiB and 10 GiB phases need about 25 GB)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Disk space
+        if: runner.os == 'Windows'
+        run: df -h . || true
+
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      - uses: actions/cache@v4
+        id: tools
+        with:
+          path: |
+            .tmp/minio
+            .tmp/rustfs
+          key: bench-tools-${{ runner.os }}-${{ env.MINIO_RELEASE }}-rustfs-${{ env.RUSTFS_TAG }}-v1
+      - uses: actions/setup-go@v5
+        if: steps.tools.outputs.cache-hit != 'true'
+        with:
+          go-version: stable
+          cache: false
+      - name: Build MinIO and mc from source (pinned release)
+        if: steps.tools.outputs.cache-hit != 'true'
+        # dl.min.io answers 410 for archived binaries and Docker Hub no longer serves minio/minio.
+        run: |
+          exe=""; [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
+          mkdir -p .tmp/minio
+          git clone -q --depth 1 --branch "$MINIO_RELEASE" https://github.com/minio/minio "$RUNNER_TEMP/minio-src"
+          (cd "$RUNNER_TEMP/minio-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/minio$exe" .)
+          git clone -q --depth 1 https://github.com/minio/mc "$RUNNER_TEMP/mc-src"
+          (cd "$RUNNER_TEMP/mc-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/mc$exe" .)
+      - name: Download RustFS release
+        if: steps.tools.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .tmp/rustfs "$RUNNER_TEMP/rustfs-dl"
+          if [ "$RUNNER_OS" = "Windows" ]; then want='windows.*(x86_64|amd64).*\.zip$'; bin=rustfs.exe; else want='linux.*(x86_64|amd64).*\.zip$'; bin=rustfs; fi
+          tag=""
+          for t in "$RUSTFS_TAG" "v$RUSTFS_TAG"; do
+            if gh release view "$t" -R rustfs/rustfs >/dev/null 2>&1; then tag="$t"; break; fi
+          done
+          if [ -z "$tag" ]; then echo "::warning::RustFS release $RUSTFS_TAG not found; the report will say RustFS was not measured"; exit 0; fi
+          asset=$(gh release view "$tag" -R rustfs/rustfs --json assets --jq '.assets[].name' | grep -Ei "$want" | grep -vi musl | head -1)
+          [ -z "$asset" ] && asset=$(gh release view "$tag" -R rustfs/rustfs --json assets --jq '.assets[].name' | grep -Ei "$want" | head -1)
+          if [ -z "$asset" ]; then echo "::warning::no RustFS asset for $RUNNER_OS in $tag"; exit 0; fi
+          gh release download "$tag" -R rustfs/rustfs -p "$asset" -D "$RUNNER_TEMP/rustfs-dl"
+          (cd "$RUNNER_TEMP/rustfs-dl" && unzip -q -o "$asset")
+          found=$(find "$RUNNER_TEMP/rustfs-dl" -type f -name "$bin" | head -1)
+          if [ -z "$found" ]; then echo "::warning::$bin not in $asset"; exit 0; fi
+          cp "$found" ".tmp/rustfs/$bin"
+          chmod +x ".tmp/rustfs/$bin" || true
+      - name: Tool versions
+        run: |
+          ls -l .tmp/minio .tmp/rustfs || true
+          for b in .tmp/minio/minio* .tmp/minio/mc* .tmp/rustfs/rustfs*; do [ -f "$b" ] && "$b" --version | head -1; done || true
+
+      - name: Run the full matrix (the command that produced measurements/s3_warp_minio_vs_awan.md)
+        run: python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB,10GiB --concurrent 64 --duration 2 --output measurements/s3_warp_minio_vs_awan.md
+      - name: Report to the job summary
+        if: always()
+        run: |
+          if [ -f measurements/s3_warp_minio_vs_awan.md ]; then
+            cat measurements/s3_warp_minio_vs_awan.md >> "$GITHUB_STEP_SUMMARY"
+            cat measurements/s3_warp_minio_vs_awan.md   # also in the log, readable without the web UI
+          else
+            echo "no report" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: full-matrix-${{ matrix.os }}
+          path: measurements/s3_warp_minio_vs_awan.md
+          if-no-files-found: warn
