@@ -133,6 +133,7 @@ pub struct VolumeManager {
     mmap: RwLock<Option<Arc<Mmap>>>,
     remap_count: AtomicU64,
     is_sparse: bool,
+    max_span: u64,
 }
 
 impl VolumeManager {
@@ -266,7 +267,14 @@ impl VolumeManager {
             mmap: RwLock::new(initial_mmap),
             remap_count: AtomicU64::new(0),
             is_sparse: sparse,
+            max_span: MAX_VOLUME_SPAN,
         })
+    }
+
+    /// Largest byte offset a needle may reach in this volume (default `MAX_VOLUME_SPAN`).
+    /// Smaller spans are for tests and small deployments.
+    pub fn set_max_span(&mut self, span: u64) {
+        self.max_span = span;
     }
 
     pub fn file(&self) -> Arc<AlignedFile> {
@@ -364,10 +372,10 @@ impl VolumeManager {
         }
 
         let raw_off = self.current_offset.fetch_add(total_len, Ordering::SeqCst);
-        let offset = if raw_off < MAX_VOLUME_SPAN {
+        let offset = if raw_off < self.max_span {
             raw_off
         } else {
-            let wrapped = (raw_off - SECTOR_SIZE as u64) % (MAX_VOLUME_SPAN - SECTOR_SIZE as u64);
+            let wrapped = (raw_off - SECTOR_SIZE as u64) % (self.max_span - SECTOR_SIZE as u64);
             SECTOR_SIZE as u64 + ((wrapped / SECTOR_SIZE as u64) * SECTOR_SIZE as u64)
         };
 
@@ -375,7 +383,7 @@ impl VolumeManager {
         self.file.write_aligned_at(offset, &buf)?;
 
         // Append 46-byte record to .idx under dedicated lock
-        if raw_off < MAX_VOLUME_SPAN {
+        if raw_off < self.max_span {
             let mut idx_entry = [0u8; 46];
             idx_entry[0..8].copy_from_slice(&key_hash.to_le_bytes());
             idx_entry[8..12].copy_from_slice(&self.volume_id.to_le_bytes());
