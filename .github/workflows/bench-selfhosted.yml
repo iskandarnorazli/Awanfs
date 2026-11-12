@@ -1,0 +1,56 @@
+name: Benchmarks on the self-hosted runner
+
+# Long benchmark runs (#58) on the owner's machine, never on GitHub-hosted runners: a runner
+# registered with the label "bench" (benchmarks/RUNNER.md). Manual or weekly; never on pull
+# requests, so no PR code runs on that machine. Results: job summary and artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Seconds per phase"
+        default: "30"
+      runs:
+        description: "Rounds per server (ratio check)"
+        default: "3"
+  schedule:
+    - cron: "17 18 * * 6" # Sunday 02:17 in Malaysia; skipped if the runner is offline
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-selfhosted
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    runs-on: [ self-hosted, bench ]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Machine
+        run: python -c "import os, platform; print(platform.platform(), os.cpu_count(), 'CPUs')"
+      - name: Ratio check against MinIO (builds the server, fetches MinIO if missing)
+        run: python benchmarks/bench.py --runs ${{ inputs.runs || '3' }} --duration ${{ inputs.duration || '30' }} --output measurements/bench_selfhosted.md
+      - name: Full matrix (AwanFS, MinIO, RustFS where present)
+        run: python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB --concurrent 64 --duration ${{ inputs.duration || '30' }}s --output measurements/s3_full_selfhosted.md
+      - name: Report
+        if: always()
+        shell: python
+        run: |
+          import os
+          out = os.environ["GITHUB_STEP_SUMMARY"]
+          for p in ("measurements/bench_selfhosted.md", "measurements/s3_full_selfhosted.md"):
+              if os.path.exists(p):
+                  text = open(p, encoding="utf-8").read()
+                  print(text)
+                  open(out, "a", encoding="utf-8").write(text + "\n\n")
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-selfhosted
+          path: |
+            measurements/bench_selfhosted.md
+            measurements/s3_full_selfhosted.md
+          if-no-files-found: warn
