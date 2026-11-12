@@ -60,8 +60,8 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
+            if let (Some(h), Some(l)) = (crate::s3_api::hex_digit(bytes[i + 1]), crate::s3_api::hex_digit(bytes[i + 2])) {
+                out.push(h << 4 | l);
                 i += 3;
                 continue;
             }
