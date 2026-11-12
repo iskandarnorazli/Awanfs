@@ -132,6 +132,8 @@ async fn admin_reader_and_scoped_users_get_what_their_policies_say() {
     let xml = scoped(Method::POST, "/team-a?delete", body).send().await.unwrap().text().await.unwrap();
     assert!(xml.contains("<Deleted><Key>x</Key>") || xml.contains("<Key>x</Key>"), "{}", xml);
     assert!(xml.contains("AccessDenied"), "keep/z is refused inside the batch: {}", xml);
+    assert_eq!(scoped(Method::GET, "/team-a/x", b"").send().await.unwrap().status(), StatusCode::NOT_FOUND, "the batch deleted x");
+    assert_eq!(scoped(Method::GET, "/team-a/keep/z", b"").send().await.unwrap().status(), StatusCode::OK, "the refused key is still there");
 
     // Admin can do everything.
     assert_eq!(admin(Method::DELETE, "/team-b/doc", b"").send().await.unwrap().status(), StatusCode::NO_CONTENT);
@@ -147,11 +149,11 @@ async fn admin_reader_and_scoped_users_get_what_their_policies_say() {
     let without_reader = CONFIG.split("[[users]]").filter(|u| !u.contains("AKREADER")).collect::<Vec<_>>().join("[[users]]");
     write_config(&dir, &without_reader);
     iam.reload().unwrap();
-    let res = reader(Method::GET, "/team-a/x", b"").send().await.unwrap();
+    let res = reader(Method::GET, "/team-a/keep/z", b"").send().await.unwrap();
     assert!(res.text().await.unwrap().contains("InvalidAccessKeyId"), "the reader is gone after the reload");
     write_config(&dir, "this is not toml [[[");
     assert!(iam.reload().is_err());
-    assert_eq!(scoped(Method::GET, "/team-a/x", b"").send().await.unwrap().status(), StatusCode::OK, "users kept after a failed reload");
+    assert_eq!(scoped(Method::GET, "/team-a/keep/z", b"").send().await.unwrap().status(), StatusCode::OK, "users kept after a failed reload");
 }
 
 #[test]
