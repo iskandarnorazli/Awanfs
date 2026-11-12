@@ -5,8 +5,10 @@
 //! A count that goes up is a regression: find the new copy, write or sync before changing the
 //! expected value. A count that goes down is an improvement: lower the expected value in the
 //! same change. Two counts describe known costs that should go down:
-//! - a full GET of a multipart object copies every part into one buffer (`full_multipart_get`);
-//! - a single PUT is acknowledged without a disk sync (`put_64k`); group commit is #29.
+//! - a full GET of a multipart object copies every part into one buffer (`full_multipart_get`).
+//!
+//! Syncs: in the default `group` durability mode (#29) a lone write waits for one sync of the
+//! volume and one of its journal (2); concurrent writers share them (`durability_test.rs`).
 
 use reqwest::header::{ETAG, RANGE};
 use reqwest::StatusCode;
@@ -72,8 +74,9 @@ async fn single_object_put_get_range_delete() {
     let before = s.snap();
     let res = s.client.put(format!("{}/bkt/k", s.url)).body(payload.clone()).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    // put_64k: one aligned volume write; the payload is copied once into the aligned buffer.
-    assert_eq!(s.since(&before), work(1, needle_bytes(1, 65536), 0, 1, 65536), "put_64k");
+    // put_64k: one aligned volume write; the payload is copied once into the aligned buffer;
+    // acknowledged after the volume and journal syncs.
+    assert_eq!(s.since(&before), work(1, needle_bytes(1, 65536), 2, 1, 65536), "put_64k");
 
     let before = s.snap();
     let res = s.client.get(format!("{}/bkt/k", s.url)).send().await.unwrap();
@@ -96,7 +99,7 @@ async fn single_object_put_get_range_delete() {
     let before = s.snap();
     let res = s.client.delete(format!("{}/bkt/k", s.url)).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
-    assert_eq!(s.since(&before), work(1, needle_bytes(1, 0), 0, 0, 0), "delete: one tombstone needle");
+    assert_eq!(s.since(&before), work(1, needle_bytes(1, 0), 2, 0, 0), "delete: one tombstone needle, synced");
 }
 
 #[tokio::test]
@@ -133,7 +136,7 @@ async fn multipart_upload_and_reads() {
     assert_eq!(res.status(), StatusCode::OK);
     let d = s.since(&before);
     // complete: one manifest needle; the parts are not copied.
-    assert_eq!((d.disk_writes, d.disk_syncs, d.disk_reads, d.payload_copies), (1, 0, 0, 1), "complete_multipart: {:?}", d);
+    assert_eq!((d.disk_writes, d.disk_syncs, d.disk_reads, d.payload_copies), (1, 2, 0, 1), "complete_multipart: {:?}", d);
     assert!(d.payload_copy_bytes < 4096, "complete_multipart copied {} bytes; only the manifest should be copied", d.payload_copy_bytes);
 
     let before = s.snap();
