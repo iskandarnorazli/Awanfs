@@ -24,7 +24,7 @@ trap cleanup EXIT
 pass=0; fail=0
 check() { # name, command...
   local name="$1"; shift
-  if "$@" >>"$EVID/$name.txt" 2>&1; then echo "ok    $name"; pass=$((pass+1)); else echo "FAIL  $name (see $EVID/$name.txt)"; fail=$((fail+1)); fi; }
+  if "$@" >>"$EVID/$name.txt" 2>&1; then echo "ok    $name"; pass=$((pass+1)); else echo "FAIL  $name (see $EVID/$name.txt)"; tail -n 15 "$EVID/$name.txt" | sed "s/^/      /"; fail=$((fail+1)); fi; }
 same() { cmp -s "$1" "$2"; }
 
 doctor() { curl -s -o /dev/null -w '%{http_code}\n' "$URL/" | grep -q 200 && echo "server up on $PORT, pid $PID, data $DATA"; }
