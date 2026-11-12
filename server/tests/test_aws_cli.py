@@ -37,7 +37,7 @@ class TestAwsCliCompat(unittest.TestCase):
             subprocess.run(build_cmd + ["--manifest-path", manifest], check=True)
 
         cls.server_process = subprocess.Popen(
-            [server_bin, "--port", str(cls.port)],
+            [server_bin, "--port", str(cls.port), "--allow-anonymous"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )

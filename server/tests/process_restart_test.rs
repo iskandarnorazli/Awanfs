@@ -26,7 +26,7 @@ fn free_port() -> u16 {
 async fn start(dir: &Path) -> (Child, String) {
     let port = free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_s3-server"))
-        .args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap()])
+        .args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

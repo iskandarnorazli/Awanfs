@@ -82,7 +82,7 @@ impl Default for SigV4KeyCache {
 
 pub fn parse_iso8601_epoch(dt: &str) -> Option<u64> {
     // Basic format: "20261110T120000Z"
-    if dt.len() < 16 || !dt.ends_with('Z') {
+    if dt.len() < 16 || !dt.is_ascii() || !dt.ends_with('Z') {
         return None;
     }
     let year: i32 = dt[0..4].parse().ok()?;
@@ -91,6 +91,9 @@ pub fn parse_iso8601_epoch(dt: &str) -> Option<u64> {
     let hour: u32 = dt[9..11].parse().ok()?;
     let min: u32 = dt[11..13].parse().ok()?;
     let sec: u32 = dt[13..15].parse().ok()?;
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
 
     // Approximate days from epoch (valid for 2020..2030)
     let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
