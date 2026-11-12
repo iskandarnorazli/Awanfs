@@ -47,7 +47,7 @@ jobs:
       - name: promtool check rules
         run: |
           v=3.5.0
-          curl -sSL -o /tmp/prom.tgz "https://github.com/prometheus/prometheus/releases/download/v$v/prometheus-$v.linux-amd64.tar.gz"
+          curl -fsSL --retry 5 --retry-all-errors -o /tmp/prom.tgz "https://github.com/prometheus/prometheus/releases/download/v$v/prometheus-$v.linux-amd64.tar.gz"
           tar -xzf /tmp/prom.tgz -C /tmp
           /tmp/prometheus-$v.linux-amd64/promtool check rules deploy/prometheus/alerts.yml
 
