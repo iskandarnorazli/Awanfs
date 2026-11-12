@@ -193,3 +193,41 @@ fn test_storage_engine_spill_on_capacity_limit() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The #13 gate: 1.2 million keys in one bucket (100,000 in memory, the rest spilled), every one
+/// readable, and the process's peak resident memory at most 200 MB. Run in CI on Linux in a
+/// release build (`-- --ignored`); peak RSS comes from /proc/self/status (VmHWM).
+#[test]
+#[ignore]
+fn spill_holds_1_2_million_keys_in_bounded_memory() {
+    let dir = temp_dir("scale");
+    let spill = SpillIndex::open(&dir.join("metadata.db")).expect("open spill db");
+    let mut engine = StorageEngine::new(100_000, 4 * 1024 * 1024, 65536);
+    engine.attach_spill_index(spill);
+    let b_id = engine.create_bucket("scale").unwrap();
+    let n = 1_200_000u64;
+    for i in 0..n {
+        let key = format!("obj-{:07}", i);
+        engine.put_object(b_id, key.as_bytes(), 4096 * (i + 1), i, i, !i, 0, 0).expect("put");
+        if i % 200_000 == 0 {
+            println!("{} keys written", i);
+        }
+    }
+    for i in 0..n {
+        let key = format!("obj-{:07}", i);
+        let m = engine.get_object(b_id, key.as_bytes()).unwrap_or_else(|_| panic!("{} missing", key));
+        assert_eq!((m.size, m.vol_offset), (i, 4096 * (i + 1)), "{}", key);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kb: u64 = status
+            .lines()
+            .find(|l| l.starts_with("VmHWM:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap();
+        println!("peak RSS for {} keys: {} MB", n, kb / 1024);
+        assert!(kb <= 200 * 1024, "peak RSS {} MB above 200 MB", kb / 1024);
+    }
+}
