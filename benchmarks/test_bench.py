@@ -14,6 +14,9 @@ class BenchTests(unittest.TestCase):
             p = bench.report_path(0)
         self.assertTrue(p.endswith(os.path.join("measurements", "bench_1970-01-01_my-box-01.md")), p)
 
+    def test_output_in_the_current_directory_needs_no_folder(self):
+        bench.ensure_parent("bench_smoke.md")  # CI run 1: makedirs('') raised FileNotFoundError
+
     def test_no_docker_outside_linux(self):
         with mock.patch.object(bench.sys, "platform", "win32"):
             self.assertFalse(bench.from_image("quay.io/minio/minio:x", "/usr/bin/minio", "out"))
