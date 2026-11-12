@@ -2,13 +2,14 @@
   "_machine": "github ubuntu-latest (2 CPUs)",
   "_source": "lower ratio of CI runs 43151084225 attempts 1 and 2 (same commit 99911dc), 2026-11-12",
   "_note": "The two runs differed by up to 50% (put_64k 12.33 vs 6.13), so the tolerance starts at 40%. Narrow it once a week of nightly runs shows the real spread.",
-  "tolerance": 0.40,
+  "tolerance": 0.4,
   "ratios": {
-    "put_64k": 6.13,
+    "put_64k": 3.94,
     "get_64k": 1.64,
-    "range_get_4k": 2.10,
+    "range_get_4k": 2.1,
     "mixed_64k": 2.15,
-    "put_1m": 2.01,
+    "put_1m": 1.16,
     "get_1m": 2.74
-  }
+  },
+  "_put_rows": "put_64k and put_1m re-recorded from run 43249085801 (commit a16d683, 2026-11-12), the first with group durability (#29): both servers now sync before answering a PUT. One run; the other rows are unchanged."
 }
