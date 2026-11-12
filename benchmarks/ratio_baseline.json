@@ -1,0 +1,14 @@
+{
+  "_machine": "github ubuntu-latest (2 CPUs)",
+  "_source": "lower ratio of CI runs 43151084225 attempts 1 and 2 (same commit 99911dc), 2026-11-12",
+  "_note": "The two runs differed by up to 50% (put_64k 12.33 vs 6.13), so the tolerance starts at 40%. Narrow it once a week of nightly runs shows the real spread.",
+  "tolerance": 0.40,
+  "ratios": {
+    "put_64k": 6.13,
+    "get_64k": 1.64,
+    "range_get_4k": 2.10,
+    "mixed_64k": 2.15,
+    "put_1m": 2.01,
+    "get_1m": 2.74
+  }
+}
