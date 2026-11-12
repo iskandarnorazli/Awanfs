@@ -1,0 +1,61 @@
+name: ceph s3-tests
+
+# Conformance (#47): the ceph s3-tests suite against a fresh AwanFS. Fails only when a test in
+# tests/s3tests/passing.txt stops passing; the report lists new passes to add.
+
+on:
+  schedule:
+    - cron: "37 20 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "tests/s3tests/**"
+      - ".github/workflows/s3-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  s3tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Build
+        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Start AwanFS
+        run: |
+          mkdir -p /tmp/awanfs-data
+          AWANFS_ACCESS_KEY=AWANFSMAINKEY0000000 AWANFS_SECRET_KEY=awanfs-main-secret-for-s3-tests-0000000000 AWANFS_LOG=off \
+            nohup server/target/release/s3-server --port 9000 --data-dir /tmp/awanfs-data --auto-compaction off > /tmp/awanfs.log 2>&1 &
+          for i in $(seq 1 50); do curl -sf http://127.0.0.1:9000/_awanfs/health/ready && break; sleep 0.2; done
+      - name: Get s3-tests
+        run: |
+          git clone -q --depth 1 https://github.com/ceph/s3-tests /tmp/s3-tests
+          echo "s3-tests commit: $(git -C /tmp/s3-tests rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q -r /tmp/s3-tests/requirements.txt pytest-timeout
+      - name: Run
+        run: |
+          cd /tmp/s3-tests
+          S3TEST_CONF=$GITHUB_WORKSPACE/tests/s3tests/s3tests.conf /tmp/venv/bin/pytest s3tests/functional/test_s3.py \
+            -p no:cacheprovider -q --timeout=60 --junitxml=/tmp/s3tests-results.xml -o junit_family=xunit1 || true
+          test -s /tmp/s3tests-results.xml
+      - name: Ratchet
+        run: python3 tests/s3tests/ratchet.py /tmp/s3tests-results.xml tests/s3tests/passing.txt --report /tmp/s3tests-report.md
+      - name: Summary
+        if: always()
+        run: |
+          [ -f /tmp/s3tests-report.md ] && cat /tmp/s3tests-report.md >> "$GITHUB_STEP_SUMMARY"
+          tail -20 /tmp/awanfs.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s3tests-results
+          path: |
+            /tmp/s3tests-results.xml
+            /tmp/s3tests-report.md
