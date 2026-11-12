@@ -75,10 +75,21 @@ impl MultipartManager {
 
     pub fn with_staging_dir(staging_dir: PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&staging_dir);
+        // Completed multipart objects keep their bytes in their upload's directory, so ids
+        // continue after the highest one on disk instead of starting at 1 again.
+        let next_id = std::fs::read_dir(&staging_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter_map(|n| n.strip_prefix("upload-").and_then(|h| u64::from_str_radix(h, 16).ok()))
+                    .max()
+                    .map_or(1, |m| m + 1)
+            })
+            .unwrap_or(1);
         Self {
             uploads: RwLock::new(BTreeMap::new()),
             completed_extents: RwLock::new(BTreeMap::new()),
-            next_upload_id: RwLock::new(1),
+            next_upload_id: RwLock::new(next_id),
             enforce_min_part_size: AtomicBool::new(false),
             staging_dir,
             staged_mmaps: RwLock::new(HashMap::new()),
@@ -109,10 +120,20 @@ impl MultipartManager {
         Ok(mmap)
     }
 
-    pub fn create_upload(&self, bucket: &str, bucket_id: u32, key: &str) -> String {
+    /// Starts an upload. Its staging directory is created here, and only if it does not exist
+    /// yet, so an id (and the parts of a completed object stored under it) is never reused.
+    pub fn create_upload(&self, bucket: &str, bucket_id: u32, key: &str) -> std::io::Result<String> {
         let mut id_gen = self.next_upload_id.write();
-        let upload_id = format!("upload-{:016x}", *id_gen);
-        *id_gen += 1;
+        let upload_id = loop {
+            let id = format!("upload-{:016x}", *id_gen);
+            *id_gen += 1;
+            match std::fs::create_dir(self.staging_dir.join(&id)) {
+                Ok(()) => break id,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        };
+        drop(id_gen);
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -132,7 +153,7 @@ impl MultipartManager {
         };
 
         self.uploads.write().insert(upload_id.clone(), upload);
-        upload_id
+        Ok(upload_id)
     }
 
     pub fn write_staged_part(

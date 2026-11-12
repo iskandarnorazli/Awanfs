@@ -1341,7 +1341,10 @@ pub async fn handle_s3_request(
 
             // 1. Multipart POST /{bucket}/{key}?uploads -> CreateMultipartUpload
             if method == Method::POST && query_map.contains_key("uploads") {
-                let upload_id = state.multipart.create_upload(&bucket, b_id, &key);
+                let upload_id = match state.multipart.create_upload(&bucket, b_id, &key) {
+                    Ok(id) => id,
+                    Err(e) => return Ok(internal_error_response(&key, &format!("could not start the upload: {}", e))),
+                };
                 let xml = initiate_multipart_upload_result_xml(&bucket, &key, &upload_id);
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
