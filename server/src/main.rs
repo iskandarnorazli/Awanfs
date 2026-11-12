@@ -20,6 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut listen = std::env::var("AWANFS_LISTEN").unwrap_or_else(|_| "127.0.0.1".to_string());
     let mut allow_anonymous = std::env::var("AWANFS_ALLOW_ANONYMOUS").ok().as_deref() == Some("1");
+    let mut access_log: Option<String> = None;
     let mut durability = std::env::var("AWANFS_DURABILITY").unwrap_or_else(|_| "group".to_string());
 
     let mut args = std::env::args().skip(1);
@@ -38,6 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if let Some(d) = args.next() {
                 durability = d;
             }
+        } else if arg == "--access-log" {
+            access_log = args.next();
         } else if arg == "--allow-anonymous" {
             allow_anonymous = true;
         } else if arg == "--data-dir" || arg == "-d" {
@@ -66,6 +69,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     state.auth = auth;
     state.set_durability(durability);
+    // S3 server access log (#46): --access-log <file> or -, or AWANFS_ACCESS_LOG; off by default.
+    if let Some(target) = access_log.or_else(|| std::env::var("AWANFS_ACCESS_LOG").ok()).filter(|t| !t.is_empty()) {
+        let sink: s3_server::request_log::LogSink = if target == "-" {
+            Arc::new(|line: &str| println!("{}", line))
+        } else {
+            let file = std::fs::OpenOptions::new().create(true).append(true).open(&target).unwrap_or_else(|e| {
+                eprintln!("cannot open the access log {}: {}", target, e);
+                std::process::exit(2);
+            });
+            let file = std::sync::Mutex::new(file);
+            Arc::new(move |line: &str| {
+                use std::io::Write;
+                if let Ok(mut f) = file.lock() {
+                    let _ = writeln!(f, "{}", line);
+                }
+            })
+        };
+        *state.audit_log.write() = Some(sink);
+    }
     // One JSON line per request on stderr; AWANFS_LOG=off turns it off.
     if std::env::var("AWANFS_LOG").ok().as_deref() != Some("off") {
         let sink: s3_server::request_log::LogSink = Arc::new(|line: &str| eprintln!("{}", line));
