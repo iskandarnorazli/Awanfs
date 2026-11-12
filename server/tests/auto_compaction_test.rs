@@ -90,3 +90,33 @@ async fn a_lone_volume_is_sealed_and_compacted_only_above_the_minimum_size() {
     assert_eq!(state.volumes.read().len(), 1, "volume 1 sealed, compacted away; the new one is active");
     assert_eq!(c.get(format!("{}/ac-bkt/k3", url)).send().await.unwrap().status(), StatusCode::NOT_FOUND);
 }
+
+/// The #14 gate: 100 MB of objects, 50 MB deleted, compaction, footprint about 50 MB, and
+/// every remaining object intact. Footprint = bytes used in the open volumes (volume 1 is a
+/// sparse 32 GiB file, so its length says nothing).
+#[tokio::test]
+async fn deleting_half_of_100_mb_and_compacting_halves_the_footprint() {
+    let dir = temp_dir("footprint");
+    let c = reqwest::Client::new();
+    let (state, url, _h) = start(&dir, None).await;
+    assert_eq!(c.put(format!("{}/fp-bkt", url)).send().await.unwrap().status(), StatusCode::OK);
+    let mb = 1024 * 1024;
+    let obj = |i: usize| -> Vec<u8> { (0..mb).map(|j| ((j * 31 + i * 7) % 251) as u8).collect() };
+    for i in 0..100 {
+        assert_eq!(c.put(format!("{}/fp-bkt/o{}", url, i)).body(obj(i)).send().await.unwrap().status(), StatusCode::OK);
+    }
+    let used = |s: &S3ServiceState| -> u64 { s.volumes.read().values().map(|v| v.offset()).sum() };
+    let before = used(&state);
+    assert!(before >= 100 * mb as u64, "100 MB written, {} used", before);
+    for i in (0..100).step_by(2) {
+        assert_eq!(c.delete(format!("{}/fp-bkt/o{}", url, i)).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    }
+    let r = state.auto_compact_once(0.20, 0).await.unwrap().expect("half of it is dead");
+    assert_eq!(r.live_needles_copied, 50);
+    let after = used(&state);
+    assert!(after < before * 55 / 100 && after >= 50 * mb as u64, "footprint {} after, {} before", after, before);
+    for i in (1..100).step_by(2) {
+        let got = c.get(format!("{}/fp-bkt/o{}", url, i)).send().await.unwrap().bytes().await.unwrap();
+        assert!(&got[..] == &obj(i)[..], "o{}", i);
+    }
+}
