@@ -175,3 +175,17 @@ async fn copied_object_survives_source_overwrite_and_restart() {
     let (url, _h) = spawn(Arc::new(S3ServiceState::with_data_dir(&dir))).await;
     assert_eq!(get(&c, &url, "dst").await, (StatusCode::OK, b"original bytes".to_vec()), "the copy after a restart");
 }
+
+#[tokio::test]
+async fn bucket_answers_head_after_restart() {
+    let dir = temp_dir("bucket_head");
+    let c = reqwest::Client::new();
+    {
+        let (url, _h) = spawn(Arc::new(S3ServiceState::with_data_dir(&dir))).await;
+        assert_eq!(c.put(format!("{}/bkt", url)).send().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(c.put(format!("{}/bkt/s", url)).body(&b"x"[..]).send().await.unwrap().status(), StatusCode::OK);
+    }
+    let (url, _h) = spawn(Arc::new(S3ServiceState::with_data_dir(&dir))).await;
+    assert_eq!(c.head(format!("{}/bkt", url)).send().await.unwrap().status(), StatusCode::OK, "HEAD bucket after a restart");
+    assert_eq!(get(&c, &url, "s").await, (StatusCode::OK, b"x".to_vec()));
+}
