@@ -132,7 +132,7 @@ def format_markdown_report(
         f"- **Client Affinity Pin:** {hw_info.get('affinity_client', 'Cores 4..7 (Mask 0xF0)')}",
         f"- **Live MinIO Binary Status:** {hw_info.get('minio_status', 'not measured')}",
         f"- **Live RustFS Binary Status:** {hw_info.get('rustfs_status', 'not measured')}",
-        "- **Durability per PUT:** `s3-server` acknowledges a PUT before it is flushed to disk (no fsync on the write path; group commit is #490). MinIO and RustFS fsync each PUT, so PUT and mixed rows compare a non-durable write with durable ones.",
+        "- **Durability per PUT:** `s3-server` acknowledges a PUT before it is flushed to disk (no fsync on the write path; group commit is #29). MinIO syncs each PUT (O_DSYNC), so PUT and mixed rows against MinIO compare a non-durable write with a durable one. RustFS's sync behaviour is not verified here.",
         "",
         "## 2. Live Measured HTTP/1.1 Keep-Alive Throughput & Latency Matrix (64 KiB – 10 GiB)",
         "",
@@ -241,7 +241,7 @@ def format_markdown_report(
         "",
         f"## {section_num}. Open-Source S3 Alternatives Reference Comparison (`COMPETITIVE_LANDSCAPE.md`)",
         "",
-        "> **Provenance Note (Audit Rule 3):** Official standalone MinIO (`RELEASE.2025-09-07T16-13-09Z`, Go 1.24.6 windows/amd64) and RustFS (`v1.0.5`, Apache 2.0 Rust windows/x86_64) binaries were executed live on local NVMe pinned to Cores 0..3 with anonymous public access policy enabled via `mc.exe`, receiving identical persistent HTTP/1.1 keep-alive requests from client workers pinned to Cores 4..7. Peak Working Set RSS was measured live using Windows OS API `GetProcessMemoryInfo`. Note that for 1 MiB multipart upload with 256 KiB parts, both MinIO and RustFS strictly reject parts smaller than 5 MiB with HTTP 400 `EntityTooSmall` per AWS S3 RFC specification, whereas `s3-server` accepts them, which does not conform to S3. Reference figures for SeaweedFS, Garage and Ceph RGW are not measured here and are left out.",
+        f"> **Provenance Note (Audit Rule 3):** MinIO ({hw_info.get('minio_status', 'not measured')}) and RustFS ({hw_info.get('rustfs_status', 'not measured')}) ran on this machine ({hw_info.get('os', platform.platform())}) with anonymous access enabled via `mc`, receiving the same persistent HTTP/1.1 keep-alive requests as `s3-server`. Server pinning: {hw_info.get('affinity_server', 'not recorded')}. Peak RSS comes from the OS (`GetProcessMemoryInfo` on Windows, `/proc/<pid>/status` VmHWM on Linux). Note that for 1 MiB multipart upload with 256 KiB parts, both MinIO and RustFS strictly reject parts smaller than 5 MiB with HTTP 400 `EntityTooSmall` per AWS S3 RFC specification, whereas `s3-server` accepts them, which does not conform to S3. Reference figures for SeaweedFS, Garage and Ceph RGW are not measured here and are left out.",
         "",
         "| Dimension | `s3-server` (Measured Local) | MinIO (Go, Measured Local) | RustFS (Rust, Measured Local) |",
         "| :--- | :--- | :--- | :--- |",
@@ -249,7 +249,7 @@ def format_markdown_report(
         f"| **64 KiB GET Throughput** | **{get_64k.mib_per_sec:.1f} MiB/s ({get_64k.ops_per_sec:.0f} ops/s)** | {m_get_64k.mib_per_sec:.1f} MiB/s ({m_get_64k.ops_per_sec:.0f} ops/s) | {r_get_64k.mib_per_sec:.1f} MiB/s ({r_get_64k.ops_per_sec:.0f} ops/s) |",
         f"| **1 MiB PUT Throughput** | **{put_1m.mib_per_sec:.1f} MiB/s ({put_1m.ops_per_sec:.0f} ops/s)** | {m_put_1m.mib_per_sec:.1f} MiB/s ({m_put_1m.ops_per_sec:.0f} ops/s) | {r_put_1m.mib_per_sec:.1f} MiB/s ({r_put_1m.ops_per_sec:.0f} ops/s) |",
         f"| **1 MiB / 10 GiB GET Throughput** | **{get_1m.mib_per_sec:.1f} – {get_10g.mib_per_sec:.1f} MiB/s** | {m_get_1m.mib_per_sec:.1f} – {m_get_10g.mib_per_sec:.1f} MiB/s | {r_get_1m.mib_per_sec:.1f} – {r_get_10g.mib_per_sec:.1f} MiB/s |",
-        f"| **Server Peak RSS (64K–10G)** | **{max_rss:.1f} MB (Bounded 16 MiB Slab Cache)** | {m_max_rss:.1f} MB (Go GC heap) | {r_max_rss:.1f} MB (Rust jemalloc) |",
+        f"| **Server Peak RSS (64K–10G)** | **{max_rss:.1f} MB (1 GiB payload cache cap)** | {m_max_rss:.1f} MB (Go GC heap) | {r_max_rss:.1f} MB (Rust jemalloc) |",
         "| **Metadata Layout** | **64B `ObjectMeta` Columnar SoA** | Per-object `xl.meta` file | Multi-volume FS Metadata |",
         "| **Small-File Disk Layout** | **4096B WORM Needle Volume** | 2+ files/inodes per object | Multi-volume File Store |",
         "| **License** | **Permissive (Workspace / MIT / Apache-2.0)** | AGPLv3 (Active Community OSS) | Apache 2.0 (Active Rust OSS) |",
@@ -264,7 +264,17 @@ def get_free_port() -> int:
         return s.getsockname()[1]
 
 
+PIN_MIN_CPUS = 8  # the server gets cores 0..3 and the client cores 4..7
+
+
+def can_pin() -> bool:
+    return (os.cpu_count() or 0) >= PIN_MIN_CPUS and (sys.platform == "win32" or hasattr(os, "sched_setaffinity"))
+
+
 def set_affinity_mask(pid_or_current: Optional[int], mask: int) -> None:
+    """Pins a process to the cores in `mask`; does nothing on machines with fewer than 8 CPUs."""
+    if not can_pin():
+        return
     if sys.platform == "win32":
         try:
             if pid_or_current is None:
@@ -280,6 +290,75 @@ def set_affinity_mask(pid_or_current: Optional[int], mask: int) -> None:
                     ctypes.windll.kernel32.CloseHandle(handle)
         except Exception:
             pass
+    else:
+        try:
+            os.sched_setaffinity(pid_or_current or 0, {i for i in range(64) if mask >> i & 1})
+        except Exception:
+            pass
+
+
+def affinity_labels() -> Tuple[str, str]:
+    if can_pin():
+        return "Cores 0..3 (Affinity Mask 0x0F)", "Cores 4..7 (Affinity Mask 0xF0)"
+    n = os.cpu_count() or 0
+    return (f"not pinned ({n} logical cores; pinning needs {PIN_MIN_CPUS})",) * 2
+
+
+def cpu_model() -> str:
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/cpuinfo", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("model name"):
+                        return line.split(":", 1)[1].strip()
+        except OSError:
+            pass
+    return platform.processor() or platform.machine() or "unknown"
+
+
+def host_ram_gb() -> str:
+    """Physical RAM in GB, read from the OS; 'unknown' when it cannot be read."""
+    try:
+        if sys.platform == "win32":
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            st = MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return f"{st.ullTotalPhys / 1024 ** 3:.1f}"
+        elif hasattr(os, "sysconf") and "SC_PHYS_PAGES" in os.sysconf_names:
+            return f"{os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / 1024 ** 3:.1f}"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def binary_version(path: str) -> str:
+    """First line of `<binary> --version`, to name exactly what was measured."""
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
+        for line in (out.stdout + out.stderr).splitlines():
+            if line.strip():
+                return line.strip()
+    except Exception:
+        pass
+    return "version unknown"
+
+
+def anonymous_put_ok(host: str, port: int, bucket: str) -> bool:
+    """True when an unsigned PUT works: the harness client sends unsigned requests."""
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=10.0)
+        conn.request("PUT", f"/{bucket}/__harness_probe", body=b"x", headers={"Content-Length": "1"})
+        ok = conn.getresponse().status == 200
+        conn.close()
+        return ok
+    except Exception:
+        return False
 
 
 class BaselineFileS3Handler(http.server.BaseHTTPRequestHandler):
@@ -1031,7 +1110,9 @@ def main():
         subprocess.run([mc_bin, "mb", f"{alias_name}/{bucket}"], capture_output=True)
         subprocess.run([mc_bin, "anonymous", "set", "public", f"{alias_name}/{bucket}"], capture_output=True)
 
-        minio_status = "Measured Live (minio.exe RELEASE.2025-09-07T16-13-09Z, Go 1.24.6 windows/amd64)"
+        minio_status = f"Measured Live ({binary_version(minio_bin)})"
+        if not anonymous_put_ok(host, minio_port, bucket):
+            minio_status += "; WARNING: anonymous PUT probe failed, so its rows are not valid"
 
         print(f"  [1/10] MinIO: Running 64 KiB PUT phase ({dur_sec}s, {args.concurrent} workers)...")
         baseline_results["put_64k"] = run_workload_phase(host, minio_port, bucket, 64 * 1024, args.concurrent, dur_sec, "put", minio_proc.pid)
@@ -1152,7 +1233,9 @@ def main():
         subprocess.run([mc_bin, "mb", f"{alias_name}/{bucket}"], capture_output=True)
         subprocess.run([mc_bin, "anonymous", "set", "public", f"{alias_name}/{bucket}"], capture_output=True)
 
-        rustfs_status = "Measured Live (rustfs.exe v1.0.5, Apache 2.0 Rust x86_64)"
+        rustfs_status = f"Measured Live ({binary_version(rustfs_bin)})"
+        if not anonymous_put_ok(host, rustfs_port, bucket):
+            rustfs_status += "; WARNING: anonymous PUT probe failed, so its rows are not valid"
 
         print(f"  [1/10] RustFS: Running 64 KiB PUT phase ({dur_sec}s, {args.concurrent} workers)...")
         rustfs_results["put_64k"] = run_workload_phase(host, rustfs_port, bucket, 64 * 1024, args.concurrent, dur_sec, "put", rustfs_proc.pid)
@@ -1202,13 +1285,14 @@ def main():
         rustfs_proc.wait()
         shutil.rmtree(rustfs_data_dir, ignore_errors=True)
 
+    pin_server, pin_client = affinity_labels()
     hw_info = {
-        "cpu": platform.processor() or "AMD / Intel x86_64",
-        "cores": str(os.cpu_count() or 8),
-        "ram_gb": "32.0",
+        "cpu": cpu_model(),
+        "cores": str(os.cpu_count() or "unknown"),
+        "ram_gb": host_ram_gb(),
         "os": f"{platform.system()} {platform.release()} ({platform.machine()})",
-        "affinity_server": "Cores 0..3 (Affinity Mask 0x0F)",
-        "affinity_client": "Cores 4..7 (Affinity Mask 0xF0)",
+        "affinity_server": pin_server,
+        "affinity_client": pin_client,
         "minio_status": minio_status,
         "rustfs_status": rustfs_status,
     }
