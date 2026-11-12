@@ -62,12 +62,12 @@ async fn put_that_cannot_be_written_is_an_error_not_a_200() {
 
     let (url, _handle) = spawn(Arc::clone(&state)).await;
     let c = reqwest::Client::new();
-    assert_eq!(c.put(format!("{}/b", url)).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(c.put(format!("{}/bkt", url)).send().await.unwrap().status(), StatusCode::OK);
 
-    let res = c.put(format!("{}/b/big", url)).body(pattern(128 * 1024, 2)).send().await.unwrap();
+    let res = c.put(format!("{}/bkt/big", url)).body(pattern(128 * 1024, 2)).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR, "a PUT the volume could not store was acknowledged");
 
-    let get = c.get(format!("{}/b/big", url)).send().await.unwrap();
+    let get = c.get(format!("{}/bkt/big", url)).send().await.unwrap();
     assert_eq!(get.status(), StatusCode::NOT_FOUND, "a failed PUT must not create the object");
 }
 
@@ -77,10 +77,10 @@ async fn get_of_a_corrupted_payload_is_an_error_not_zeros() {
     let state = Arc::new(S3ServiceState::with_data_dir(&dir));
     let (url, _handle) = spawn(Arc::clone(&state)).await;
     let c = reqwest::Client::new();
-    assert_eq!(c.put(format!("{}/b", url)).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(c.put(format!("{}/bkt", url)).send().await.unwrap().status(), StatusCode::OK);
 
     let payload = pattern(64 * 1024, 1);
-    let put = c.put(format!("{}/b/obj", url)).body(payload.clone()).send().await.unwrap();
+    let put = c.put(format!("{}/bkt/obj", url)).body(payload.clone()).send().await.unwrap();
     assert_eq!(put.status(), StatusCode::OK);
 
     // Flip one payload byte on disk, then drop the cached copy so the GET reads the volume.
@@ -98,7 +98,7 @@ async fn get_of_a_corrupted_payload_is_an_error_not_zeros() {
     drop(f);
     state.payload_cache.clear();
 
-    let res = c.get(format!("{}/b/obj", url)).send().await.unwrap();
+    let res = c.get(format!("{}/bkt/obj", url)).send().await.unwrap();
     let status = res.status();
     let body = res.bytes().await.unwrap_or_default();
     assert_eq!(
@@ -111,7 +111,7 @@ async fn get_of_a_corrupted_payload_is_an_error_not_zeros() {
 }
 
 async fn upload_multipart(c: &reqwest::Client, url: &str, parts: &[&[u8]]) {
-    let init = c.post(format!("{}/b/big?uploads", url)).send().await.unwrap();
+    let init = c.post(format!("{}/bkt/big?uploads", url)).send().await.unwrap();
     assert_eq!(init.status(), StatusCode::OK);
     let xml = init.text().await.unwrap();
     let upload_id = xml.split("<UploadId>").nth(1).unwrap().split("</UploadId>").next().unwrap().to_string();
@@ -120,7 +120,7 @@ async fn upload_multipart(c: &reqwest::Client, url: &str, parts: &[&[u8]]) {
     for (i, data) in parts.iter().enumerate() {
         let n = i + 1;
         let res = c
-            .put(format!("{}/b/big?partNumber={}&uploadId={}", url, n, upload_id))
+            .put(format!("{}/bkt/big?partNumber={}&uploadId={}", url, n, upload_id))
             .body(data.to_vec())
             .send()
             .await
@@ -131,7 +131,7 @@ async fn upload_multipart(c: &reqwest::Client, url: &str, parts: &[&[u8]]) {
     }
     complete.push_str("</CompleteMultipartUpload>");
     let res = c
-        .post(format!("{}/b/big?uploadId={}", url, upload_id))
+        .post(format!("{}/bkt/big?uploadId={}", url, upload_id))
         .body(complete)
         .send()
         .await
@@ -151,9 +151,9 @@ async fn completed_multipart_object_survives_restart() {
     {
         let state = Arc::new(S3ServiceState::with_data_dir(&dir));
         let (url, handle) = spawn(state).await;
-        assert_eq!(c.put(format!("{}/b", url)).send().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(c.put(format!("{}/bkt", url)).send().await.unwrap().status(), StatusCode::OK);
         upload_multipart(&c, &url, &[&p1, &p2]).await;
-        let res = c.get(format!("{}/b/big", url)).send().await.unwrap();
+        let res = c.get(format!("{}/bkt/big", url)).send().await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(&res.bytes().await.unwrap()[..], &whole[..]);
         handle.shutdown();
@@ -161,7 +161,7 @@ async fn completed_multipart_object_survives_restart() {
 
     let state = Arc::new(S3ServiceState::with_data_dir(&dir));
     let (url, _handle) = spawn(state).await;
-    let res = c.get(format!("{}/b/big", url)).send().await.unwrap();
+    let res = c.get(format!("{}/bkt/big", url)).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::OK, "the multipart object is gone after a restart");
     let body = res.bytes().await.unwrap();
     assert_eq!(body.len(), whole.len());
