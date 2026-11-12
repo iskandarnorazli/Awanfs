@@ -59,6 +59,84 @@ fn engine_error_response(code: i32, resource: &str) -> Response<ResponseBody> {
         .unwrap()
 }
 
+/// The largest object, and the largest part, S3 accepts in one request.
+pub const MAX_OBJECT_BODY: u64 = 5 << 30;
+/// Request bodies that are XML (multipart completion, multi-object delete, lifecycle).
+pub const MAX_XML_BODY: u64 = 16 << 20;
+/// Room for aws-chunked framing (chunk sizes and signatures) on top of the payload.
+const CHUNK_FRAMING_SLACK: u64 = 16 << 20;
+
+fn body_limit_for(method: &Method, target: &ParsedTarget) -> u64 {
+    match (method, target) {
+        // PutObject and UploadPart; CompleteMultipartUpload and the other POSTs carry XML.
+        (&Method::PUT, ParsedTarget::Object { .. }) => MAX_OBJECT_BODY,
+        _ => MAX_XML_BODY,
+    }
+}
+
+fn entity_too_large(resource: &str, limit: u64) -> Response<ResponseBody> {
+    let xml = s3_error_xml(
+        "EntityTooLarge",
+        &format!("Your proposed upload exceeds the maximum allowed size of {} bytes.", limit),
+        resource,
+        "req-size",
+    );
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(CONTENT_TYPE, "application/xml")
+        .header("connection", "close")
+        .body(full_body(Bytes::from(xml)))
+        .unwrap()
+}
+
+/// Reads a request body of at most `limit` bytes. `Ok(Err(response))` is the answer to send
+/// when the body is too large or cut short.
+async fn read_body(body: hyper::body::Incoming, limit: u64, resource: &str) -> Result<Result<Bytes, Response<ResponseBody>>, hyper::Error> {
+    match http_body_util::Limited::new(body, limit as usize).collect().await {
+        Ok(c) => Ok(Ok(c.to_bytes())),
+        Err(e) => {
+            if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+                return Ok(Err(entity_too_large(resource, limit)));
+            }
+            match e.downcast::<hyper::Error>() {
+                Ok(h) => Err(*h),
+                Err(other) => {
+                    let xml = s3_error_xml("IncompleteBody", &other.to_string(), resource, "req-body");
+                    Ok(Err(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header(CONTENT_TYPE, "application/xml")
+                        .body(full_body(Bytes::from(xml)))
+                        .unwrap()))
+                }
+            }
+        }
+    }
+}
+
+/// A response body sent as a list of chunks, one frame each: the parts of a multipart object
+/// go out from their mmaps without being copied into one buffer (#36).
+struct ChunksBody(std::collections::VecDeque<Bytes>);
+
+impl hyper::body::Body for ChunksBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        std::task::Poll::Ready(self.0.pop_front().map(|b| Ok(hyper::body::Frame::data(b))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(self.0.iter().map(|b| b.len() as u64).sum())
+    }
+}
+
 /// Ids of the `volume_NNNN.dat` files in `dir`, ascending.
 fn volume_ids(dir: &Path) -> Vec<u32> {
     let mut ids: Vec<u32> = std::fs::read_dir(dir)
@@ -561,11 +639,7 @@ impl S3ServiceState {
         let extents = self.multipart.get_completed_extents(b_id, key).ok_or(VolumeError::CorruptIndex)?;
         let mut out = Vec::with_capacity(size as usize);
         for ext in extents {
-            let mapped = ext.staged_path.as_ref().and_then(|p| self.multipart.get_or_mmap_part(p).ok());
-            let chunk = match mapped {
-                Some(mmap) => Bytes::from_owner(crate::volume::MmapOwner(mmap)),
-                None => self.load_payload(b_id, ext.vol_offset, ext.part_size as usize)?,
-            };
+            let chunk = self.part_bytes(b_id, &ext)?;
             let n = (ext.part_size as usize).min(chunk.len());
             self.work.payload_copy(n as u64);
             out.extend_from_slice(&chunk[..n]);
@@ -574,6 +648,14 @@ impl S3ServiceState {
             return Err(VolumeError::CorruptIndex);
         }
         Ok(Bytes::from(out))
+    }
+
+    /// The bytes of one part of a multipart object: its staged file's mmap, or its needle.
+    pub fn part_bytes(&self, b_id: u32, ext: &PartExtent) -> Result<Bytes, VolumeError> {
+        match ext.staged_path.as_ref().and_then(|p| self.multipart.get_or_mmap_part(p).ok()) {
+            Some(mmap) => Ok(Bytes::from_owner(crate::volume::MmapOwner(mmap))),
+            None => self.load_payload(b_id, ext.vol_offset, ext.part_size as usize),
+        }
     }
 
     pub fn hook(&self, point: &'static str, key: &str) {
@@ -795,6 +877,18 @@ pub async fn handle_s3_request(
 
     let target = parse_s3_target(path, host_hdr);
 
+    // Size limits (#36), checked on the declared length before any body is read.
+    let body_limit = body_limit_for(&method, &target);
+    let declared = req
+        .headers()
+        .get("x-amz-decoded-content-length")
+        .or_else(|| req.headers().get(CONTENT_LENGTH))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if declared.is_some_and(|n| n > body_limit) {
+        return Ok(entity_too_large(path, body_limit));
+    }
+
     match target {
         ParsedTarget::Service => {
             if method == Method::GET {
@@ -824,7 +918,10 @@ pub async fn handle_s3_request(
             match method {
                 Method::PUT => {
                     if query_map.contains_key("lifecycle") {
-                        let body_bytes = req.into_body().collect().await?.to_bytes();
+                        let body_bytes = match read_body(req.into_body(), MAX_XML_BODY, path).await? {
+                            Ok(b) => b,
+                            Err(resp) => return Ok(resp),
+                        };
                         let body_str = String::from_utf8_lossy(&body_bytes);
                         match parse_lifecycle_xml(&body_str) {
                             Ok(rules) => {
@@ -1056,7 +1153,10 @@ pub async fn handle_s3_request(
                 }
 
                 Method::POST if query_map.contains_key("delete") => {
-                    let body_bytes = req.into_body().collect().await?.to_bytes();
+                    let body_bytes = match read_body(req.into_body(), MAX_XML_BODY, path).await? {
+                        Ok(b) => b,
+                        Err(resp) => return Ok(resp),
+                    };
                     let body_str = String::from_utf8_lossy(&body_bytes);
 
                     let mut keys_to_delete = Vec::new();
@@ -1175,7 +1275,10 @@ pub async fn handle_s3_request(
 
                 let is_chunked = req.headers().get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
                 let signed_headers = req.headers().clone();
-                let raw_bytes = req.into_body().collect().await?.to_bytes();
+                let raw_bytes = match read_body(req.into_body(), MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, path).await? {
+                    Ok(b) => b,
+                    Err(resp) => return Ok(resp),
+                };
                 if !crate::auth::payload_hash_ok(&signed_headers, &raw_bytes) {
                     let xml = s3_error_xml("XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.", &key, "req-sha256");
                     return Ok(Response::builder()
@@ -1238,7 +1341,10 @@ pub async fn handle_s3_request(
             // 3. Multipart POST /{bucket}/{key}?uploadId=ID -> CompleteMultipartUpload
             if method == Method::POST && query_map.contains_key("uploadId") {
                 let upload_id = &query_map["uploadId"];
-                let body_bytes = req.into_body().collect().await?.to_bytes();
+                let body_bytes = match read_body(req.into_body(), MAX_XML_BODY, path).await? {
+                    Ok(b) => b,
+                    Err(resp) => return Ok(resp),
+                };
                 let body_str = String::from_utf8_lossy(&body_bytes);
 
                 // Parse XML <Part><PartNumber>N</PartNumber><ETag>E</ETag></Part>
@@ -1511,7 +1617,10 @@ pub async fn handle_s3_request(
                     let is_chunked = req.headers().get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
                     let content_md5_hdr = req.headers().get("content-md5").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
                     let signed_headers = req.headers().clone();
-                    let raw_bytes = req.into_body().collect().await?.to_bytes();
+                    let raw_bytes = match read_body(req.into_body(), MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, path).await? {
+                        Ok(b) => b,
+                        Err(resp) => return Ok(resp),
+                    };
                     if !crate::auth::payload_hash_ok(&signed_headers, &raw_bytes) {
                         let xml = s3_error_xml("XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.", &key, "req-sha256");
                         return Ok(Response::builder()
@@ -1721,38 +1830,37 @@ pub async fn handle_s3_request(
                                         if let Some(slice) = single_extent_slice {
                                             slice
                                         } else {
-                                            // 2. Multi-extent boundary crossing: stitch only the cross-boundary slice
-                                            let req_len = (range.end - range.start + 1) as usize;
-                                            let mut out = Vec::with_capacity(req_len);
+                                            // 2. The range crosses parts: send one slice of each part, no copy.
+                                            let mut chunks = std::collections::VecDeque::new();
                                             let mut p_start = 0u64;
                                             for ext in extents {
                                                 let p_end = ext.cumulative_end;
                                                 if p_end > range.start && p_start <= range.end {
-                                                    let mapped = ext
-                                                        .staged_path
-                                                        .as_ref()
-                                                        .and_then(|path| state.multipart.get_or_mmap_part(path).ok());
-                                                    let chunk = match mapped {
-                                                        Some(mmap) => Bytes::from_owner(crate::volume::MmapOwner(mmap)),
-                                                        None => match state.load_payload(b_id, ext.vol_offset, ext.part_size as usize) {
-                                                            Ok(b) => b,
-                                                            Err(e) => return Ok(internal_error_response(&key, &format!("could not read a part: {:?}", e))),
-                                                        },
+                                                    let chunk = match state.part_bytes(b_id, &ext) {
+                                                        Ok(b) => b,
+                                                        Err(e) => return Ok(internal_error_response(&key, &format!("could not read a part: {:?}", e))),
                                                     };
                                                     let s_start = range.start.saturating_sub(p_start) as usize;
-                                                    let s_end = ((range.end + 1).min(p_end) - p_start) as usize;
-                                                    if s_start < chunk.len() {
-                                                        let piece = &chunk[s_start..s_end.min(chunk.len())];
-                                                        state.work.payload_copy(piece.len() as u64);
-                                                        out.extend_from_slice(piece);
+                                                    let s_end = (((range.end + 1).min(p_end) - p_start) as usize).min(chunk.len());
+                                                    if s_start < s_end {
+                                                        chunks.push_back(chunk.slice(s_start..s_end));
                                                     }
                                                 }
                                                 p_start = p_end;
                                             }
-                                            if out.len() as u64 != range.end - range.start + 1 {
+                                            if chunks.iter().map(|c| c.len() as u64).sum::<u64>() != range.end - range.start + 1 {
                                                 return Ok(internal_error_response(&key, "a part of the object is missing"));
                                             }
-                                            Bytes::from(out)
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::PARTIAL_CONTENT)
+                                                .header(CONTENT_TYPE, "application/octet-stream")
+                                                .header(ETAG, etag_val)
+                                                .header(ACCEPT_RANGES, "bytes")
+                                                .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
+                                                .header(CONTENT_LENGTH, (range.end - range.start + 1).to_string())
+                                                .header(LAST_MODIFIED, "Tue, 10 Nov 2026 00:00:00 GMT")
+                                                .body(ChunksBody(chunks).boxed())
+                                                .unwrap());
                                         }
                                     } else {
                                         return Ok(internal_error_response(&key, "the multipart object's part list is missing"));
@@ -1800,48 +1908,46 @@ pub async fn handle_s3_request(
                         }
                     }
 
+                    if is_multipart && !is_head {
+                        let extents = match state.multipart.get_completed_extents(b_id, &key) {
+                            Some(e) => e,
+                            None => return Ok(internal_error_response(&key, "the multipart object's part list is missing")),
+                        };
+                        let mut chunks = std::collections::VecDeque::with_capacity(extents.len());
+                        for ext in extents {
+                            let chunk = match state.part_bytes(b_id, &ext) {
+                                Ok(b) => b,
+                                Err(e) => return Ok(internal_error_response(&key, &format!("could not read a part: {:?}", e))),
+                            };
+                            let n = (ext.part_size as usize).min(chunk.len());
+                            chunks.push_back(chunk.slice(..n));
+                        }
+                        if chunks.iter().map(|c| c.len() as u64).sum::<u64>() != meta.size {
+                            return Ok(internal_error_response(&key, "a part of the object is missing"));
+                        }
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/octet-stream")
+                            .header(ETAG, etag_val)
+                            .header(ACCEPT_RANGES, "bytes")
+                            .header(CONTENT_LENGTH, meta.size.to_string())
+                            .header(LAST_MODIFIED, "Tue, 10 Nov 2026 00:00:00 GMT")
+                            .body(ChunksBody(chunks).boxed())
+                            .unwrap());
+                    }
+
                     // Coalesce concurrent hot GET requests via SingleFlight before reading/stitching payload
                     let payload = if is_head {
                         Bytes::new()
                     } else {
                         let single_flight_key = format!("{}/{}/{}", bucket, key, meta.vol_offset);
                         let state_for_read = Arc::clone(&state);
-                        let key_for_read = key.clone();
                         state
                             .single_flight
                             .execute_or_join(&single_flight_key, || async move {
-                                if is_multipart {
-                                    if let Some(extents) =
-                                        state_for_read.multipart.get_completed_extents(b_id, &key_for_read)
-                                    {
-                                        // An unreadable part yields an empty body; the length check
-                                        // after the single-flight turns that into a 500.
-                                        let mut stitched = Vec::with_capacity(meta.size as usize);
-                                        for ext in extents {
-                                            let mapped = ext
-                                                .staged_path
-                                                .as_ref()
-                                                .and_then(|path| state_for_read.multipart.get_or_mmap_part(path).ok());
-                                            let chunk = match mapped {
-                                                Some(mmap) => Bytes::from_owner(crate::volume::MmapOwner(mmap)),
-                                                None => match state_for_read.load_payload(b_id, ext.vol_offset, ext.part_size as usize) {
-                                                    Ok(b) => b,
-                                                    Err(_) => return Bytes::new(),
-                                                },
-                                            };
-                                            let part_len = (ext.part_size as usize).min(chunk.len());
-                                            state_for_read.work.payload_copy(part_len as u64);
-                                            stitched.extend_from_slice(&chunk[..part_len]);
-                                        }
-                                        Bytes::from(stitched)
-                                    } else {
-                                        Bytes::new()
-                                    }
-                                } else {
-                                    state_for_read
-                                        .load_payload(b_id, meta.vol_offset, meta.size as usize)
-                                        .unwrap_or_default()
-                                }
+                                state_for_read
+                                    .load_payload(b_id, meta.vol_offset, meta.size as usize)
+                                    .unwrap_or_default()
                             })
                             .await
                     };
