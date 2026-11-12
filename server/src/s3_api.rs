@@ -9,6 +9,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use md5::{Digest, Md5};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -261,6 +262,10 @@ pub struct S3ServiceState {
     /// Disk writes, syncs, reads and payload copies, for the work-count tests.
     pub work: Arc<WorkCounters>,
     pub test_hook: Arc<RwLock<Option<TestHook>>>,
+    /// Striped per-key locks: requests that change one key take its lock from before the
+    /// volume write until the engine row is updated, so log order equals index order
+    /// (`verification/tla/ObjectVersions.tla`, `UseKeyLock`).
+    pub key_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
 }
 
 impl S3ServiceState {
@@ -297,6 +302,7 @@ impl S3ServiceState {
             next_vol_offset: Arc::new(RwLock::new(4096)),
             work,
             test_hook: Arc::new(RwLock::new(None)),
+            key_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
         }
     }
 
@@ -405,6 +411,7 @@ impl S3ServiceState {
             next_vol_offset: Arc::new(RwLock::new(initial_vol_offset)),
             work,
             test_hook: Arc::new(RwLock::new(None)),
+            key_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
         }
     }
 
@@ -464,6 +471,44 @@ impl S3ServiceState {
         Ok(report)
     }
 
+    /// Takes the lock of (bucket, key). Calls the test hook with `key_lock_contended` when
+    /// another request holds it.
+    pub async fn lock_key(&self, b_id: u32, key: &str) -> tokio::sync::MutexGuard<'_, ()> {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (b_id, key).hash(&mut h);
+        let m = &self.key_locks[(h.finish() as usize) % self.key_locks.len()];
+        match m.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                self.hook("key_lock_contended", key);
+                m.lock().await
+            }
+        }
+    }
+
+    /// The bytes of an object, single or multipart, verified.
+    pub fn read_object_bytes(&self, b_id: u32, key: &str, vol_offset: u64, size: u64, flags: u16) -> Result<Bytes, VolumeError> {
+        if flags & AWAN_FLAG_MULTIPART == 0 {
+            return self.load_payload(b_id, vol_offset, size as usize);
+        }
+        let extents = self.multipart.get_completed_extents(b_id, key).ok_or(VolumeError::CorruptIndex)?;
+        let mut out = Vec::with_capacity(size as usize);
+        for ext in extents {
+            let mapped = ext.staged_path.as_ref().and_then(|p| self.multipart.get_or_mmap_part(p).ok());
+            let chunk = match mapped {
+                Some(mmap) => Bytes::from_owner(crate::volume::MmapOwner(mmap)),
+                None => self.load_payload(b_id, ext.vol_offset, ext.part_size as usize)?,
+            };
+            let n = (ext.part_size as usize).min(chunk.len());
+            self.work.payload_copy(n as u64);
+            out.extend_from_slice(&chunk[..n]);
+        }
+        if out.len() as u64 != size {
+            return Err(VolumeError::CorruptIndex);
+        }
+        Ok(Bytes::from(out))
+    }
+
     pub fn hook(&self, point: &'static str, key: &str) {
         let hook = self.test_hook.read().clone();
         if let Some(h) = hook {
@@ -473,15 +518,12 @@ impl S3ServiceState {
 
     /// Writes the payload to the volume. An error means nothing was stored.
     pub fn store_payload(&self, b_id: u32, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64) -> Result<u64, VolumeError> {
-        if data.is_empty() {
-            return Ok(0);
-        }
         let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
         let loc = vm.write_needle(b_id as u16, key, data, flags, etag_hi, etag_lo)?;
         self.needle_crc_map.write().insert((b_id, loc.offset), loc.payload_crc32c);
         self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
         // Cache hot payloads up to 4 MiB in dynamic auto-scaling LRU cache
-        if data.len() <= 4 * 1024 * 1024 {
+        if !data.is_empty() && data.len() <= 4 * 1024 * 1024 {
             self.payload_cache.insert(b_id, loc.offset, data.clone());
         }
         Ok(loc.offset)
@@ -1046,6 +1088,7 @@ pub async fn handle_s3_request(
                     Ok((composite_etag, total_size, extents)) => {
                         // Store object in @flat ObjectMeta
                         let (hi, lo, _, _) = compute_md5(composite_etag.as_bytes());
+                        let _key_guard = state.lock_key(b_id, &key).await;
                         // Log the part list as a manifest needle, so recovery rebuilds the object.
                         let manifest = Bytes::from(encode_extents_manifest(&state.multipart.staging_dir, total_size, &extents));
                         let manifest_offset = match state.store_payload(
@@ -1187,16 +1230,35 @@ pub async fn handle_s3_request(
                         };
                         drop(engine);
 
-                        let mut engine = state.engine.write();
-                        engine.put_object(
+                        // The copy gets a needle of its own: it must survive a restart and an
+                        // overwrite or delete of its source.
+                        let src_flags = unpack_flags(src_meta.bucket_flags);
+                        let bytes = match state.read_object_bytes(src_b_id, src_key, src_meta.vol_offset, src_meta.size, src_flags) {
+                            Ok(b) => b,
+                            Err(e) => return Ok(internal_error_response(&key, &format!("could not read the copy source: {:?}", e))),
+                        };
+                        let flags = if bytes.is_empty() { AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE } else { AWAN_FLAG_ACTIVE };
+                        let _key_guard = state.lock_key(b_id, &key).await;
+                        let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset);
+                        let vol_offset = match state.store_payload(b_id, &key, &bytes, flags, src_meta.etag_hi, src_meta.etag_lo) {
+                            Ok(off) => off,
+                            Err(e) => return Ok(internal_error_response(&key, &format!("could not store the copy: {:?}", e))),
+                        };
+                        if let Some(prev_off) = old_info {
+                            if prev_off > 0 && prev_off != vol_offset {
+                                state.payload_cache.remove(b_id, prev_off);
+                                state.needle_crc_map.write().remove(&(b_id, prev_off));
+                            }
+                        }
+                        state.engine.write().put_object(
                             b_id,
                             key.as_bytes(),
-                            src_meta.vol_offset,
+                            vol_offset,
                             src_meta.size,
                             src_meta.etag_hi,
                             src_meta.etag_lo,
                             0,
-                            AWAN_FLAG_ACTIVE | AWAN_FLAG_SHARED_REF,
+                            flags,
                         ).unwrap();
 
                         let etag_hex = md5_to_etag_hex(src_meta.etag_hi, src_meta.etag_lo);
@@ -1209,6 +1271,12 @@ pub async fn handle_s3_request(
                             .unwrap());
                     }
 
+                    let if_none_match_star = req
+                        .headers()
+                        .get("If-None-Match")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v.trim() == "*")
+                        .unwrap_or(false);
                     // Check If-None-Match: * (Atomic mutex creation)
                     if let Some(inm) = req.headers().get("If-None-Match").and_then(|v| v.to_str().ok()) {
                         if inm.trim() == "*" {
@@ -1287,18 +1355,24 @@ pub async fn handle_s3_request(
                         AWAN_FLAG_ACTIVE
                     };
 
+                    let _key_guard = state.lock_key(b_id, &key).await;
+                    if if_none_match_star && state.engine.read().get_object(b_id, key.as_bytes()).is_ok() {
+                        let xml = s3_error_xml("PreconditionFailed", "At least one of the pre-conditions you specified did not hold.", &key, "req-inm");
+                        return Ok(Response::builder()
+                            .status(StatusCode::PRECONDITION_FAILED)
+                            .header(CONTENT_TYPE, "application/xml")
+                            .body(full_body(Bytes::from(xml)))
+                            .unwrap());
+                    }
                     let old_info = {
                         let engine = state.engine.read();
                         engine.get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size))
                     };
 
-                    let vol_offset = if decoded_bytes.is_empty() {
-                        0
-                    } else {
-                        match state.store_payload(b_id, &key, &decoded_bytes, flags, etag_hi, etag_lo) {
-                            Ok(off) => off,
-                            Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
-                        }
+                    // Zero-byte objects get a needle too, so they and empty overwrites survive a restart.
+                    let vol_offset = match state.store_payload(b_id, &key, &decoded_bytes, flags, etag_hi, etag_lo) {
+                        Ok(off) => off,
+                        Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                     };
                     state.hook("put_stored", &key);
 
@@ -1561,7 +1635,21 @@ pub async fn handle_s3_request(
                 }
 
                 Method::DELETE => {
+                    let _key_guard = state.lock_key(b_id, &key).await;
                     state.hook("delete_start", &key);
+                    // Log the tombstone first; only a logged delete removes the row, so a failed
+                    // write is a 500 and the object stays (verification/tla, DeleteLogsFirst).
+                    let vm = match state.volume_manager.read().clone() {
+                        Some(vm) => vm,
+                        None => return Ok(internal_error_response(&key, "no volume is open")),
+                    };
+                    match vm.write_needle(b_id as u16, &key, &[], AWAN_FLAG_TOMBSTONE, 0, 0) {
+                        Ok(loc) => {
+                            state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                            state.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                        }
+                        Err(e) => return Ok(internal_error_response(&key, &format!("could not record the delete: {:?}", e))),
+                    }
                     state.mvcc.tombstone(b_id, &key);
                     let old_info = {
                         let mut engine = state.engine.write();
@@ -1576,13 +1664,6 @@ pub async fn handle_s3_request(
                             let raw_len = 64 + key.as_bytes().len() + sz as usize;
                             let dead_bytes = (((raw_len + 4095) / 4096) * 4096) as u64;
                             state.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
-                        }
-                    }
-                    let vm_opt = state.volume_manager.read().clone();
-                    if let Some(ref vm) = vm_opt {
-                        if let Ok(loc) = vm.write_needle(b_id as u16, &key, &[], AWAN_FLAG_TOMBSTONE, 0, 0) {
-                            state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                            state.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                         }
                     }
                     Ok(Response::builder()

@@ -2,7 +2,8 @@
 //! 32 GiB WORM Needle Volume Slab Storage Engine and Crash Recovery Journal (#470)
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::collections::BTreeSet;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -127,6 +128,16 @@ impl AsRef<[u8]> for MmapOwner {
     }
 }
 
+/// Bytes per `.idx` journal record (key hash, volume id, offset, total length, payload size,
+/// flags, payload CRC).
+const IDX_RECORD: usize = 42;
+
+/// The next needle offset the journal knows about after `after`: recovery jumps there over a
+/// gap left by a failed or interrupted write (#38).
+fn next_indexed(indexed: &BTreeSet<u64>, after: u64) -> Option<u64> {
+    indexed.range(after + 1..).next().copied()
+}
+
 pub struct VolumeManager {
     dir: PathBuf,
     volume_id: u32,
@@ -139,6 +150,8 @@ pub struct VolumeManager {
     max_span: u64,
     work: Arc<WorkCounters>,
     fail_next_write: std::sync::atomic::AtomicBool,
+    /// Needle offsets from the `.idx` journal at open time.
+    indexed: BTreeSet<u64>,
 }
 
 impl VolumeManager {
@@ -158,11 +171,20 @@ impl VolumeManager {
         let file_exists = dat_path.exists();
         let aligned_file = Arc::new(AlignedFile::open_direct(&dat_path, false)?);
 
-        let idx_file = OpenOptions::new()
+        let mut idx_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open(&idx_path)?;
+        // Read the journal, then append after it: a reopen must not overwrite earlier records.
+        let mut idx_bytes = Vec::new();
+        idx_file.read_to_end(&mut idx_bytes)?;
+        idx_file.seek(SeekFrom::End(0))?;
+        let indexed: BTreeSet<u64> = idx_bytes
+            .chunks_exact(IDX_RECORD)
+            .map(|r| u64::from_le_bytes(r[12..20].try_into().unwrap()))
+            .filter(|&o| o >= SECTOR_SIZE as u64)
+            .collect();
 
         let mut file_len = aligned_file.metadata()?.len();
         if file_len >= MAX_VOLUME_SPAN {
@@ -224,8 +246,14 @@ impl VolumeManager {
 
                 let magic = u32::from_le_bytes(header_bytes[0..4].try_into().unwrap());
                 if magic != NEEDLE_MAGIC {
-                    // Sparse unwritten sector or invalid magic encountered
-                    break;
+                    // Unwritten sector: the end of the volume, or a gap the journal can step over.
+                    match next_indexed(&indexed, scan_offset) {
+                        Some(next) => {
+                            scan_offset = next;
+                            continue;
+                        }
+                        None => break,
+                    }
                 }
 
                 match NeedleHeader::decode(&header_bytes) {
@@ -234,13 +262,25 @@ impl VolumeManager {
                         let total_len = (((raw_len + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE) as u64;
                         if scan_offset + total_len > file_len {
                             // Incomplete needle written during crash
-                            break;
+                            match next_indexed(&indexed, scan_offset) {
+                                Some(next) => {
+                                    scan_offset = next;
+                                    continue;
+                                }
+                                None => break,
+                            }
                         }
                         scan_offset += total_len;
                     }
                     Err(_) => {
-                        // Torn needle encountered
-                        break;
+                        // Torn needle: step over it when the journal knows a later needle.
+                        match next_indexed(&indexed, scan_offset) {
+                            Some(next) => {
+                                scan_offset = next;
+                                continue;
+                            }
+                            None => break,
+                        }
                     }
                 }
             }
@@ -275,6 +315,7 @@ impl VolumeManager {
             max_span: MAX_VOLUME_SPAN,
             work: Arc::new(WorkCounters::default()),
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
+            indexed,
         })
     }
 
@@ -515,14 +556,26 @@ impl VolumeManager {
 
             let hdr = match NeedleHeader::decode(&header_bytes) {
                 Ok(h) => h,
-                Err(_) => break,
+                Err(_) => match next_indexed(&self.indexed, scan_offset) {
+                    Some(next) => {
+                        scan_offset = next;
+                        continue;
+                    }
+                    None => break,
+                },
             };
 
             let raw_len = 64 + hdr.key_len as usize + hdr.payload_size as usize;
             let total_len = (((raw_len + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE) as u64;
 
             if scan_offset + total_len > file_len {
-                break;
+                match next_indexed(&self.indexed, scan_offset) {
+                    Some(next) => {
+                        scan_offset = next;
+                        continue;
+                    }
+                    None => break,
+                }
             }
 
             let key_str = if (64 + hdr.key_len as usize) <= SECTOR_SIZE {
