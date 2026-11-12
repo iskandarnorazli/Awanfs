@@ -138,6 +138,7 @@ pub struct VolumeManager {
     is_sparse: bool,
     max_span: u64,
     work: Arc<WorkCounters>,
+    fail_next_write: std::sync::atomic::AtomicBool,
 }
 
 impl VolumeManager {
@@ -273,7 +274,14 @@ impl VolumeManager {
             is_sparse: sparse,
             max_span: MAX_VOLUME_SPAN,
             work: Arc::new(WorkCounters::default()),
+            fail_next_write: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Fault injection for tests: the next `write_needle` reserves its offset and then fails,
+    /// as a disk error would, leaving a gap in the volume.
+    pub fn fail_next_write(&self) {
+        self.fail_next_write.store(true, Ordering::SeqCst);
     }
 
     /// Largest byte offset a needle may reach in this volume (default `MAX_VOLUME_SPAN`).
@@ -391,6 +399,9 @@ impl VolumeManager {
         let offset = self.current_offset.fetch_add(total_len, Ordering::SeqCst);
         if offset + total_len > self.max_span {
             return Err(VolumeError::VolumeFull { offset, len: total_len });
+        }
+        if self.fail_next_write.swap(false, Ordering::SeqCst) {
+            return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected write failure")));
         }
 
         // Lock-free concurrent positional write directly to disjoint disk offset
