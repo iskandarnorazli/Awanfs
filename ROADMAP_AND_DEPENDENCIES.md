@@ -1,147 +1,61 @@
-# Awan Storage Phased Roadmap & Dependency Graph
+# AwanFS roadmap and dependencies
 
-> **Execution Plan: Prerequisite Issues, Gates, and Phased Delivery**
+Plan of record since 2026-11-12. The GitHub milestones Phase 1-4 hold the issues, and GitHub's "blocked by" links record the order inside them. The decisions behind the plan are in [`ARCHITECTURE.md`](ARCHITECTURE.md#0-decisions-2026-11-12). The earlier plan, written while this code lived in awan-lang, is in git history.
 
----
+## Phases
 
-## 1. Dependency Graph & Phase Sequencing
+| Phase | Goal | Issues |
+|---|---|---|
+| 1. Correctness and security | Acknowledged data is kept and readable; only authorised clients get in; failures are errors | #35 auth, #38 recovery gaps, #29 durability modes, #37 volume rollover, #36 streaming bodies and size limit, #39 DELETE errors, #40 index full, #14 safe compaction; closing #12, #17, #18, #19, #22, #24 after #33, and #23 after #36 |
+| 2. Production operations | What an operator needs to run it | #41 logs and request IDs, #42 `/metrics`, #43 tracing, #44 health, #45 Grafana and alerts, #46 access log, #47 s3-tests, #48 fuzzing, #49 packaging, #30 TLS, #53 IAM |
+| 3. Scale and efficiency | Grow past one disk's worth of metadata and data without losing speed | #50 format version, #26 tiered metadata and Bloom filter, #13 redb review, #51 compression, #28 copy-on-write compaction, #31 versioning |
+| 4. Multi-node (future) | High availability across machines | #52 clustering design, #27 multi-drive erasure coding, #15 erasure and heartbeat code |
+
+## Order inside and across phases
+
+An arrow points from an issue to the issues it unblocks.
 
 ```mermaid
-flowchart TD
-    subgraph PreReqs["Phase 0: Consolidation & Housekeeping"]
-        P0_1["#447: Vector literals in VM"]
-        P0_2["#451: Stream particle identifier in VM"]
-        P0_3["#454: Tensor GPU residency in VM"]
-        P0_1 & P0_2 & P0_3 --> P0_Gate["Gate: KNOWN_FAILING.txt clean (0 failures)"]
+flowchart LR
+    subgraph P1["Phase 1"]
+        I35["#35 auth"]
+        I38["#38 recovery gaps"] --> I29["#29 durability modes"]
+        I38 --> I37["#37 volume rollover"] --> I14["#14 safe compaction"]
+        I36["#36 streaming bodies"] --> I23["#23 streaming digest"]
+        I39["#39 DELETE errors"]
+        I40["#40 index full"]
     end
-
-    subgraph Primitives["Phase 1: Hardware Crypto & Hashing"]
-        P1_1["crypto_sha256_block intrinsic"]
-        P1_2["crypto_crc32c_block intrinsic"]
-        P1_3["crypto_hmac_sha256 intrinsic"]
-        P0_Gate --> P1_1 & P1_2 & P1_3
-        P1_1 & P1_2 & P1_3 --> P1_Gate["Gate: 3.5 GB/s hashing throughput & parity probes"]
+    subgraph P2["Phase 2"]
+        I41["#41 logs"] --> I43["#43 tracing"]
+        I41 --> I46["#46 access log"]
+        I42["#42 /metrics"] --> I45["#45 Grafana"]
+        I44["#44 health"] --> I49["#49 packaging"]
+        I47["#47 s3-tests"]
+        I53["#53 IAM"]
+        I30["#30 TLS"]
+        I48["#48 fuzzing"]
     end
-
-    subgraph HybridPoC["Phase 2A: Fast-Track Hybrid S3 Substrate PoC"]
-        P2A_1["Rust HTTP/1.1 Substrate & Core Pinning"]
-        P2A_2["Awan Native @flat ObjectMeta C-ABI Bridge"]
-        P2A_3["MinIO Differential Testing & Fuzzing Oracle"]
-        P2A_4["MinIO warp Live Benchmark Harness"]
-        P1_Gate --> P2A_1 & P2A_2
-        P2A_1 & P2A_2 --> P2A_3 --> P2A_4
-        P2A_4 --> P2A_Gate["Gate: warp mixed head-to-head evidence vs MinIO"]
+    subgraph P3["Phase 3"]
+        I50["#50 format version"] --> I26["#26 tiered metadata"]
+        I50 --> I51["#51 compression"]
+        I50 --> I31["#31 versioning"]
+        I28["#28 CoW compaction"]
+        I13["#13 redb review"]
     end
-
-    subgraph Reactor["Phase 2B: Pure-Awan Async I/O Reactor (#53)"]
-        P2_1["Linux io_uring registered buffer engine"]
-        P2_2["Windows IOCP / RIO engine"]
-        P2_3["Unified sys_ring_* runtime built-ins"]
-        P2A_Gate --> P2_1 & P2_2 & P2_3
-        P2_1 & P2_2 & P2_3 --> P2_Gate["Gate: 50,000 concurrent sockets without thread spawn"]
+    subgraph P4["Phase 4"]
+        I52["#52 clustering design"] --> I27["#27 multi-drive EC"]
+        I52 --> I15["#15 erasure code"]
     end
-
-    subgraph MemoryIO["Phase 3: Zero-Copy Slicing & Table I/O (#202)"]
-        P3_1["Unshared buffer sub-range slicing (Range: bytes)"]
-        P3_2["Memory-mapped file backing (mmap)"]
-        P2_Gate --> P3_1 & P3_2
-        P3_1 & P3_2 --> P3_Gate["Gate: Zero heap allocation on sub-range reads"]
-    end
-
-    subgraph TLS["Phase 4: Native TLS 1.3 Termination"]
-        P4_1["rustls C-ABI wrapper with catch_unwind"]
-        P4_2["tls_accept, tls_recv, tls_send built-ins"]
-        P3_Gate --> P4_1 & P4_2
-        P4_1 & P4_2 --> P4_Gate["Gate: aws-cli connects via https:// without flags"]
-    end
-
-    subgraph Daemon["Phase 5: S3 Daemon & B2B Pilot Assembly"]
-        P5_1["S3 REST Flat-Header Parser"]
-        P5_2["@flat ObjectMeta Indexer"]
-        P5_3["Ed25519 License Key Verifier"]
-        P4_Gate --> P5_1 & P5_2 & P5_3
-        P5_1 & P5_2 & P5_3 --> P5_Gate["Gate: BoxCompute / KotakSakti B2B Pilot Deployment"]
-    end
+    I35 --> I46
+    I35 --> I47
+    I35 --> I53
+    I37 --> I50
+    I36 --> I51
+    I14 --> I28
 ```
 
----
+## Gates
 
-## 2. Detailed Phase Specifications & Gates
-
-### Phase 0: VM Hardening Consolidation (Issues #447, #451, #454)
-- **Objective:** Maintain Core Invariant 2 ("One oracle for every engine") by resolving all pending triaged failures in `tests/KNOWN_FAILING.txt`.
-- **Tasks:**
-  1. Fix `Vector` literals and types in the VM compiler ([#447](https://github.com/iskandarnorazli/awan-lang/issues/447)).
-  2. Fix stream particle pipeline identifier `B` resolution in VM ([#451](https://github.com/iskandarnorazli/awan-lang/issues/451)).
-  3. Fix VM `Tensor` GPU residency assertion and `to_host` method ([#454](https://github.com/iskandarnorazli/awan-lang/issues/454)).
-- **Exit Gate:** `bash tests/run_awan_tests.sh` passes 100% of tests with `KNOWN_FAILING.txt` completely empty.
-
----
-
-### Phase 1: Hardware-Accelerated Crypto Intrinsics
-- **Objective:** Replace scalar bitwise hashing with hardware-accelerated CPU instructions.
-- **Tasks:**
-  1. Add `crypto_sha256_block`, `crypto_crc32c_block`, and `crypto_hmac_sha256` to `core/src/builtins/catalog.rs`.
-  2. Implement pure-software reference in VM (`libs/awan-crypto/sha256.awan`).
-  3. Implement native LLVM lowering in `llvm_bridge.rs` using Intel SHA extensions and ARMv8 Crypto intrinsics.
-  4. Add parity probes in `core/tests/feature_parity_test.rs`.
-- **Exit Gate:**
-  - Hashing a 1 GB payload runs in $< 300\text{ ms}$ ($> 3.3\text{ GB/s}$ throughput per core).
-  - Parity probes pass identical NIST test vectors on both VM and Native.
-
----
-
-### Phase 2A: Fast-Track Hybrid S3 Substrate PoC (`HYBRID_POC_SPECIFICATION.md`)
-- **Objective:** Deliver runnable S3 REST daemon (`PUT`, `GET`, `HEAD`, `DELETE`, `Range`) combining Rust substrate with Awan native `@flat ObjectMeta` index to benchmark head-to-head against MinIO via `warp`.
-- **Tasks:**
-  1. Stand up Rust HTTP/1.1 socket reactor and thread-per-core NUMA worker pool.
-  2. Implement C-ABI bridge to Awan compiled native `@flat ObjectMeta` table and chunk slab allocator.
-  3. Deploy MinIO differential testing and fuzzing oracle (verifying 100% status code, ETag, and byte-range parity).
-  4. Run official MinIO `warp` benchmark suite (`put`, `get`, `mixed`) with core pinning.
-- **Exit Gate:**
-  - Differential fuzzing passes 10,000 randomized operations against MinIO with 0 mismatches.
-  - `warp mixed` records throughput and latency in `docs/measurements/s3_warp_minio_vs_awan.md`.
-
----
-
-### Phase 2B: Pure-Awan Async Completion I/O Reactor (Issue #53)
-- **Objective:** Eliminate thread-per-connection scaling bottleneck via kernel completion rings.
-- **Tasks:**
-  1. Implement `sys_ring_*` runtime abstraction in `core/src/runtime/reactor.rs`.
-  2. Linux: Wire to `io_uring` with registered buffers.
-  3. Windows: Wire to IOCP / Registered I/O (RIO).
-  4. Expose non-blocking socket built-ins in `catalog.rs`.
-- **Exit Gate:**
-  - Benchmark sustains **50,000 idle TCP connections** using $< 200\text{ MB}$ RAM on both Windows and Linux CI runners.
-
----
-
-### Phase 3: Zero-Copy Raw Buffer Slicing & Memory Mapping (Issue #202)
-- **Objective:** Support S3 byte-range queries without allocating intermediate sub-arrays.
-- **Tasks:**
-  1. Implement `vssa_lower_slice` for unshared containers in `compiler_src/backend/vssa_builder.awan`.
-  2. Add memory-mapped file handles (`mmap` / `MapViewOfFile`) in `core/src/runtime/`.
-- **Exit Gate:**
-  - Reading `Range: bytes=1048576-2097152` from a 10 GB file allocates **0 bytes** of heap and completes in $< 5\text{ µs}$.
-
----
-
-### Phase 4: Native TLS 1.3 Termination
-- **Objective:** Enable official AWS tools (`aws-cli`, Boto3, Go SDK) to connect over encrypted HTTPS.
-- **Tasks:**
-  1. Add `rustls` dependency to `core/Cargo.toml`.
-  2. Wrap Rust TLS sessions in `extern "C"` functions with `std::panic::catch_unwind`.
-  3. Expose `tls_accept`, `tls_recv`, and `tls_send` built-ins.
-- **Exit Gate:**
-  - `aws s3 cp test.bin s3://mybucket/ --endpoint-url https://localhost:9443` succeeds without `--no-verify-ssl` or insecure flags.
-
----
-
-### Phase 5: S3 Daemon Assembly & B2B Pilot
-- **Objective:** Assemble `awan-storage` daemon binary with license key verification for B2B deployment.
-- **Tasks:**
-  1. Assemble single-binary daemon: `awan-storage-server --config config.toml`.
-  2. Integrate Ed25519 offline license verification ([`LICENSING_AND_COMMERCIAL.md`](LICENSING_AND_COMMERCIAL.md)).
-  3. Deploy pilot instance with BoxCompute / KotakSakti agent sandboxes.
-- **Exit Gate:**
-  - Agent sandbox cold-start snapshot restoration completes in $< 15\text{ ms}$ under 500 concurrent container loads.
+Every issue's gate is a test or a CI check. Two rules hold for all of them:
+- No wall-clock thresholds. Performance is gated by exact work counts per request type (`server/tests/work_count_test.rs`) and by the nightly AwanFS/MinIO ratio (`benchmarks/ratio_check.py`).
+- A test that fails before the change it guards, recorded in the commit message.
