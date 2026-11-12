@@ -92,6 +92,10 @@ def ensure_minio():
     return minio, mc
 
 
+def ensure_parent(path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+
+
 def report_path(now=None) -> str:
     stamp = time.strftime("%Y-%m-%d", time.gmtime(now))
     host = "".join(c if c.isalnum() or c in "-_" else "-" for c in platform.node()) or "host"
@@ -129,7 +133,7 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     cmd = "python benchmarks/bench.py " + " ".join(argv if argv is not None else sys.argv[1:])
     out = a.output or report_path()
-    os.makedirs(os.path.dirname(out), exist_ok=True)
+    ensure_parent(out)
 
     server = build_server()
     if a.awanfs_only:
