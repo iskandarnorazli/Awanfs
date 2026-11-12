@@ -6,3 +6,4 @@ __pycache__/
 *.so
 dist/*.exe
 .tmp/
+bench_smoke.md

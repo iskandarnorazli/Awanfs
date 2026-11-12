@@ -100,6 +100,13 @@ cargo test --locked --manifest-path server/Cargo.toml
 ```
 CI runs it on ubuntu-latest and windows-latest. `work_count_test.rs` pins the disk writes, syncs, reads and copies of each request type; the nightly MinIO ratio check is `benchmarks/ratio_check.py`.
 
+### Benchmark on Your Machine
+```bash
+python benchmarks/bench.py                 # AwanFS vs MinIO, report in measurements/
+python benchmarks/bench.py --awanfs-only   # no MinIO needed
+```
+See [`benchmarks/README.md`](benchmarks/README.md) for what it measures and how to read it.
+
 ### Run Live Head-to-Head Benchmark Suite
 ```bash
 python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB,10GiB --concurrent 64 --duration 2 --output measurements/s3_warp_minio_vs_awan.md

@@ -30,3 +30,9 @@ jobs:
         run: cargo build --locked --release --manifest-path server/Cargo.toml
       - name: Benchmark harness self-tests
         run: python benchmarks/test_run_warp_benchmark.py
+      - name: Benchmark tooling self-tests
+        run: |
+          python benchmarks/test_ratio_check.py
+          python benchmarks/test_bench.py
+      - name: Local benchmark smoke run (AwanFS only, 1 round of 1 s)
+        run: python benchmarks/bench.py --awanfs-only --runs 1 --duration 1 --output bench_smoke.md
