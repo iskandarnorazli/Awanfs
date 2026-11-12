@@ -66,6 +66,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     state.auth = auth;
     state.set_durability(durability);
+    // One JSON line per request on stderr; AWANFS_LOG=off turns it off.
+    if std::env::var("AWANFS_LOG").ok().as_deref() != Some("off") {
+        let sink: s3_server::request_log::LogSink = Arc::new(|line: &str| eprintln!("{}", line));
+        *state.access_log.write() = Some(sink);
+    }
     let state = Arc::new(state);
 
     println!("S3 Storage Server listening on http://{}", addr);
