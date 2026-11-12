@@ -12,3 +12,6 @@ bench_smoke.md
 verification/tla/*_TTrace_*
 verification/tla/states/
 verification/evidence/
+fuzz/target/
+fuzz/artifacts/
+fuzz/Cargo.lock

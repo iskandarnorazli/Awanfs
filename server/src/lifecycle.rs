@@ -55,83 +55,104 @@ impl Default for LifecycleManager {
     }
 }
 
+/// Parses a lifecycle configuration with a real XML reader. The old parser searched for tag
+/// strings, so an `<ID>` whose text contained `<Status>` set the status, and `&amp;` stayed
+/// escaped (found by the round-trip fuzz target, #48).
 pub fn parse_lifecycle_xml(xml_str: &str) -> Result<Vec<LifecycleRule>, &'static str> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    #[derive(Default)]
+    struct Draft {
+        id: Option<String>,
+        status: Option<String>,
+        prefix: Option<String>,
+        expiration_days: Option<String>,
+        abort_days: Option<String>,
+    }
+
+    let mut reader = Reader::from_str(xml_str);
+    reader.config_mut().trim_text(true);
+    let mut path: Vec<String> = Vec::new();
     let mut rules = Vec::new();
-    let mut cursor = xml_str;
+    let mut draft: Option<Draft> = None;
 
-    while let Some(start) = cursor.find("<Rule>") {
-        let rest = &cursor[start + 6..];
-        let end = match rest.find("</Rule>") {
-            Some(e) => e,
-            None => break,
-        };
-        let rule_block = &rest[..end];
-        cursor = &rest[end + 7..];
+    fn field<'a>(d: &'a mut Draft, path: &[String]) -> Option<&'a mut Option<String>> {
+        let rule_at = path.iter().rposition(|p| p == "Rule")?;
+        let inner: Vec<&str> = path[rule_at + 1..].iter().map(|s| s.as_str()).collect();
+        match inner.as_slice() {
+            ["ID"] => Some(&mut d.id),
+            ["Status"] => Some(&mut d.status),
+            ["Prefix"] | ["Filter", "Prefix"] | ["Filter", "And", "Prefix"] => Some(&mut d.prefix),
+            ["Expiration", "Days"] => Some(&mut d.expiration_days),
+            ["AbortIncompleteMultipartUpload", "DaysAfterInitiation"] => Some(&mut d.abort_days),
+            _ => None,
+        }
+    }
 
-        let id = rule_block
-            .find("<ID>")
-            .and_then(|s| {
-                let r = &rule_block[s + 4..];
-                let e = r.find("</ID>")?;
-                Some(r[..e].to_string())
-            })
-            .unwrap_or_else(|| format!("rule-{}", rules.len() + 1));
-
-        let status = rule_block
-            .find("<Status>")
-            .and_then(|s| {
-                let r = &rule_block[s + 8..];
-                let e = r.find("</Status>")?;
-                Some(&r[..e] == "Enabled")
-            })
-            .unwrap_or(true);
-
-        let prefix = rule_block
-            .find("<Prefix>")
-            .and_then(|s| {
-                let r = &rule_block[s + 8..];
-                let e = r.find("</Prefix>")?;
-                Some(r[..e].to_string())
-            })
-            .unwrap_or_default();
-
-        let expiration_days = rule_block
-            .find("<Expiration>")
-            .and_then(|s| {
-                let r = &rule_block[s + 12..];
-                let e = r.find("</Expiration>")?;
-                let exp_block = &r[..e];
-                let d_start = exp_block.find("<Days>")?;
-                let d_rest = &exp_block[d_start + 6..];
-                let d_end = d_rest.find("</Days>")?;
-                d_rest[..d_end].parse::<u32>().ok()
-            });
-
-        let abort_multipart_days = rule_block
-            .find("<AbortIncompleteMultipartUpload>")
-            .and_then(|s| {
-                let r = &rule_block[s + 32..];
-                let e = r.find("</AbortIncompleteMultipartUpload>")?;
-                let block = &r[..e];
-                let d_start = block.find("<DaysAfterInitiation>")?;
-                let d_rest = &block[d_start + 21..];
-                let d_end = d_rest.find("</DaysAfterInitiation>")?;
-                d_rest[..d_end].parse::<u32>().ok()
-            });
-
-        rules.push(LifecycleRule {
-            id,
-            status,
-            prefix,
-            expiration_days,
-            abort_multipart_days,
-        });
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                if name == "Rule" {
+                    draft = Some(Draft::default());
+                }
+                path.push(name);
+                if let Some(d) = draft.as_mut() {
+                    if let Some(f) = field(d, &path) {
+                        f.get_or_insert_with(String::new);
+                    }
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                path.push(name);
+                if let Some(d) = draft.as_mut() {
+                    if let Some(f) = field(d, &path) {
+                        f.get_or_insert_with(String::new);
+                    }
+                }
+                path.pop();
+            }
+            Ok(Event::Text(t)) => {
+                let v = t.unescape().map_err(|_| "MalformedXML")?;
+                if let Some(d) = draft.as_mut() {
+                    if let Some(f) = field(d, &path) {
+                        f.get_or_insert_with(String::new).push_str(&v);
+                    }
+                }
+            }
+            Ok(Event::CData(c)) => {
+                let v = String::from_utf8_lossy(&c.into_inner()).into_owned();
+                if let Some(d) = draft.as_mut() {
+                    if let Some(f) = field(d, &path) {
+                        f.get_or_insert_with(String::new).push_str(&v);
+                    }
+                }
+            }
+            Ok(Event::End(_)) => {
+                if path.last().map(|s| s.as_str()) == Some("Rule") {
+                    if let Some(d) = draft.take() {
+                        rules.push(LifecycleRule {
+                            id: d.id.unwrap_or_else(|| format!("rule-{}", rules.len() + 1)),
+                            status: d.status.map_or(true, |s| s == "Enabled"),
+                            prefix: d.prefix.unwrap_or_default(),
+                            expiration_days: d.expiration_days.and_then(|v| v.trim().parse().ok()),
+                            abort_multipart_days: d.abort_days.and_then(|v| v.trim().parse().ok()),
+                        });
+                    }
+                }
+                path.pop();
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return Err("MalformedXML"),
+            Ok(_) => {}
+        }
     }
 
     if rules.is_empty() {
         return Err("MalformedXML");
     }
-
     Ok(rules)
 }
 

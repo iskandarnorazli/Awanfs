@@ -157,3 +157,30 @@ fn authenticate_never_panics_on_generated_headers() {
         assert!(res.is_ok(), "panic on Authorization {:?}, query {:?}", auth, q);
     }
 }
+
+#[test]
+fn lifecycle_xml_round_trips_through_its_serialiser() {
+    let mut r = Rng(1234);
+    let bits = ["a", "logs/", "&", "&amp;", "<Status>Disabled</Status>", "&lt;", "\"", "'", " ", "é", "]]>", "x"];
+    for _ in 0..5_000 {
+        let mut rules = Vec::new();
+        for i in 0..(1 + r.below(3)) {
+            let mut id = String::new();
+            let mut prefix = String::new();
+            for _ in 0..r.below(4) {
+                id.push_str(r.pick(&bits));
+                prefix.push_str(r.pick(&bits));
+            }
+            rules.push(s3_server::LifecycleRule {
+                id: if id.trim().is_empty() { format!("rule-{}", i + 1) } else { id.trim().to_string() },
+                status: r.below(2) == 0,
+                prefix: prefix.trim().to_string(),
+                expiration_days: if r.below(2) == 0 { Some(r.below(1000) as u32) } else { None },
+                abort_multipart_days: if r.below(2) == 0 { Some(r.below(30) as u32) } else { None },
+            });
+        }
+        let xml = s3_server::lifecycle_config_xml(&rules);
+        let back = parse_lifecycle_xml(&xml).unwrap_or_else(|e| panic!("{} for {}", e, xml));
+        assert_eq!(back, rules, "round trip of {}", xml);
+    }
+}

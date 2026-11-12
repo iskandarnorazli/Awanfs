@@ -1,0 +1,4 @@
+AWS4-HMAC-SHA256 Credential=AKIAFUZZ/20261112/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-date,Signature=00
+20261112T000000Z
+
+/b/k
