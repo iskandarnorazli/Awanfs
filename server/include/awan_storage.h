@@ -39,6 +39,7 @@ typedef struct {
 #define AWAN_ERR_PRECONDITION      -4
 #define AWAN_ERR_CAPACITY          -5
 #define AWAN_ERR_INVALID_ARG       -6
+#define AWAN_ERR_SPILL             -7
 #define AWAN_ERR_PANIC           -999
 
 // Engine lifecycle
