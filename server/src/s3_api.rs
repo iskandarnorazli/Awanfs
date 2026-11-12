@@ -1304,7 +1304,10 @@ pub async fn handle_s3_request(
                 };
 
                 let (hi, lo, hex, raw_md5) = compute_md5(&decoded_bytes);
-                let staged_path = state.multipart.write_staged_part(upload_id, part_num, &decoded_bytes).ok();
+                let staged_path = match state.multipart.write_staged_part(upload_id, part_num, &decoded_bytes) {
+                    Ok(p) => Some(p),
+                    Err(e) => return Ok(internal_error_response(&key, &format!("could not store the part: {}", e))),
+                };
                 let vol_offset = 0;
 
                 match state.multipart.upload_part(
