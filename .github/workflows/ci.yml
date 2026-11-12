@@ -25,7 +25,7 @@ jobs:
         with:
           workspaces: server
       - name: Build and test the server
-        run: cargo test --locked --manifest-path server/Cargo.toml
+        run: cargo test --locked --no-fail-fast --manifest-path server/Cargo.toml
       - name: Release build
         run: cargo build --locked --release --manifest-path server/Cargo.toml
       - name: Benchmark harness self-tests

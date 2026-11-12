@@ -158,3 +158,20 @@ async fn zero_byte_objects_and_overwrites_survive_restart() {
     assert_eq!(get(&c, &url, "k").await, (StatusCode::OK, Vec::new()), "the empty overwrite of k");
     assert_eq!(get(&c, &url, "folder/").await, (StatusCode::OK, Vec::new()), "the zero-byte folder marker");
 }
+
+#[tokio::test]
+async fn copied_object_survives_source_overwrite_and_restart() {
+    let dir = temp_dir("copy");
+    let c = reqwest::Client::new();
+    {
+        let (url, _h) = spawn(Arc::new(S3ServiceState::with_data_dir(&dir))).await;
+        assert_eq!(c.put(format!("{}/bkt", url)).send().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(c.put(format!("{}/bkt/src", url)).body(&b"original bytes"[..]).send().await.unwrap().status(), StatusCode::OK);
+        let res = c.put(format!("{}/bkt/dst", url)).header("x-amz-copy-source", "/bkt/src").send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(c.put(format!("{}/bkt/src", url)).body(&b"replaced"[..]).send().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(get(&c, &url, "dst").await, (StatusCode::OK, b"original bytes".to_vec()), "the copy after its source was overwritten");
+    }
+    let (url, _h) = spawn(Arc::new(S3ServiceState::with_data_dir(&dir))).await;
+    assert_eq!(get(&c, &url, "dst").await, (StatusCode::OK, b"original bytes".to_vec()), "the copy after a restart");
+}
