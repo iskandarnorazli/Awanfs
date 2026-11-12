@@ -68,7 +68,7 @@ async fn test_online_compaction_reclaims_dead_space() {
     assert!(frag >= 0.20, "Fragmentation ratio must be >= 20%, got {}", frag);
 
     // 4. Perform online compaction
-    let report = state.perform_online_compaction().expect("online compaction");
+    let report = state.perform_online_compaction().await.expect("online compaction");
     assert_eq!(report.live_needles_copied, 20);
     // 30 dead data needles + 30 dead tombstone markers = 60 dead needles reclaimed
     assert_eq!(report.dead_needles_reclaimed, 60);
