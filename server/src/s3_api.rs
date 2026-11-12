@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::aws_chunked::decode_aws_chunked;
 use crate::cache::PayloadCache;
 use crate::coalesce::SingleFlight;
 use crate::compaction::CompactionReport;
@@ -1636,7 +1635,7 @@ async fn handle_s3_inner(
                     }
                 };
 
-                let is_chunked = req.headers().get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
+                let is_chunked = crate::auth::is_aws_chunked(req.headers());
                 let signed_headers = req.headers().clone();
                 let declared_len = signed_headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
                 if let Some(len) = declared_len.filter(|&n| !is_chunked && n > STREAM_PUT_MIN) {
@@ -1719,12 +1718,14 @@ async fn handle_s3_inner(
                         .unwrap());
                 }
                 let decoded_bytes = if is_chunked {
-                    match decode_aws_chunked(&raw_bytes) {
+                    let mut verifier = crate::auth::ChunkVerifier::for_request(&state.auth, &signed_headers);
+                    let cache = &state.sigv4_cache;
+                    match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |data, sig| verifier.as_mut().map_or(true, |v| v.check(cache, data, sig))) {
                         Ok(b) => b,
                         Err(e) => {
                             let xml = s3_error_xml(e, "Error decoding chunked body", &key, "req-up-part");
                             return Ok(Response::builder()
-                                .status(StatusCode::FORBIDDEN)
+                                .status(if e == "SignatureDoesNotMatch" { StatusCode::FORBIDDEN } else { StatusCode::BAD_REQUEST })
                                 .header(CONTENT_TYPE, "application/xml")
                                 .body(full_body(Bytes::from(xml)))
                                 .unwrap());
@@ -2048,7 +2049,7 @@ async fn handle_s3_inner(
 
                     // Standard PutObject
                     let expected_len = req.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok());
-                    let is_chunked = req.headers().get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
+                    let is_chunked = crate::auth::is_aws_chunked(req.headers());
                     let content_md5_hdr = req.headers().get("content-md5").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
                     let signed_headers = req.headers().clone();
                     if let Some(len) = expected_len.map(|n| n as u64).filter(|&n| !is_chunked && n > STREAM_PUT_MIN) {
@@ -2146,12 +2147,14 @@ async fn handle_s3_inner(
                     }
 
                     let decoded_bytes = if is_chunked {
-                        match decode_aws_chunked(&raw_bytes) {
+                        let mut verifier = crate::auth::ChunkVerifier::for_request(&state.auth, &signed_headers);
+                        let cache = &state.sigv4_cache;
+                        match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |data, sig| verifier.as_mut().map_or(true, |v| v.check(cache, data, sig))) {
                             Ok(b) => b,
                             Err(e) => {
                                 let xml = s3_error_xml(e, "Error decoding chunked body", &key, "req-put-obj");
                                 return Ok(Response::builder()
-                                    .status(StatusCode::FORBIDDEN)
+                                    .status(if e == "SignatureDoesNotMatch" { StatusCode::FORBIDDEN } else { StatusCode::BAD_REQUEST })
                                     .header(CONTENT_TYPE, "application/xml")
                                     .body(full_body(Bytes::from(xml)))
                                     .unwrap());
