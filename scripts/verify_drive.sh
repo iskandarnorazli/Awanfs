@@ -27,7 +27,9 @@ check() { # name, command...
   if "$@" >>"$EVID/$name.txt" 2>&1; then echo "ok    $name"; pass=$((pass+1)); else echo "FAIL  $name (see $EVID/$name.txt)"; tail -n 15 "$EVID/$name.txt" | sed "s/^/      /"; fail=$((fail+1)); fi; }
 same() { cmp -s "$1" "$2"; }
 
-doctor() { curl -s -o /dev/null -w '%{http_code}\n' "$URL/" | grep -q 200 && echo "server up on $PORT, pid $PID, data $DATA"; }
+# Up, refusing unsigned requests (403), and answering the aws CLI's signed ones.
+doctor() { curl -s -o /dev/null -w '%{http_code}\n' "$URL/" | grep -q 403 && S3 list-buckets >/dev/null &&
+  echo "server up on $PORT, pid $PID, data $DATA; unsigned 403, signed 200"; }
 
 j_buckets() { S3 create-bucket --bucket verify-bkt && S3 list-buckets | grep -q '"verify-bkt"' && S3 head-bucket --bucket verify-bkt; }
 j_objects() { head -c 70000 /dev/urandom >"$EVID/obj.bin"; S3 put-object --bucket verify-bkt --key a/obj --body "$EVID/obj.bin" >/dev/null &&
