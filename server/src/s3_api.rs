@@ -8,7 +8,7 @@ use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, 
 use hyper::{Method, Request, Response, StatusCode};
 use md5::{Digest, Md5};
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use crate::lifecycle::*;
 use crate::multipart::*;
 use crate::mvcc::MvccStore;
 use crate::sigv4::*;
-use crate::volume::{Durability, VolumeError, VolumeManager};
+use crate::volume::{global_offset, split_offset, Durability, NeedleLocation, VolumeError, VolumeManager};
 use crate::work::WorkCounters;
 use crate::xml::*;
 use std::path::{Path, PathBuf};
@@ -57,6 +57,22 @@ fn engine_error_response(code: i32, resource: &str) -> Response<ResponseBody> {
         .header(CONTENT_TYPE, "application/xml")
         .body(full_body(Bytes::from(s3_error_xml(s3_code, msg, resource, "req-index"))))
         .unwrap()
+}
+
+/// Ids of the `volume_NNNN.dat` files in `dir`, ascending.
+fn volume_ids(dir: &Path) -> Vec<u32> {
+    let mut ids: Vec<u32> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let name = e.file_name().into_string().ok()?;
+                    name.strip_prefix("volume_")?.strip_suffix(".dat")?.parse().ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort_unstable();
+    ids
 }
 
 fn no_volume_error() -> VolumeError {
@@ -270,7 +286,13 @@ pub struct S3ServiceState {
     pub total_volume_bytes: Arc<AtomicU64>,
     pub tombstone_bytes: Arc<AtomicU64>,
     pub active_volume_id: Arc<AtomicU32>,
+    /// The volume new writes go to.
     pub volume_manager: Arc<RwLock<Option<Arc<VolumeManager>>>>,
+    /// Every open volume by id, the active one included; reads look up the volume of a
+    /// global offset here (#37).
+    pub volumes: Arc<RwLock<BTreeMap<u32, Arc<VolumeManager>>>>,
+    /// Held while a full volume is sealed and the next one opened.
+    roll_lock: Arc<parking_lot::Mutex<()>>,
     pub needle_crc_map: Arc<RwLock<HashMap<(u32, u64), u32>>>,
     pub payload_cache: Arc<PayloadCache>,
     pub next_vol_offset: Arc<RwLock<u64>>,
@@ -313,6 +335,8 @@ impl S3ServiceState {
             lifecycle: Arc::new(LifecycleManager::new()),
             single_flight: Arc::new(SingleFlight::new()),
             mvcc: Arc::new(MvccStore::new()),
+            volumes: Arc::new(RwLock::new(vol_mgr.iter().map(|vm| (vm.id(), Arc::clone(vm))).collect())),
+            roll_lock: Arc::new(parking_lot::Mutex::new(())),
             volume_manager: Arc::new(RwLock::new(vol_mgr)),
             needle_crc_map: Arc::new(RwLock::new(HashMap::new())),
             payload_cache: Arc::new(PayloadCache::default_auto_scaled()),
@@ -327,10 +351,19 @@ impl S3ServiceState {
     pub fn with_data_dir(dir: &Path) -> Self {
         let _ = std::fs::create_dir_all(dir);
         let work = Arc::new(WorkCounters::default());
-        let vol_mgr = VolumeManager::open_sparse(dir, 1).ok().map(|mut vm| {
-            vm.attach_work_counters(Arc::clone(&work));
-            Arc::new(vm)
-        });
+        // Every volume in id order; writes go to the last one (#37).
+        let mut volumes: BTreeMap<u32, Arc<VolumeManager>> = BTreeMap::new();
+        let mut ids = volume_ids(dir);
+        if ids.is_empty() {
+            ids.push(1);
+        }
+        for id in ids {
+            if let Ok(mut vm) = VolumeManager::open_sparse(dir, id) {
+                vm.attach_work_counters(Arc::clone(&work));
+                volumes.insert(id, Arc::new(vm));
+            }
+        }
+        let vol_mgr = volumes.values().next_back().cloned();
         let multipart = Arc::new(
             MultipartManager::with_staging_dir(dir.join(".staging")).with_work_counters(Arc::clone(&work)),
         );
@@ -363,8 +396,9 @@ impl S3ServiceState {
             }
         }
 
-        // 2. Replay needle volume
-        if let Some(ref vm) = vol_mgr {
+        // 2. Replay the needle volumes, oldest first: writes only move to a newer volume, so
+        // volume order is log order.
+        for vm in volumes.values() {
             initial_vol_offset = vm.offset().max(4096);
             let mut crcs = needle_crc_map.write();
             // Collect the log first: a multipart manifest needle is read back from the volume,
@@ -373,13 +407,14 @@ impl S3ServiceState {
             let _ = vm.recover_needles(|b_id, key, offset, size, etag_hi, etag_lo, flags, crc32c| {
                 events.push((b_id, key, offset, size, etag_hi, etag_lo, flags, crc32c));
             });
-            for (b_id, key, offset, size, etag_hi, etag_lo, flags, crc32c) in events {
+            for (b_id, key, local, size, etag_hi, etag_lo, flags, crc32c) in events {
+                let offset = global_offset(vm.id(), local);
                 crcs.insert((b_id as u32, offset), crc32c);
                 if flags & AWAN_FLAG_TOMBSTONE != 0 {
                     let _ = engine.delete_object(b_id as u32, key.as_bytes());
                 } else if flags & AWAN_FLAG_MULTIPART != 0 {
                     let manifest = vm
-                        .read_needle_bytes(1, offset, crc32c)
+                        .read_needle_bytes(vm.id(), local, crc32c)
                         .ok()
                         .and_then(|b| decode_extents_manifest(&multipart.staging_dir, &b));
                     if let Some((total, extents)) = manifest {
@@ -410,19 +445,22 @@ impl S3ServiceState {
             }
         }
 
-        let initial_bytes = if let Some(ref vm) = vol_mgr { vm.offset() } else { 0 };
+        let initial_bytes = volumes.values().map(|vm| vm.offset()).sum();
+        let active_id = vol_mgr.as_ref().map(|vm| vm.id()).unwrap_or(1);
 
         Self {
             data_dir: Some(dir.to_path_buf()),
             total_volume_bytes: Arc::new(AtomicU64::new(initial_bytes)),
             tombstone_bytes: Arc::new(AtomicU64::new(0)),
-            active_volume_id: Arc::new(AtomicU32::new(1)),
+            active_volume_id: Arc::new(AtomicU32::new(active_id)),
             engine: Arc::new(RwLock::new(engine)),
             multipart,
             sigv4_cache: Arc::new(SigV4KeyCache::new()),
             lifecycle: Arc::new(LifecycleManager::new()),
             single_flight: Arc::new(SingleFlight::new()),
             mvcc: Arc::new(MvccStore::new()),
+            volumes: Arc::new(RwLock::new(volumes)),
+            roll_lock: Arc::new(parking_lot::Mutex::new(())),
             volume_manager: Arc::new(RwLock::new(vol_mgr)),
             needle_crc_map,
             payload_cache: Arc::new(PayloadCache::default_auto_scaled()),
@@ -449,6 +487,14 @@ impl S3ServiceState {
             Some(ref d) => d.clone(),
             None => return Ok(CompactionReport::default()),
         };
+        if self.volumes.read().len() > 1 {
+            // Compaction moves one volume's live needles; with several volumes it would drop
+            // the objects in the others. Safe multi-volume compaction is #14.
+            return Err(VolumeError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "compaction of more than one volume is not supported yet (#14)",
+            )));
+        }
         let cur_vol = self.active_volume_id.load(Ordering::SeqCst);
         let target_vol = cur_vol + 1;
 
@@ -475,13 +521,15 @@ impl S3ServiceState {
             let mut crc_map = self.needle_crc_map.write();
             for (k_str, loc) in &report.new_locations {
                 if let Some(&b_id) = key_buckets.get(k_str) {
-                    let _ = engine.update_object_offset(b_id, k_str.as_bytes(), loc.offset);
-                    crc_map.insert((b_id, loc.offset), loc.payload_crc32c);
+                    let g = global_offset(target_vol, loc.offset);
+                    let _ = engine.update_object_offset(b_id, k_str.as_bytes(), g);
+                    crc_map.insert((b_id, g), loc.payload_crc32c);
                 }
             }
         }
 
         self.payload_cache.clear();
+        *self.volumes.write() = std::iter::once((target_vol, Arc::clone(&new_mgr))).collect();
         *self.volume_manager.write() = Some(new_mgr);
         self.active_volume_id.store(target_vol, Ordering::SeqCst);
         self.total_volume_bytes.store(new_vol_bytes, Ordering::Relaxed);
@@ -560,16 +608,95 @@ impl S3ServiceState {
     /// Writes the payload to the volume and waits until it is durable. An error means the
     /// write is not acknowledged.
     pub async fn store_payload(&self, b_id: u32, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64) -> Result<u64, VolumeError> {
-        let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
-        let loc = vm.write_needle(b_id as u16, key, data, flags, etag_hi, etag_lo)?;
+        let (vm, loc, offset) = self.write_to_active(b_id, key, data, flags, etag_hi, etag_lo)?;
         self.make_durable(&vm, loc.seq).await?;
-        self.needle_crc_map.write().insert((b_id, loc.offset), loc.payload_crc32c);
+        self.needle_crc_map.write().insert((b_id, offset), loc.payload_crc32c);
         self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
         // Cache hot payloads up to 4 MiB in dynamic auto-scaling LRU cache
         if !data.is_empty() && data.len() <= 4 * 1024 * 1024 {
-            self.payload_cache.insert(b_id, loc.offset, data.clone());
+            self.payload_cache.insert(b_id, offset, data.clone());
         }
-        Ok(loc.offset)
+        Ok(offset)
+    }
+
+    /// Writes a needle to the active volume. When it is full, seals it, opens the next one
+    /// and writes there (#37). Returns the volume, the local location and the global offset.
+    pub fn write_to_active(
+        &self,
+        b_id: u32,
+        key: &str,
+        data: &[u8],
+        flags: u16,
+        etag_hi: u64,
+        etag_lo: u64,
+    ) -> Result<(Arc<VolumeManager>, NeedleLocation, u64), VolumeError> {
+        let mut attempts = 0;
+        loop {
+            let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+            match vm.write_needle(b_id as u16, key, data, flags, etag_hi, etag_lo) {
+                Ok(loc) => {
+                    let g = global_offset(vm.id(), loc.offset);
+                    return Ok((vm, loc, g));
+                }
+                // A needle bigger than a whole volume would roll forever: refuse it.
+                Err(VolumeError::VolumeFull { len, .. }) if len + crate::direct_io::SECTOR_SIZE as u64 > vm.max_span() => {
+                    return Err(VolumeError::VolumeFull { offset: 0, len })
+                }
+                Err(VolumeError::VolumeFull { .. }) if attempts < 8 => {
+                    attempts += 1;
+                    self.roll_volume(&vm)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Opens the volume after `full` and makes it the active one, unless another writer
+    /// already did. The full volume stays open for reads.
+    fn roll_volume(&self, full: &Arc<VolumeManager>) -> Result<(), VolumeError> {
+        let _g = self.roll_lock.lock();
+        let active = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+        if active.id() != full.id() {
+            return Ok(());
+        }
+        let next_id = self.volumes.read().keys().next_back().copied().unwrap_or(full.id()).max(full.id()) + 1;
+        let mut vm = VolumeManager::open_sparse(full.dir(), next_id)?;
+        vm.attach_work_counters(full.work_counters());
+        vm.set_max_span(full.max_span());
+        vm.set_durability(full.durability());
+        let vm = Arc::new(vm);
+        if vm.durability() == Durability::Fast {
+            vm.start_flusher(std::time::Duration::from_secs(1));
+        }
+        // A sealed volume in `fast` mode gets one last sync, so its tail is not left to the
+        // flusher alone.
+        if full.durability() == Durability::Fast {
+            let _ = full.flush_if_dirty();
+        }
+        self.volumes.write().insert(next_id, Arc::clone(&vm));
+        *self.volume_manager.write() = Some(vm);
+        self.active_volume_id.store(next_id, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// The volume holding a global offset, and the offset inside it.
+    fn volume_for(&self, global: u64) -> Result<(Arc<VolumeManager>, u64), VolumeError> {
+        let (id, local) = split_offset(global);
+        if let Some(vm) = self.volume_manager.read().clone() {
+            if vm.id() == id {
+                return Ok((vm, local));
+            }
+        }
+        let vm = self.volumes.read().get(&id).cloned().ok_or(VolumeError::CorruptIndex)?;
+        Ok((vm, local))
+    }
+
+    /// Sets the span of the active volume and of every volume opened after it. Tests use a
+    /// small span to make rollover happen.
+    pub fn set_volume_span(&self, span: u64) {
+        if let Some(vm) = self.volume_manager.read().clone() {
+            vm.set_max_span(span);
+        }
     }
 
     /// Reads and verifies a payload. An error means the bytes could not be read or failed
@@ -584,14 +711,14 @@ impl S3ServiceState {
         if let Some(cached) = self.payload_cache.get(b_id, vol_offset) {
             return Ok(cached);
         }
-        let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+        let (vm, local) = self.volume_for(vol_offset)?;
         let expected_crc = self
             .needle_crc_map
             .read()
             .get(&(b_id, vol_offset))
             .copied()
             .ok_or(VolumeError::CorruptIndex)?;
-        let bytes = vm.read_needle_bytes(1, vol_offset, expected_crc)?;
+        let bytes = vm.read_needle_bytes(vm.id(), local, expected_crc)?;
         if bytes.len() != expected_size {
             return Err(VolumeError::CorruptIndex);
         }
@@ -1740,12 +1867,8 @@ pub async fn handle_s3_request(
                     state.hook("delete_start", &key);
                     // Log the tombstone first; only a logged delete removes the row, so a failed
                     // write is a 500 and the object stays (verification/tla, DeleteLogsFirst).
-                    let vm = match state.volume_manager.read().clone() {
-                        Some(vm) => vm,
-                        None => return Ok(internal_error_response(&key, "no volume is open")),
-                    };
-                    match vm.write_needle(b_id as u16, &key, &[], AWAN_FLAG_TOMBSTONE, 0, 0) {
-                        Ok(loc) => {
+                    match state.write_to_active(b_id, &key, &[], AWAN_FLAG_TOMBSTONE, 0, 0) {
+                        Ok((vm, loc, _)) => {
                             state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                             state.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                             if let Err(e) = state.make_durable(&vm, loc.seq).await {
