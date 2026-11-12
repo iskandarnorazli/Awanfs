@@ -1,0 +1,52 @@
+# AwanFS S3 server as a systemd service (#49).
+# Install: copy s3-server to /usr/local/bin, this file to /etc/systemd/system/, and put the keys
+# in /etc/awanfs/awanfs.env (mode 0600):
+#   AWANFS_ACCESS_KEY=...
+#   AWANFS_SECRET_KEY=...
+#   # AWANFS_LISTEN=0.0.0.0     (default 127.0.0.1)
+#   # AWANFS_DURABILITY=group   (group, fast or strict)
+# then: systemctl daemon-reload && systemctl enable --now awanfs
+
+[Unit]
+Description=AwanFS S3-compatible object store
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/awanfs/awanfs.env
+ExecStart=/usr/local/bin/s3-server --port 9000 --data-dir /var/lib/awanfs
+# SIGTERM starts the graceful shutdown: no new connections, requests in flight finish (up to
+# 30 s), every volume is synced, exit 0.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=2
+
+DynamicUser=yes
+StateDirectory=awanfs
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
