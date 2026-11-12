@@ -8,7 +8,7 @@ use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, 
 use hyper::{Method, Request, Response, StatusCode};
 use md5::{Digest, Md5};
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use crate::lifecycle::*;
 use crate::multipart::*;
 use crate::mvcc::MvccStore;
 use crate::sigv4::*;
-use crate::volume::{VolumeError, VolumeManager};
+use crate::volume::{global_offset, split_offset, Durability, NeedleLocation, VolumeError, VolumeManager};
 use crate::work::WorkCounters;
 use crate::xml::*;
 use std::path::{Path, PathBuf};
@@ -42,6 +42,115 @@ fn internal_error_response(resource: &str, detail: &str) -> Response<ResponseBod
         .header(CONTENT_TYPE, "application/xml")
         .body(full_body(Bytes::from(xml)))
         .unwrap()
+}
+
+/// The answer for an index error from `put_object` or `has_room_for`.
+fn engine_error_response(code: i32, resource: &str) -> Response<ResponseBody> {
+    let (status, s3_code, msg) = match code {
+        ERR_CAPACITY => (StatusCode::SERVICE_UNAVAILABLE, "SlowDown", "The object index is full."),
+        ERR_BUCKET_NOT_FOUND => (StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist."),
+        ERR_INVALID_ARG => (StatusCode::BAD_REQUEST, "KeyTooLongError", "The key is empty or longer than 1024 bytes."),
+        _ => return internal_error_response(resource, &format!("index error {}", code)),
+    };
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/xml")
+        .body(full_body(Bytes::from(s3_error_xml(s3_code, msg, resource, "req-index"))))
+        .unwrap()
+}
+
+/// The largest object, and the largest part, S3 accepts in one request.
+pub const MAX_OBJECT_BODY: u64 = 5 << 30;
+/// Request bodies that are XML (multipart completion, multi-object delete, lifecycle).
+pub const MAX_XML_BODY: u64 = 16 << 20;
+/// Room for aws-chunked framing (chunk sizes and signatures) on top of the payload.
+const CHUNK_FRAMING_SLACK: u64 = 16 << 20;
+
+fn body_limit_for(method: &Method, target: &ParsedTarget) -> u64 {
+    match (method, target) {
+        // PutObject and UploadPart; CompleteMultipartUpload and the other POSTs carry XML.
+        (&Method::PUT, ParsedTarget::Object { .. }) => MAX_OBJECT_BODY,
+        _ => MAX_XML_BODY,
+    }
+}
+
+fn entity_too_large(resource: &str, limit: u64) -> Response<ResponseBody> {
+    let xml = s3_error_xml(
+        "EntityTooLarge",
+        &format!("Your proposed upload exceeds the maximum allowed size of {} bytes.", limit),
+        resource,
+        "req-size",
+    );
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(CONTENT_TYPE, "application/xml")
+        .header("connection", "close")
+        .body(full_body(Bytes::from(xml)))
+        .unwrap()
+}
+
+/// Reads a request body of at most `limit` bytes. `Ok(Err(response))` is the answer to send
+/// when the body is too large or cut short.
+async fn read_body(body: hyper::body::Incoming, limit: u64, resource: &str) -> Result<Result<Bytes, Response<ResponseBody>>, hyper::Error> {
+    match http_body_util::Limited::new(body, limit as usize).collect().await {
+        Ok(c) => Ok(Ok(c.to_bytes())),
+        Err(e) => {
+            if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+                return Ok(Err(entity_too_large(resource, limit)));
+            }
+            match e.downcast::<hyper::Error>() {
+                Ok(h) => Err(*h),
+                Err(other) => {
+                    let xml = s3_error_xml("IncompleteBody", &other.to_string(), resource, "req-body");
+                    Ok(Err(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header(CONTENT_TYPE, "application/xml")
+                        .body(full_body(Bytes::from(xml)))
+                        .unwrap()))
+                }
+            }
+        }
+    }
+}
+
+/// A response body sent as a list of chunks, one frame each: the parts of a multipart object
+/// go out from their mmaps without being copied into one buffer (#36).
+struct ChunksBody(std::collections::VecDeque<Bytes>);
+
+impl hyper::body::Body for ChunksBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        std::task::Poll::Ready(self.0.pop_front().map(|b| Ok(hyper::body::Frame::data(b))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(self.0.iter().map(|b| b.len() as u64).sum())
+    }
+}
+
+/// Ids of the `volume_NNNN.dat` files in `dir`, ascending.
+fn volume_ids(dir: &Path) -> Vec<u32> {
+    let mut ids: Vec<u32> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let name = e.file_name().into_string().ok()?;
+                    name.strip_prefix("volume_")?.strip_suffix(".dat")?.parse().ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort_unstable();
+    ids
 }
 
 fn no_volume_error() -> VolumeError {
@@ -255,7 +364,13 @@ pub struct S3ServiceState {
     pub total_volume_bytes: Arc<AtomicU64>,
     pub tombstone_bytes: Arc<AtomicU64>,
     pub active_volume_id: Arc<AtomicU32>,
+    /// The volume new writes go to.
     pub volume_manager: Arc<RwLock<Option<Arc<VolumeManager>>>>,
+    /// Every open volume by id, the active one included; reads look up the volume of a
+    /// global offset here (#37).
+    pub volumes: Arc<RwLock<BTreeMap<u32, Arc<VolumeManager>>>>,
+    /// Held while a full volume is sealed and the next one opened.
+    roll_lock: Arc<parking_lot::Mutex<()>>,
     pub needle_crc_map: Arc<RwLock<HashMap<(u32, u64), u32>>>,
     pub payload_cache: Arc<PayloadCache>,
     pub next_vol_offset: Arc<RwLock<u64>>,
@@ -266,6 +381,8 @@ pub struct S3ServiceState {
     /// volume write until the engine row is updated, so log order equals index order
     /// (`verification/tla/ObjectVersions.tla`, `UseKeyLock`).
     pub key_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
+    /// Who may call; `AuthConfig::open()` by default, the binary sets it from flags and env.
+    pub auth: crate::auth::AuthConfig,
 }
 
 impl S3ServiceState {
@@ -296,6 +413,8 @@ impl S3ServiceState {
             lifecycle: Arc::new(LifecycleManager::new()),
             single_flight: Arc::new(SingleFlight::new()),
             mvcc: Arc::new(MvccStore::new()),
+            volumes: Arc::new(RwLock::new(vol_mgr.iter().map(|vm| (vm.id(), Arc::clone(vm))).collect())),
+            roll_lock: Arc::new(parking_lot::Mutex::new(())),
             volume_manager: Arc::new(RwLock::new(vol_mgr)),
             needle_crc_map: Arc::new(RwLock::new(HashMap::new())),
             payload_cache: Arc::new(PayloadCache::default_auto_scaled()),
@@ -303,16 +422,26 @@ impl S3ServiceState {
             work,
             test_hook: Arc::new(RwLock::new(None)),
             key_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
+            auth: crate::auth::AuthConfig::open(),
         }
     }
 
     pub fn with_data_dir(dir: &Path) -> Self {
         let _ = std::fs::create_dir_all(dir);
         let work = Arc::new(WorkCounters::default());
-        let vol_mgr = VolumeManager::open_sparse(dir, 1).ok().map(|mut vm| {
-            vm.attach_work_counters(Arc::clone(&work));
-            Arc::new(vm)
-        });
+        // Every volume in id order; writes go to the last one (#37).
+        let mut volumes: BTreeMap<u32, Arc<VolumeManager>> = BTreeMap::new();
+        let mut ids = volume_ids(dir);
+        if ids.is_empty() {
+            ids.push(1);
+        }
+        for id in ids {
+            if let Ok(mut vm) = VolumeManager::open_sparse(dir, id) {
+                vm.attach_work_counters(Arc::clone(&work));
+                volumes.insert(id, Arc::new(vm));
+            }
+        }
+        let vol_mgr = volumes.values().next_back().cloned();
         let multipart = Arc::new(
             MultipartManager::with_staging_dir(dir.join(".staging")).with_work_counters(Arc::clone(&work)),
         );
@@ -345,8 +474,9 @@ impl S3ServiceState {
             }
         }
 
-        // 2. Replay needle volume
-        if let Some(ref vm) = vol_mgr {
+        // 2. Replay the needle volumes, oldest first: writes only move to a newer volume, so
+        // volume order is log order.
+        for vm in volumes.values() {
             initial_vol_offset = vm.offset().max(4096);
             let mut crcs = needle_crc_map.write();
             // Collect the log first: a multipart manifest needle is read back from the volume,
@@ -355,13 +485,14 @@ impl S3ServiceState {
             let _ = vm.recover_needles(|b_id, key, offset, size, etag_hi, etag_lo, flags, crc32c| {
                 events.push((b_id, key, offset, size, etag_hi, etag_lo, flags, crc32c));
             });
-            for (b_id, key, offset, size, etag_hi, etag_lo, flags, crc32c) in events {
+            for (b_id, key, local, size, etag_hi, etag_lo, flags, crc32c) in events {
+                let offset = global_offset(vm.id(), local);
                 crcs.insert((b_id as u32, offset), crc32c);
                 if flags & AWAN_FLAG_TOMBSTONE != 0 {
                     let _ = engine.delete_object(b_id as u32, key.as_bytes());
                 } else if flags & AWAN_FLAG_MULTIPART != 0 {
                     let manifest = vm
-                        .read_needle_bytes(1, offset, crc32c)
+                        .read_needle_bytes(vm.id(), local, crc32c)
                         .ok()
                         .and_then(|b| decode_extents_manifest(&multipart.staging_dir, &b));
                     if let Some((total, extents)) = manifest {
@@ -392,19 +523,22 @@ impl S3ServiceState {
             }
         }
 
-        let initial_bytes = if let Some(ref vm) = vol_mgr { vm.offset() } else { 0 };
+        let initial_bytes = volumes.values().map(|vm| vm.offset()).sum();
+        let active_id = vol_mgr.as_ref().map(|vm| vm.id()).unwrap_or(1);
 
         Self {
             data_dir: Some(dir.to_path_buf()),
             total_volume_bytes: Arc::new(AtomicU64::new(initial_bytes)),
             tombstone_bytes: Arc::new(AtomicU64::new(0)),
-            active_volume_id: Arc::new(AtomicU32::new(1)),
+            active_volume_id: Arc::new(AtomicU32::new(active_id)),
             engine: Arc::new(RwLock::new(engine)),
             multipart,
             sigv4_cache: Arc::new(SigV4KeyCache::new()),
             lifecycle: Arc::new(LifecycleManager::new()),
             single_flight: Arc::new(SingleFlight::new()),
             mvcc: Arc::new(MvccStore::new()),
+            volumes: Arc::new(RwLock::new(volumes)),
+            roll_lock: Arc::new(parking_lot::Mutex::new(())),
             volume_manager: Arc::new(RwLock::new(vol_mgr)),
             needle_crc_map,
             payload_cache: Arc::new(PayloadCache::default_auto_scaled()),
@@ -412,6 +546,7 @@ impl S3ServiceState {
             work,
             test_hook: Arc::new(RwLock::new(None)),
             key_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
+            auth: crate::auth::AuthConfig::open(),
         }
     }
 
@@ -430,6 +565,14 @@ impl S3ServiceState {
             Some(ref d) => d.clone(),
             None => return Ok(CompactionReport::default()),
         };
+        if self.volumes.read().len() > 1 {
+            // Compaction moves one volume's live needles; with several volumes it would drop
+            // the objects in the others. Safe multi-volume compaction is #14.
+            return Err(VolumeError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "compaction of more than one volume is not supported yet (#14)",
+            )));
+        }
         let cur_vol = self.active_volume_id.load(Ordering::SeqCst);
         let target_vol = cur_vol + 1;
 
@@ -456,13 +599,15 @@ impl S3ServiceState {
             let mut crc_map = self.needle_crc_map.write();
             for (k_str, loc) in &report.new_locations {
                 if let Some(&b_id) = key_buckets.get(k_str) {
-                    let _ = engine.update_object_offset(b_id, k_str.as_bytes(), loc.offset);
-                    crc_map.insert((b_id, loc.offset), loc.payload_crc32c);
+                    let g = global_offset(target_vol, loc.offset);
+                    let _ = engine.update_object_offset(b_id, k_str.as_bytes(), g);
+                    crc_map.insert((b_id, g), loc.payload_crc32c);
                 }
             }
         }
 
         self.payload_cache.clear();
+        *self.volumes.write() = std::iter::once((target_vol, Arc::clone(&new_mgr))).collect();
         *self.volume_manager.write() = Some(new_mgr);
         self.active_volume_id.store(target_vol, Ordering::SeqCst);
         self.total_volume_bytes.store(new_vol_bytes, Ordering::Relaxed);
@@ -494,11 +639,7 @@ impl S3ServiceState {
         let extents = self.multipart.get_completed_extents(b_id, key).ok_or(VolumeError::CorruptIndex)?;
         let mut out = Vec::with_capacity(size as usize);
         for ext in extents {
-            let mapped = ext.staged_path.as_ref().and_then(|p| self.multipart.get_or_mmap_part(p).ok());
-            let chunk = match mapped {
-                Some(mmap) => Bytes::from_owner(crate::volume::MmapOwner(mmap)),
-                None => self.load_payload(b_id, ext.vol_offset, ext.part_size as usize)?,
-            };
+            let chunk = self.part_bytes(b_id, &ext)?;
             let n = (ext.part_size as usize).min(chunk.len());
             self.work.payload_copy(n as u64);
             out.extend_from_slice(&chunk[..n]);
@@ -509,6 +650,14 @@ impl S3ServiceState {
         Ok(Bytes::from(out))
     }
 
+    /// The bytes of one part of a multipart object: its staged file's mmap, or its needle.
+    pub fn part_bytes(&self, b_id: u32, ext: &PartExtent) -> Result<Bytes, VolumeError> {
+        match ext.staged_path.as_ref().and_then(|p| self.multipart.get_or_mmap_part(p).ok()) {
+            Some(mmap) => Ok(Bytes::from_owner(crate::volume::MmapOwner(mmap))),
+            None => self.load_payload(b_id, ext.vol_offset, ext.part_size as usize),
+        }
+    }
+
     pub fn hook(&self, point: &'static str, key: &str) {
         let hook = self.test_hook.read().clone();
         if let Some(h) = hook {
@@ -516,17 +665,120 @@ impl S3ServiceState {
         }
     }
 
-    /// Writes the payload to the volume. An error means nothing was stored.
-    pub fn store_payload(&self, b_id: u32, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64) -> Result<u64, VolumeError> {
-        let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
-        let loc = vm.write_needle(b_id as u16, key, data, flags, etag_hi, etag_lo)?;
-        self.needle_crc_map.write().insert((b_id, loc.offset), loc.payload_crc32c);
+    /// Waits until the volume write numbered `seq` is as durable as the volume's mode
+    /// promises (#29). The sync runs on the blocking pool, not on the executor.
+    pub async fn make_durable(&self, vm: &Arc<VolumeManager>, seq: u64) -> Result<(), VolumeError> {
+        if vm.durability() == Durability::Fast {
+            return Ok(());
+        }
+        let vm = Arc::clone(vm);
+        tokio::task::spawn_blocking(move || vm.make_durable(seq))
+            .await
+            .map_err(|e| VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?
+    }
+
+    /// Sets the durability mode of the open volume; `Fast` also starts its flusher.
+    pub fn set_durability(&self, mode: Durability) {
+        if let Some(vm) = self.volume_manager.read().clone() {
+            vm.set_durability(mode);
+            if mode == Durability::Fast {
+                vm.start_flusher(std::time::Duration::from_secs(1));
+            }
+        }
+    }
+
+    /// Writes the payload to the volume and waits until it is durable. An error means the
+    /// write is not acknowledged.
+    pub async fn store_payload(&self, b_id: u32, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64) -> Result<u64, VolumeError> {
+        let (vm, loc, offset) = self.write_to_active(b_id, key, data, flags, etag_hi, etag_lo)?;
+        self.make_durable(&vm, loc.seq).await?;
+        self.needle_crc_map.write().insert((b_id, offset), loc.payload_crc32c);
         self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
         // Cache hot payloads up to 4 MiB in dynamic auto-scaling LRU cache
         if !data.is_empty() && data.len() <= 4 * 1024 * 1024 {
-            self.payload_cache.insert(b_id, loc.offset, data.clone());
+            self.payload_cache.insert(b_id, offset, data.clone());
         }
-        Ok(loc.offset)
+        Ok(offset)
+    }
+
+    /// Writes a needle to the active volume. When it is full, seals it, opens the next one
+    /// and writes there (#37). Returns the volume, the local location and the global offset.
+    pub fn write_to_active(
+        &self,
+        b_id: u32,
+        key: &str,
+        data: &[u8],
+        flags: u16,
+        etag_hi: u64,
+        etag_lo: u64,
+    ) -> Result<(Arc<VolumeManager>, NeedleLocation, u64), VolumeError> {
+        let mut attempts = 0;
+        loop {
+            let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+            match vm.write_needle(b_id as u16, key, data, flags, etag_hi, etag_lo) {
+                Ok(loc) => {
+                    let g = global_offset(vm.id(), loc.offset);
+                    return Ok((vm, loc, g));
+                }
+                // A needle bigger than a whole volume would roll forever: refuse it.
+                Err(VolumeError::VolumeFull { len, .. }) if len + crate::direct_io::SECTOR_SIZE as u64 > vm.max_span() => {
+                    return Err(VolumeError::VolumeFull { offset: 0, len })
+                }
+                Err(VolumeError::VolumeFull { .. }) if attempts < 8 => {
+                    attempts += 1;
+                    self.roll_volume(&vm)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Opens the volume after `full` and makes it the active one, unless another writer
+    /// already did. The full volume stays open for reads.
+    fn roll_volume(&self, full: &Arc<VolumeManager>) -> Result<(), VolumeError> {
+        let _g = self.roll_lock.lock();
+        let active = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+        if active.id() != full.id() {
+            return Ok(());
+        }
+        let next_id = self.volumes.read().keys().next_back().copied().unwrap_or(full.id()).max(full.id()) + 1;
+        let mut vm = VolumeManager::open_sparse(full.dir(), next_id)?;
+        vm.attach_work_counters(full.work_counters());
+        vm.set_max_span(full.max_span());
+        vm.set_durability(full.durability());
+        let vm = Arc::new(vm);
+        if vm.durability() == Durability::Fast {
+            vm.start_flusher(std::time::Duration::from_secs(1));
+        }
+        // A sealed volume in `fast` mode gets one last sync, so its tail is not left to the
+        // flusher alone.
+        if full.durability() == Durability::Fast {
+            let _ = full.flush_if_dirty();
+        }
+        self.volumes.write().insert(next_id, Arc::clone(&vm));
+        *self.volume_manager.write() = Some(vm);
+        self.active_volume_id.store(next_id, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// The volume holding a global offset, and the offset inside it.
+    fn volume_for(&self, global: u64) -> Result<(Arc<VolumeManager>, u64), VolumeError> {
+        let (id, local) = split_offset(global);
+        if let Some(vm) = self.volume_manager.read().clone() {
+            if vm.id() == id {
+                return Ok((vm, local));
+            }
+        }
+        let vm = self.volumes.read().get(&id).cloned().ok_or(VolumeError::CorruptIndex)?;
+        Ok((vm, local))
+    }
+
+    /// Sets the span of the active volume and of every volume opened after it. Tests use a
+    /// small span to make rollover happen.
+    pub fn set_volume_span(&self, span: u64) {
+        if let Some(vm) = self.volume_manager.read().clone() {
+            vm.set_max_span(span);
+        }
     }
 
     /// Reads and verifies a payload. An error means the bytes could not be read or failed
@@ -541,14 +793,14 @@ impl S3ServiceState {
         if let Some(cached) = self.payload_cache.get(b_id, vol_offset) {
             return Ok(cached);
         }
-        let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+        let (vm, local) = self.volume_for(vol_offset)?;
         let expected_crc = self
             .needle_crc_map
             .read()
             .get(&(b_id, vol_offset))
             .copied()
             .ok_or(VolumeError::CorruptIndex)?;
-        let bytes = vm.read_needle_bytes(1, vol_offset, expected_crc)?;
+        let bytes = vm.read_needle_bytes(vm.id(), local, expected_crc)?;
         if bytes.len() != expected_size {
             return Err(VolumeError::CorruptIndex);
         }
@@ -602,17 +854,40 @@ pub async fn handle_s3_request(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let auth_header = req.headers().get("Authorization").and_then(|v| v.to_str().ok());
-    if let Err(code) = validate_sigv4_auth(auth_header, &query_map, now_sec) {
+    if let Err(code) = crate::auth::authenticate(
+        &state.auth,
+        &state.sigv4_cache,
+        req.method().as_str(),
+        req.uri().path(),
+        req.uri().query().unwrap_or(""),
+        req.headers(),
+        now_sec,
+    ) {
+        let status = match code {
+            "AuthorizationHeaderMalformed" | "AuthorizationQueryParametersError" => StatusCode::BAD_REQUEST,
+            _ => StatusCode::FORBIDDEN,
+        };
         let xml = s3_error_xml(code, "Authentication failed", path, "req-auth");
         return Ok(Response::builder()
-            .status(StatusCode::FORBIDDEN)
+            .status(status)
             .header(CONTENT_TYPE, "application/xml")
             .body(full_body(Bytes::from(xml)))
             .unwrap());
     }
 
     let target = parse_s3_target(path, host_hdr);
+
+    // Size limits (#36), checked on the declared length before any body is read.
+    let body_limit = body_limit_for(&method, &target);
+    let declared = req
+        .headers()
+        .get("x-amz-decoded-content-length")
+        .or_else(|| req.headers().get(CONTENT_LENGTH))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if declared.is_some_and(|n| n > body_limit) {
+        return Ok(entity_too_large(path, body_limit));
+    }
 
     match target {
         ParsedTarget::Service => {
@@ -643,7 +918,10 @@ pub async fn handle_s3_request(
             match method {
                 Method::PUT => {
                     if query_map.contains_key("lifecycle") {
-                        let body_bytes = req.into_body().collect().await?.to_bytes();
+                        let body_bytes = match read_body(req.into_body(), MAX_XML_BODY, path).await? {
+                            Ok(b) => b,
+                            Err(resp) => return Ok(resp),
+                        };
                         let body_str = String::from_utf8_lossy(&body_bytes);
                         match parse_lifecycle_xml(&body_str) {
                             Ok(rules) => {
@@ -875,7 +1153,10 @@ pub async fn handle_s3_request(
                 }
 
                 Method::POST if query_map.contains_key("delete") => {
-                    let body_bytes = req.into_body().collect().await?.to_bytes();
+                    let body_bytes = match read_body(req.into_body(), MAX_XML_BODY, path).await? {
+                        Ok(b) => b,
+                        Err(resp) => return Ok(resp),
+                    };
                     let body_str = String::from_utf8_lossy(&body_bytes);
 
                     let mut keys_to_delete = Vec::new();
@@ -993,7 +1274,19 @@ pub async fn handle_s3_request(
                 };
 
                 let is_chunked = req.headers().get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
-                let raw_bytes = req.into_body().collect().await?.to_bytes();
+                let signed_headers = req.headers().clone();
+                let raw_bytes = match read_body(req.into_body(), MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, path).await? {
+                    Ok(b) => b,
+                    Err(resp) => return Ok(resp),
+                };
+                if !crate::auth::payload_hash_ok(&signed_headers, &raw_bytes) {
+                    let xml = s3_error_xml("XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.", &key, "req-sha256");
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header(CONTENT_TYPE, "application/xml")
+                        .body(full_body(Bytes::from(xml)))
+                        .unwrap());
+                }
                 let decoded_bytes = if is_chunked {
                     match decode_aws_chunked(&raw_bytes) {
                         Ok(b) => b,
@@ -1011,7 +1304,10 @@ pub async fn handle_s3_request(
                 };
 
                 let (hi, lo, hex, raw_md5) = compute_md5(&decoded_bytes);
-                let staged_path = state.multipart.write_staged_part(upload_id, part_num, &decoded_bytes).ok();
+                let staged_path = match state.multipart.write_staged_part(upload_id, part_num, &decoded_bytes) {
+                    Ok(p) => Some(p),
+                    Err(e) => return Ok(internal_error_response(&key, &format!("could not store the part: {}", e))),
+                };
                 let vol_offset = 0;
 
                 match state.multipart.upload_part(
@@ -1048,7 +1344,10 @@ pub async fn handle_s3_request(
             // 3. Multipart POST /{bucket}/{key}?uploadId=ID -> CompleteMultipartUpload
             if method == Method::POST && query_map.contains_key("uploadId") {
                 let upload_id = &query_map["uploadId"];
-                let body_bytes = req.into_body().collect().await?.to_bytes();
+                let body_bytes = match read_body(req.into_body(), MAX_XML_BODY, path).await? {
+                    Ok(b) => b,
+                    Err(resp) => return Ok(resp),
+                };
                 let body_str = String::from_utf8_lossy(&body_bytes);
 
                 // Parse XML <Part><PartNumber>N</PartNumber><ETag>E</ETag></Part>
@@ -1089,6 +1388,9 @@ pub async fn handle_s3_request(
                         // Store object in @flat ObjectMeta
                         let (hi, lo, _, _) = compute_md5(composite_etag.as_bytes());
                         let _key_guard = state.lock_key(b_id, &key).await;
+                        if let Err(code) = state.engine.read().has_room_for(b_id, key.as_bytes()) {
+                            return Ok(engine_error_response(code, &key));
+                        }
                         // Log the part list as a manifest needle, so recovery rebuilds the object.
                         let manifest = Bytes::from(encode_extents_manifest(&state.multipart.staging_dir, total_size, &extents));
                         let manifest_offset = match state.store_payload(
@@ -1098,7 +1400,7 @@ pub async fn handle_s3_request(
                             AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART,
                             hi,
                             lo,
-                        ) {
+                        ).await {
                             Ok(off) => off,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not record the multipart object: {:?}", e))),
                         };
@@ -1113,7 +1415,7 @@ pub async fn handle_s3_request(
                                 .unwrap());
                         }
                         let mut engine = state.engine.write();
-                        engine.put_object(
+                        if let Err(code) = engine.put_object(
                             b_id,
                             key.as_bytes(),
                             manifest_offset,
@@ -1122,7 +1424,9 @@ pub async fn handle_s3_request(
                             lo,
                             extents.len() as u16,
                             AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART,
-                        ).unwrap();
+                        ) {
+                            return Ok(engine_error_response(code, &key));
+                        }
 
                         let location = format!("http://127.0.0.1:9000/{}/{}", bucket, key);
                         let xml = complete_multipart_upload_result_xml(&bucket, &key, &composite_etag, &location);
@@ -1253,8 +1557,11 @@ pub async fn handle_s3_request(
                         };
                         let flags = if bytes.is_empty() { AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE } else { AWAN_FLAG_ACTIVE };
                         let _key_guard = state.lock_key(b_id, &key).await;
+                        if let Err(code) = state.engine.read().has_room_for(b_id, key.as_bytes()) {
+                            return Ok(engine_error_response(code, &key));
+                        }
                         let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset);
-                        let vol_offset = match state.store_payload(b_id, &key, &bytes, flags, src_meta.etag_hi, src_meta.etag_lo) {
+                        let vol_offset = match state.store_payload(b_id, &key, &bytes, flags, src_meta.etag_hi, src_meta.etag_lo).await {
                             Ok(off) => off,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not store the copy: {:?}", e))),
                         };
@@ -1264,7 +1571,7 @@ pub async fn handle_s3_request(
                                 state.needle_crc_map.write().remove(&(b_id, prev_off));
                             }
                         }
-                        state.engine.write().put_object(
+                        if let Err(code) = state.engine.write().put_object(
                             b_id,
                             key.as_bytes(),
                             vol_offset,
@@ -1273,7 +1580,9 @@ pub async fn handle_s3_request(
                             src_meta.etag_lo,
                             0,
                             flags,
-                        ).unwrap();
+                        ) {
+                            return Ok(engine_error_response(code, &key));
+                        }
 
                         let etag_hex = md5_to_etag_hex(src_meta.etag_hi, src_meta.etag_lo);
                         let xml = copy_object_result_xml(&etag_hex, "2026-11-10T00:00:00.000Z");
@@ -1310,7 +1619,19 @@ pub async fn handle_s3_request(
                     let expected_len = req.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok());
                     let is_chunked = req.headers().get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
                     let content_md5_hdr = req.headers().get("content-md5").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
-                    let raw_bytes = req.into_body().collect().await?.to_bytes();
+                    let signed_headers = req.headers().clone();
+                    let raw_bytes = match read_body(req.into_body(), MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, path).await? {
+                        Ok(b) => b,
+                        Err(resp) => return Ok(resp),
+                    };
+                    if !crate::auth::payload_hash_ok(&signed_headers, &raw_bytes) {
+                        let xml = s3_error_xml("XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.", &key, "req-sha256");
+                        return Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header(CONTENT_TYPE, "application/xml")
+                            .body(full_body(Bytes::from(xml)))
+                            .unwrap());
+                    }
 
                     if let Some(exp) = expected_len {
                         if raw_bytes.len() < exp {
@@ -1378,13 +1699,16 @@ pub async fn handle_s3_request(
                             .body(full_body(Bytes::from(xml)))
                             .unwrap());
                     }
+                    if let Err(code) = state.engine.read().has_room_for(b_id, key.as_bytes()) {
+                        return Ok(engine_error_response(code, &key));
+                    }
                     let old_info = {
                         let engine = state.engine.read();
                         engine.get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size))
                     };
 
                     // Zero-byte objects get a needle too, so they and empty overwrites survive a restart.
-                    let vol_offset = match state.store_payload(b_id, &key, &decoded_bytes, flags, etag_hi, etag_lo) {
+                    let vol_offset = match state.store_payload(b_id, &key, &decoded_bytes, flags, etag_hi, etag_lo).await {
                         Ok(off) => off,
                         Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                     };
@@ -1401,7 +1725,7 @@ pub async fn handle_s3_request(
                     }
 
                     let mut engine = state.engine.write();
-                    engine.put_object(
+                    if let Err(code) = engine.put_object(
                         b_id,
                         key.as_bytes(),
                         vol_offset,
@@ -1410,7 +1734,9 @@ pub async fn handle_s3_request(
                         etag_lo,
                         0,
                         flags,
-                    ).unwrap();
+                    ) {
+                        return Ok(engine_error_response(code, &key));
+                    }
 
                     let resp = Response::builder()
                         .status(StatusCode::OK)
@@ -1507,38 +1833,37 @@ pub async fn handle_s3_request(
                                         if let Some(slice) = single_extent_slice {
                                             slice
                                         } else {
-                                            // 2. Multi-extent boundary crossing: stitch only the cross-boundary slice
-                                            let req_len = (range.end - range.start + 1) as usize;
-                                            let mut out = Vec::with_capacity(req_len);
+                                            // 2. The range crosses parts: send one slice of each part, no copy.
+                                            let mut chunks = std::collections::VecDeque::new();
                                             let mut p_start = 0u64;
                                             for ext in extents {
                                                 let p_end = ext.cumulative_end;
                                                 if p_end > range.start && p_start <= range.end {
-                                                    let mapped = ext
-                                                        .staged_path
-                                                        .as_ref()
-                                                        .and_then(|path| state.multipart.get_or_mmap_part(path).ok());
-                                                    let chunk = match mapped {
-                                                        Some(mmap) => Bytes::from_owner(crate::volume::MmapOwner(mmap)),
-                                                        None => match state.load_payload(b_id, ext.vol_offset, ext.part_size as usize) {
-                                                            Ok(b) => b,
-                                                            Err(e) => return Ok(internal_error_response(&key, &format!("could not read a part: {:?}", e))),
-                                                        },
+                                                    let chunk = match state.part_bytes(b_id, &ext) {
+                                                        Ok(b) => b,
+                                                        Err(e) => return Ok(internal_error_response(&key, &format!("could not read a part: {:?}", e))),
                                                     };
                                                     let s_start = range.start.saturating_sub(p_start) as usize;
-                                                    let s_end = ((range.end + 1).min(p_end) - p_start) as usize;
-                                                    if s_start < chunk.len() {
-                                                        let piece = &chunk[s_start..s_end.min(chunk.len())];
-                                                        state.work.payload_copy(piece.len() as u64);
-                                                        out.extend_from_slice(piece);
+                                                    let s_end = (((range.end + 1).min(p_end) - p_start) as usize).min(chunk.len());
+                                                    if s_start < s_end {
+                                                        chunks.push_back(chunk.slice(s_start..s_end));
                                                     }
                                                 }
                                                 p_start = p_end;
                                             }
-                                            if out.len() as u64 != range.end - range.start + 1 {
+                                            if chunks.iter().map(|c| c.len() as u64).sum::<u64>() != range.end - range.start + 1 {
                                                 return Ok(internal_error_response(&key, "a part of the object is missing"));
                                             }
-                                            Bytes::from(out)
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::PARTIAL_CONTENT)
+                                                .header(CONTENT_TYPE, "application/octet-stream")
+                                                .header(ETAG, etag_val)
+                                                .header(ACCEPT_RANGES, "bytes")
+                                                .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
+                                                .header(CONTENT_LENGTH, (range.end - range.start + 1).to_string())
+                                                .header(LAST_MODIFIED, "Tue, 10 Nov 2026 00:00:00 GMT")
+                                                .body(ChunksBody(chunks).boxed())
+                                                .unwrap());
                                         }
                                     } else {
                                         return Ok(internal_error_response(&key, "the multipart object's part list is missing"));
@@ -1586,48 +1911,46 @@ pub async fn handle_s3_request(
                         }
                     }
 
+                    if is_multipart && !is_head {
+                        let extents = match state.multipart.get_completed_extents(b_id, &key) {
+                            Some(e) => e,
+                            None => return Ok(internal_error_response(&key, "the multipart object's part list is missing")),
+                        };
+                        let mut chunks = std::collections::VecDeque::with_capacity(extents.len());
+                        for ext in extents {
+                            let chunk = match state.part_bytes(b_id, &ext) {
+                                Ok(b) => b,
+                                Err(e) => return Ok(internal_error_response(&key, &format!("could not read a part: {:?}", e))),
+                            };
+                            let n = (ext.part_size as usize).min(chunk.len());
+                            chunks.push_back(chunk.slice(..n));
+                        }
+                        if chunks.iter().map(|c| c.len() as u64).sum::<u64>() != meta.size {
+                            return Ok(internal_error_response(&key, "a part of the object is missing"));
+                        }
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/octet-stream")
+                            .header(ETAG, etag_val)
+                            .header(ACCEPT_RANGES, "bytes")
+                            .header(CONTENT_LENGTH, meta.size.to_string())
+                            .header(LAST_MODIFIED, "Tue, 10 Nov 2026 00:00:00 GMT")
+                            .body(ChunksBody(chunks).boxed())
+                            .unwrap());
+                    }
+
                     // Coalesce concurrent hot GET requests via SingleFlight before reading/stitching payload
                     let payload = if is_head {
                         Bytes::new()
                     } else {
                         let single_flight_key = format!("{}/{}/{}", bucket, key, meta.vol_offset);
                         let state_for_read = Arc::clone(&state);
-                        let key_for_read = key.clone();
                         state
                             .single_flight
                             .execute_or_join(&single_flight_key, || async move {
-                                if is_multipart {
-                                    if let Some(extents) =
-                                        state_for_read.multipart.get_completed_extents(b_id, &key_for_read)
-                                    {
-                                        // An unreadable part yields an empty body; the length check
-                                        // after the single-flight turns that into a 500.
-                                        let mut stitched = Vec::with_capacity(meta.size as usize);
-                                        for ext in extents {
-                                            let mapped = ext
-                                                .staged_path
-                                                .as_ref()
-                                                .and_then(|path| state_for_read.multipart.get_or_mmap_part(path).ok());
-                                            let chunk = match mapped {
-                                                Some(mmap) => Bytes::from_owner(crate::volume::MmapOwner(mmap)),
-                                                None => match state_for_read.load_payload(b_id, ext.vol_offset, ext.part_size as usize) {
-                                                    Ok(b) => b,
-                                                    Err(_) => return Bytes::new(),
-                                                },
-                                            };
-                                            let part_len = (ext.part_size as usize).min(chunk.len());
-                                            state_for_read.work.payload_copy(part_len as u64);
-                                            stitched.extend_from_slice(&chunk[..part_len]);
-                                        }
-                                        Bytes::from(stitched)
-                                    } else {
-                                        Bytes::new()
-                                    }
-                                } else {
-                                    state_for_read
-                                        .load_payload(b_id, meta.vol_offset, meta.size as usize)
-                                        .unwrap_or_default()
-                                }
+                                state_for_read
+                                    .load_payload(b_id, meta.vol_offset, meta.size as usize)
+                                    .unwrap_or_default()
                             })
                             .await
                     };
@@ -1653,14 +1976,13 @@ pub async fn handle_s3_request(
                     state.hook("delete_start", &key);
                     // Log the tombstone first; only a logged delete removes the row, so a failed
                     // write is a 500 and the object stays (verification/tla, DeleteLogsFirst).
-                    let vm = match state.volume_manager.read().clone() {
-                        Some(vm) => vm,
-                        None => return Ok(internal_error_response(&key, "no volume is open")),
-                    };
-                    match vm.write_needle(b_id as u16, &key, &[], AWAN_FLAG_TOMBSTONE, 0, 0) {
-                        Ok(loc) => {
+                    match state.write_to_active(b_id, &key, &[], AWAN_FLAG_TOMBSTONE, 0, 0) {
+                        Ok((vm, loc, _)) => {
                             state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                             state.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                            if let Err(e) = state.make_durable(&vm, loc.seq).await {
+                                return Ok(internal_error_response(&key, &format!("could not sync the delete: {:?}", e)));
+                            }
                         }
                         Err(e) => return Ok(internal_error_response(&key, &format!("could not record the delete: {:?}", e))),
                     }

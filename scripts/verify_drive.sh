@@ -16,7 +16,7 @@ URL="http://127.0.0.1:$PORT"
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-verifykey}" AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-verifysecret}" AWS_DEFAULT_REGION=us-east-1 AWS_PAGER=""
 S3() { aws --endpoint-url "$URL" s3api "$@"; }
 PID=""
-start() { "$BIN" --port "$PORT" --data-dir "$DATA" >>"$EVID/server.log" 2>&1 & PID=$!;
+start() { AWANFS_ACCESS_KEY="$AWS_ACCESS_KEY_ID" AWANFS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" "$BIN" --port "$PORT" --data-dir "$DATA" >>"$EVID/server.log" 2>&1 & PID=$!;
   for _ in $(seq 1 100); do curl -s -o /dev/null "$URL/" && return 0; sleep 0.1; done; echo "server did not start"; return 1; }
 stop() { [ -n "$PID" ] && kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; PID=""; }
 cleanup() { stop; rm -rf "$DATA"; }
@@ -27,7 +27,9 @@ check() { # name, command...
   if "$@" >>"$EVID/$name.txt" 2>&1; then echo "ok    $name"; pass=$((pass+1)); else echo "FAIL  $name (see $EVID/$name.txt)"; tail -n 15 "$EVID/$name.txt" | sed "s/^/      /"; fail=$((fail+1)); fi; }
 same() { cmp -s "$1" "$2"; }
 
-doctor() { curl -s -o /dev/null -w '%{http_code}\n' "$URL/" | grep -q 200 && echo "server up on $PORT, pid $PID, data $DATA"; }
+# Up, refusing unsigned requests (403), and answering the aws CLI's signed ones.
+doctor() { curl -s -o /dev/null -w '%{http_code}\n' "$URL/" | grep -q 403 && S3 list-buckets >/dev/null &&
+  echo "server up on $PORT, pid $PID, data $DATA; unsigned 403, signed 200"; }
 
 j_buckets() { S3 create-bucket --bucket verify-bkt && S3 list-buckets | grep -q '"verify-bkt"' && S3 head-bucket --bucket verify-bkt; }
 j_objects() { head -c 70000 /dev/urandom >"$EVID/obj.bin"; S3 put-object --bucket verify-bkt --key a/obj --body "$EVID/obj.bin" >/dev/null &&

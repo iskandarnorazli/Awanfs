@@ -1001,7 +1001,7 @@ def main():
     s3_data_dir = tempfile.mkdtemp(prefix="s3_server_bench_")
     port = get_free_port()
     server_proc = subprocess.Popen(
-        [server_bin, "--port", str(port), "--data-dir", s3_data_dir],
+        [server_bin, "--port", str(port), "--data-dir", s3_data_dir, "--allow-anonymous"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
