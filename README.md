@@ -15,7 +15,7 @@ Read this before you run it anywhere that matters. Plan of record: the Phase 1-4
 - **One access key, no TLS.** Requests are checked with SigV4 against one key pair and the server listens on 127.0.0.1 by default (#35). There are no per-user policies (#53) and no TLS (#30): put a TLS proxy in front before opening it to a network.
 - **Writes are synced before the 200 by default** (`group` durability, #29). The measurements below were taken before that change, when a PUT was acknowledged without a sync; they will be re-run.
 - **Volumes of 32 GiB, rolled over when full** (#37). `S3ServiceState::compact_oldest_volume` moves the live objects of the oldest volume into the active one and deletes it, safely while requests run (#14). Nothing calls it on a schedule yet, so space from overwrites and deletes is only reclaimed when it is called.
-- A PUT or part body is held in memory before it is written (up to the S3 limit of 5 GiB; larger declared bodies get 400 `EntityTooLarge` before they are read). XML bodies are capped at 16 MiB. Streaming PUT bodies to disk is the rest of #36; multipart GETs already stream part by part.
+- A PUT body above 4 MiB with a `Content-Length` is written to disk as it arrives, in 1 MiB pieces; smaller bodies, `aws-chunked` bodies and multipart parts are still held in memory before they are written. Declared bodies above the S3 limit of 5 GiB get 400 `EntityTooLarge` before they are read; XML bodies are capped at 16 MiB. Multipart GETs stream part by part (#36).
 
 ## 1. Executive Summary
 
