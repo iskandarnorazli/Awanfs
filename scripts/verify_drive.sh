@@ -48,7 +48,7 @@ j_copy() { echo "copy me" >"$EVID/c.bin"; S3 put-object --bucket verify-bkt --ke
   S3 get-object --bucket verify-bkt --key c-dst "$EVID/c.out" >/dev/null && same "$EVID/c.bin" "$EVID/c.out"; }
 j_restart() { echo "survives" >"$EVID/s.bin"; S3 put-object --bucket verify-bkt --key s --body "$EVID/s.bin" >/dev/null && stop && start &&
   S3 get-object --bucket verify-bkt --key s "$EVID/s.out" >/dev/null && same "$EVID/s.bin" "$EVID/s.out" &&
-  S3 head-bucket --bucket vb; }
+  S3 head-bucket --bucket verify-bkt; }
 
 start || exit 1
 check doctor doctor
