@@ -427,6 +427,8 @@ pub struct S3ServiceState {
     pub data_dir: Option<PathBuf>,
     pub total_volume_bytes: Arc<AtomicU64>,
     pub tombstone_bytes: Arc<AtomicU64>,
+    /// Bytes per second compaction may copy; 0 = no limit (#28). The binary sets 50 MB/s.
+    pub compaction_rate: Arc<AtomicU64>,
     pub active_volume_id: Arc<AtomicU32>,
     /// The volume new writes go to.
     pub volume_manager: Arc<RwLock<Option<Arc<VolumeManager>>>>,
@@ -476,6 +478,7 @@ impl S3ServiceState {
             data_dir: None,
             total_volume_bytes: Arc::new(AtomicU64::new(initial_bytes)),
             tombstone_bytes: Arc::new(AtomicU64::new(0)),
+            compaction_rate: Arc::new(AtomicU64::new(0)),
             active_volume_id: Arc::new(AtomicU32::new(1)),
             engine: Arc::new(RwLock::new(AwanStorageEngine::new(100_000, 4_194_304, 65536))),
             multipart: Arc::new(
@@ -606,6 +609,7 @@ impl S3ServiceState {
             data_dir: Some(dir.to_path_buf()),
             total_volume_bytes: Arc::new(AtomicU64::new(initial_bytes)),
             tombstone_bytes: Arc::new(AtomicU64::new(0)),
+            compaction_rate: Arc::new(AtomicU64::new(0)),
             active_volume_id: Arc::new(AtomicU32::new(active_id)),
             engine: Arc::new(RwLock::new(engine)),
             multipart,
@@ -738,6 +742,7 @@ impl S3ServiceState {
 
         let mut report = CompactionReport::default();
         let mut written: BTreeMap<u32, Arc<VolumeManager>> = BTreeMap::new();
+        let mut throttle = crate::throttle::Throttle::new(self.compaction_rate.load(Ordering::Relaxed));
         for (b_id, key, local, size, etag_hi, etag_lo, flags, crc) in needles {
             let g_old = global_offset(old_id, local);
             if flags & AWAN_FLAG_TOMBSTONE != 0 {
@@ -752,6 +757,7 @@ impl S3ServiceState {
             }
             self.hook("compact_copy", &key);
             let bytes = if size == 0 { Bytes::new() } else { old.read_needle_bytes(old_id, local, crc)? };
+            let copied = bytes.len() as u64;
             let (vm, loc, g_new) = self.write_to_active(b_id, &key, &bytes, flags, etag_hi, etag_lo)?;
             written.insert(vm.id(), Arc::clone(&vm));
             if let Err(code) = self.engine.write().update_object_offset(b_id, key.as_bytes(), g_new) {
@@ -766,8 +772,9 @@ impl S3ServiceState {
             report.live_needles_copied += 1;
             report.new_locations.insert(key, loc);
             drop(_guard);
-            // Let requests run between copies: compaction is background work.
+            // Let requests run between copies, and pace the copies (#28), with no key locked.
             tokio::task::yield_now().await;
+            throttle.spend(copied).await;
         }
 
         // The copies must be on disk before the only other copy goes, in every durability mode.
