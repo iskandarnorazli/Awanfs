@@ -21,6 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut listen = std::env::var("AWANFS_LISTEN").unwrap_or_else(|_| "127.0.0.1".to_string());
     let mut allow_anonymous = std::env::var("AWANFS_ALLOW_ANONYMOUS").ok().as_deref() == Some("1");
     let mut access_log: Option<String> = None;
+    let mut config_path: Option<PathBuf> = None;
     let mut auto_compaction = std::env::var("AWANFS_AUTO_COMPACTION").ok().as_deref() != Some("off");
     let mut durability = std::env::var("AWANFS_DURABILITY").unwrap_or_else(|_| "group".to_string());
 
@@ -44,6 +45,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             auto_compaction = args.next().as_deref() != Some("off");
         } else if arg == "--access-log" {
             access_log = args.next();
+        } else if arg == "--config" {
+            config_path = args.next().map(PathBuf::from);
         } else if arg == "--allow-anonymous" {
             allow_anonymous = true;
         } else if arg == "--data-dir" || arg == "-d" {
@@ -54,8 +57,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let auth = AuthConfig::from_env(allow_anonymous);
-    if auth.credentials.is_none() && !auth.allow_anonymous {
-        eprintln!("No credentials: set AWANFS_ACCESS_KEY and AWANFS_SECRET_KEY, or pass --allow-anonymous to let anyone who can reach the port read, write and delete.");
+    // Users and policies (#53): --config <file> or AWANFS_CONFIG.
+    let iam = match config_path.or_else(|| std::env::var("AWANFS_CONFIG").ok().filter(|s| !s.is_empty()).map(PathBuf::from)) {
+        Some(p) => match s3_server::iam::ReloadingIam::open(&p) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("cannot load the config: {}", e);
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+    let has_users = iam.as_ref().is_some_and(|r| !r.current().is_empty());
+    if auth.credentials.is_none() && !has_users && !auth.allow_anonymous {
+        eprintln!("No credentials: set AWANFS_ACCESS_KEY and AWANFS_SECRET_KEY, give users in --config, or pass --allow-anonymous to let anyone who can reach the port read, write and delete.");
         std::process::exit(2);
     }
     let durability = match Durability::parse(&durability) {
@@ -71,6 +86,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None => S3ServiceState::new(),
     };
     state.auth = auth;
+    if let Some(r) = iam {
+        r.watch(std::time::Duration::from_secs(60));
+        *state.iam.write() = Some(r);
+    }
     state.set_durability(durability);
     // S3 server access log (#46): --access-log <file> or -, or AWANFS_ACCESS_LOG; off by default.
     if let Some(target) = access_log.or_else(|| std::env::var("AWANFS_ACCESS_LOG").ok()).filter(|t| !t.is_empty()) {
