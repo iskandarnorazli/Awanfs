@@ -156,22 +156,28 @@ impl MultipartManager {
         Ok(upload_id)
     }
 
+    /// Writes a part to a temporary file, syncs it and renames it into place, so a failed
+    /// re-upload of a part number leaves the earlier, acknowledged part intact.
     pub fn write_staged_part(
         &self,
         upload_id: &str,
         part_number: u32,
         data: &[u8],
     ) -> std::io::Result<PathBuf> {
-        use std::io::Write;
+        let mut w = self.begin_part(upload_id, part_number)?;
+        w.write_unbuffered(data)?;
+        w.finish()
+    }
+
+    /// Starts a part whose body arrives in pieces (#36): see `PartWriter`.
+    pub fn begin_part(&self, upload_id: &str, part_number: u32) -> std::io::Result<PartWriter> {
         let upload_dir = self.staging_dir.join(upload_id);
         std::fs::create_dir_all(&upload_dir)?;
-        let part_file_path = upload_dir.join(format!("part_{:05}.dat", part_number));
-        let mut file = std::fs::File::create(&part_file_path)?;
-        file.write_all(data)?;
-        self.work.disk_write(data.len() as u64);
-        file.sync_all()?;
-        self.work.disk_sync();
-        Ok(part_file_path)
+        let path = upload_dir.join(format!("part_{:05}.dat", part_number));
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let tmp = upload_dir.join(format!("part_{:05}.dat.partial-{}", part_number, nanos));
+        let file = std::fs::File::create(&tmp)?;
+        Ok(PartWriter { file, tmp, path, buf: Vec::new(), written: 0, work: Arc::clone(&self.work), done: false })
     }
 
     pub fn get_upload(&self, upload_id: &str) -> Option<MultipartUpload> {
@@ -323,6 +329,85 @@ impl MultipartManager {
     /// Re-registers a completed object's extents (used when recovery replays its manifest needle).
     pub fn restore_completed(&self, bucket_id: u32, key: &str, extents: Vec<PartExtent>) {
         self.completed_extents.write().insert((bucket_id, key.to_string()), extents);
+    }
+}
+
+/// Size of the pieces a streamed part is written in.
+pub const PART_CHUNK: usize = 1 << 20;
+
+/// A part file being written: a temporary file renamed into place by `finish`, removed if the
+/// writer is dropped before.
+pub struct PartWriter {
+    file: std::fs::File,
+    tmp: PathBuf,
+    path: PathBuf,
+    buf: Vec<u8>,
+    written: u64,
+    work: Arc<crate::work::WorkCounters>,
+    done: bool,
+}
+
+impl PartWriter {
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Adds arriving bytes; they go to the file in `PART_CHUNK` pieces.
+    pub fn write(&mut self, mut data: &[u8]) -> std::io::Result<()> {
+        if self.buf.capacity() == 0 {
+            self.buf.reserve_exact(PART_CHUNK);
+        }
+        self.written += data.len() as u64;
+        while !data.is_empty() {
+            let n = (PART_CHUNK - self.buf.len()).min(data.len());
+            self.buf.extend_from_slice(&data[..n]);
+            data = &data[n..];
+            if self.buf.len() == PART_CHUNK {
+                self.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One write of a whole part held in memory: no buffer, no copy.
+    fn write_unbuffered(&mut self, data: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        self.file.write_all(data)?;
+        self.work.disk_write(data.len() as u64);
+        self.written += data.len() as u64;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        if !self.buf.is_empty() {
+            self.file.write_all(&self.buf)?;
+            self.work.disk_write(self.buf.len() as u64);
+            self.buf.clear();
+        }
+        Ok(())
+    }
+
+    /// Writes what is left, syncs, and renames the file into place.
+    pub fn finish(mut self) -> std::io::Result<PathBuf> {
+        let buffered = self.buf.capacity() > 0;
+        self.flush()?;
+        if buffered {
+            self.work.payload_copy(self.written);
+        }
+        self.file.sync_all()?;
+        self.work.disk_sync();
+        std::fs::rename(&self.tmp, &self.path)?;
+        self.done = true;
+        Ok(self.path.clone())
+    }
+}
+
+impl Drop for PartWriter {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
     }
 }
 
