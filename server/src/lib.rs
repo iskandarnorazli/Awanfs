@@ -18,6 +18,7 @@ pub mod multipart;
 pub mod mvcc;
 pub mod reactor;
 pub mod request_log;
+pub mod trace;
 pub mod s3_api;
 pub mod sigv4;
 pub mod spill;

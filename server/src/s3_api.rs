@@ -25,6 +25,7 @@ use crate::sigv4::*;
 use crate::volume::{global_offset, split_offset, Durability, NeedleLocation, VolumeError, VolumeManager};
 use crate::work::WorkCounters;
 use crate::xml::*;
+use tracing::Instrument;
 use std::path::{Path, PathBuf};
 
 pub type ResponseBody = BoxBody<Bytes, std::convert::Infallible>;
@@ -861,8 +862,8 @@ impl S3ServiceState {
     /// Writes the payload to the volume and waits until it is durable. An error means the
     /// write is not acknowledged.
     pub async fn store_payload(&self, b_id: u32, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64) -> Result<u64, VolumeError> {
-        let (vm, loc, offset) = self.write_to_active(b_id, key, data, flags, etag_hi, etag_lo)?;
-        self.make_durable(&vm, loc.seq).await?;
+        let (vm, loc, offset) = tracing::info_span!("volume.write", bytes = data.len() as u64).in_scope(|| self.write_to_active(b_id, key, data, flags, etag_hi, etag_lo))?;
+        self.make_durable(&vm, loc.seq).instrument(tracing::info_span!("volume.sync")).await?;
         self.needle_crc_map.write().insert((b_id, offset), loc.payload_crc32c);
         self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
         // Cache hot payloads up to 4 MiB in dynamic auto-scaling LRU cache
@@ -1178,6 +1179,16 @@ pub async fn handle_s3_request(
         ParsedTarget::Object { bucket, key } => (bucket, key),
     };
     let request_id = crate::request_log::new_request_id();
+    // One span per request (#43); exported only when an OTLP endpoint is configured.
+    let traceparent = req.headers().get("traceparent").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let span = tracing::info_span!(
+        "s3.request",
+        request_id = %request_id,
+        method = %req.method(),
+        operation = op,
+        traceparent = %traceparent,
+        status = tracing::field::Empty
+    );
     let audit = state.audit_log.read().clone().map(|sink| {
         let h = req.headers();
         let get = |n: &str| h.get(n).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
@@ -1188,12 +1199,13 @@ pub async fn handle_s3_request(
         let uri = format!("{} {} {:?}", req.method(), req.uri(), req.version());
         (sink, crate::request_log::claimed_access_key(h.get("authorization").and_then(|v| v.to_str().ok()), query), remote, uri, get("user-agent"), get("host"), signed, presigned)
     });
-    let (resp, error_code) = crate::request_log::with_request_id(request_id.clone(), handle_s3_inner(Arc::clone(&state), req)).await;
+    let (resp, error_code) = crate::request_log::with_request_id(request_id.clone(), handle_s3_inner(Arc::clone(&state), req)).instrument(span.clone()).await;
     let mut resp = resp?;
     if let Ok(v) = hyper::header::HeaderValue::from_str(&request_id) {
         resp.headers_mut().insert("x-amz-request-id", v);
     }
     let bytes_out = if is_head { 0 } else { content_length(resp.headers()) };
+    span.record("status", resp.status().as_u16());
     let elapsed = started.elapsed();
     state.metrics.record(op, resp.status().as_u16(), elapsed.as_secs_f64(), bytes_in, bytes_out);
     let sink = state.access_log.read().clone();
