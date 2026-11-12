@@ -1,0 +1,42 @@
+name: Update Cargo.lock
+
+# Owner decision 17: new crates reach Cargo.lock through this workflow. Run it on a branch
+# whose server/Cargo.toml adds or changes a dependency: it resolves only what changed
+# (`cargo update --workspace`, which keeps every other locked version) and pushes the new
+# Cargo.lock to that branch. A push by this workflow does not start CI; dispatch CI on the
+# branch afterwards (ci.yml has workflow_dispatch).
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch whose server/Cargo.toml changed (not main)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  lock:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse main
+        if: inputs.branch == 'main'
+        run: |
+          echo "Run this on a feature branch, then merge its PR." >&2
+          exit 1
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve new dependencies only
+        run: cargo update --workspace --manifest-path server/Cargo.toml
+      - name: Show the change
+        run: git diff --stat -- server/Cargo.lock && git diff -- server/Cargo.lock | grep -E '^[+-]name|^[+-]version' || true
+      - name: Commit and push
+        run: |
+          if git diff --quiet -- server/Cargo.lock; then echo "Cargo.lock already up to date"; exit 0; fi
+          git config user.name "Iskandar Norazli"
+          git config user.email "111472977+iskandarnorazli@users.noreply.github.com"
+          git commit -m "Cargo.lock: resolve dependencies added in server/Cargo.toml (lockfile workflow)" -- server/Cargo.lock
+          git push origin HEAD:${{ inputs.branch }}
