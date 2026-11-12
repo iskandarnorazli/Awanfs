@@ -28,6 +28,7 @@ jobs:
         run: cargo test --locked --no-fail-fast --manifest-path server/Cargo.toml
       - name: Spill index at 1.2M keys, peak RSS at most 200 MB (#13, Linux)
         if: runner.os == 'Linux'
+        timeout-minutes: 15
         run: cargo test --locked --release --manifest-path server/Cargo.toml --test metadata_spill_test -- --ignored --nocapture
       - name: Release build
         run: cargo build --locked --release --manifest-path server/Cargo.toml

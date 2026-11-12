@@ -12,9 +12,13 @@ const META_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("object_m
 /// Page cache of the spill database (#13).
 pub const SPILL_CACHE_BYTES: usize = 64 << 20;
 
+/// One commit in this many is durable (#13).
+const DURABLE_EVERY: u64 = 4096;
+
 #[derive(Clone)]
 pub struct SpillIndex {
     db: Arc<Database>,
+    commits: Arc<std::sync::atomic::AtomicU64>,
 }
 
 fn make_db_key(bucket_id: u32, key: &[u8]) -> Vec<u8> {
@@ -66,7 +70,7 @@ impl SpillIndex {
         }
         write_txn.commit()?;
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self { db: Arc::new(db), commits: Arc::new(std::sync::atomic::AtomicU64::new(0)) })
     }
 
     /// Empties the index. The server does this at boot and rebuilds it from the volume
@@ -82,12 +86,23 @@ impl SpillIndex {
         Ok(())
     }
 
+    fn next_durability(&self) -> Durability {
+        let n = self.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n % DURABLE_EVERY == 0 {
+            Durability::Immediate
+        } else {
+            Durability::None
+        }
+    }
+
     pub fn put(&self, bucket_id: u32, key: &[u8], meta: &ObjectMeta) -> Result<(), redb::Error> {
         let db_key = make_db_key(bucket_id, key);
         let encoded = encode_meta(meta);
         let mut write_txn = self.db.begin_write()?;
         // Not fsynced: the volumes are the record, and boot rebuilds this index from them.
-        write_txn.set_durability(Durability::None);
+        // Every DURABLE_EVERY-th commit is durable, so redb can reuse the pages earlier
+        // non-durable commits freed (it only reclaims them at a durable commit).
+        write_txn.set_durability(self.next_durability());
         {
             let mut table = write_txn.open_table(META_TABLE)?;
             table.insert(&db_key[..], &encoded[..])?;
@@ -110,7 +125,7 @@ impl SpillIndex {
     pub fn delete(&self, bucket_id: u32, key: &[u8]) -> Result<bool, redb::Error> {
         let db_key = make_db_key(bucket_id, key);
         let mut write_txn = self.db.begin_write()?;
-        write_txn.set_durability(Durability::None);
+        write_txn.set_durability(self.next_durability());
         let existed = {
             let mut table = write_txn.open_table(META_TABLE)?;
             let rem = table.remove(&db_key[..])?;
