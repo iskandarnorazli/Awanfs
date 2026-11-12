@@ -431,6 +431,8 @@ pub struct S3ServiceState {
     pub auth: crate::auth::AuthConfig,
     /// Why the server is not ready yet (`None` when it is); see `/_awanfs/health/ready` (#44).
     pub not_ready: Arc<RwLock<Option<&'static str>>>,
+    /// Request counts, latencies and bytes for `/_awanfs/metrics` (#42).
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl S3ServiceState {
@@ -472,6 +474,7 @@ impl S3ServiceState {
             key_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
             auth: crate::auth::AuthConfig::open(),
             not_ready: Arc::new(RwLock::new(None)),
+            metrics: Arc::new(crate::metrics::Metrics::default()),
         }
     }
 
@@ -597,6 +600,7 @@ impl S3ServiceState {
             key_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
             auth: crate::auth::AuthConfig::open(),
             not_ready: Arc::new(RwLock::new(None)),
+            metrics: Arc::new(crate::metrics::Metrics::default()),
         }
     }
 
@@ -968,8 +972,80 @@ fn admin_response(state: &S3ServiceState, method: &Method, path: &str) -> Respon
             None => plain(StatusCode::OK, "ready"),
             Some(reason) => plain(StatusCode::SERVICE_UNAVAILABLE, &format!("not ready: {}", reason)),
         },
+        "/_awanfs/metrics" => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+            .body(full_body(Bytes::from(render_metrics(state))))
+            .unwrap(),
         _ => plain(StatusCode::NOT_FOUND, "no such endpoint"),
     }
+}
+
+/// Everything `/_awanfs/metrics` reports, in Prometheus text format.
+pub fn render_metrics(state: &S3ServiceState) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(8192);
+    state.metrics.render(&mut out);
+    let used: u64 = state.volumes.read().values().map(|v| v.offset()).sum();
+    let (free, active_id) = match state.volume_manager.read().clone() {
+        Some(vm) => (vm.max_span().saturating_sub(vm.offset()), vm.id()),
+        None => (0, 0),
+    };
+    let (hits, misses) = state.payload_cache.hit_counts();
+    let w = state.work.snapshot();
+    let gauges: [(&str, &str, &str, u64); 14] = [
+        ("awanfs_volume_used_bytes", "gauge", "Bytes written into all open volumes, including dead needles.", used),
+        ("awanfs_volume_free_span_bytes", "gauge", "Span left in the active volume before it rolls over.", free),
+        ("awanfs_volumes_open", "gauge", "Open volumes.", state.volumes.read().len() as u64),
+        ("awanfs_active_volume_id", "gauge", "Id of the volume new writes go to.", active_id as u64),
+        ("awanfs_payload_cache_hits_total", "counter", "Payload cache lookups that hit.", hits),
+        ("awanfs_payload_cache_misses_total", "counter", "Payload cache lookups that missed.", misses),
+        ("awanfs_payload_cache_bytes", "gauge", "Bytes held by the payload cache.", state.payload_cache.current_bytes() as u64),
+        ("awanfs_disk_writes_total", "counter", "Disk write calls (work counters).", w.disk_writes),
+        ("awanfs_disk_write_bytes_total", "counter", "Bytes passed to disk write calls.", w.disk_write_bytes),
+        ("awanfs_disk_syncs_total", "counter", "fsync / FlushFileBuffers calls.", w.disk_syncs),
+        ("awanfs_disk_reads_total", "counter", "Disk read calls (not mmap page faults).", w.disk_reads),
+        ("awanfs_payload_copies_total", "counter", "Copies of payload bytes into server buffers.", w.payload_copies),
+        ("awanfs_payload_copy_bytes_total", "counter", "Payload bytes copied.", w.payload_copy_bytes),
+        ("awanfs_ready", "gauge", "1 when /_awanfs/health/ready answers 200.", state.readiness().is_none() as u64),
+    ];
+    for (name, kind, help, v) in gauges {
+        let _ = writeln!(out, "# HELP {} {}\n# TYPE {} {}\n{} {}", name, help, name, kind, name, v);
+    }
+    out
+}
+
+/// The S3 operation a request is, for the metrics.
+fn operation_name(method: &Method, target: &ParsedTarget, query: &str) -> &'static str {
+    let has = |k: &str| query.split('&').any(|p| p == k || p.starts_with(&format!("{}=", k)));
+    match target {
+        ParsedTarget::Service => "ListBuckets",
+        ParsedTarget::Bucket { .. } => match *method {
+            Method::PUT if has("lifecycle") => "PutBucketLifecycle",
+            Method::GET if has("lifecycle") => "GetBucketLifecycle",
+            Method::POST if has("delete") => "DeleteObjects",
+            Method::PUT => "CreateBucket",
+            Method::DELETE => "DeleteBucket",
+            Method::HEAD => "HeadBucket",
+            Method::GET => "ListObjects",
+            _ => "Other",
+        },
+        ParsedTarget::Object { .. } => match *method {
+            Method::POST if has("uploads") => "CreateMultipartUpload",
+            Method::POST if has("uploadId") => "CompleteMultipartUpload",
+            Method::PUT if has("uploadId") => "UploadPart",
+            Method::DELETE if has("uploadId") => "AbortMultipartUpload",
+            Method::PUT => "PutObject",
+            Method::GET => "GetObject",
+            Method::HEAD => "HeadObject",
+            Method::DELETE => "DeleteObject",
+            _ => "Other",
+        },
+    }
+}
+
+fn content_length(h: &hyper::HeaderMap) -> u64 {
+    h.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
 pub async fn handle_s3_request(
@@ -979,6 +1055,24 @@ pub async fn handle_s3_request(
     if req.uri().path().starts_with(ADMIN_PREFIX) {
         return Ok(admin_response(&state, req.method(), req.uri().path()));
     }
+    let started = std::time::Instant::now();
+    let host = req.headers().get(HOST).and_then(|v| v.to_str().ok());
+    let mut op = operation_name(req.method(), &parse_s3_target(req.uri().path(), host), req.uri().query().unwrap_or(""));
+    if op == "PutObject" && req.headers().contains_key("x-amz-copy-source") {
+        op = "CopyObject";
+    }
+    let bytes_in = content_length(req.headers());
+    let is_head = req.method() == Method::HEAD;
+    let resp = handle_s3_inner(Arc::clone(&state), req).await?;
+    let bytes_out = if is_head { 0 } else { content_length(resp.headers()) };
+    state.metrics.record(op, resp.status().as_u16(), started.elapsed().as_secs_f64(), bytes_in, bytes_out);
+    Ok(resp)
+}
+
+async fn handle_s3_inner(
+    state: Arc<S3ServiceState>,
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<ResponseBody>, hyper::Error> {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let path = uri.path();
