@@ -47,6 +47,7 @@ pub const ERR_BUCKET_NOT_EMPTY: i32 = -3;
 pub const ERR_PRECONDITION: i32 = -4;
 pub const ERR_CAPACITY: i32 = -5;
 pub const ERR_INVALID_ARG: i32 = -6;
+pub const ERR_SPILL: i32 = -7;
 pub const ERR_PANIC: i32 = -999;
 
 pub const AWAN_OK: i32 = OK;
@@ -268,6 +269,19 @@ impl StorageEngine {
         Err(ERR_NOT_FOUND)
     }
 
+    /// Would `put_object` find room for this key? An existing key or a spill index always
+    /// has room. Callers check before logging a write, so a full index answers 503 before
+    /// anything reaches the volume (#40). Two new keys can still race for the last row; the
+    /// loser's `put_object` returns `ERR_CAPACITY`.
+    pub fn has_room_for(&self, bucket_id: u32, key: &[u8]) -> Result<(), i32> {
+        let bucket = self.buckets.get(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
+        if bucket.key_index.contains_key(key) || self.spill_index.is_some() || self.table.key_hashes.len() < self.max_objects {
+            Ok(())
+        } else {
+            Err(ERR_CAPACITY)
+        }
+    }
+
     pub fn put_object(
         &mut self,
         bucket_id: u32,
@@ -338,7 +352,9 @@ impl StorageEngine {
                     created_at: now_ms,
                     key_slice: 0,
                 };
-                let _ = spill.put(bucket_id, key, &meta);
+                // A failed spill write must not be acknowledged: the object would be on the
+                // volume but missing from the index until a restart.
+                spill.put(bucket_id, key, &meta).map_err(|_| ERR_SPILL)?;
                 self.spilled_keys.entry(bucket_id).or_default().insert(key.to_vec());
                 return Ok(());
             }
