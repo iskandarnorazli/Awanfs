@@ -83,5 +83,54 @@ class TestMachineFacts(unittest.TestCase):
             self.assertTrue(server.startswith("not pinned"))
 
 
+
+class BoundedJoin(unittest.TestCase):
+    """#135: a phase worker stuck in a request must not hang the phase, the job or the run."""
+
+    def test_workers_that_finish_are_all_joined_and_none_is_reported_stuck(self):
+        import threading
+        import run_warp_benchmark as r
+        done = threading.Event()
+        threads = [threading.Thread(target=done.wait, args=(0.01,), daemon=True) for _ in range(8)]
+        for t in threads:
+            t.start()
+        self.assertEqual(r.join_all(threads, "quick", timeout_sec=10.0), 0)
+        self.assertFalse(any(t.is_alive() for t in threads))
+
+    def test_a_stuck_worker_is_counted_and_the_wait_is_bounded(self):
+        import threading
+        import time
+        import run_warp_benchmark as r
+        release = threading.Event()  # never set: these threads stand in for a stuck request
+        threads = [threading.Thread(target=release.wait, daemon=True) for _ in range(3)]
+        quick = [threading.Thread(target=time.sleep, args=(0.01,), daemon=True) for _ in range(2)]
+        for t in threads + quick:
+            t.start()
+        t0 = time.perf_counter()
+        stuck = r.join_all(threads + quick, "stuck", timeout_sec=0.5)
+        waited = time.perf_counter() - t0
+        self.assertEqual(stuck, 3, "the three that never return are counted")
+        self.assertLess(waited, 5.0, f"the wait is bounded, took {waited:.2f}s")
+        release.set()
+
+    def test_the_phase_workers_are_daemons_so_a_stuck_one_cannot_hold_the_process(self):
+        import inspect
+        import run_warp_benchmark as r
+        src = inspect.getsource(r)
+        self.assertEqual(src.count("threading.Thread(target=worker"), 3)
+        for call in ("threading.Thread(target=worker, args=(i,), daemon=True)",
+                     "threading.Thread(target=worker, daemon=True)",
+                     "threading.Thread(target=upload_worker, daemon=True)",
+                     "threading.Thread(target=range_get_worker, daemon=True)"):
+            self.assertIn(call, src, f"{call} is not a daemon thread")
+        # Counted, not asserted on the source, so a failure does not print the whole module.
+        self.assertEqual(src.count("        t.join()\n"), 0, "an unbounded join is left in a phase")
+
+    def test_every_phase_joins_through_the_helper(self):
+        import inspect
+        import run_warp_benchmark as r
+        self.assertEqual(inspect.getsource(r).count("join_all(threads, phase_label)"), 5)
+
+
 if __name__ == "__main__":
     unittest.main()

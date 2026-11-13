@@ -162,6 +162,10 @@ def format_markdown_report(
         m = minio_or_baseline.get(key, BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0, measured=False))
         r = rust_fb.get(key, BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0, measured=False))
 
+        # A phase that did not finish is not a slow phase: say so in the row (#135).
+        if not a.measured and a.note:
+            lines.append(f"| **{label}** | **S3 Storage Server** | did not finish: {a.note} | | | | | | |")
+
         lines.append(
             f"| **{label}** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **{a.mib_per_sec:.1f}** | **{a.ops_per_sec:.1f}** | **{a.p50_ms:.2f}** | **{a.p90_ms:.2f}** | **{a.p99_ms:.2f}** | **{a.p999_ms:.2f}** | **{a.peak_rss_mb:.1f} MB** |"
         )
@@ -446,6 +450,26 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+PHASE_JOIN_TIMEOUT_SEC = 120.0
+
+
+def join_all(threads: List[threading.Thread], label: str, timeout_sec: float = PHASE_JOIN_TIMEOUT_SEC) -> int:
+    """Waits for `threads` up to `timeout_sec` in total; returns how many are still running.
+
+    A phase worker leaves its loop only between requests, so one stuck request used to hang the
+    phase, the job and the whole run with nothing in the log (#135). Bounded here, and the
+    threads are daemons, so a stuck one cannot keep the process alive either.
+    """
+    deadline = time.perf_counter() + timeout_sec
+    for t in threads:
+        t.join(timeout=max(0.0, deadline - time.perf_counter()))
+    stuck = sum(1 for t in threads if t.is_alive())
+    if stuck:
+        print(f"    {label}: {stuck} of {len(threads)} workers still in a request "
+              f"{timeout_sec:.0f}s after the stop; this phase did not finish", flush=True)
+    return stuck
+
+
 def run_workload_phase(
     host: str,
     port: int,
@@ -457,6 +481,7 @@ def run_workload_phase(
     server_pid: Optional[int] = None,
 ) -> BenchmarkMetrics:
     payload = os.urandom(payload_size)
+    phase_label = f"{mode} {payload_size}B c={concurrency}"
     stop_event = threading.Event()
     latencies: List[float] = []
     lat_lock = threading.Lock()
@@ -545,7 +570,7 @@ def run_workload_phase(
         with bytes_lock:
             total_bytes += local_bytes
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(concurrency)]
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(concurrency)]
     t_start = time.perf_counter()
     for t in threads:
         t.start()
@@ -553,8 +578,7 @@ def run_workload_phase(
     time.sleep(duration_sec)
     stop_event.set()
 
-    for t in threads:
-        t.join()
+    stuck = join_all(threads, phase_label)
     t_total = time.perf_counter() - t_start
 
     ops = len(latencies)
@@ -571,7 +595,8 @@ def run_workload_phase(
         p99_ms=p99,
         p999_ms=p999,
         peak_rss_mb=peak_rss,
-        measured=True,
+        measured=not stuck,
+        note=(f"{stuck} workers did not finish their request" if stuck else ""),
     )
 
 
@@ -587,6 +612,7 @@ def run_multipart_upload_duration_phase(
 ) -> BenchmarkMetrics:
     """Runs complete S3 Multipart Upload lifecycles (?uploads -> UploadPart x K -> CompleteMultipartUpload)."""
     part_payload = os.urandom(part_size)
+    phase_label = f"multipart {parts_per_object}x{part_size}B c={concurrency}"
     stop_event = threading.Event()
     latencies: List[float] = []
     lat_lock = threading.Lock()
@@ -660,14 +686,13 @@ def run_multipart_upload_duration_phase(
         with bytes_lock:
             total_bytes += local_bytes
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(concurrency)]
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(concurrency)]
     t_start = time.perf_counter()
     for t in threads:
         t.start()
     time.sleep(duration_sec)
     stop_event.set()
-    for t in threads:
-        t.join()
+    stuck = join_all(threads, phase_label)
     t_total = time.perf_counter() - t_start
 
     ops = len(latencies)
@@ -684,7 +709,8 @@ def run_multipart_upload_duration_phase(
         p99_ms=p99,
         p999_ms=p999,
         peak_rss_mb=peak_rss,
-        measured=True,
+        measured=not stuck,
+        note=(f"{stuck} workers did not finish their request" if stuck else ""),
     )
 
 
@@ -705,6 +731,7 @@ def run_large_multipart_object_phase(
     """
     num_parts = total_size_bytes // part_size_bytes
     part_payload = os.urandom(part_size_bytes)
+    phase_label = f"large multipart {total_size_bytes}B parts {part_size_bytes}B c={concurrency}"
     obj_path = f"/{bucket}/{key}"
 
     # --- Phase A: Multipart Upload ---
@@ -750,11 +777,10 @@ def run_large_multipart_object_phase(
                     up_bytes += part_size_bytes
         w_conn.close()
 
-    threads = [threading.Thread(target=upload_worker) for _ in range(concurrency)]
+    threads = [threading.Thread(target=upload_worker, daemon=True) for _ in range(concurrency)]
     for t in threads:
         t.start()
-    for t in threads:
-        t.join()
+    stuck = join_all(threads, phase_label)
 
     parts_xml = "".join(
         f"<Part><PartNumber>{p}</PartNumber><ETag>{etags[p]}</ETag></Part>"
@@ -782,7 +808,8 @@ def run_large_multipart_object_phase(
         p99_ms=up_p99,
         p999_ms=up_p999,
         peak_rss_mb=up_rss,
-        measured=True,
+        measured=not stuck,
+        note=(f"{stuck} workers did not finish their request" if stuck else ""),
     )
 
     # --- Phase B: Parallel RFC 9110 Range GET over the 1 GiB Multipart Object ---
@@ -817,11 +844,10 @@ def run_large_multipart_object_phase(
         w_conn.close()
 
     t_down_start = time.perf_counter()
-    threads = [threading.Thread(target=range_get_worker) for _ in range(concurrency)]
+    threads = [threading.Thread(target=range_get_worker, daemon=True) for _ in range(concurrency)]
     for t in threads:
         t.start()
-    for t in threads:
-        t.join()
+    stuck = join_all(threads, phase_label)
     t_down_total = time.perf_counter() - t_down_start
 
     d_p50, d_p90, d_p99, d_p999 = calculate_percentiles(down_lats)
@@ -834,7 +860,8 @@ def run_large_multipart_object_phase(
         p99_ms=d_p99,
         p999_ms=d_p999,
         peak_rss_mb=down_rss,
-        measured=True,
+        measured=not stuck,
+        note=(f"{stuck} workers did not finish their request" if stuck else ""),
     )
     return put_metrics, get_metrics
 
@@ -852,6 +879,7 @@ def run_fixed_volume_phase(
 ) -> BenchmarkMetrics:
     """Streams an exact total volume (e.g. 10 GiB) in 64 MiB chunks across concurrent workers."""
     payload = os.urandom(part_size_bytes)
+    phase_label = f"fixed volume {total_volume_bytes}B parts {part_size_bytes}B c={concurrency}"
     total_parts = total_volume_bytes // part_size_bytes
     next_part_idx = 0
     idx_lock = threading.Lock()
@@ -911,12 +939,11 @@ def run_fixed_volume_phase(
         with bytes_lock:
             total_bytes += local_bytes
 
-    threads = [threading.Thread(target=worker) for _ in range(concurrency)]
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(concurrency)]
     t_start = time.perf_counter()
     for t in threads:
         t.start()
-    for t in threads:
-        t.join()
+    stuck = join_all(threads, phase_label)
     t_total = time.perf_counter() - t_start
 
     ops = len(latencies)
@@ -933,7 +960,8 @@ def run_fixed_volume_phase(
         p99_ms=p99,
         p999_ms=p999,
         peak_rss_mb=peak_rss,
-        measured=True,
+        measured=not stuck,
+        note=(f"{stuck} workers did not finish their request" if stuck else ""),
     )
 
 
