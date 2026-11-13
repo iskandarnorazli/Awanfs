@@ -1350,10 +1350,14 @@ impl S3ServiceState {
         self.make_durable(&vm, loc.seq).instrument(tracing::info_span!("volume.sync")).await?;
         self.needle_crc_map.write().insert((b_id, offset), loc.payload_crc32c);
         self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-        // Cache hot payloads up to 4 MiB in dynamic auto-scaling LRU cache; the cache holds
-        // object bytes, so a compressed payload is cached when it is first read.
+        // Cache payloads up to 4 MiB as views of the volume mapping, not the request's heap
+        // buffer (#126): the page cache already holds these bytes. Only when the current mapping
+        // covers the needle (no remap on the write path); otherwise the first GET caches it.
+        // Compressed payloads are cached as object bytes when first read.
         if !data.is_empty() && data.len() <= 4 * 1024 * 1024 && flags & crate::meta_index::FLAG_COMPRESSED == 0 {
-            self.payload_cache.insert(b_id, offset, data.clone());
+            if let Some(view) = vm.mapped_payload(loc.offset, loc.payload_crc32c) {
+                self.payload_cache.insert(b_id, offset, view);
+            }
         }
         Ok(offset)
     }
