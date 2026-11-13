@@ -33,6 +33,34 @@ class Ceiling(unittest.TestCase):
         self.assertFalse(br.over_ceiling(700.0, 256, 500), "a run only passes by stating a bigger overhead")
 
 
+class Verdict(unittest.TestCase):
+    """The first CI runs of this script reported "ok" for a run in which every request failed:
+    runs 43504508701 and 43504519493, put 0.00 MiB/s at 532.5 ops/s, get 0.00 MiB/s at
+    7450.7 ops/s, peak RSS 16.9 MiB. Those are the rows below."""
+
+    MIB = 1 << 20
+
+    def test_the_run_that_failed_every_request_is_not_measured(self):
+        rows = [("put", 0.0, 532.5, 25.15, 14.9), ("get", 0.0, 7450.7, 33.43, 16.9)]
+        result, reasons = br.verdict(rows, 16.9, 256, 200, self.MIB)
+        self.assertEqual(result, "NOT MEASURED")
+        self.assertEqual(len(reasons), 2, reasons)
+
+    def test_one_failed_phase_is_enough_to_refuse_the_run(self):
+        rows = [("put", 300.0, 300.0, 40.0, 200.0), ("get", 0.0, 9000.0, 1.0, 200.0)]
+        self.assertEqual(br.verdict(rows, 200.0, 256, 200, self.MIB)[0], "NOT MEASURED")
+
+    def test_a_measured_run_under_the_ceiling_is_ok_and_over_it_is_over(self):
+        rows = [("put", 300.0, 300.0, 40.0, 300.0), ("get", 900.0, 900.0, 10.0, 310.0)]
+        self.assertEqual(br.verdict(rows, 310.0, 256, 200, self.MIB), ("ok", []))
+        self.assertEqual(br.verdict(rows, 500.0, 256, 200, self.MIB)[0], "OVER")
+
+    def test_the_bucket_is_created_before_the_phases(self):
+        import inspect
+        src = inspect.getsource(br.main)
+        self.assertLess(src.index("create_bucket(port"), src.index("run_workload_phase("))
+
+
 class Cli(unittest.TestCase):
     def test_the_parsers_defaults_are_the_workflow_steps_values(self):
         a = br.build_parser().parse_args(["--server-bin", "x"])

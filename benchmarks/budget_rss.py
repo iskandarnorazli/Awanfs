@@ -6,7 +6,8 @@ one object size, and reports its peak RSS against the budget plus a stated overh
     python benchmarks/budget_rss.py --server-bin server/target/release/s3-server \
         --budget 256MiB --concurrency 64 --size 1MiB --duration 10
 
-Exit codes: 0 under the ceiling, 1 over it, 2 the server did not start.
+Exit codes: 0 under the ceiling, 1 over it or not measured (a phase that moved no bytes),
+2 the server did not start.
 
 The ceiling is the budget plus `--overhead` MiB. The overhead is the binary, the runtime, the
 volume mapping's resident pages and the index; it is not part of the budget, which bounds the
@@ -70,6 +71,33 @@ def over_ceiling(peak_mib: float, budget_mib: float, overhead: float) -> bool:
     return peak_mib > ceiling_mib(budget_mib, overhead)
 
 
+def verdict(rows, peak_mib: float, budget_mib: float, overhead: float, size_bytes: int) -> "tuple[str, list]":
+    """("ok" | "OVER" | "NOT MEASURED", reasons). A phase that moved fewer bytes than one object
+    did not measure anything: the first runs of this script answered every request 404
+    (no bucket) and reported 532 ops/s, 0.00 MiB/s and an idle server's 17 MiB as "ok"."""
+    reasons = []
+    for mode, mib, ops, _p99, _rss in rows:
+        if mib * (1 << 20) < size_bytes:
+            reasons.append(f"{mode} moved {mib:.2f} MiB/s at {ops:.1f} ops/s: the requests failed")
+    if reasons:
+        return "NOT MEASURED", reasons
+    if over_ceiling(peak_mib, budget_mib, overhead):
+        return "OVER", [f"peak RSS {peak_mib:.1f} MiB over {ceiling_mib(budget_mib, overhead):.1f} MiB"]
+    return "ok", []
+
+
+def create_bucket(port: int, bucket: str) -> None:
+    """The phases write into `bucket`, so it has to exist, or every request answers 404."""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10.0)
+    conn.request("PUT", f"/{bucket}")
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    if resp.status != 200:
+        sys.exit(f"could not create bucket {bucket}: HTTP {resp.status}")
+
+
 def main(argv=None) -> int:
     a = build_parser().parse_args(argv)
 
@@ -77,6 +105,7 @@ def main(argv=None) -> int:
     proc, port = start_server(a.server_bin, a.budget, a.data_dir)
     rows, peak = [], 0.0
     try:
+        create_bucket(port, "budget")
         for mode in ("put", "get"):
             m = run_workload_phase("127.0.0.1", port, "budget", SIZES[a.size], a.concurrency,
                                    a.duration, mode, server_pid=proc.pid)
@@ -87,7 +116,7 @@ def main(argv=None) -> int:
         proc.wait()
 
     ceiling = ceiling_mib(a.budget_mib, a.overhead)
-    over = over_ceiling(peak, a.budget_mib, a.overhead)
+    result, reasons = verdict(rows, peak, a.budget_mib, a.overhead, SIZES[a.size])
     lines = [
         f"Command: `python benchmarks/budget_rss.py --budget {a.budget} --concurrency {a.concurrency} "
         f"--size {a.size} --duration {a.duration} --overhead {a.overhead}`",
@@ -104,7 +133,8 @@ def main(argv=None) -> int:
     lines += [
         "",
         f"Peak RSS {peak:.1f} MiB against a ceiling of {ceiling:.1f} MiB "
-        f"(budget {a.budget_mib:.0f} + overhead {a.overhead:.0f}): **{'OVER' if over else 'ok'}**.",
+        f"(budget {a.budget_mib:.0f} + overhead {a.overhead:.0f}): **{result}**."
+        + ("".join(f"\n- {r}" for r in reasons)),
         "",
         "The budget bounds the payload cache and the bytes in-flight request bodies hold. The "
         "overhead above it is the binary, the runtime, the resident pages of the volume mapping "
@@ -116,8 +146,8 @@ def main(argv=None) -> int:
     if a.report:
         with open(a.report, "w", encoding="utf-8") as fh:
             fh.write(report)
-    if over:
-        print(f"\nbudget check failed: peak RSS {peak:.1f} MiB, ceiling {ceiling:.1f} MiB")
+    if result != "ok":
+        print(f"\nbudget check {result}: " + "; ".join(reasons))
         return 1
     return 0
 
