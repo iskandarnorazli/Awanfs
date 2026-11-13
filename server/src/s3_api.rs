@@ -726,6 +726,15 @@ impl S3ServiceState {
                         multipart.restore_completed(b_id as u32, &key, extents);
                     }
                 } else {
+                    // A compressed needle's index row holds the object's size, not the stored one (#51).
+                    let size = if flags & crate::meta_index::FLAG_COMPRESSED != 0 {
+                        match vm.payload_prefix(local, key.len(), crate::compress::PREFIX_LEN).ok().and_then(|p| crate::compress::logical_size(&p)) {
+                            Some(n) => n,
+                            None => continue,
+                        }
+                    } else {
+                        size
+                    };
                     let _ = engine.put_object(
                         b_id as u32,
                         key.as_bytes(),
@@ -985,6 +994,9 @@ impl S3ServiceState {
 
     /// The bytes of an object, single or multipart, verified.
     pub fn read_object_bytes(&self, b_id: u32, key: &str, vol_offset: u64, size: u64, flags: u16) -> Result<Bytes, VolumeError> {
+        if flags & crate::meta_index::FLAG_COMPRESSED != 0 {
+            return self.load_compressed(b_id, vol_offset, size);
+        }
         if flags & AWAN_FLAG_MULTIPART == 0 {
             return self.load_payload(b_id, vol_offset, size as usize);
         }
@@ -1039,6 +1051,66 @@ impl S3ServiceState {
         }
     }
 
+    /// Whether new objects in `bucket` are compressed: `[[buckets]]` in the config (#51).
+    pub fn compresses(&self, bucket: &str) -> bool {
+        self.iam.read().as_ref().map(|i| i.current().compresses(bucket)).unwrap_or(false)
+    }
+
+    /// `store_payload` for a whole object: compressed when its bucket asks for it and the
+    /// bytes shrink (#51). Returns the offset and the flags the needle was written with.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_object(&self, b_id: u32, bucket: &str, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64) -> Result<(u64, u16), VolumeError> {
+        let plain = flags & (AWAN_FLAG_MULTIPART | AWAN_FLAG_ZERO_BYTE | AWAN_FLAG_TOMBSTONE) == 0;
+        if plain && self.compresses(bucket) {
+            if let Some(enc) = crate::compress::encode(data) {
+                let f = flags | crate::meta_index::FLAG_COMPRESSED;
+                let off = self.store_payload(b_id, key, &Bytes::from(enc), f, etag_hi, etag_lo).await?;
+                return Ok((off, f));
+            }
+        }
+        Ok((self.store_payload(b_id, key, data, flags, etag_hi, etag_lo).await?, flags))
+    }
+
+    /// The payload bytes as stored, verified against their CRC.
+    fn read_stored(&self, b_id: u32, vol_offset: u64) -> Result<Bytes, VolumeError> {
+        if vol_offset == 0 {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let (vm, local) = self.volume_for(vol_offset)?;
+        let crc = self.needle_crc_map.read().get(&(b_id, vol_offset)).copied().ok_or(VolumeError::CorruptIndex)?;
+        vm.read_needle_bytes(vm.id(), local, crc)
+    }
+
+    /// Bytes `start..=end` of a compressed object, decoding only the blocks they overlap.
+    pub fn load_compressed_range(&self, b_id: u32, vol_offset: u64, size: u64, start: u64, end: u64) -> Result<Bytes, VolumeError> {
+        if let Some(cached) = self.payload_cache.get(b_id, vol_offset) {
+            let e = ((end + 1) as usize).min(cached.len());
+            return Ok(cached.slice((start as usize).min(e)..e));
+        }
+        let stored = self.read_stored(b_id, vol_offset)?;
+        let (bytes, _) = crate::compress::decode_range(&stored, start, end + 1).map_err(decode_error)?;
+        if bytes.len() as u64 != (end + 1).min(size).saturating_sub(start) {
+            return Err(VolumeError::CorruptIndex);
+        }
+        Ok(Bytes::from(bytes))
+    }
+
+    /// A whole compressed object; cached as object bytes up to 4 MiB.
+    pub fn load_compressed(&self, b_id: u32, vol_offset: u64, size: u64) -> Result<Bytes, VolumeError> {
+        if let Some(cached) = self.payload_cache.get(b_id, vol_offset) {
+            return Ok(cached);
+        }
+        let stored = self.read_stored(b_id, vol_offset)?;
+        let bytes = Bytes::from(crate::compress::decode(&stored).map_err(decode_error)?);
+        if bytes.len() as u64 != size {
+            return Err(VolumeError::CorruptIndex);
+        }
+        if bytes.len() <= 4 * 1024 * 1024 {
+            self.payload_cache.insert(b_id, vol_offset, bytes.clone());
+        }
+        Ok(bytes)
+    }
+
     /// Writes the payload to the volume and waits until it is durable. An error means the
     /// write is not acknowledged.
     pub async fn store_payload(&self, b_id: u32, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64) -> Result<u64, VolumeError> {
@@ -1046,8 +1118,9 @@ impl S3ServiceState {
         self.make_durable(&vm, loc.seq).instrument(tracing::info_span!("volume.sync")).await?;
         self.needle_crc_map.write().insert((b_id, offset), loc.payload_crc32c);
         self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-        // Cache hot payloads up to 4 MiB in dynamic auto-scaling LRU cache
-        if !data.is_empty() && data.len() <= 4 * 1024 * 1024 {
+        // Cache hot payloads up to 4 MiB in dynamic auto-scaling LRU cache; the cache holds
+        // object bytes, so a compressed payload is cached when it is first read.
+        if !data.is_empty() && data.len() <= 4 * 1024 * 1024 && flags & crate::meta_index::FLAG_COMPRESSED == 0 {
             self.payload_cache.insert(b_id, offset, data.clone());
         }
         Ok(offset)
@@ -1067,6 +1140,13 @@ impl S3ServiceState {
         let mut attempts = 0;
         loop {
             let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+            // An older AwanFS reads a format 1 volume and would serve compressed bytes as the
+            // object: compressed needles go to a format 2 volume (decision 20, #51).
+            if flags & crate::meta_index::FLAG_COMPRESSED != 0 && vm.format() < 2 && attempts < 8 {
+                attempts += 1;
+                self.roll_volume(&vm)?;
+                continue;
+            }
             match vm.write_needle(b_id as u16, key, data, flags, etag_hi, etag_lo) {
                 Ok(loc) => {
                     let g = global_offset(vm.id(), loc.offset);
@@ -1195,6 +1275,10 @@ impl Default for S3ServiceState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn decode_error(e: crate::compress::CompressError) -> VolumeError {
+    VolumeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
 /// The client's address, put into the request's extensions by the reactor.
@@ -2342,8 +2426,8 @@ async fn handle_s3_inner(
                             return Ok(engine_error_response(code, &key));
                         }
                         let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset);
-                        let vol_offset = match state.store_payload(b_id, &key, &bytes, flags, src_meta.etag_hi, src_meta.etag_lo).await {
-                            Ok(off) => off,
+                        let (vol_offset, flags) = match state.store_object(b_id, &bucket, &key, &bytes, flags, src_meta.etag_hi, src_meta.etag_lo).await {
+                            Ok(written) => written,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not store the copy: {:?}", e))),
                         };
                         if let Some(prev_off) = old_info {
@@ -2596,8 +2680,8 @@ async fn handle_s3_inner(
                     };
 
                     // Zero-byte objects get a needle too, so they and empty overwrites survive a restart.
-                    let vol_offset = match state.store_payload(b_id, &key, &decoded_bytes, flags, etag_hi, etag_lo).await {
-                        Ok(off) => off,
+                    let (vol_offset, flags) = match state.store_object(b_id, &bucket, &key, &decoded_bytes, flags, etag_hi, etag_lo).await {
+                        Ok(written) => written,
                         Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                     };
                     state.hook("put_stored", &key);
@@ -2621,6 +2705,7 @@ async fn handle_s3_inner(
                         let flags = unpack_flags(m.bucket_flags);
                         (m, flags & AWAN_FLAG_MULTIPART != 0)
                     };
+                    let is_compressed = unpack_flags(meta.bucket_flags) & crate::meta_index::FLAG_COMPRESSED != 0;
 
                     let etag_val = if is_multipart {
                         let part_count = unpack_part_count(meta.bucket_flags);
@@ -2725,6 +2810,11 @@ async fn handle_s3_inner(
                                     } else {
                                         return Ok(internal_error_response(&key, "the multipart object's part list is missing"));
                                     }
+                                } else if is_compressed {
+                                    match state.load_compressed_range(b_id, meta.vol_offset, meta.size, range.start, range.end) {
+                                        Ok(b) => b,
+                                        Err(e) => return Ok(internal_error_response(&key, &format!("could not read the object: {:?}", e))),
+                                    }
                                 } else {
                                     let full = match state.load_payload(b_id, meta.vol_offset, meta.size as usize) {
                                         Ok(b) => b,
@@ -2805,9 +2895,11 @@ async fn handle_s3_inner(
                         state
                             .single_flight
                             .execute_or_join(&single_flight_key, || async move {
-                                state_for_read
-                                    .load_payload(b_id, meta.vol_offset, meta.size as usize)
-                                    .unwrap_or_default()
+                                if is_compressed {
+                                    state_for_read.load_compressed(b_id, meta.vol_offset, meta.size).unwrap_or_default()
+                                } else {
+                                    state_for_read.load_payload(b_id, meta.vol_offset, meta.size as usize).unwrap_or_default()
+                                }
                             })
                             .await
                     };
