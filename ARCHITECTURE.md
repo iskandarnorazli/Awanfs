@@ -68,6 +68,15 @@ Owner decisions after the 2026-11-12 unattended run (#64-#83), each the recommen
 |---|---|---|
 | 35 | **The repository is public (Apache-2.0); CI runs on GitHub-hosted runners only.** The self-hosted runners serve one workflow, `bench-selfhosted.yml`, for benchmarks that need more than 8 cores. Supersedes 29 (hosted CI is the merge gate again), 30 (public repositories have free minutes) and 33 (benchmarks run hosted unless they need more than 8 cores). Fork pull-request workflows need approval for every external contributor (`benchmarks/RUNNER.md`). | all PRs, #58 |
 
+### Decisions (2026-11-13, fifth set: next work and S3 feature scope)
+
+| # | Decision | Issues |
+|---|---|---|
+| 36 | **Memory plan first:** payload cache as mmap views, not heap copies; one `--memory-budget`; a cap on request bytes held in memory. Measured by the nightly peak RSS and ratio. Conformance quick wins (#111-#114) come after. | #57, #111-#114 |
+| 37 | **Object lock: governance and compliance modes, plus legal hold**, as S3 defines them, on top of versioning (#31). | #120 |
+| 38 | **Encryption: SSE-S3 with a local master key that wraps per-object keys, and SSE-C;** SSE-KMS through an external service later. | #121 |
+| 39 | **Access: bucket policies (on the #53 evaluator), canned ACLs and the public access block;** no per-grantee ACL grants. | #122 |
+
 Tests follow two rules: no wall-clock thresholds, and a test that fails before the change it guards.
 
 ---
