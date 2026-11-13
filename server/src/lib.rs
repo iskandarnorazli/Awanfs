@@ -20,6 +20,7 @@ pub mod reactor;
 pub mod request_log;
 pub mod tls;
 pub mod throttle;
+pub mod trace;
 pub mod s3_api;
 pub mod sigv4;
 pub mod spill;
