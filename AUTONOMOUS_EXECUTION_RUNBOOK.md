@@ -40,7 +40,6 @@ Before starting each wave, read only the specific sections listed below:
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | 64-byte `@flat ObjectMeta` layout, Key String Arena, ART prefix index, `@flat PartExtent` table, 4096B WORM Needle layout, `.idx` crash recovery | Before `#463` and `#470` |
 | [`API_SPECIFICATION.md`](API_SPECIFICATION.md) | Path-style vs virtual-host routing, Bucket/Object/Multipart/Lifecycle endpoints, `Expect: 100-continue`, 3 SigV4 modes (`<hex>`, `UNSIGNED-PAYLOAD`, `aws-chunked`), RFC 9110 Range rules | Before `#462`, `#467`, `#468` |
 | [`EDGE_CASES_AND_CONTRACTS.md`](EDGE_CASES_AND_CONTRACTS.md) | 12 edge-case operational contracts (disconnects, `0B` objects, single-flight coalescing, path traversal, MVCC overwrite isolation, etc.) & 22 S3 XML error codes | Before `#469` |
-| [`COMPETITIVE_LANDSCAPE.md`](COMPETITIVE_LANDSCAPE.md) | MinIO `warp` benchmark parameters and competitive baseline context | Before `#465`, `#466`, `#471` |
 
 ---
 
