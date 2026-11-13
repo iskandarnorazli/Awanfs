@@ -6,7 +6,8 @@ speed mostly cancels out of the ratio, so it can be compared across runs on shar
 which raw MiB/s cannot.
 
 A workload fails when its ratio drops more than `tolerance` (default 20%) below the baseline in
-`--baseline`. Without a baseline the script only reports, and prints the JSON to commit as one.
+`--baseline`, and the run fails when AwanFS's median peak RSS is over that file's
+`rss_ceiling_mib`. Without a baseline the script only reports, and prints the JSON to commit as one.
 
 Throughput counts bytes from successful responses only (`BenchmarkMetrics.mib_per_sec`); the
 harness's ops/s also counts failed requests.
@@ -84,8 +85,23 @@ def compare(ratios: Dict[str, Optional[float]], baseline: Optional[dict]) -> Tup
     return rows, bad
 
 
+def check_rss(rss: Optional[Dict[str, List[float]]], baseline: Optional[dict]) -> Tuple[Optional[float], Optional[float], List[str]]:
+    """(AwanFS median peak RSS, ceiling, failures). A ceiling of None only reports.
+
+    Peak RSS counts resident file pages of the mapped volumes, so a read that faults a payload
+    in shows up here. That is the point: a container's memory limit counts those pages too.
+    """
+    med = statistics.median(rss["awanfs"]) if rss and rss.get("awanfs") else None
+    ceiling = (baseline or {}).get("rss_ceiling_mib")
+    if med is None or ceiling is None:
+        return med, ceiling, []
+    if med > float(ceiling):
+        return med, ceiling, [f"AwanFS peak RSS {med:.1f} MiB, ceiling {float(ceiling):.1f} MiB"]
+    return med, ceiling, []
+
+
 def render(rows: List[tuple], awanfs: Dict[str, List[float]], minio: Dict[str, List[float]], cmd: str, runs: int,
-           rss: Optional[Dict[str, List[float]]] = None) -> str:
+           rss: Optional[Dict[str, List[float]]] = None, rss_ceiling: Optional[float] = None) -> str:
     def f(x):
         return "-" if x is None else f"{x:.2f}"
 
@@ -106,9 +122,17 @@ def render(rows: List[tuple], awanfs: Dict[str, List[float]], minio: Dict[str, L
         lines.append(f"| `{name}` | {f(a_med)} | {f(m_med)} | {f(r)} | {f(b)} | {verdict} |")
     if rss and all(rss.get(k) for k in ("awanfs", "minio")):
         a_rss, m_rss = statistics.median(rss["awanfs"]), statistics.median(rss["minio"])
-        lines += ["", "| server | peak RSS over all workloads, MiB (median of runs) |", "|---|---|",
-                  f"| AwanFS | {a_rss:.1f} |", f"| MinIO | {m_rss:.1f} |",
-                  "", "Peak RSS is recorded, not checked: it includes file pages of mapped volumes, which the OS can reclaim."]
+        if rss_ceiling is None:
+            verdict, note = "no ceiling", "No RSS ceiling in the baseline, so peak RSS is only reported."
+        elif a_rss > float(rss_ceiling):
+            verdict = "OVER THE CEILING"
+            note = f"AwanFS peak RSS is over the ceiling of {float(rss_ceiling):.1f} MiB. This check fails the run."
+        else:
+            verdict = "ok"
+            note = f"Ceiling {float(rss_ceiling):.1f} MiB. Peak RSS counts resident file pages of the mapped " \
+                   "volumes, which a container's memory limit counts too."
+        lines += ["", "| server | peak RSS over all workloads, MiB (median of runs) | verdict |", "|---|---|---|",
+                  f"| AwanFS | {a_rss:.1f} | {verdict} |", f"| MinIO | {m_rss:.1f} | - |", "", note]
     lines += ["", "AwanFS runs in its default `group` durability mode: PUTs are synced before the answer, as in MinIO.", ""]
     return "\n".join(lines)
 
@@ -218,9 +242,12 @@ def main(argv=None) -> int:
             baseline = json.load(fh)
     ratios = median_ratios(awanfs, minio)
     rows, bad = compare(ratios, baseline)
-    report = render(rows, awanfs, minio, cmd, a.runs, rss)
+    _, ceiling, rss_bad = check_rss(rss, baseline)
+    bad += rss_bad
+    report = render(rows, awanfs, minio, cmd, a.runs, rss, ceiling)
     if baseline is None:
         suggestion = {"tolerance": 0.20, "_machine": "github ubuntu-latest",
+                      "rss_ceiling_mib": round(2 * statistics.median(rss["awanfs"])) if rss.get("awanfs") else None,
                       "ratios": {k: round(v, 3) for k, v in ratios.items() if v is not None}}
         report += "\nNo baseline yet. After review, commit this as `benchmarks/ratio_baseline.json`:\n\n```json\n" \
                   + json.dumps(suggestion, indent=2) + "\n```\n"

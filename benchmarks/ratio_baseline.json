@@ -3,6 +3,8 @@
   "_source": "lower ratio of CI runs 43151084225 attempts 1 and 2 (same commit 99911dc), 2026-11-12",
   "_note": "The two runs differed by up to 50% (put_64k 12.33 vs 6.13), so the tolerance starts at 40%. Narrow it once a week of nightly runs shows the real spread.",
   "tolerance": 0.4,
+  "rss_ceiling_mib": 250,
+  "_rss_ceiling_source": "AwanFS peak RSS was 117.0 MiB (run 43400978818) and 117.9 MiB (run 43401885277) on github ubuntu-latest, 5 runs each. The ceiling is set at roughly twice that. Caching views of the volume mapping on the PUT path (#126, reverted) measured 2258.9 MiB on the same workloads (run 43413585215), which this ceiling catches.",
   "ratios": {
     "put_64k": 3.94,
     "get_64k": 1.64,
