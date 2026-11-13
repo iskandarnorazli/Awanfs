@@ -140,7 +140,7 @@ AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
   policy = '''{"Statement": [{"Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"],
                               "Resource": ["arn:aws:s3:::photos", "arn:aws:s3:::photos/*"]}]}'''
   ```
-- `--allow-anonymous` (or `AWANFS_ALLOW_ANONYMOUS=1`) also accepts unsigned requests, for local tests and benchmarks. Without keys and without that flag the server refuses to start (exit code 2).
+- `--allow-anonymous` (or `AWANFS_ALLOW_ANONYMOUS=1`) also accepts unsigned requests, for local tests and benchmarks. Without keys and without that flag the server refuses to start (exit code 2). It is refused together with users in `--config` (also exit code 2): unsigned requests are not checked against any policy, so anyone reaching the port would get more access than the users you restricted (#130).
 
 ### Docker and systemd
 ```bash
