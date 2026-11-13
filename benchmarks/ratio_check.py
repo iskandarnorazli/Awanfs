@@ -36,7 +36,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from run_warp_benchmark import get_free_port, run_workload_phase  # noqa: E402
+from run_warp_benchmark import get_free_port, get_process_peak_rss_mb, run_workload_phase  # noqa: E402
 
 KIB = 1024
 MIB = 1024 * 1024
@@ -84,7 +84,8 @@ def compare(ratios: Dict[str, Optional[float]], baseline: Optional[dict]) -> Tup
     return rows, bad
 
 
-def render(rows: List[tuple], awanfs: Dict[str, List[float]], minio: Dict[str, List[float]], cmd: str, runs: int) -> str:
+def render(rows: List[tuple], awanfs: Dict[str, List[float]], minio: Dict[str, List[float]], cmd: str, runs: int,
+           rss: Optional[Dict[str, List[float]]] = None) -> str:
     def f(x):
         return "-" if x is None else f"{x:.2f}"
 
@@ -103,6 +104,11 @@ def render(rows: List[tuple], awanfs: Dict[str, List[float]], minio: Dict[str, L
         a_med = statistics.median(awanfs[name]) if awanfs.get(name) else None
         m_med = statistics.median(minio[name]) if minio.get(name) else None
         lines.append(f"| `{name}` | {f(a_med)} | {f(m_med)} | {f(r)} | {f(b)} | {verdict} |")
+    if rss and all(rss.get(k) for k in ("awanfs", "minio")):
+        a_rss, m_rss = statistics.median(rss["awanfs"]), statistics.median(rss["minio"])
+        lines += ["", "| server | peak RSS over all workloads, MiB (median of runs) |", "|---|---|",
+                  f"| AwanFS | {a_rss:.1f} |", f"| MinIO | {m_rss:.1f} |",
+                  "", "Peak RSS is recorded, not checked: it includes file pages of mapped volumes, which the OS can reclaim."]
     lines += ["", "AwanFS runs in its default `group` durability mode: PUTs are synced before the answer, as in MinIO.", ""]
     return "\n".join(lines)
 
@@ -159,11 +165,13 @@ def start_minio(minio_bin: str, mc_bin: str) -> Tuple[subprocess.Popen, int, str
     return proc, port, data
 
 
-def measure(start, duration: float) -> Dict[str, float]:
+def measure(start, duration: float) -> Tuple[Dict[str, float], float]:
+    """MiB/s per workload, and the server's peak RSS in MiB after all of them (0 if unknown)."""
     proc, port, data = start()
     try:
-        return {name: run_workload_phase("127.0.0.1", port, BUCKET, size, conc, duration, mode, proc.pid).mib_per_sec
-                for name, (size, conc, mode) in WORKLOADS.items()}
+        mib = {name: run_workload_phase("127.0.0.1", port, BUCKET, size, conc, duration, mode, proc.pid).mib_per_sec
+               for name, (size, conc, mode) in WORKLOADS.items()}
+        return mib, get_process_peak_rss_mb(proc.pid)
     finally:
         proc.terminate()
         try:
@@ -187,6 +195,7 @@ def main(argv=None) -> int:
 
     awanfs: Dict[str, List[float]] = {n: [] for n in WORKLOADS}
     minio: Dict[str, List[float]] = {n: [] for n in WORKLOADS}
+    rss: Dict[str, List[float]] = {"awanfs": [], "minio": []}
     starters = [("awanfs", lambda: start_awanfs(a.server_bin), awanfs),
                 ("minio", lambda: start_minio(a.minio_bin, a.mc_bin), minio)]
     try:
@@ -194,8 +203,11 @@ def main(argv=None) -> int:
             order = starters if run % 2 == 0 else starters[::-1]
             for label, start, sink in order:
                 print(f"run {run + 1}/{a.runs}: {label}", flush=True)
-                for name, mib in measure(start, a.duration).items():
+                results, peak = measure(start, a.duration)
+                for name, mib in results.items():
                     sink[name].append(mib)
+                if peak > 0:
+                    rss[label].append(peak)
     except RuntimeError as e:
         print(f"setup failed: {e}")
         return 2
@@ -206,7 +218,7 @@ def main(argv=None) -> int:
             baseline = json.load(fh)
     ratios = median_ratios(awanfs, minio)
     rows, bad = compare(ratios, baseline)
-    report = render(rows, awanfs, minio, cmd, a.runs)
+    report = render(rows, awanfs, minio, cmd, a.runs, rss)
     if baseline is None:
         suggestion = {"tolerance": 0.20, "_machine": "github ubuntu-latest",
                       "ratios": {k: round(v, 3) for k, v in ratios.items() if v is not None}}

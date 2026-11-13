@@ -35,5 +35,22 @@ class BenchTests(unittest.TestCase):
         self.assertIn("--awanfs-only", str(e.exception))
 
 
+class AwanfsOnly(unittest.TestCase):
+    def test_reads_throughput_and_peak_rss_from_measure(self):
+        import tempfile
+        orig = bench.ratio_check.measure
+        bench.ratio_check.measure = lambda start, duration: ({n: 10.0 for n in bench.ratio_check.WORKLOADS}, 64.0)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                out = os.path.join(d, "r.md")
+                self.assertEqual(bench.awanfs_only("unused", 1, 0.1, out, "cmd"), 0)
+                with open(out, encoding="utf-8") as fh:
+                    text = fh.read()
+        finally:
+            bench.ratio_check.measure = orig
+        self.assertIn("| 10.0 |", text)
+        self.assertIn("Peak RSS over all workloads: 64.0 MiB", text)
+
+
 if __name__ == "__main__":
     unittest.main()
