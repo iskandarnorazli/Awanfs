@@ -1,8 +1,10 @@
 name: Benchmarks on the self-hosted runner
 
-# Long benchmark runs (#58) on the owner's machine, never on GitHub-hosted runners: a runner
-# registered with the label "bench" (benchmarks/RUNNER.md). Manual or weekly; never on pull
-# requests, so no PR code runs on that machine. Results: job summary and artifact.
+# The only workflow on a self-hosted runner (decision 35): benchmarks that need more than 8
+# cores, which GitHub-hosted runners do not have. Everything else, other benchmarks included
+# (bench-ratio.yml, bench-full.yml), runs on GitHub-hosted runners. A runner registered with the
+# label "bench" (benchmarks/RUNNER.md); manual or weekly; never on pull requests, so no PR code
+# runs on that machine. Results: job summary and artifact.
 
 on:
   workflow_dispatch:
@@ -29,8 +31,14 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
-      - name: Machine
-        run: python -c "import os, platform; print(platform.platform(), os.cpu_count(), 'CPUs')"
+      - name: Machine (more than 8 cores, or this belongs on a hosted runner)
+        shell: python
+        run: |
+          import os, platform, sys
+          n = os.cpu_count() or 0
+          print(platform.platform(), n, "CPUs")
+          if n <= 8:
+              sys.exit(f"{n} CPUs: this workflow is for benchmarks that need more than 8 cores; use bench-ratio.yml or bench-full.yml on hosted runners")
       - name: Ratio check against MinIO (builds the server, fetches MinIO if missing)
         run: python benchmarks/bench.py --runs ${{ inputs.runs || '3' }} --duration ${{ inputs.duration || '30' }} --output measurements/bench_selfhosted.md
       - name: Full matrix (AwanFS, MinIO, RustFS where present)
