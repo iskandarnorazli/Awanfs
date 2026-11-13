@@ -62,6 +62,12 @@ Owner decisions after the 2026-11-12 unattended run (#64-#83), each the recommen
 | 33 | **Benchmarks run on the owner's laptop** (Windows runner and `awanfs-bench`) through try runs, one job at a time; the numbers track changes, they are not for publication (#58). | #23, #36, #57, #58 |
 | 34 | **Branch clean-up** is the owner's, in one pass after the open PRs merge. | — |
 
+### Decisions (2026-11-13, fourth set: public repository)
+
+| # | Decision | Issues |
+|---|---|---|
+| 35 | **The repository is public (Apache-2.0); CI runs on GitHub-hosted runners only.** The self-hosted runners serve one workflow, `bench-selfhosted.yml`, for benchmarks that need more than 8 cores. Supersedes 29 (hosted CI is the merge gate again), 30 (public repositories have free minutes) and 33 (benchmarks run hosted unless they need more than 8 cores). Fork pull-request workflows need approval for every external contributor (`benchmarks/RUNNER.md`). | all PRs, #58 |
+
 Tests follow two rules: no wall-clock thresholds, and a test that fails before the change it guards.
 
 ---

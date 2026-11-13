@@ -1,8 +1,10 @@
 # Benchmark runner on your own machine
 
-`.github/workflows/bench-selfhosted.yml` runs the long benchmarks (#58) on a GitHub Actions
-self-hosted runner with the label `bench`: manually (Actions, "Benchmarks on the self-hosted
-runner", Run workflow) or weekly when the runner is online. It never runs on pull requests.
+`.github/workflows/bench-selfhosted.yml` runs the benchmarks that need more than 8 cores (#58)
+on a GitHub Actions self-hosted runner with the label `bench`: manually (Actions, "Benchmarks on
+the self-hosted runner", Run workflow) or weekly when the runner is online. It refuses machines
+with 8 cores or fewer and never runs on pull requests. Everything else, the other benchmarks
+included, runs on GitHub-hosted runners (decision 35).
 
 ## Install the runner (Windows, about 10 minutes)
 
@@ -34,12 +36,19 @@ On Linux, the same page gives the commands; use `./config.sh ... --labels bench`
   protection, Exclusions, and say in the report that you did.
 - The disk under the work folder is the disk being measured: put the runner on the NVMe drive.
 
-## Safety
+## Safety (the repository is public)
 
-The repository is private, so only collaborators can trigger workflows. The workflow runs on
-`workflow_dispatch` and `schedule` only, never on `pull_request`, so code from a pull request
-never runs on this machine. Do not add `runs-on: [self-hosted, bench]` to a workflow that runs
-on pull requests.
+Anyone can open a pull request, and a pull request from a fork can edit workflow files,
+including `runs-on`. GitHub runs such a workflow only after a maintainer approves it, so:
+
+- Settings, Actions, General, "Approval for running fork pull request workflows from
+  contributors": choose **Require approval for all external contributors**.
+- Never approve a workflow run from a fork when the pull request changes anything under
+  `.github/`. Read the diff first.
+- Only `bench-selfhosted.yml` may use `runs-on: [self-hosted, bench]`, and it runs on
+  `workflow_dispatch` and `schedule` only. Never add a self-hosted runner to a workflow that
+  runs on `pull_request` or `pull_request_target`.
+- Keep the runner offline (stop the service) when you are not benchmarking.
 
 ## Remove it
 
