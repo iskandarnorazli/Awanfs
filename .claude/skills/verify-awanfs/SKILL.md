@@ -36,3 +36,5 @@ The script kills only the PID it started and deletes only the temporary data dir
 ## Helpers
 
 `scripts/verify_drive.sh` is the whole harness: `start`, `stop`, `doctor`, `check <name> <command>`, the comparison helpers `same` (bytes), `md5q` (single-part ETag), `mpetag` (multipart ETag) and `words` (a CLI text list, sorted), and one `j_<feature>` function per journey. A journey depends only on `j_buckets` having run; one that needs its own state makes its own bucket. Add a journey by adding a function, a file under `features/`, a row in its README, and its name in the default list.
+
+A journey declares its locals before its `&&` chain. `A && local x; x=... && B` is two lists, and a failure in `A` is lost whenever `B` passes: `j_listing` passed live with a wrong delimiter listing that way. The script refuses to run a journey written like that (exit 2). Before changing a journey, run `bash scripts/test_verify_drive.sh`: it needs no server, drives `j_listing` against a stubbed `S3` that answers one early listing wrong, and checks the startup refusal.

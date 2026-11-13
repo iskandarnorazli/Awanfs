@@ -31,6 +31,8 @@ same() { cmp -s "$1" "$2"; }
 doctor() { curl -s -o /dev/null -w '%{http_code}\n' "$URL/" | grep -q 403 && S3 list-buckets >/dev/null &&
   echo "server up on $PORT, pid $PID, data $DATA; unsigned 403, signed 200"; }
 
+# A journey declares its locals before its && chain: `A && local x; x=... && B` is two lists, and
+# a failure in A is lost when B passes. j_listing passed live with a wrong delimiter listing that way.
 md5q() { echo "\"$(md5sum "$1" | cut -d' ' -f1)\""; }  # the quoted MD5 S3 returns as a single-part ETag
 words() { tr '\t' '\n' | sort | tr '\n' ' '; }          # aws --output text list -> sorted, space-separated
 mpetag() { python3 -c 'import hashlib,sys;print("\"%s-%d\"" % (hashlib.md5(b"".join(hashlib.md5(open(f,"rb").read()).digest() for f in sys.argv[1:])).hexdigest(), len(sys.argv)-1))' "$@"; }
@@ -40,7 +42,7 @@ j_buckets() { S3 create-bucket --bucket verify-bkt && S3 list-buckets | grep -q 
   S3 create-bucket --bucket verify-gone && echo x >"$EVID/b.bin" && S3 put-object --bucket verify-gone --key k --body "$EVID/b.bin" >/dev/null &&
   ! S3 delete-bucket --bucket verify-gone 2>"$EVID/b.err" && grep -q BucketNotEmpty "$EVID/b.err" &&
   S3 delete-object --bucket verify-gone --key k && S3 delete-bucket --bucket verify-gone && ! S3 head-bucket --bucket verify-gone 2>/dev/null; }
-j_objects() { head -c 70000 /dev/urandom >"$EVID/obj.bin" && local et &&
+j_objects() { local et; head -c 70000 /dev/urandom >"$EVID/obj.bin" &&
   et=$(S3 put-object --bucket verify-bkt --key a/obj --body "$EVID/obj.bin" --query ETag --output text) && [ "$et" = "$(md5q "$EVID/obj.bin")" ] &&
   S3 get-object --bucket verify-bkt --key a/obj "$EVID/obj.out" >/dev/null && same "$EVID/obj.bin" "$EVID/obj.out" &&
   S3 head-object --bucket verify-bkt --key a/obj | grep -q '"ContentLength": 70000' &&
@@ -60,8 +62,8 @@ j_ranges() { head -c 20000 /dev/urandom >"$EVID/r.bin" && S3 put-object --bucket
   S3 get-object --bucket verify-bkt --key r --range bytes=19990- "$EVID/r3.out" >"$EVID/r3.json" && grep -q '"ContentRange": "bytes 19990-19999/20000"' "$EVID/r3.json" &&
   tail -c 10 "$EVID/r.bin" >"$EVID/r3.expect" && same "$EVID/r3.expect" "$EVID/r3.out" &&
   ! S3 get-object --bucket verify-bkt --key r --range bytes=20000-20010 "$EVID/r4.out" 2>"$EVID/r4.err" && grep -q InvalidRange "$EVID/r4.err"; }
-j_multipart() { head -c 6000000 /dev/urandom >"$EVID/p1" && head -c 1000 /dev/urandom >"$EVID/p2" &&
-  local id e1 e2 et id2; id=$(S3 create-multipart-upload --bucket verify-bkt --key mp --query UploadId --output text) &&
+j_multipart() { local id e1 e2 et id2; head -c 6000000 /dev/urandom >"$EVID/p1" && head -c 1000 /dev/urandom >"$EVID/p2" &&
+  id=$(S3 create-multipart-upload --bucket verify-bkt --key mp --query UploadId --output text) &&
   e1=$(S3 upload-part --bucket verify-bkt --key mp --part-number 1 --upload-id "$id" --body "$EVID/p1" --query ETag --output text) &&
   e2=$(S3 upload-part --bucket verify-bkt --key mp --part-number 2 --upload-id "$id" --body "$EVID/p2" --query ETag --output text) &&
   [ "$e1" = "$(md5q "$EVID/p1")" ] && [ "$e2" = "$(md5q "$EVID/p2")" ] &&
@@ -80,10 +82,10 @@ j_copy() { echo "copy me" >"$EVID/c.bin" && S3 put-object --bucket verify-bkt --
   S3 delete-object --bucket verify-bkt --key c-src &&
   S3 get-object --bucket verify-cp --key c "$EVID/c2.out" >/dev/null && same "$EVID/c.bin" "$EVID/c2.out" &&
   ! S3 copy-object --bucket verify-bkt --key c-x --copy-source verify-bkt/c-missing 2>"$EVID/c.err" && grep -q NoSuchKey "$EVID/c.err"; }
-j_versioning() { S3 create-bucket --bucket verify-ver &&
+j_versioning() { local a b; S3 create-bucket --bucket verify-ver &&
   S3 put-bucket-versioning --bucket verify-ver --versioning-configuration Status=Enabled &&
   S3 get-bucket-versioning --bucket verify-ver --query Status --output text | grep -qx Enabled &&
-  echo one >"$EVID/v1.bin" && echo two >"$EVID/v2.bin" && local a b &&
+  echo one >"$EVID/v1.bin" && echo two >"$EVID/v2.bin" &&
   a=$(S3 put-object --bucket verify-ver --key k --body "$EVID/v1.bin" --query VersionId --output text) &&
   b=$(S3 put-object --bucket verify-ver --key k --body "$EVID/v2.bin" --query VersionId --output text) &&
   [ -n "$a" ] && [ "$a" != None ] && [ "$a" != "$b" ] &&
@@ -93,18 +95,18 @@ j_versioning() { S3 create-bucket --bucket verify-ver &&
   S3 delete-object --bucket verify-ver --key k >/dev/null && ! S3 head-object --bucket verify-ver --key k 2>/dev/null &&
   S3 list-object-versions --bucket verify-ver --query 'length(DeleteMarkers)' --output text | grep -qx 1 &&
   S3 get-object --bucket verify-ver --key k --version-id "$b" "$EVID/vb.out" >/dev/null && same "$EVID/v2.bin" "$EVID/vb.out"; }
-j_listing() { S3 create-bucket --bucket verify-list && echo x >"$EVID/l.bin" &&
+j_listing() { local tok; S3 create-bucket --bucket verify-list && echo x >"$EVID/l.bin" &&
   for k in a/1 a/2 b/1 top; do S3 put-object --bucket verify-list --key "$k" --body "$EVID/l.bin" >/dev/null || return 1; done &&
   [ "$(S3 list-objects-v2 --bucket verify-list --delimiter / --query 'CommonPrefixes[].Prefix' --output text | words)" = "a/ b/ " ] &&
   [ "$(S3 list-objects-v2 --bucket verify-list --delimiter / --query 'Contents[].Key' --output text | words)" = "top " ] &&
   [ "$(S3 list-objects-v2 --bucket verify-list --prefix a/ --query 'Contents[].Key' --output text | words)" = "a/1 a/2 " ] &&
-  local tok; tok=$(S3 list-objects-v2 --bucket verify-list --max-keys 1 --no-paginate --query NextContinuationToken --output text) &&
+  tok=$(S3 list-objects-v2 --bucket verify-list --max-keys 1 --no-paginate --query NextContinuationToken --output text) &&
   [ -n "$tok" ] && [ "$tok" != None ] &&
   [ "$(S3 list-objects-v2 --bucket verify-list --max-keys 3 --no-paginate --continuation-token "$tok" --query 'Contents[].Key' --output text | words)" = "a/2 b/1 top " ]; }
-j_restart() { echo "survives" >"$EVID/s.bin" && S3 put-object --bucket verify-bkt --key s --body "$EVID/s.bin" >/dev/null &&
+j_restart() { local id e1 e2 a; echo "survives" >"$EVID/s.bin" && S3 put-object --bucket verify-bkt --key s --body "$EVID/s.bin" >/dev/null &&
   S3 put-object --bucket verify-bkt --key s-gone --body "$EVID/s.bin" >/dev/null && S3 delete-object --bucket verify-bkt --key s-gone &&
   head -c 5300000 /dev/urandom >"$EVID/sp1" && head -c 700 /dev/urandom >"$EVID/sp2" &&
-  local id e1 e2 a; id=$(S3 create-multipart-upload --bucket verify-bkt --key s-mp --query UploadId --output text) &&
+  id=$(S3 create-multipart-upload --bucket verify-bkt --key s-mp --query UploadId --output text) &&
   e1=$(S3 upload-part --bucket verify-bkt --key s-mp --part-number 1 --upload-id "$id" --body "$EVID/sp1" --query ETag --output text) &&
   e2=$(S3 upload-part --bucket verify-bkt --key s-mp --part-number 2 --upload-id "$id" --body "$EVID/sp2" --query ETag --output text) &&
   S3 complete-multipart-upload --bucket verify-bkt --key s-mp --upload-id "$id" --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$e1},{\"PartNumber\":2,\"ETag\":$e2}]}" >/dev/null &&
@@ -118,6 +120,10 @@ j_restart() { echo "survives" >"$EVID/s.bin" && S3 put-object --bucket verify-bk
   S3 get-bucket-versioning --bucket verify-rv --query Status --output text | grep -qx Enabled &&
   S3 get-object --bucket verify-rv --key k --version-id "$a" "$EVID/srv.out" >/dev/null && same "$EVID/s.bin" "$EVID/srv.out" &&
   S3 head-bucket --bucket verify-bkt; }
+
+# Refuse to run a journey whose && chain is split by a `local x;` (see the note above md5q).
+masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:]]+local [^;]*;|&& *local ' || true)
+[ -z "$masked" ] || { echo "a journey splits its && chain with local:"; echo "$masked"; exit 2; }
 
 start || exit 1
 check doctor doctor
