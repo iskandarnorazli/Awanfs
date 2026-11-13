@@ -6,6 +6,7 @@
 //! from it, by `ChunkVerifier` (owner decision 14). The trailer signature of the `-TRAILER` form
 //! is not checked; AwanFS does not use the trailing checksum it protects.
 
+use crate::iam::{Iam, Principal};
 use crate::sigv4::{compute_sigv4_signature, parse_iso8601_epoch, SigV4KeyCache};
 use hyper::HeaderMap;
 use sha2::{Digest, Sha256};
@@ -150,18 +151,42 @@ pub fn authenticate(
     headers: &HeaderMap,
     now_sec: u64,
 ) -> Result<(), &'static str> {
+    authenticate_with(cfg, None, cache, method, raw_path, raw_query, headers, now_sec).map(|_| ())
+}
+
+/// The secret for an access key, and who it belongs to: the root pair, or a config user.
+fn secret_for<'a>(cfg: &'a AuthConfig, iam: Option<&'a Iam>, access_key: &str) -> Option<(Principal, &'a str)> {
+    if let Some((a, s)) = &cfg.credentials {
+        if a == access_key {
+            return Some((Principal::Root, s.as_str()));
+        }
+    }
+    iam.and_then(|i| i.user(access_key)).map(|u| (Principal::User(access_key.to_string()), u.secret.as_str()))
+}
+
+/// `authenticate` with the config file's users too (#53); returns who signed the request.
+#[allow(clippy::too_many_arguments)]
+pub fn authenticate_with(
+    cfg: &AuthConfig,
+    iam: Option<&Iam>,
+    cache: &SigV4KeyCache,
+    method: &str,
+    raw_path: &str,
+    raw_query: &str,
+    headers: &HeaderMap,
+    now_sec: u64,
+) -> Result<Principal, &'static str> {
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
     let pairs = query_pairs(raw_query);
     let q = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
     let presigned = q("X-Amz-Algorithm").is_some();
 
     if auth_header.is_none() && !presigned {
-        return if cfg.allow_anonymous { Ok(()) } else { Err("AccessDenied") };
+        return if cfg.allow_anonymous { Ok(Principal::Anonymous) } else { Err("AccessDenied") };
     }
-    let (access, secret) = match &cfg.credentials {
-        Some((a, s)) => (a.as_str(), s.as_str()),
-        None => return if cfg.allow_anonymous { Ok(()) } else { Err("InvalidAccessKeyId") },
-    };
+    if cfg.credentials.is_none() && iam.is_none_or(|i| i.is_empty()) {
+        return if cfg.allow_anonymous { Ok(Principal::Anonymous) } else { Err("InvalidAccessKeyId") };
+    }
 
     let (p, amz_date, payload_hash, skip) = if let Some(h) = auth_header {
         let rest = h.strip_prefix("AWS4-HMAC-SHA256").ok_or("AuthorizationHeaderMalformed")?.trim();
@@ -230,9 +255,7 @@ pub fn authenticate(
         (parsed, amz_date, "UNSIGNED-PAYLOAD".to_string(), Some("X-Amz-Signature"))
     };
 
-    if p.access_key != access {
-        return Err("InvalidAccessKeyId");
-    }
+    let (principal, secret) = secret_for(cfg, iam, p.access_key).ok_or("InvalidAccessKeyId")?;
     let canonical_request = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
         method,
@@ -251,7 +274,7 @@ pub fn authenticate(
     );
     let expected = compute_sigv4_signature(cache, secret, p.date8, p.region, p.service, &string_to_sign);
     if constant_time_eq(&expected, &p.signature.to_ascii_lowercase()) {
-        Ok(())
+        Ok(principal)
     } else {
         Err("SignatureDoesNotMatch")
     }
@@ -283,7 +306,11 @@ impl ChunkVerifier {
     /// For a request `authenticate` accepted: `Some` when its body is a signed `aws-chunked`
     /// stream and keys are configured, else `None` (nothing to check).
     pub fn for_request(cfg: &AuthConfig, headers: &HeaderMap) -> Option<Self> {
-        let (_, secret) = cfg.credentials.as_ref()?;
+        Self::for_request_with(cfg, None, headers)
+    }
+
+    /// `for_request`, looking the signer's secret up among the config users too.
+    pub fn for_request_with(cfg: &AuthConfig, iam: Option<&Iam>, headers: &HeaderMap) -> Option<Self> {
         let content = headers.get("x-amz-content-sha256")?.to_str().ok()?;
         if !content.starts_with("STREAMING-AWS4-HMAC-SHA256-PAYLOAD") {
             return None;
@@ -299,9 +326,10 @@ impl ChunkVerifier {
                 sig = Some(v);
             }
         }
-        let (_, date8, region, service) = parse_credential(cred?).ok()?;
+        let (access_key, date8, region, service) = parse_credential(cred?).ok()?;
+        let (_, secret) = secret_for(cfg, iam, access_key)?;
         Some(ChunkVerifier {
-            secret: secret.clone(),
+            secret: secret.to_string(),
             date8: date8.to_string(),
             region: region.to_string(),
             service: service.to_string(),

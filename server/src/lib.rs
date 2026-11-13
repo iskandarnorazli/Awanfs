@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod multipart;
 pub mod mvcc;
 pub mod reactor;
+pub mod iam;
 pub mod request_log;
 pub mod tls;
 pub mod throttle;

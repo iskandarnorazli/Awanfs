@@ -573,6 +573,8 @@ pub struct S3ServiceState {
     pub access_log: Arc<RwLock<Option<crate::request_log::LogSink>>>,
     /// Where S3-format server access log lines go; `None` (the default) writes none (#46).
     pub audit_log: Arc<RwLock<Option<crate::request_log::LogSink>>>,
+    /// Users and policies from the config file (#53); `None` = only the root key pair.
+    pub iam: Arc<RwLock<Option<Arc<crate::iam::ReloadingIam>>>>,
 }
 
 impl S3ServiceState {
@@ -618,6 +620,7 @@ impl S3ServiceState {
             metrics: Arc::new(crate::metrics::Metrics::default()),
             access_log: Arc::new(RwLock::new(None)),
             audit_log: Arc::new(RwLock::new(None)),
+            iam: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -766,6 +769,7 @@ impl S3ServiceState {
             metrics: Arc::new(crate::metrics::Metrics::default()),
             access_log: Arc::new(RwLock::new(None)),
             audit_log: Arc::new(RwLock::new(None)),
+            iam: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1465,8 +1469,10 @@ async fn handle_s3_inner(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if let Err(code) = crate::auth::authenticate(
+    let iam = state.iam.read().as_ref().map(|r| r.current());
+    let principal = match crate::auth::authenticate_with(
         &state.auth,
+        iam.as_deref(),
         &state.sigv4_cache,
         req.method().as_str(),
         req.uri().path(),
@@ -1474,16 +1480,43 @@ async fn handle_s3_inner(
         req.headers(),
         now_sec,
     ) {
-        let status = match code {
-            "AuthorizationHeaderMalformed" | "AuthorizationQueryParametersError" => StatusCode::BAD_REQUEST,
-            _ => StatusCode::FORBIDDEN,
+        Ok(p) => p,
+        Err(code) => {
+            let status = match code {
+                "AuthorizationHeaderMalformed" | "AuthorizationQueryParametersError" => StatusCode::BAD_REQUEST,
+                _ => StatusCode::FORBIDDEN,
+            };
+            let xml = s3_error_xml(code, "Authentication failed", path, "req-auth");
+            return Ok(Response::builder()
+                .status(status)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(full_body(Bytes::from(xml)))
+                .unwrap());
+        }
+    };
+    // Policies (#53): a config user may only do what its policy allows; root and anonymous
+    // (when allowed) are unrestricted.
+    let user_may = |action: &str, resource: &str| match &principal {
+        crate::iam::Principal::User(ak) => iam.as_ref().is_some_and(|i| i.allows(ak, action, resource)),
+        _ => true,
+    };
+    {
+        let (b, k) = match parse_s3_target(path, host_hdr) {
+            ParsedTarget::Service => (None, None),
+            ParsedTarget::Bucket { bucket } => (Some(bucket), None),
+            ParsedTarget::Object { bucket, key } => (Some(bucket), Some(key)),
         };
-        let xml = s3_error_xml(code, "Authentication failed", path, "req-auth");
-        return Ok(Response::builder()
-            .status(status)
-            .header(CONTENT_TYPE, "application/xml")
-            .body(full_body(Bytes::from(xml)))
-            .unwrap());
+        let copy_src = req.headers().get("x-amz-copy-source").and_then(|v| v.to_str().ok());
+        for (action, resource) in crate::iam::requirements(method.as_str(), b.as_deref(), k.as_deref(), query, copy_src) {
+            if !user_may(action, &resource) {
+                let xml = s3_error_xml("AccessDenied", &format!("Access Denied: {} on {}", action, resource), path, "req-iam");
+                return Ok(Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(full_body(Bytes::from(xml)))
+                    .unwrap());
+            }
+        }
     }
 
     let target = parse_s3_target(path, host_hdr);
@@ -1828,15 +1861,20 @@ async fn handle_s3_inner(
                     // lock. Before, the rows were dropped with no tombstone, and every deleted
                     // object came back at the next restart.
                     let mut ok_keys = Vec::new();
-                    let mut failed: Vec<(String, String)> = Vec::new();
+                    let mut failed: Vec<(String, &'static str, String)> = Vec::new();
                     for k in &keys_to_delete {
+                        // Each key is checked against the signer's policy (#53).
+                        if !user_may("s3:DeleteObject", &format!("arn:aws:s3:::{}/{}", bucket, k)) {
+                            failed.push((k.clone(), "AccessDenied", "Access Denied".to_string()));
+                            continue;
+                        }
                         match state.delete_key(b_id, k).await {
                             Ok(()) => ok_keys.push(k.as_str()),
-                            Err(e) => failed.push((k.clone(), e)),
+                            Err(e) => failed.push((k.clone(), "InternalError", e)),
                         }
                     }
                     let deleted: Vec<DeleteItemResult> = ok_keys.into_iter().map(|key| DeleteItemResult { key, version_id: None }).collect();
-                    let errors: Vec<DeleteErrorItem> = failed.iter().map(|(k, e)| DeleteErrorItem { key: k, code: "InternalError", message: e }).collect();
+                    let errors: Vec<DeleteErrorItem> = failed.iter().map(|(k, c, e)| DeleteErrorItem { key: k, code: c, message: e }).collect();
                     let xml = delete_objects_result_xml(&deleted, &errors);
                     Ok(Response::builder()
                         .status(StatusCode::OK)
@@ -1939,7 +1977,7 @@ async fn handle_s3_inner(
                     let mut sha = declared_sha.as_ref().map(|_| sha2::Sha256::new());
                     let mut md5 = Md5::new();
                     let mut body = req.into_body();
-                    let mut verifier = crate::auth::ChunkVerifier::for_request(&state.auth, &signed_headers);
+                    let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
                     let cache = &state.sigv4_cache;
                     let mut decoder = is_chunked.then(|| crate::aws_chunked::ChunkedDecoder::new(move |sha: &str, sig: Option<&str>| verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))));
                     while let Some(frame) = body.frame().await {
@@ -2027,7 +2065,7 @@ async fn handle_s3_inner(
                         .unwrap());
                 }
                 let decoded_bytes = if is_chunked {
-                    let mut verifier = crate::auth::ChunkVerifier::for_request(&state.auth, &signed_headers);
+                    let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
                     let cache = &state.sigv4_cache;
                     match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |sha, sig| verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))) {
                         Ok(b) => b,
@@ -2398,7 +2436,7 @@ async fn handle_s3_inner(
                         let mut sha = declared_sha.as_ref().map(|_| sha2::Sha256::new());
                         let mut digest = crate::digest::StreamingDigest::new();
                         let mut body = req.into_body();
-                        let mut verifier = crate::auth::ChunkVerifier::for_request(&state.auth, &signed_headers);
+                        let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
                         let cache = &state.sigv4_cache;
                         let mut decoder = is_chunked.then(|| crate::aws_chunked::ChunkedDecoder::new(move |sha: &str, sig: Option<&str>| verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))));
                         while let Some(frame) = body.frame().await {
@@ -2493,7 +2531,7 @@ async fn handle_s3_inner(
                     }
 
                     let decoded_bytes = if is_chunked {
-                        let mut verifier = crate::auth::ChunkVerifier::for_request(&state.auth, &signed_headers);
+                        let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
                         let cache = &state.sigv4_cache;
                         match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |sha, sig| verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))) {
                             Ok(b) => b,

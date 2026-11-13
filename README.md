@@ -98,7 +98,7 @@ AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
 ```
 - The server listens on `127.0.0.1` only. `--listen 0.0.0.0` (or `AWANFS_LISTEN`) opens it to the network.
 - HTTPS: `--cert cert.pem --key key.pem` (or `AWANFS_TLS_CERT`/`AWANFS_TLS_KEY`) serves TLS with HTTP/1.1 and HTTP/2 on the port, and no plain HTTP unless `--http-port <port>` adds a plain listener. A renewed certificate is picked up within 60 s of the files changing, or at once on SIGHUP (Unix); a broken file keeps the old certificate.
-- Requests are checked with AWS Signature Version 4, in the `Authorization` header or as a presigned URL, against `AWANFS_ACCESS_KEY`/`AWANFS_SECRET_KEY`. A body whose SHA-256 differs from `x-amz-content-sha256` is refused. One key pair for now; IAM-style users and policies are #53.
+- Requests are checked with AWS Signature Version 4, in the `Authorization` header or as a presigned URL, against `AWANFS_ACCESS_KEY`/`AWANFS_SECRET_KEY`. A body whose SHA-256 differs from `x-amz-content-sha256` is refused. More users with policies: `--config` below.
 - `--durability group|fast|strict` (or `AWANFS_DURABILITY`) sets when a write is acknowledged. After a power cut:
   - `group` (default): every acknowledged PUT, DELETE and multipart completion is kept. Writers wait for a shared sync of the volume and its journal; concurrent writers share one.
   - `fast`: writes are acknowledged before they reach the disk and a background thread syncs once a second, so about the last second of acknowledged writes can be lost. For caches and data you can fetch again.
@@ -110,6 +110,15 @@ AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
 - Access log (off by default): `--access-log <file>` or `--access-log -` for stdout (or `AWANFS_ACCESS_LOG`) writes one line per request in the Amazon S3 server access log format: requester access key, operation, bucket, key, status, error code, bytes, time, request ID.
 - Traces (off by default): `--otlp-endpoint http://collector:4318` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) exports a span per request, with child spans for volume writes and syncs, over OTLP/HTTP JSON to Tempo, Jaeger or an OpenTelemetry Collector. A W3C `traceparent` header continues the caller's trace.
 - Stopping: Ctrl-C or SIGTERM (Ctrl-Break, console close or system shutdown on Windows) marks the server not ready, stops accepting connections, lets requests in flight finish (up to 30 s), syncs every volume and exits 0.
+- Several users with policies: `--config awanfs.toml` (or `AWANFS_CONFIG`). The file holds secrets, so on Unix the server refuses it unless only its owner can read it (`chmod 600`). Each user has an AWS-style policy (Effect Allow/Deny, Action and Resource with `*` and `?`; Condition, Principal and NotAction are refused rather than ignored). Explicit Deny wins. The file reloads within 60 s of a change, or on SIGHUP. The `AWANFS_ACCESS_KEY` pair, if set, keeps full access.
+  ```toml
+  [[users]]
+  name = "reader"
+  access_key = "AKREADER"
+  secret_key = "change-me"
+  policy = '''{"Statement": [{"Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"],
+                              "Resource": ["arn:aws:s3:::photos", "arn:aws:s3:::photos/*"]}]}'''
+  ```
 - `--allow-anonymous` (or `AWANFS_ALLOW_ANONYMOUS=1`) also accepts unsigned requests, for local tests and benchmarks. Without keys and without that flag the server refuses to start (exit code 2).
 
 ### Docker and systemd
