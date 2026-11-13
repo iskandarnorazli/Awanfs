@@ -35,6 +35,12 @@ pub const FLAG_SHARED_REF: u16 = 0x0008;
 pub const FLAG_ZERO_BYTE: u16 = 0x0010;
 /// The payload is compressed (`compress.rs`, #51); only in format 2 volumes.
 pub const FLAG_COMPRESSED: u16 = 0x0020;
+/// A version of a key in a versioned bucket (`versions.rs`, #31): its creation time is its id.
+pub const FLAG_VERSIONED: u16 = 0x0040;
+/// With `FLAG_VERSIONED`: the null version (Suspended buckets).
+pub const FLAG_NULL_ID: u16 = 0x0080;
+/// A tombstone removing one version; its 8-byte payload is the id (0 for null).
+pub const FLAG_VERSION_DELETE: u16 = 0x0100;
 
 pub const AWAN_FLAG_ACTIVE: u16 = FLAG_ACTIVE;
 pub const AWAN_FLAG_TOMBSTONE: u16 = FLAG_TOMBSTONE;

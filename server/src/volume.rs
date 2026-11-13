@@ -114,9 +114,16 @@ pub struct NeedleWriter {
     chunk: AlignedBuffer,
     chunk_start: u64,
     chunk_fill: usize,
+    /// Creation time for the header; now when unset (a version id, #31).
+    created_at: Option<u64>,
 }
 
 impl NeedleWriter {
+    /// The needle's creation time (header bytes 36..44): a version's id (#31).
+    pub fn set_created_at(&mut self, ns: u64) {
+        self.created_at = Some(ns);
+    }
+
     pub fn volume(&self) -> &Arc<VolumeManager> {
         &self.vm
     }
@@ -173,7 +180,7 @@ impl NeedleWriter {
             return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "fewer bytes than the declared length")));
         }
         self.flush_chunk()?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let now = self.created_at.unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64);
         let key_bytes = self.key.as_bytes();
         let mut header = NeedleHeader {
             magic: NEEDLE_MAGIC,
@@ -258,6 +265,21 @@ struct SyncState {
     synced: u64,
     /// A writer is running the shared sync.
     syncing: bool,
+}
+
+/// A needle found by `scan_needles`.
+#[derive(Debug, Clone)]
+pub struct ScannedNeedle {
+    pub bucket_id: u16,
+    pub key: String,
+    /// Local offset in the volume.
+    pub offset: u64,
+    pub payload_size: u64,
+    pub etag_hi: u64,
+    pub etag_lo: u64,
+    pub flags: u16,
+    pub payload_crc32c: u32,
+    pub created_at_ns: u64,
 }
 
 /// 64-byte Header of a Needle on disk.
@@ -747,6 +769,21 @@ impl VolumeManager {
         etag_hi: u64,
         etag_lo: u64,
     ) -> Result<NeedleLocation, VolumeError> {
+        self.write_needle_at(bucket_id, key, payload, flags, etag_hi, etag_lo, None)
+    }
+
+    /// `write_needle` with a given creation time: a version id, kept by compaction (#31).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_needle_at(
+        &self,
+        bucket_id: u16,
+        key: &str,
+        payload: &[u8],
+        flags: u16,
+        etag_hi: u64,
+        etag_lo: u64,
+        created_at: Option<u64>,
+    ) -> Result<NeedleLocation, VolumeError> {
         let key_bytes = key.as_bytes();
         let key_len = key_bytes.len() as u16;
         let payload_size = payload.len() as u64;
@@ -758,7 +795,7 @@ impl VolumeManager {
 
         let mut buf = AlignedBuffer::new(total_len as usize);
 
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let now = created_at.unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64);
         let mut header = NeedleHeader {
             magic: NEEDLE_MAGIC,
             header_crc32c: 0,
@@ -848,6 +885,7 @@ impl VolumeManager {
             chunk: AlignedBuffer::new(STREAM_CHUNK),
             chunk_start: SECTOR_SIZE as u64,
             chunk_fill: 0,
+            created_at: None,
         })
     }
 
@@ -920,6 +958,14 @@ impl VolumeManager {
     where
         F: FnMut(u16, String, u64, u64, u64, u64, u16, u32),
     {
+        self.scan_needles(|n| visitor(n.bucket_id, n.key, n.offset, n.payload_size, n.etag_hi, n.etag_lo, n.flags, n.payload_crc32c))
+    }
+
+    /// `recover_needles` with every header field the replay needs, creation time included.
+    pub fn scan_needles<F>(&self, mut visitor: F) -> Result<(), VolumeError>
+    where
+        F: FnMut(ScannedNeedle),
+    {
         let file_len = self.file.metadata()?.len();
         let mut scan_offset = SECTOR_SIZE as u64;
         let mut read_buf = AlignedBuffer::new(SECTOR_SIZE);
@@ -970,16 +1016,17 @@ impl VolumeManager {
                 String::from_utf8_lossy(k_bytes).to_string()
             };
 
-            visitor(
-                hdr.bucket_id,
-                key_str,
-                scan_offset,
-                hdr.payload_size,
-                hdr.etag_hi,
-                hdr.etag_lo,
-                hdr.flags,
-                hdr.payload_crc32c,
-            );
+            visitor(ScannedNeedle {
+                bucket_id: hdr.bucket_id,
+                key: key_str,
+                offset: scan_offset,
+                payload_size: hdr.payload_size,
+                etag_hi: hdr.etag_hi,
+                etag_lo: hdr.etag_lo,
+                flags: hdr.flags,
+                payload_crc32c: hdr.payload_crc32c,
+                created_at_ns: hdr.created_at_ns,
+            });
 
             scan_offset += total_len;
         }
