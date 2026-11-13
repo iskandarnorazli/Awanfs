@@ -193,6 +193,89 @@ fn bad_request(code: &str, msg: &str, resource: &str) -> Response<ResponseBody> 
         .unwrap()
 }
 
+/// One page of a listing.
+struct ListPage {
+    objects: Vec<(Vec<u8>, crate::meta_index::ObjectMeta)>,
+    prefixes: Vec<Vec<u8>>,
+    truncated: bool,
+    /// Where the next page starts (exclusive), when truncated.
+    next: Option<Vec<u8>>,
+    /// The last key or common prefix on this page.
+    last_name: Option<Vec<u8>>,
+}
+
+/// Lists up to `max` keys and common prefixes after `start`. With a delimiter, keys sharing
+/// the part of the key up to the first delimiter after `prefix` collapse into one common prefix,
+/// and the scan jumps past them (prefix + 0xFF, a byte no UTF-8 key contains).
+fn list_page(state: &S3ServiceState, b_id: u32, prefix: &[u8], delimiter: &[u8], start: &[u8], max: usize) -> ListPage {
+    let mut page = ListPage { objects: Vec::new(), prefixes: Vec::new(), truncated: false, next: None, last_name: None };
+    let mut cursor = start.to_vec();
+    'outer: loop {
+        let batch = state.engine.read().list_keys(b_id, prefix, &cursor, 1000);
+        if batch.is_empty() {
+            break;
+        }
+        for (k, meta) in batch {
+            let group = if delimiter.is_empty() {
+                None
+            } else {
+                k[prefix.len()..].windows(delimiter.len()).position(|w| w == delimiter).map(|p| k[..prefix.len() + p + delimiter.len()].to_vec())
+            };
+            if page.objects.len() + page.prefixes.len() >= max {
+                page.truncated = true;
+                page.next = Some(cursor.clone());
+                break 'outer;
+            }
+            match group {
+                Some(cp) => {
+                    let mut past = cp.clone();
+                    past.push(0xFF);
+                    if cp.as_slice() <= start {
+                        // The marker was this common prefix (V1 NextMarker): already returned.
+                        cursor = past;
+                        continue 'outer;
+                    }
+                    page.last_name = Some(cp.clone());
+                    page.prefixes.push(cp);
+                    cursor = past;
+                    continue 'outer;
+                }
+                None => {
+                    cursor = k.clone();
+                    page.last_name = Some(k.clone());
+                    page.objects.push((k, meta));
+                }
+            }
+        }
+    }
+    page
+}
+
+fn encode_hex_token(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+fn decode_hex_token(t: &str) -> Option<Vec<u8>> {
+    if t.len() % 2 != 0 {
+        return None;
+    }
+    (0..t.len()).step_by(2).map(|i| u8::from_str_radix(t.get(i..i + 2)?, 16).ok()).collect()
+}
+
+/// `encoding-type=url`: every byte but unreserved characters and `/` as %XX, so any URL
+/// decoder (botocore uses unquote_plus) gives the key back.
+pub fn s3_url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
 /// Ids of the `volume_NNNN.dat` files in `dir`, ascending.
 fn volume_ids(dir: &Path) -> Vec<u32> {
     let mut ids: Vec<u32> = std::fs::read_dir(dir)
@@ -1603,9 +1686,9 @@ async fn handle_s3_inner(
                             .unwrap());
                     }
 
-                    // ListObjectsV2
-                    let engine = state.engine.read();
-                    let b_id = match engine.lookup_bucket(&bucket) {
+                    // ListObjects (V1), ListObjectsV2 and ListObjectVersions: prefix, delimiter,
+                    // paging and encoding-type=url, over in-memory and spilled keys alike.
+                    let b_id = match state.engine.read().lookup_bucket(&bucket) {
                         Ok(id) => id,
                         Err(_) => {
                             let xml = s3_error_xml("NoSuchBucket", "The specified bucket does not exist", &bucket, "req-list-obj");
@@ -1616,49 +1699,68 @@ async fn handle_s3_inner(
                                 .unwrap());
                         }
                     };
-
-                    let prefix = query_map.get("prefix").map(|s| s.as_str()).unwrap_or("");
+                    let q = |k: &str| query_map.get(k).map(|s| s.as_str()).unwrap_or("");
                     let versions = query_map.contains_key("versions");
-                    let start_after = query_map
-                        .get(if versions { "key-marker" } else { "start-after" })
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    let max_keys = query_map.get("max-keys").and_then(|s| s.parse().ok()).unwrap_or(1000u32);
-
-                    let mut records = vec![AwanObjectMeta::default(); max_keys as usize];
-                    let count = engine.scan_objects(
-                        b_id,
-                        prefix.as_bytes(),
-                        start_after.as_bytes(),
-                        max_keys as usize,
-                        &mut records,
-                    );
-
-                    let mut contents = Vec::with_capacity(count);
-                    let mut key_strings = Vec::with_capacity(count);
-                    let mut etag_strings = Vec::with_capacity(count);
-
-                    for meta in records.iter().take(count) {
-                        let (off, len) = unpack_key_slice(meta.key_slice);
-                        let k_str = String::from_utf8_lossy(&engine.key_arena[off..off + len]).to_string();
-                        key_strings.push(k_str);
-                        let etag_hex = md5_to_etag_hex(meta.etag_hi, meta.etag_lo);
-                        etag_strings.push(etag_hex);
-                    }
-
-                    for (i, meta) in records.iter().take(count).enumerate() {
-                        contents.push(S3ObjectEntry {
-                            key: &key_strings[i],
-                            last_modified: "2026-11-10T00:00:00.000Z",
-                            etag: &etag_strings[i],
-                            size: meta.size,
-                        });
-                    }
-
-                    let xml = if versions {
-                        list_object_versions_xml(&bucket, prefix, start_after, max_keys, false, &contents)
+                    let v2 = q("list-type") == "2";
+                    let prefix = q("prefix");
+                    let delimiter = q("delimiter");
+                    let url_encode = q("encoding-type") == "url";
+                    let max_keys = query_map.get("max-keys").and_then(|s| s.parse::<usize>().ok()).unwrap_or(1000).min(1000);
+                    // Where to start, exclusive: V2's continuation token (hex of the cursor) wins
+                    // over start-after; V1 uses marker; versions use key-marker.
+                    let start: Vec<u8> = if versions {
+                        q("key-marker").as_bytes().to_vec()
+                    } else if v2 {
+                        match query_map.get("continuation-token") {
+                            Some(t) => match decode_hex_token(t) {
+                                Some(c) => c,
+                                None => {
+                                    let xml = s3_error_xml("InvalidArgument", "The continuation token provided is incorrect", &bucket, "req-list-obj");
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::BAD_REQUEST)
+                                        .header(CONTENT_TYPE, "application/xml")
+                                        .body(full_body(Bytes::from(xml)))
+                                        .unwrap());
+                                }
+                            },
+                            None => q("start-after").as_bytes().to_vec(),
+                        }
                     } else {
-                        list_objects_v2_xml(&bucket, prefix, start_after, max_keys, false, None, &contents, &[])
+                        q("marker").as_bytes().to_vec()
+                    };
+                    let page = list_page(&state, b_id, prefix.as_bytes(), delimiter.as_bytes(), &start, max_keys);
+                    let enc = |s: &str| if url_encode { s3_url_encode(s) } else { s.to_string() };
+                    let key_strings: Vec<String> = page.objects.iter().map(|(k, _)| enc(&String::from_utf8_lossy(k))).collect();
+                    let etag_strings: Vec<String> = page.objects.iter().map(|(_, m)| md5_to_etag_hex(m.etag_hi, m.etag_lo)).collect();
+                    let prefix_strings: Vec<String> = page.prefixes.iter().map(|p| enc(&String::from_utf8_lossy(p))).collect();
+                    let contents: Vec<S3ObjectEntry> = page
+                        .objects
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (_, m))| S3ObjectEntry { key: &key_strings[i], last_modified: "2026-11-10T00:00:00.000Z", etag: &etag_strings[i], size: m.size })
+                        .collect();
+                    let cps: Vec<&str> = prefix_strings.iter().map(|s| s.as_str()).collect();
+                    let next = page.next.as_ref().map(|c| encode_hex_token(c));
+                    let xml = if versions {
+                        list_object_versions_xml(&bucket, prefix, q("key-marker"), max_keys as u32, page.truncated, &contents)
+                    } else if v2 {
+                        list_objects_v2_xml_full(&ListV2 {
+                            bucket: &bucket,
+                            prefix: &enc(prefix),
+                            delimiter: &enc(delimiter),
+                            start_after: &enc(q("start-after")),
+                            continuation_token: query_map.get("continuation-token").map(|s| s.as_str()),
+                            max_keys: max_keys as u32,
+                            truncated: page.truncated,
+                            next_token: next.as_deref(),
+                            encoding_url: url_encode,
+                            contents: &contents,
+                            prefixes: &cps,
+                        })
+                    } else {
+                        // V1: NextMarker is the last key or prefix returned, when truncated.
+                        let next_marker = if page.truncated { page.last_name.as_ref().map(|n| enc(&String::from_utf8_lossy(n))) } else { None };
+                        list_objects_v1_xml(&bucket, &enc(prefix), &enc(delimiter), &enc(q("marker")), max_keys as u32, page.truncated, next_marker.as_deref(), url_encode, &contents, &cps)
                     };
                     Ok(Response::builder()
                         .status(StatusCode::OK)
