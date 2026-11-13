@@ -1,10 +1,12 @@
 name: Nightly full benchmark matrix
 
-# The full three-way report (AwanFS, MinIO, RustFS; 64 KiB to 10 GiB; latency percentiles,
-# peak RSS, concurrency sweep), produced by exactly the command used for
-# measurements/s3_warp_minio_vs_awan.md, on GitHub-hosted Linux and Windows runners.
+# The three-way report (AwanFS, MinIO, RustFS; latency percentiles, peak RSS, concurrency
+# sweep) at the object sizes a GitHub-hosted runner can finish, on Linux and Windows. The
+# 1 GiB and 10 GiB sizes of measurements/s3_warp_minio_vs_awan.md need the self-hosted runner
+# (bench-selfhosted.yml, decision 35).
 # Report only: it does not fail on slow numbers (the ratio check in bench-ratio.yml does that).
-# Results: the job summary and the "full-matrix-<os>" artifact of each run.
+# Results: the job summary and the "full-matrix-<os>" artifact of each run, written to this
+# run's own file so a run that measures nothing reports nothing.
 
 on:
   schedule:
@@ -97,20 +99,32 @@ jobs:
           ls -l .tmp/minio .tmp/rustfs || true
           for b in .tmp/minio/minio* .tmp/minio/mc* .tmp/rustfs/rustfs*; do [ -f "$b" ] && "$b" --version | head -1; done || true
 
-      - name: Run the full matrix (the command that produced measurements/s3_warp_minio_vs_awan.md)
-        run: python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB,10GiB --concurrent 64 --duration 2 --output measurements/s3_warp_minio_vs_awan.md
+      # Sizes a GitHub-hosted runner can finish: 4 CPUs and about 14 GB of free disk. The
+      # 1 GiB and 10 GiB sizes are the self-hosted workflow's job (decision 35): with them,
+      # run 43398517562 hit the 150-minute timeout on both platforms and measured nothing.
+      # The output path is this run's own, never the committed measurement file, so a run that
+      # measures nothing cannot print the committed numbers as if it had produced them.
+      # python -u, because a buffered stdout reaches the log only when the process exits: run
+      # 43398517562 was cancelled at its job timeout and its log held not one phase marker, so
+      # there was no way to see where it had got to. The step timeout is below the job's, so a
+      # run that wedges fails with its log instead of being cancelled with nothing.
+      - name: Run the full matrix
+        timeout-minutes: 45
+        run: |
+          rm -f ci_full_matrix.md
+          python -u benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB --concurrent 64 --duration 2 --output ci_full_matrix.md
       - name: Report to the job summary
         if: always()
         run: |
-          if [ -f measurements/s3_warp_minio_vs_awan.md ]; then
-            cat measurements/s3_warp_minio_vs_awan.md >> "$GITHUB_STEP_SUMMARY"
-            cat measurements/s3_warp_minio_vs_awan.md   # also in the log, readable without the web UI
+          if [ -s ci_full_matrix.md ]; then
+            cat ci_full_matrix.md >> "$GITHUB_STEP_SUMMARY"
+            cat ci_full_matrix.md   # also in the log, readable without the web UI
           else
-            echo "no report" >> "$GITHUB_STEP_SUMMARY"
+            echo "This run measured nothing: no ci_full_matrix.md. The committed measurements/ files are from other machines and are not this run's output." | tee -a "$GITHUB_STEP_SUMMARY"
           fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: full-matrix-${{ matrix.os }}
-          path: measurements/s3_warp_minio_vs_awan.md
+          path: ci_full_matrix.md
           if-no-files-found: warn
