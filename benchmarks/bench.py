@@ -104,10 +104,14 @@ def report_path(now=None) -> str:
 
 def awanfs_only(server: str, runs: int, duration: float, out: str, cmd: str) -> int:
     results = {name: [] for name in ratio_check.WORKLOADS}
+    peaks = []
     for r in range(runs):
         print(f"run {r + 1}/{runs}: awanfs", flush=True)
-        for name, mib in ratio_check.measure(lambda: ratio_check.start_awanfs(server), duration).items():
+        mib_by_workload, peak = ratio_check.measure(lambda: ratio_check.start_awanfs(server), duration)
+        for name, mib in mib_by_workload.items():
             results[name].append(mib)
+        if peak > 0:
+            peaks.append(peak)
     lines = [f"Command: `{cmd}`", "",
              f"# AwanFS throughput ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})", "",
              f"Machine: {platform.node()} ({platform.platform()}, {os.cpu_count()} CPUs). {runs} runs, "
@@ -116,6 +120,8 @@ def awanfs_only(server: str, runs: int, duration: float, out: str, cmd: str) -> 
     for name, (size, conc, _mode) in ratio_check.WORKLOADS.items():
         v = results[name]
         lines.append(f"| `{name}` | {size // 1024} KiB | {conc} | {statistics.median(v):.1f} | {min(v):.1f} | {max(v):.1f} |")
+    if peaks:
+        lines += ["", f"Peak RSS over all workloads: {statistics.median(peaks):.1f} MiB (median of runs; includes reclaimable file pages)."]
     text = "\n".join(lines) + "\n"
     print(text)
     with open(out, "w", encoding="utf-8") as fh:
