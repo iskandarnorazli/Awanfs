@@ -132,5 +132,62 @@ class BoundedJoin(unittest.TestCase):
         self.assertEqual(inspect.getsource(r).count("join_all(threads, phase_label)"), 5)
 
 
+
+class BoundedWarmup(unittest.TestCase):
+    """#135: the sequential warm-up gets its own bound and says what happened.
+
+    Runs the real phase against a server that accepts connections and never answers, which is
+    what a wedged server looks like to the client.
+    """
+
+    def test_a_server_that_never_answers_does_not_hang_the_warm_up(self):
+        import socket
+        import threading
+        import time
+        import run_warp_benchmark as r
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(64)
+        port = listener.getsockname()[1]
+        held = []
+        stop = threading.Event()
+
+        def accept_and_ignore():
+            listener.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    c, _ = listener.accept()
+                    held.append(c)  # accepted, never answered
+                except OSError:
+                    pass
+
+        t = threading.Thread(target=accept_and_ignore, daemon=True)
+        t.start()
+        try:
+            t0 = time.perf_counter()
+            m = r.run_workload_phase("127.0.0.1", port, "bkt", 1024, 2, 0.2, "put",
+                                     server_pid=None, warmup_timeout_sec=2.0)
+            took = time.perf_counter() - t0
+        finally:
+            stop.set()
+            for c in held:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+            listener.close()
+
+        self.assertLess(took, 60.0, f"the phase has to come back; it took {took:.0f}s")
+        self.assertFalse(m.measured, "a phase whose warm-up failed is not a measurement")
+        self.assertIn("warm-up", m.note, m.note)
+
+    def test_the_warm_up_timeout_is_its_own_bound(self):
+        import run_warp_benchmark as r
+        self.assertGreater(r.WARMUP_TIMEOUT_SEC, 0)
+        self.assertIn("if time.perf_counter() > warm_deadline:", __import__("inspect").getsource(r))
+
+
 if __name__ == "__main__":
     unittest.main()

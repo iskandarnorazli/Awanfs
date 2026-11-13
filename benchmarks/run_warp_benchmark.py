@@ -451,6 +451,9 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 PHASE_JOIN_TIMEOUT_SEC = 120.0
+# The warm-up is sequential, so it gets its own bound: a phase whose objects are not all
+# written is reported, not waited on.
+WARMUP_TIMEOUT_SEC = 120.0
 
 
 def join_all(threads: List[threading.Thread], label: str, timeout_sec: float = PHASE_JOIN_TIMEOUT_SEC) -> int:
@@ -479,6 +482,7 @@ def run_workload_phase(
     duration_sec: float,
     mode: str,  # "put", "get", or "range_get_4k"
     server_pid: Optional[int] = None,
+    warmup_timeout_sec: float = WARMUP_TIMEOUT_SEC,
 ) -> BenchmarkMetrics:
     payload = os.urandom(payload_size)
     phase_label = f"{mode} {payload_size}B c={concurrency}"
@@ -488,19 +492,45 @@ def run_workload_phase(
     total_bytes = 0
     bytes_lock = threading.Lock()
 
+    # The warm-up writes every key the workers will read: concurrency x keys PUTs, one at a
+    # time. Each connection has a 10 s socket timeout and a failure used to be swallowed and the
+    # loop continued, so a server that had stopped answering turned this into
+    # concurrency x keys x 10 s of silence: 85 minutes at 64 workers and 8 keys. Bounded here,
+    # and what happened is reported, because the phase cannot be measured without it (#135).
     pool_keys_per_worker = 4 if payload_size >= 1024 * 1024 else 8
+    want = concurrency * pool_keys_per_worker
+    warm_start = time.perf_counter()
+    warm_deadline = warm_start + warmup_timeout_sec
+    warm_ok, warm_fail, last_error = 0, 0, ""
+    warm_sock_timeout = min(10.0, max(1.0, warmup_timeout_sec / 4.0))
     for w in range(concurrency):
-        conn = http.client.HTTPConnection(host, port, timeout=10.0)
+        conn = http.client.HTTPConnection(host, port, timeout=warm_sock_timeout)
         for k in range(pool_keys_per_worker):
+            if time.perf_counter() > warm_deadline:
+                break
             path = f"/{bucket}/worker_{w}_obj_{k}.dat"
             try:
                 conn.request("PUT", path, body=payload, headers={"Content-Length": str(payload_size), "Connection": "keep-alive"})
                 resp = conn.getresponse()
                 resp.read()
-            except Exception:
+                if resp.status == 200:
+                    warm_ok += 1
+                else:
+                    warm_fail += 1
+                    last_error = f"HTTP {resp.status}"
+            except Exception as e:
+                warm_fail += 1
+                last_error = f"{type(e).__name__}: {e}"
                 conn.close()
-                conn = http.client.HTTPConnection(host, port, timeout=10.0)
+                conn = http.client.HTTPConnection(host, port, timeout=warm_sock_timeout)
         conn.close()
+        if time.perf_counter() > warm_deadline:
+            break
+    warm_took = time.perf_counter() - warm_start
+    warm_short = warm_ok + warm_fail < want
+    print(f"    {phase_label}: warm-up wrote {warm_ok} of {want} objects in {warm_took:.1f}s"
+          + (f", {warm_fail} failed, last: {last_error}" if warm_fail else "")
+          + (f", gave up after {warmup_timeout_sec:.0f}s" if warm_short else ""), flush=True)
 
     def worker(worker_id: int):
         nonlocal total_bytes
@@ -595,8 +625,14 @@ def run_workload_phase(
         p99_ms=p99,
         p999_ms=p999,
         peak_rss_mb=peak_rss,
-        measured=not stuck,
-        note=(f"{stuck} workers did not finish their request" if stuck else ""),
+        measured=not stuck and not warm_short and warm_fail == 0,
+        note=", ".join(
+            x for x in (
+                f"{stuck} workers did not finish their request" if stuck else "",
+                f"warm-up wrote {warm_ok} of {want} objects" if warm_short or warm_fail else "",
+                f"last warm-up error: {last_error}" if last_error else "",
+            ) if x
+        ),
     )
 
 
