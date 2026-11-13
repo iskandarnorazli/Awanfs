@@ -67,7 +67,21 @@ jobs:
         run: .tmp/minio/minio --version && .tmp/minio/mc --version
 
       - name: Ratio check self-tests
-        run: python benchmarks/test_ratio_check.py
+        run: python benchmarks/test_ratio_check.py && python benchmarks/test_budget_rss.py
+
+      # #127 gate line 2: with a 256 MiB budget, 64 clients doing 1 MiB PUTs and GETs keep peak
+      # RSS under the budget plus the overhead this step states.
+      - name: Does --memory-budget hold?
+        id: budget
+        run: |
+          set +e
+          python benchmarks/budget_rss.py --server-bin server/target/release/s3-server \
+            --budget 256MiB --budget-mib 256 --concurrency 64 --size 1MiB --duration 10 \
+            --overhead 200 --report budget_report.md
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          [ -f budget_report.md ] && cat budget_report.md >> "$GITHUB_STEP_SUMMARY"
+          exit $code
 
       - name: Run the ratio check
         id: ratio
@@ -85,7 +99,9 @@ jobs:
         if: always()
         with:
           name: ratio-report
-          path: ratio_report.md
+          path: |
+            ratio_report.md
+            budget_report.md
           if-no-files-found: ignore
 
       - name: Open or update a perf-regression issue

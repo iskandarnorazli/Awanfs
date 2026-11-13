@@ -35,11 +35,12 @@ impl PayloadCache {
         }
     }
 
-    /// Auto-scales default cache capacity:
-    /// Default to 1 GiB or 25% of system memory, minimum 128 MiB.
+    /// The cache's half of this process's memory budget (#127): `--memory-budget` if it was
+    /// given, otherwise a quarter of the container's limit or the machine's RAM, held between
+    /// 128 MiB and 2 GiB. On a machine where nothing is detected that is 1 GiB, which is the
+    /// fixed cap this replaces.
     pub fn default_auto_scaled() -> Self {
-        const DEFAULT_CAP: usize = 1024 * 1024 * 1024; // 1 GiB
-        Self::new(DEFAULT_CAP)
+        Self::new(crate::memory::effective().cache.min(usize::MAX as u64) as usize)
     }
 
     pub fn get(&self, b_id: u32, offset: u64) -> Option<Bytes> {
