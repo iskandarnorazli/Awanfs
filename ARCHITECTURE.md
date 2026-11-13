@@ -77,6 +77,15 @@ Owner decisions after the 2026-11-12 unattended run (#64-#83), each the recommen
 | 38 | **Encryption: SSE-S3 with a local master key that wraps per-object keys, and SSE-C;** SSE-KMS through an external service later. | #121 |
 | 39 | **Access: bucket policies (on the #53 evaluator), canned ACLs and the public access block;** no per-grantee ACL grants. | #122 |
 
+**Decision 40 (2026-11-13): `--allow-anonymous` is refused together with users in `--config`.**
+Policies are checked for `Principal::User` only, so an unsigned request accepted by
+`--allow-anonymous` would get more access than any user the config restricts. The server exits 2
+and names both flags. `--allow-anonymous` on its own is unchanged: the startup message already
+says anyone who can reach the port can read, write and delete. A config that sets only
+`[[buckets]]` restricts nobody, so it is not the combination. The policy model for public access
+is #122 (decision 39), which replaces this guard when it lands. Found by an adversarial review of
+#53, filed as #130.
+
 **Correction to 36 (2026-11-13, measured).** The plan's first item, a payload cache holding views
 of the volume mapping instead of heap copies of request bodies, was implemented (#126), merged and
 then reverted. Its premise was wrong: AwanFS writes volumes with direct I/O, so written bytes are
