@@ -226,11 +226,13 @@ async fn compaction_keeps_every_version_and_their_order() {
         }
         // An unrelated overwrite leaves dead needles to reclaim.
         put(&c, &url, "vb/other", b"x").await;
-        let mut compacted = 0;
-        while st.compact_oldest_volume().await.unwrap().volume_removed {
-            compacted += 1;
+        // Compact every volume that existed before the active one. With all versions live,
+        // each compaction fills new volumes, so "until nothing is left" would never end.
+        let volumes = std::fs::read_dir(&dir).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".dat")).count();
+        assert!(volumes >= 3, "6 versions of 20 KB span {} volumes of 64 KiB", volumes);
+        for i in 0..volumes - 1 {
+            assert!(st.compact_oldest_volume().await.unwrap().volume_removed, "compaction {} removed its volume", i);
         }
-        assert!(compacted >= 2, "compacted {} volumes", compacted);
         for (i, v) in ids.iter().enumerate() {
             assert_eq!(get_version(&c, &url, "vb/k", v).await.1, vec![b'a' + i as u8; 20_000], "version {} after compaction", i);
         }
