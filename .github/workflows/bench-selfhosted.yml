@@ -39,26 +39,42 @@ jobs:
           print(platform.platform(), n, "CPUs")
           if n <= 8:
               sys.exit(f"{n} CPUs: this workflow is for benchmarks that need more than 8 cores; use bench-ratio.yml or bench-full.yml on hosted runners")
+      # Both reports go to this run's own files, which the run removes first, and never into
+      # measurements/: a report step with "if: always()" prints whatever is at its path, so a
+      # job that measured nothing would otherwise print a committed report as its own output
+      # (that happened in run 43398517562; see bench-full.yml).
       - name: Ratio check against MinIO (builds the server, fetches MinIO if missing)
-        run: python benchmarks/bench.py --runs ${{ inputs.runs || '3' }} --duration ${{ inputs.duration || '30' }} --output measurements/bench_selfhosted.md
+        run: |
+          rm -f selfhosted_ratio.md
+          python benchmarks/bench.py --runs ${{ inputs.runs || '3' }} --duration ${{ inputs.duration || '30' }} --output selfhosted_ratio.md
       - name: Full matrix (AwanFS, MinIO, RustFS where present)
-        run: python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB --concurrent 64 --duration ${{ inputs.duration || '30' }}s --output measurements/s3_full_selfhosted.md
+        run: |
+          rm -f selfhosted_full.md
+          python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB --concurrent 64 --duration ${{ inputs.duration || '30' }}s --output selfhosted_full.md
       - name: Report
         if: always()
         shell: python
         run: |
           import os
           out = os.environ["GITHUB_STEP_SUMMARY"]
-          for p in ("measurements/bench_selfhosted.md", "measurements/s3_full_selfhosted.md"):
-              if os.path.exists(p):
+          wrote = False
+          for p in ("selfhosted_ratio.md", "selfhosted_full.md"):
+              if os.path.exists(p) and os.path.getsize(p) > 0:
                   text = open(p, encoding="utf-8").read()
                   print(text)
                   open(out, "a", encoding="utf-8").write(text + "\n\n")
+                  wrote = True
+          if not wrote:
+              msg = ("This run measured nothing: neither selfhosted_ratio.md nor "
+                     "selfhosted_full.md was written. The committed measurements/ files are "
+                     "from other machines and are not this run's output.")
+              print(msg)
+              open(out, "a", encoding="utf-8").write(msg + "\n")
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: bench-selfhosted
           path: |
-            measurements/bench_selfhosted.md
-            measurements/s3_full_selfhosted.md
+            selfhosted_ratio.md
+            selfhosted_full.md
           if-no-files-found: warn
