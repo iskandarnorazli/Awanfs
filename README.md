@@ -8,14 +8,16 @@ Split from `awan-lang/awan-storage` on 2026-11-12, with its git history. Measure
 
 ---
 
-## Status (2026-11-12): not production-ready yet
+## Status (2026-11-13): not production-ready yet
 
-Read this before you run it anywhere that matters. Plan of record: the Phase 1-4 milestones and [`ROADMAP_AND_DEPENDENCIES.md`](ROADMAP_AND_DEPENDENCIES.md); decisions in [`ARCHITECTURE.md`](ARCHITECTURE.md#0-decisions-2026-11-12).
+Read this before you run it anywhere that matters. Plan of record: the Phase 1-4 milestones and [`ROADMAP_AND_DEPENDENCIES.md`](ROADMAP_AND_DEPENDENCIES.md); decisions in [`ARCHITECTURE.md`](ARCHITECTURE.md#0-decisions-2026-11-12); on-disk format in [`FORMAT.md`](FORMAT.md).
 
-- **One access key.** Requests are checked with SigV4 against one key pair and the server listens on 127.0.0.1 by default (#35). There are no per-user policies yet (#53).
-- **Writes are synced before the 200 by default** (`group` durability, #29). The measurements below were taken before that change, when a PUT was acknowledged without a sync; they will be re-run.
-- **Volumes of 32 GiB, rolled over when full** (#37). Every 10 minutes the server compacts the oldest volume when at least 20 % of it is dead (overwritten or deleted objects): its live objects move to the active volume and it is deleted, safely while requests run (#14). A lone volume is sealed for this only once it holds 1 GiB. `--auto-compaction off` (or `AWANFS_AUTO_COMPACTION=off`) turns it off; compaction copies at most 50 MB/s (`--compaction-rate <MB/s>`, 0 for no limit); `S3ServiceState::compact_oldest_volume` still compacts on demand.
-- A PUT body above 4 MiB with a `Content-Length` is written to disk as it arrives, in 1 MiB pieces, and so is an UploadPart above 4 MiB, into its staged part file. Smaller bodies and `aws-chunked` bodies are still held in memory before they are written. Declared bodies above the S3 limit of 5 GiB get 400 `EntityTooLarge` before they are read; XML bodies are capped at 16 MiB. Multipart GETs stream part by part (#36).
+- **Access:** SigV4 with a root key from the environment, plus users with IAM-style JSON policies in a TOML file (`--config`, #53). The server listens on 127.0.0.1 by default. HTTPS with `--cert`/`--key`, reloaded when the files change (#30).
+- **Durability:** writes are synced before the 200 by default (`group` durability, #29). The benchmark numbers below were taken before that change and will be re-run.
+- **Volumes** of 32 GiB, rolled over when full (#37), compacted in the background when at least 20 % is dead (#14), at most 50 MB/s (`--compaction-rate`, #28).
+- **Bodies:** a PUT or UploadPart above 4 MiB streams to disk, `aws-chunked` included (#36); bodies above 5 GiB get 400 `EntityTooLarge` before they are read. Multipart GETs stream part by part.
+- **Observability:** request logs with request IDs; OTLP/HTTP traces with `--otlp-endpoint` (#43).
+- **Not yet:** replication and erasure coding across nodes, bucket policies and ACLs, object lock.
 
 ## 1. Executive Summary
 
@@ -169,3 +171,9 @@ Pre-compiled standalone binaries with SHA-256 integrity verification:
 - `dist/SHA256SUMS.txt` (SHA-256 Checksum Manifest)
 
 The repository can be copied or shared standalone as a complete, independent Rust project.
+
+---
+
+## License
+
+Apache License 2.0: see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). Security reports: [`SECURITY.md`](SECURITY.md). Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md).
