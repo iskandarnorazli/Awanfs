@@ -933,6 +933,34 @@ impl VolumeManager {
         Ok(full_bytes.slice(p_start..p_end))
     }
 
+    /// The payload at `offset` as a view of the mapping the volume already has, when that
+    /// mapping covers it and its bytes match `crc`; never remaps (#126). The payload cache keeps
+    /// these views instead of heap copies of request bodies.
+    pub fn mapped_payload(&self, offset: u64, crc: u32) -> Option<Bytes> {
+        let m = self.mmap.read().clone()?;
+        let start = offset as usize;
+        if start + 64 > m.len() {
+            return None;
+        }
+        let mut hdr = [0u8; 64];
+        hdr.copy_from_slice(&m[start..start + 64]);
+        let header = NeedleHeader::decode(&hdr).ok()?;
+        let p_start = start + 64 + header.key_len as usize;
+        let p_end = p_start + header.payload_size as usize;
+        if p_end > m.len() || crc32c::crc32c(&m[p_start..p_end]) != crc {
+            return None;
+        }
+        Some(Bytes::from_owner(MmapOwner(m)).slice(p_start..p_end))
+    }
+
+    /// Whether `p` points into this volume's current mapping (tests of #126).
+    pub fn maps(&self, p: *const u8) -> bool {
+        self.mmap.read().as_ref().is_some_and(|m| {
+            let base = m.as_ptr() as usize;
+            (base..base + m.len()).contains(&(p as usize))
+        })
+    }
+
     pub fn read_needle(
         &self,
         volume_id: u32,
