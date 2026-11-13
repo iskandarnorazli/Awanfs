@@ -457,6 +457,40 @@ impl StorageEngine {
         }
     }
 
+    /// Up to `limit` live objects of a bucket whose keys start with `prefix` and sort after
+    /// `after` (exclusive), in key order, with their keys. In-memory rows and the spill index
+    /// are merged; spilled rows have no key in the arena, which is why this returns keys.
+    pub fn list_keys(&self, bucket_id: u32, prefix: &[u8], after: &[u8], limit: usize) -> Vec<(Vec<u8>, ObjectMeta)> {
+        use std::ops::Bound;
+        let Some(bucket) = self.buckets.get(&bucket_id) else { return Vec::new() };
+        let mut merged: BTreeMap<Vec<u8>, ObjectMeta> = BTreeMap::new();
+        let lower = if after >= prefix { Bound::Excluded(after.to_vec()) } else { Bound::Included(prefix.to_vec()) };
+        for (k, &row_idx) in bucket.key_index.range::<Vec<u8>, _>((lower, Bound::Unbounded)) {
+            if !k.starts_with(prefix) {
+                break;
+            }
+            let flags = unpack_flags(self.table.bucket_flags[row_idx]);
+            if flags & FLAG_ACTIVE != 0 && flags & FLAG_TOMBSTONE == 0 {
+                merged.insert(k.clone(), self.table.get(row_idx));
+                if merged.len() >= limit {
+                    break;
+                }
+            }
+        }
+        if let Some(ref spill) = self.spill_index {
+            let sa = if after.is_empty() { None } else { Some(after) };
+            if let Ok(items) = spill.scan_prefix(bucket_id, prefix, sa, limit) {
+                for (k, meta) in items {
+                    let flags = unpack_flags(meta.bucket_flags);
+                    if flags & FLAG_ACTIVE != 0 && flags & FLAG_TOMBSTONE == 0 && k.as_slice() > after {
+                        merged.insert(k, meta);
+                    }
+                }
+            }
+        }
+        merged.into_iter().take(limit).collect()
+    }
+
     pub fn scan_objects(
         &self,
         bucket_id: u32,
