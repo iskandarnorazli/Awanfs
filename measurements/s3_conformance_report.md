@@ -1,5 +1,7 @@
 `python awan-storage/tests/run_s3_conformance.py --output docs/measurements/s3_conformance_report.md`
 
+> Superseded 2026-11-13: this was a 15-check script from the awan-lang days. Conformance is now measured with the ceph s3-tests suite (838 tests, 244 passing on 2026-11-13), tracked in #123.
+
 # Official S3 Conformance Gauntlet Report (#471)
 
 - **Total Conformance Checks:** 15
