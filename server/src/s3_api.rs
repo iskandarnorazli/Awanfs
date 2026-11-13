@@ -186,6 +186,14 @@ fn finish_put(
         .unwrap()
 }
 
+fn put_ok_response(etag_hex: &str, version_id: Option<&str>) -> Response<ResponseBody> {
+    let mut b = Response::builder().status(StatusCode::OK).header(ETAG, format!("\"{}\"", etag_hex)).header(CONTENT_LENGTH, "0");
+    if let Some(v) = version_id {
+        b = b.header("x-amz-version-id", v);
+    }
+    b.body(empty_body()).unwrap()
+}
+
 fn bad_request(code: &str, msg: &str, resource: &str) -> Response<ResponseBody> {
     Response::builder()
         .status(StatusCode::BAD_REQUEST)
@@ -575,6 +583,11 @@ pub struct S3ServiceState {
     pub audit_log: Arc<RwLock<Option<crate::request_log::LogSink>>>,
     /// Users and policies from the config file (#53); `None` = only the root key pair.
     pub iam: Arc<RwLock<Option<Arc<crate::iam::ReloadingIam>>>>,
+    /// Versioning status per bucket id (#31); absent = never set.
+    pub versioning: Arc<RwLock<HashMap<u32, crate::versions::Versioning>>>,
+    /// Version histories of the keys of versioned buckets (#31). Lock order: never take the
+    /// engine lock while holding this one.
+    pub versions: Arc<RwLock<crate::versions::VersionStore>>,
 }
 
 impl S3ServiceState {
@@ -621,6 +634,8 @@ impl S3ServiceState {
             access_log: Arc::new(RwLock::new(None)),
             audit_log: Arc::new(RwLock::new(None)),
             iam: Arc::new(RwLock::new(None)),
+            versioning: Arc::new(RwLock::new(HashMap::new())),
+            versions: Arc::new(RwLock::new(crate::versions::VersionStore::default())),
         }
     }
 
@@ -663,9 +678,20 @@ impl S3ServiceState {
 
         // 1. Replay buckets manifest
         let manifest_path = dir.join("buckets.manifest");
+        let mut versioning_map: HashMap<u32, crate::versions::Versioning> = HashMap::new();
+        let mut version_store = crate::versions::VersionStore::default();
         if let Ok(content) = std::fs::read_to_string(&manifest_path) {
             for line in content.lines() {
                 let line = line.trim();
+                // `~<id>:<Enabled|Suspended>`: a bucket's versioning status (#31).
+                if let Some(rest) = line.strip_prefix('~') {
+                    if let Some((id_str, status)) = rest.split_once(':') {
+                        if let (Ok(id), Some(v)) = (id_str.parse::<u32>(), crate::versions::Versioning::parse(status)) {
+                            versioning_map.insert(id, v);
+                        }
+                    }
+                    continue;
+                }
                 if let Some(rest) = line.strip_prefix('+') {
                     if let Some((id_str, name)) = rest.split_once(':') {
                         if let Ok(id) = id_str.parse::<u32>() {
@@ -676,6 +702,7 @@ impl S3ServiceState {
                     if let Some((id_str, _)) = rest.split_once(':') {
                         if let Ok(id) = id_str.parse::<u32>() {
                             let _ = engine.delete_bucket(id);
+                            versioning_map.remove(&id);
                         }
                     }
                 }
@@ -683,19 +710,82 @@ impl S3ServiceState {
         }
 
         // 2. Replay the needle volumes, oldest first: writes only move to a newer volume, so
-        // volume order is log order.
+        // volume order is log order. Versions are ordered by their ids instead (versions.rs).
+        let mut mp_extents: HashMap<(u32, u64), Vec<PartExtent>> = HashMap::new();
         for vm in volumes.values() {
             initial_vol_offset = vm.offset().max(4096);
             let mut crcs = needle_crc_map.write();
             // Collect the log first: a multipart manifest needle is read back from the volume,
             // and the events are applied in log order so later writes win.
             let mut events = Vec::new();
-            let _ = vm.recover_needles(|b_id, key, offset, size, etag_hi, etag_lo, flags, crc32c| {
-                events.push((b_id, key, offset, size, etag_hi, etag_lo, flags, crc32c));
-            });
-            for (b_id, key, local, size, etag_hi, etag_lo, flags, crc32c) in events {
+            let _ = vm.scan_needles(|n| events.push(n));
+            for n in events {
+                let (b_id, key, local, size, etag_hi, etag_lo, flags, crc32c) = (n.bucket_id, n.key, n.offset, n.payload_size, n.etag_hi, n.etag_lo, n.flags, n.payload_crc32c);
                 let offset = global_offset(vm.id(), local);
                 crcs.insert((b_id as u32, offset), crc32c);
+                // Keys with a version history replay through the version store (#31).
+                if flags & (crate::meta_index::FLAG_VERSIONED | crate::meta_index::FLAG_VERSION_DELETE) != 0 || version_store.has(b_id as u32, &key) {
+                    let b = b_id as u32;
+                    if !version_store.has(b, &key) {
+                        let before = engine.get_object(b, key.as_bytes()).ok().map(|m| null_version_of(&m));
+                        if let Some(nv) = before.filter(|v| v.flags & AWAN_FLAG_MULTIPART != 0) {
+                            if let Some(ext) = multipart.get_completed_extents(b, &key) {
+                                mp_extents.insert((b, nv.vol_offset), ext);
+                            }
+                        }
+                        version_store.start(b, &key, before);
+                    }
+                    let null = flags & crate::meta_index::FLAG_NULL_ID != 0 || flags & crate::meta_index::FLAG_VERSIONED == 0;
+                    let ev = if flags & crate::meta_index::FLAG_VERSION_DELETE != 0 {
+                        match vm.read_needle_bytes(vm.id(), local, crc32c) {
+                            Ok(p) if p.len() == 8 => crate::versions::Event::Remove(u64::from_le_bytes(p[..8].try_into().unwrap())),
+                            _ => continue,
+                        }
+                    } else if flags & AWAN_FLAG_TOMBSTONE != 0 {
+                        crate::versions::Event::Put(crate::versions::Version { ts: n.created_at_ns, null, marker: true, vol_offset: offset, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags })
+                    } else {
+                        let (size, part_count) = if flags & AWAN_FLAG_MULTIPART != 0 {
+                            match vm.read_needle_bytes(vm.id(), local, crc32c).ok().map(|b| decode_extents_manifest(&multipart.staging_dir, &b)) {
+                                Some(Ok((total, extents))) => {
+                                    let pc = extents.len() as u16;
+                                    mp_extents.insert((b, offset), extents);
+                                    (total, pc)
+                                }
+                                Some(Err(crate::multipart::ManifestError::NewerVersion { found, supported })) => {
+                                    return Err(format!(
+                                        "the multipart manifest of {} was written in format {} by a newer AwanFS; this version reads up to {}",
+                                        key, found, supported
+                                    ))
+                                }
+                                _ => continue,
+                            }
+                        } else if flags & crate::meta_index::FLAG_COMPRESSED != 0 {
+                            match vm.payload_prefix(local, key.len(), crate::compress::PREFIX_LEN).ok().and_then(|p| crate::compress::logical_size(&p)) {
+                                Some(n) => (n, 0),
+                                None => continue,
+                            }
+                        } else {
+                            (size, 0)
+                        };
+                        crate::versions::Event::Put(crate::versions::Version { ts: n.created_at_ns, null, marker: false, vol_offset: offset, size, etag_hi, etag_lo, part_count, flags })
+                    };
+                    version_store.apply(b, &key, ev);
+                    match version_store.current(b, &key) {
+                        Some(v) if !v.marker => {
+                            let _ = engine.put_object(b, key.as_bytes(), v.vol_offset, v.size, v.etag_hi, v.etag_lo, v.part_count, v.flags);
+                            if v.flags & AWAN_FLAG_MULTIPART != 0 {
+                                if let Some(ext) = mp_extents.get(&(b, v.vol_offset)) {
+                                    multipart.restore_completed(b, &key, ext.clone());
+                                }
+                            }
+                        }
+                        _ => {
+                            let _ = engine.delete_object(b, key.as_bytes());
+                        }
+                    }
+                    version_store.tidy(b, &key);
+                    continue;
+                }
                 if flags & AWAN_FLAG_TOMBSTONE != 0 {
                     let _ = engine.delete_object(b_id as u32, key.as_bytes());
                 } else if flags & AWAN_FLAG_MULTIPART != 0 {
@@ -726,6 +816,15 @@ impl S3ServiceState {
                         multipart.restore_completed(b_id as u32, &key, extents);
                     }
                 } else {
+                    // A compressed needle's index row holds the object's size, not the stored one (#51).
+                    let size = if flags & crate::meta_index::FLAG_COMPRESSED != 0 {
+                        match vm.payload_prefix(local, key.len(), crate::compress::PREFIX_LEN).ok().and_then(|p| crate::compress::logical_size(&p)) {
+                            Some(n) => n,
+                            None => continue,
+                        }
+                    } else {
+                        size
+                    };
                     let _ = engine.put_object(
                         b_id as u32,
                         key.as_bytes(),
@@ -770,6 +869,8 @@ impl S3ServiceState {
             access_log: Arc::new(RwLock::new(None)),
             audit_log: Arc::new(RwLock::new(None)),
             iam: Arc::new(RwLock::new(None)),
+            versioning: Arc::new(RwLock::new(versioning_map)),
+            versions: Arc::new(RwLock::new(version_store)),
         })
     }
 
@@ -786,9 +887,22 @@ impl S3ServiceState {
     /// Deletes one key the way DeleteObject does: under its key lock, the tombstone is logged
     /// and synced first, and only then is the index row removed. An error means the object is
     /// still there.
-    pub async fn delete_key(&self, b_id: u32, key: &str) -> Result<(), String> {
+    /// Deletes a key: removes it, or in a versioned bucket writes a delete marker, whose
+    /// version id it returns (#31).
+    pub async fn delete_key(&self, b_id: u32, key: &str) -> Result<Option<String>, String> {
         let _key_guard = self.lock_key(b_id, key).await;
         self.hook("delete_start", key);
+        if let Some((extra, ts)) = self.version_stamp(b_id, key) {
+            let flags = AWAN_FLAG_TOMBSTONE | extra;
+            let (vm, loc, g) = self.write_to_active_at(b_id, key, &[], flags, 0, 0, Some(ts)).map_err(|e| format!("could not record the delete: {:?}", e))?;
+            self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+            self.make_durable(&vm, loc.seq).await.map_err(|e| format!("could not sync the delete: {:?}", e))?;
+            self.needle_crc_map.write().insert((b_id, g), loc.payload_crc32c);
+            self.mvcc.tombstone(b_id, key);
+            let v = crate::versions::Version { ts, null: flags & crate::meta_index::FLAG_NULL_ID != 0, marker: true, vol_offset: g, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags };
+            self.record_version(b_id, key, crate::versions::Event::Put(v)).map_err(|c| format!("index error {} for the delete marker", c))?;
+            return Ok(Some(v.id_string()));
+        }
         // Log the tombstone first; only a logged delete removes the row, so a failed write is
         // an error and the object stays (verification/tla, DeleteLogsFirst).
         match self.write_to_active(b_id, key, &[], AWAN_FLAG_TOMBSTONE, 0, 0) {
@@ -815,6 +929,120 @@ impl S3ServiceState {
                 self.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
             }
         }
+        Ok(None)
+    }
+
+    /// `DELETE ?versionId=`: removes one version for good (#31). Returns it, or `None` when the
+    /// key has no such version.
+    pub async fn delete_version(&self, b_id: u32, key: &str, id: u64) -> Result<Option<crate::versions::Version>, String> {
+        let _key_guard = self.lock_key(b_id, key).await;
+        let before = self.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| null_version_of(&m));
+        let target = {
+            let mut vs = self.versions.write();
+            if !vs.has(b_id, key) {
+                // The object of a key with no history is its null version.
+                if id != 0 || before.is_none() {
+                    return Ok(None);
+                }
+                vs.start(b_id, key, before);
+            }
+            vs.find(b_id, key, id)
+        };
+        let Some(target) = target else {
+            self.versions.write().tidy(b_id, key);
+            return Ok(None);
+        };
+        let flags = AWAN_FLAG_TOMBSTONE | crate::meta_index::FLAG_VERSION_DELETE;
+        let (vm, loc, _) = self.write_to_active(b_id, key, &id.to_le_bytes(), flags, 0, 0).map_err(|e| format!("could not record the delete: {:?}", e))?;
+        self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+        self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+        self.make_durable(&vm, loc.seq).await.map_err(|e| format!("could not sync the delete: {:?}", e))?;
+        self.record_version(b_id, key, crate::versions::Event::Remove(id)).map_err(|c| format!("index error {} after deleting a version", c))?;
+        Ok(Some(target))
+    }
+
+    /// The flags and creation time a write of `key` takes in its bucket's versioning status;
+    /// `None` when the bucket was never versioned (#31). Call under the key lock.
+    pub fn version_stamp(&self, b_id: u32, key: &str) -> Option<(u16, u64)> {
+        let status = self.versioning.read().get(&b_id).copied().unwrap_or_default();
+        let extra = match status {
+            crate::versions::Versioning::Unset => return None,
+            crate::versions::Versioning::Enabled => crate::meta_index::FLAG_VERSIONED,
+            crate::versions::Versioning::Suspended => crate::meta_index::FLAG_VERSIONED | crate::meta_index::FLAG_NULL_ID,
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        Some((extra, self.versions.read().next_ts(b_id, key, now)))
+    }
+
+    /// Records a durable version event: updates the history, drops the needles it made
+    /// unreachable, and points the index row at the current version (#31).
+    pub fn record_version(&self, b_id: u32, key: &str, ev: crate::versions::Event) -> Result<(), i32> {
+        let before = self.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| null_version_of(&m));
+        let (dead, current) = {
+            let mut vs = self.versions.write();
+            vs.start(b_id, key, before);
+            let dead = vs.apply(b_id, key, ev);
+            let current = vs.current(b_id, key);
+            vs.tidy(b_id, key);
+            (dead, current)
+        };
+        for v in dead {
+            if v.vol_offset > 0 {
+                self.payload_cache.remove(b_id, v.vol_offset);
+                self.needle_crc_map.write().remove(&(b_id, v.vol_offset));
+                let dead_bytes = (64 + key.len() as u64 + v.size).div_ceil(4096) * 4096;
+                self.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
+            }
+        }
+        match current {
+            Some(v) if !v.marker => {
+                self.engine.write().put_object(b_id, key.as_bytes(), v.vol_offset, v.size, v.etag_hi, v.etag_lo, v.part_count, v.flags)?;
+                if v.flags & AWAN_FLAG_MULTIPART != 0 {
+                    if let Some(ext) = self.manifest_extents(b_id, v.vol_offset) {
+                        self.multipart.restore_completed(b_id, key, ext);
+                    }
+                }
+            }
+            _ => {
+                let _ = self.engine.write().delete_object(b_id, key.as_bytes());
+            }
+        }
+        Ok(())
+    }
+
+    /// The part list in the manifest needle at `vol_offset`.
+    fn manifest_extents(&self, b_id: u32, vol_offset: u64) -> Option<Vec<PartExtent>> {
+        let bytes = self.read_stored(b_id, vol_offset).ok()?;
+        decode_extents_manifest(&self.multipart.staging_dir, &bytes).ok().map(|(_, e)| e)
+    }
+
+    /// The bytes of one version (#31).
+    pub fn read_version_bytes(&self, b_id: u32, key: &str, v: &crate::versions::Version) -> Result<Bytes, VolumeError> {
+        if v.flags & AWAN_FLAG_MULTIPART == 0 {
+            return self.read_object_bytes(b_id, key, v.vol_offset, v.size, v.flags);
+        }
+        let extents = self.manifest_extents(b_id, v.vol_offset).ok_or(VolumeError::CorruptIndex)?;
+        let mut out = Vec::with_capacity(v.size as usize);
+        for ext in extents {
+            let chunk = self.part_bytes(b_id, &ext)?;
+            let n = (ext.part_size as usize).min(chunk.len());
+            out.extend_from_slice(&chunk[..n]);
+        }
+        if out.len() as u64 != v.size {
+            return Err(VolumeError::CorruptIndex);
+        }
+        Ok(Bytes::from(out))
+    }
+
+    /// Records a bucket's versioning status in the manifest and in memory (#31).
+    pub fn set_versioning(&self, b_id: u32, status: crate::versions::Versioning) -> std::io::Result<()> {
+        if let Some(ref d) = self.data_dir {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(d.join("buckets.manifest"))?;
+            writeln!(f, "~{}:{}", b_id, status.as_str())?;
+            f.sync_all()?;
+        }
+        self.versioning.write().insert(b_id, status);
         Ok(())
     }
 
@@ -841,7 +1069,8 @@ impl S3ServiceState {
         let mut dead = 0;
         for (b_id, key, offset, size) in needles {
             let total = (64 + key.len() as u64 + size).div_ceil(crate::direct_io::SECTOR_SIZE as u64) * crate::direct_io::SECTOR_SIZE as u64;
-            let live = engine.get_object(b_id, key.as_bytes()).map(|m| m.vol_offset == global_offset(vol_id, offset)).unwrap_or(false);
+            let g = global_offset(vol_id, offset);
+            let live = engine.get_object(b_id, key.as_bytes()).map(|m| m.vol_offset == g).unwrap_or(false) || self.versions.read().holds_offset(b_id, &key, g);
             if !live {
                 dead += total;
             }
@@ -910,21 +1139,23 @@ impl S3ServiceState {
         };
         let old_id = old.id();
         let mut needles = Vec::new();
-        old.recover_needles(|b_id, key, offset, size, etag_hi, etag_lo, flags, crc| {
-            needles.push((b_id as u32, key, offset, size, etag_hi, etag_lo, flags, crc));
-        })?;
+        old.scan_needles(|n| needles.push((n.bucket_id as u32, n.key, n.offset, n.payload_size, n.etag_hi, n.etag_lo, n.flags, n.payload_crc32c, n.created_at_ns)))?;
 
         let mut report = CompactionReport::default();
         let mut written: BTreeMap<u32, Arc<VolumeManager>> = BTreeMap::new();
         let mut throttle = crate::throttle::Throttle::new(self.compaction_rate.load(Ordering::Relaxed));
-        for (b_id, key, local, size, etag_hi, etag_lo, flags, crc) in needles {
+        for (b_id, key, local, size, etag_hi, etag_lo, flags, crc, created_at) in needles {
             let g_old = global_offset(old_id, local);
-            if flags & AWAN_FLAG_TOMBSTONE != 0 {
+            // A delete marker still in a history is a version and is kept (#31); other
+            // tombstones only matter until the needles they cover are gone, and those are
+            // older, so already compacted.
+            if flags & AWAN_FLAG_TOMBSTONE != 0 && (flags & crate::meta_index::FLAG_VERSIONED == 0 || !self.versions.read().holds_offset(b_id, &key, g_old)) {
                 report.dead_needles_reclaimed += 1;
                 continue;
             }
             let _guard = self.lock_key(b_id, &key).await;
-            let live = self.engine.read().get_object(b_id, key.as_bytes()).map(|m| m.vol_offset == g_old).unwrap_or(false);
+            let current = self.engine.read().get_object(b_id, key.as_bytes()).map(|m| m.vol_offset == g_old).unwrap_or(false);
+            let live = current || self.versions.read().holds_offset(b_id, &key, g_old);
             if !live {
                 report.dead_needles_reclaimed += 1;
                 continue;
@@ -932,10 +1163,14 @@ impl S3ServiceState {
             self.hook("compact_copy", &key);
             let bytes = if size == 0 { Bytes::new() } else { old.read_needle_bytes(old_id, local, crc)? };
             let copied = bytes.len() as u64;
-            let (vm, loc, g_new) = self.write_to_active(b_id, &key, &bytes, flags, etag_hi, etag_lo)?;
+            // The creation time moves with the needle: it is a version's id (#31).
+            let (vm, loc, g_new) = self.write_to_active_at(b_id, &key, &bytes, flags, etag_hi, etag_lo, Some(created_at))?;
             written.insert(vm.id(), Arc::clone(&vm));
-            if let Err(code) = self.engine.write().update_object_offset(b_id, key.as_bytes(), g_new) {
-                return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("index error {} while moving {}", code, key))));
+            self.versions.write().move_offset(b_id, &key, g_old, g_new);
+            if current {
+                if let Err(code) = self.engine.write().update_object_offset(b_id, key.as_bytes(), g_new) {
+                    return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("index error {} while moving {}", code, key))));
+                }
             }
             {
                 let mut crcs = self.needle_crc_map.write();
@@ -985,6 +1220,9 @@ impl S3ServiceState {
 
     /// The bytes of an object, single or multipart, verified.
     pub fn read_object_bytes(&self, b_id: u32, key: &str, vol_offset: u64, size: u64, flags: u16) -> Result<Bytes, VolumeError> {
+        if flags & crate::meta_index::FLAG_COMPRESSED != 0 {
+            return self.load_compressed(b_id, vol_offset, size);
+        }
         if flags & AWAN_FLAG_MULTIPART == 0 {
             return self.load_payload(b_id, vol_offset, size as usize);
         }
@@ -1039,15 +1277,82 @@ impl S3ServiceState {
         }
     }
 
+    /// Whether new objects in `bucket` are compressed: `[[buckets]]` in the config (#51).
+    pub fn compresses(&self, bucket: &str) -> bool {
+        self.iam.read().as_ref().map(|i| i.current().compresses(bucket)).unwrap_or(false)
+    }
+
+    /// `store_payload` for a whole object: compressed when its bucket asks for it and the
+    /// bytes shrink (#51). Returns the offset and the flags the needle was written with.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_object(&self, b_id: u32, bucket: &str, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64, created_at: Option<u64>) -> Result<(u64, u16), VolumeError> {
+        let plain = flags & (AWAN_FLAG_MULTIPART | AWAN_FLAG_ZERO_BYTE | AWAN_FLAG_TOMBSTONE) == 0;
+        if plain && self.compresses(bucket) {
+            if let Some(enc) = crate::compress::encode(data) {
+                let f = flags | crate::meta_index::FLAG_COMPRESSED;
+                let off = self.store_payload_at(b_id, key, &Bytes::from(enc), f, etag_hi, etag_lo, created_at).await?;
+                return Ok((off, f));
+            }
+        }
+        Ok((self.store_payload_at(b_id, key, data, flags, etag_hi, etag_lo, created_at).await?, flags))
+    }
+
+    /// The payload bytes as stored, verified against their CRC.
+    fn read_stored(&self, b_id: u32, vol_offset: u64) -> Result<Bytes, VolumeError> {
+        if vol_offset == 0 {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let (vm, local) = self.volume_for(vol_offset)?;
+        let crc = self.needle_crc_map.read().get(&(b_id, vol_offset)).copied().ok_or(VolumeError::CorruptIndex)?;
+        vm.read_needle_bytes(vm.id(), local, crc)
+    }
+
+    /// Bytes `start..=end` of a compressed object, decoding only the blocks they overlap.
+    pub fn load_compressed_range(&self, b_id: u32, vol_offset: u64, size: u64, start: u64, end: u64) -> Result<Bytes, VolumeError> {
+        if let Some(cached) = self.payload_cache.get(b_id, vol_offset) {
+            let e = ((end + 1) as usize).min(cached.len());
+            return Ok(cached.slice((start as usize).min(e)..e));
+        }
+        let stored = self.read_stored(b_id, vol_offset)?;
+        let (bytes, _) = crate::compress::decode_range(&stored, start, end + 1).map_err(decode_error)?;
+        if bytes.len() as u64 != (end + 1).min(size).saturating_sub(start) {
+            return Err(VolumeError::CorruptIndex);
+        }
+        Ok(Bytes::from(bytes))
+    }
+
+    /// A whole compressed object; cached as object bytes up to 4 MiB.
+    pub fn load_compressed(&self, b_id: u32, vol_offset: u64, size: u64) -> Result<Bytes, VolumeError> {
+        if let Some(cached) = self.payload_cache.get(b_id, vol_offset) {
+            return Ok(cached);
+        }
+        let stored = self.read_stored(b_id, vol_offset)?;
+        let bytes = Bytes::from(crate::compress::decode(&stored).map_err(decode_error)?);
+        if bytes.len() as u64 != size {
+            return Err(VolumeError::CorruptIndex);
+        }
+        if bytes.len() <= 4 * 1024 * 1024 {
+            self.payload_cache.insert(b_id, vol_offset, bytes.clone());
+        }
+        Ok(bytes)
+    }
+
     /// Writes the payload to the volume and waits until it is durable. An error means the
     /// write is not acknowledged.
     pub async fn store_payload(&self, b_id: u32, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64) -> Result<u64, VolumeError> {
-        let (vm, loc, offset) = tracing::info_span!("volume.write", bytes = data.len() as u64).in_scope(|| self.write_to_active(b_id, key, data, flags, etag_hi, etag_lo))?;
+        self.store_payload_at(b_id, key, data, flags, etag_hi, etag_lo, None).await
+    }
+
+    /// `store_payload` with a given needle creation time (a version id, #31).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_payload_at(&self, b_id: u32, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64, created_at: Option<u64>) -> Result<u64, VolumeError> {
+        let (vm, loc, offset) = tracing::info_span!("volume.write", bytes = data.len() as u64).in_scope(|| self.write_to_active_at(b_id, key, data, flags, etag_hi, etag_lo, created_at))?;
         self.make_durable(&vm, loc.seq).instrument(tracing::info_span!("volume.sync")).await?;
         self.needle_crc_map.write().insert((b_id, offset), loc.payload_crc32c);
         self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-        // Cache hot payloads up to 4 MiB in dynamic auto-scaling LRU cache
-        if !data.is_empty() && data.len() <= 4 * 1024 * 1024 {
+        // Cache hot payloads up to 4 MiB in dynamic auto-scaling LRU cache; the cache holds
+        // object bytes, so a compressed payload is cached when it is first read.
+        if !data.is_empty() && data.len() <= 4 * 1024 * 1024 && flags & crate::meta_index::FLAG_COMPRESSED == 0 {
             self.payload_cache.insert(b_id, offset, data.clone());
         }
         Ok(offset)
@@ -1064,10 +1369,32 @@ impl S3ServiceState {
         etag_hi: u64,
         etag_lo: u64,
     ) -> Result<(Arc<VolumeManager>, NeedleLocation, u64), VolumeError> {
+        self.write_to_active_at(b_id, key, data, flags, etag_hi, etag_lo, None)
+    }
+
+    /// `write_to_active` with a given needle creation time (#31: version ids; compaction).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_to_active_at(
+        &self,
+        b_id: u32,
+        key: &str,
+        data: &[u8],
+        flags: u16,
+        etag_hi: u64,
+        etag_lo: u64,
+        created_at: Option<u64>,
+    ) -> Result<(Arc<VolumeManager>, NeedleLocation, u64), VolumeError> {
         let mut attempts = 0;
         loop {
             let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
-            match vm.write_needle(b_id as u16, key, data, flags, etag_hi, etag_lo) {
+            // An older AwanFS reads a format 1 volume and would serve compressed bytes as the
+            // object: compressed needles go to a format 2 volume (decision 20, #51).
+            if flags & FORMAT_2_FLAGS != 0 && vm.format() < 2 && attempts < 8 {
+                attempts += 1;
+                self.roll_volume(&vm)?;
+                continue;
+            }
+            match vm.write_needle_at(b_id as u16, key, data, flags, etag_hi, etag_lo, created_at) {
                 Ok(loc) => {
                     let g = global_offset(vm.id(), loc.offset);
                     return Ok((vm, loc, g));
@@ -1090,6 +1417,11 @@ impl S3ServiceState {
         let mut attempts = 0;
         loop {
             let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+            if flags & FORMAT_2_FLAGS != 0 && vm.format() < 2 && attempts < 8 {
+                attempts += 1;
+                self.roll_volume(&vm)?;
+                continue;
+            }
             match vm.begin_needle(b_id as u16, key, len, flags) {
                 Ok(w) => return Ok(w),
                 Err(VolumeError::VolumeFull { len, .. }) if len + crate::direct_io::SECTOR_SIZE as u64 > vm.max_span() => {
@@ -1195,6 +1527,189 @@ impl Default for S3ServiceState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Needle flags that only format 2 volumes may hold (FORMAT.md).
+const FORMAT_2_FLAGS: u16 = crate::meta_index::FLAG_COMPRESSED | crate::meta_index::FLAG_VERSIONED | crate::meta_index::FLAG_NULL_ID | crate::meta_index::FLAG_VERSION_DELETE;
+
+/// An index row as the null version of its key (#31).
+fn null_version_of(m: &crate::meta_index::ObjectMeta) -> crate::versions::Version {
+    crate::versions::Version {
+        ts: 0,
+        null: true,
+        marker: false,
+        vol_offset: m.vol_offset,
+        size: m.size,
+        etag_hi: m.etag_hi,
+        etag_lo: m.etag_lo,
+        part_count: unpack_part_count(m.bucket_flags),
+        flags: unpack_flags(m.bucket_flags),
+    }
+}
+
+fn version_etag(v: &crate::versions::Version) -> String {
+    let hex = md5_to_etag_hex(v.etag_hi, v.etag_lo);
+    if v.flags & AWAN_FLAG_MULTIPART != 0 {
+        format!("\"{}-{}\"", hex, v.part_count)
+    } else {
+        format!("\"{}\"", hex)
+    }
+}
+
+fn no_such_version(key: &str) -> Response<ResponseBody> {
+    let xml = s3_error_xml("NoSuchVersion", "The specified version does not exist.", key, "req-version");
+    Response::builder().status(StatusCode::NOT_FOUND).header(CONTENT_TYPE, "application/xml").body(full_body(Bytes::from(xml))).unwrap()
+}
+
+/// The response of a PUT that wrote a version (#31).
+#[allow(clippy::too_many_arguments)]
+fn finish_version_put(state: &S3ServiceState, b_id: u32, key: &str, ts: u64, flags: u16, vol_offset: u64, size: u64, etag_hi: u64, etag_lo: u64, part_count: u16) -> Result<String, Response<ResponseBody>> {
+    let v = crate::versions::Version { ts, null: flags & crate::meta_index::FLAG_NULL_ID != 0, marker: false, vol_offset, size, etag_hi, etag_lo, part_count, flags };
+    match state.record_version(b_id, key, crate::versions::Event::Put(v)) {
+        Ok(()) => Ok(v.id_string()),
+        Err(code) => Err(engine_error_response(code, key)),
+    }
+}
+
+/// GET or HEAD of a key with a version history, or of `?versionId=` (#31).
+fn version_get_response(state: &S3ServiceState, b_id: u32, key: &str, vid: Option<&str>, head: bool, range: Option<&str>) -> Response<ResponseBody> {
+    let id = match vid {
+        Some(s) => match crate::versions::parse_id(s) {
+            Some(i) => Some(i),
+            None => return no_such_version(key),
+        },
+        None => None,
+    };
+    let row = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| null_version_of(&m));
+    let v = {
+        let vs = state.versions.read();
+        match id {
+            None => vs.current(b_id, key),
+            Some(i) if vs.has(b_id, key) => vs.find(b_id, key, i),
+            Some(0) => row,
+            Some(_) => None,
+        }
+    };
+    let Some(v) = v else {
+        if id.is_some() {
+            return no_such_version(key);
+        }
+        let xml = s3_error_xml("NoSuchKey", "The specified key does not exist.", key, "req-get-obj");
+        return Response::builder().status(StatusCode::NOT_FOUND).header(CONTENT_TYPE, "application/xml").body(full_body(Bytes::from(xml))).unwrap();
+    };
+    if v.marker {
+        let (status, code, msg) = if id.is_some() {
+            (StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against a delete marker.")
+        } else {
+            (StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.")
+        };
+        let body = if head { empty_body() } else { full_body(Bytes::from(s3_error_xml(code, msg, key, "req-get-obj"))) };
+        return Response::builder()
+            .status(status)
+            .header(CONTENT_TYPE, "application/xml")
+            .header("x-amz-delete-marker", "true")
+            .header("x-amz-version-id", v.id_string())
+            .body(body)
+            .unwrap();
+    }
+    let bytes = if head {
+        Bytes::new()
+    } else {
+        match state.read_version_bytes(b_id, key, &v) {
+            Ok(b) => b,
+            Err(e) => return internal_error_response(key, &format!("could not read the version: {:?}", e)),
+        }
+    };
+    let builder = Response::builder()
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .header(ETAG, version_etag(&v))
+        .header(ACCEPT_RANGES, "bytes")
+        .header("x-amz-version-id", v.id_string())
+        .header(LAST_MODIFIED, "Tue, 10 Nov 2026 00:00:00 GMT");
+    if let Some(h) = range {
+        match parse_range_header(h, v.size) {
+            Ok(Some(r)) => {
+                let body = if head { empty_body() } else { full_body(bytes.slice(r.start as usize..(r.end + 1) as usize)) };
+                return builder
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(CONTENT_RANGE, format!("bytes {}-{}/{}", r.start, r.end, v.size))
+                    .header(CONTENT_LENGTH, (r.end - r.start + 1).to_string())
+                    .body(body)
+                    .unwrap();
+            }
+            Err(()) => {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .header(CONTENT_RANGE, format!("bytes */{}", v.size))
+                    .body(full_body(Bytes::from(s3_error_xml("InvalidRange", "The requested range cannot be satisfied.", key, "req-range-err"))))
+                    .unwrap();
+            }
+            Ok(None) => {}
+        }
+    }
+    let body = if head { empty_body() } else { full_body(bytes) };
+    builder.status(StatusCode::OK).header(CONTENT_LENGTH, v.size.to_string()).body(body).unwrap()
+}
+
+/// ListObjectVersions over the index and the version histories (#31). Truncates at a key
+/// boundary; a key with more versions than `max_keys` is listed whole.
+fn list_versions_response(state: &S3ServiceState, b_id: u32, bucket: &str, prefix: &str, key_marker: &str, max_keys: usize, url: bool) -> Response<ResponseBody> {
+    let rows = state.engine.read().list_keys(b_id, prefix.as_bytes(), key_marker.as_bytes(), max_keys + 1);
+    let more_rows = rows.len() > max_keys;
+    let last_row = rows.last().map(|(k, _)| String::from_utf8_lossy(k).into_owned());
+    let mut keys: BTreeMap<String, Option<crate::meta_index::ObjectMeta>> = rows.into_iter().map(|(k, m)| (String::from_utf8_lossy(&k).into_owned(), Some(m))).collect();
+    let histories: HashMap<String, Vec<crate::versions::Version>> = {
+        let vs = state.versions.read();
+        vs.keys_of(b_id, prefix)
+            .into_iter()
+            .filter(|k| k.as_str() > key_marker && (!more_rows || last_row.as_deref().map_or(true, |l| k.as_str() <= l)))
+            .map(|k| {
+                let list = vs.versions(b_id, &k).map(|l| l.to_vec()).unwrap_or_default();
+                (k, list)
+            })
+            .collect()
+    };
+    for k in histories.keys() {
+        keys.entry(k.clone()).or_insert(None);
+    }
+    let enc = |s: &str| if url { s3_url_encode(s) } else { s.to_string() };
+    let mut entries = Vec::new();
+    let mut next = None;
+    let mut truncated = false;
+    let total = keys.len();
+    for (i, (k, row)) in keys.into_iter().enumerate() {
+        let versions: Vec<crate::versions::Version> = match histories.get(&k) {
+            Some(h) => h.clone(),
+            None => row.iter().map(null_version_of).collect(),
+        };
+        if !entries.is_empty() && entries.len() + versions.len() > max_keys {
+            truncated = true;
+            break;
+        }
+        for (j, v) in versions.iter().enumerate() {
+            entries.push(VersionListing {
+                key: enc(&k),
+                version_id: v.id_string(),
+                latest: j == 0,
+                marker: v.marker,
+                last_modified: crate::versions::iso8601(v.ts),
+                etag: version_etag(v).trim_matches('"').to_string(),
+                size: v.size,
+            });
+        }
+        next = Some(enc(&k));
+        if entries.len() >= max_keys && (i + 1 < total || more_rows) {
+            truncated = true;
+            break;
+        }
+    }
+    let xml = list_versions_xml(bucket, &enc(prefix), &enc(key_marker), max_keys as u32, truncated, if truncated { next.as_deref() } else { None }, url, &entries);
+    Response::builder().status(StatusCode::OK).header(CONTENT_TYPE, "application/xml").body(full_body(Bytes::from(xml))).unwrap()
+}
+
+fn decode_error(e: crate::compress::CompressError) -> VolumeError {
+    VolumeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
 /// The client's address, put into the request's extensions by the reactor.
@@ -1310,6 +1825,9 @@ fn operation_name(method: &Method, target: &ParsedTarget, query: &str) -> &'stat
     match target {
         ParsedTarget::Service => "ListBuckets",
         ParsedTarget::Bucket { .. } => match *method {
+            Method::PUT if has("versioning") => "PutBucketVersioning",
+            Method::GET if has("versioning") => "GetBucketVersioning",
+            Method::GET if has("versions") => "ListObjectVersions",
             Method::PUT if has("lifecycle") => "PutBucketLifecycle",
             Method::GET if has("lifecycle") => "GetBucketLifecycle",
             Method::POST if has("delete") => "DeleteObjects",
@@ -1560,6 +2078,43 @@ async fn handle_s3_inner(
 
         ParsedTarget::Bucket { bucket } => {
             match method {
+                Method::PUT if query_map.contains_key("versioning") => {
+                    let body_bytes = match read_body(req.into_body(), MAX_XML_BODY, path).await? {
+                        Ok(b) => b,
+                        Err(resp) => return Ok(resp),
+                    };
+                    let body = String::from_utf8_lossy(&body_bytes);
+                    let status = body.find("<Status>").and_then(|s| body[s + 8..].split('<').next()).and_then(|t| crate::versions::Versioning::parse(t.trim()));
+                    let Some(status) = status else {
+                        return Ok(bad_request("MalformedXML", "The versioning configuration needs <Status>Enabled</Status> or <Status>Suspended</Status>.", &bucket));
+                    };
+                    let b_id = match state.engine.read().lookup_bucket(&bucket) {
+                        Ok(id) => id,
+                        Err(_) => {
+                            let xml = s3_error_xml("NoSuchBucket", "The specified bucket does not exist", &bucket, "req-versioning");
+                            return Ok(Response::builder().status(StatusCode::NOT_FOUND).header(CONTENT_TYPE, "application/xml").body(full_body(Bytes::from(xml))).unwrap());
+                        }
+                    };
+                    if let Err(e) = state.set_versioning(b_id, status) {
+                        return Ok(internal_error_response(&bucket, &format!("could not record the versioning status: {}", e)));
+                    }
+                    Ok(Response::builder().status(StatusCode::OK).header(CONTENT_LENGTH, "0").body(empty_body()).unwrap())
+                }
+
+                Method::GET if query_map.contains_key("versioning") => {
+                    let b_id = match state.engine.read().lookup_bucket(&bucket) {
+                        Ok(id) => id,
+                        Err(_) => {
+                            let xml = s3_error_xml("NoSuchBucket", "The specified bucket does not exist", &bucket, "req-versioning");
+                            return Ok(Response::builder().status(StatusCode::NOT_FOUND).header(CONTENT_TYPE, "application/xml").body(full_body(Bytes::from(xml))).unwrap());
+                        }
+                    };
+                    let status = state.versioning.read().get(&b_id).copied().unwrap_or_default();
+                    let inner = if status == crate::versions::Versioning::Unset { String::new() } else { format!("<Status>{}</Status>", status.as_str()) };
+                    let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}</VersioningConfiguration>", inner);
+                    Ok(Response::builder().status(StatusCode::OK).header(CONTENT_TYPE, "application/xml").body(full_body(Bytes::from(xml))).unwrap())
+                }
+
                 Method::PUT => {
                     if query_map.contains_key("lifecycle") {
                         let body_bytes = match read_body(req.into_body(), MAX_XML_BODY, path).await? {
@@ -1663,8 +2218,13 @@ async fn handle_s3_inner(
                         }
                     };
 
+                    if !state.versions.read().keys_of(b_id, "").is_empty() {
+                        let xml = s3_error_xml("BucketNotEmpty", "The bucket you tried to delete is not empty", &bucket, "req-del-b");
+                        return Ok(Response::builder().status(StatusCode::CONFLICT).header(CONTENT_TYPE, "application/xml").body(full_body(Bytes::from(xml))).unwrap());
+                    }
                     match engine.delete_bucket(b_id) {
                         Ok(()) => {
+                            state.versioning.write().remove(&b_id);
                             if let Some(ref d) = state.data_dir {
                                 let manifest = d.join("buckets.manifest");
                                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&manifest) {
@@ -1782,6 +2342,9 @@ async fn handle_s3_inner(
                     } else {
                         q("marker").as_bytes().to_vec()
                     };
+                    if versions {
+                        return Ok(list_versions_response(&state, b_id, &bucket, prefix, q("key-marker"), max_keys, url_encode));
+                    }
                     let page = list_page(&state, b_id, prefix.as_bytes(), delimiter.as_bytes(), &start, max_keys);
                     let enc = |s: &str| if url_encode { s3_url_encode(s) } else { s.to_string() };
                     let key_strings: Vec<String> = page.objects.iter().map(|(k, _)| enc(&String::from_utf8_lossy(k))).collect();
@@ -1830,18 +2393,28 @@ async fn handle_s3_inner(
                     };
                     let body_str = String::from_utf8_lossy(&body_bytes);
 
-                    let mut keys_to_delete = Vec::new();
+                    // Each <Object> has a <Key> and maybe a <VersionId> (#31). Keys are XML text:
+                    // "&amp;" is "&" (it was used escaped before).
+                    let text = |block: &str, tag: &str| -> Option<String> {
+                        let open = format!("<{}>", tag);
+                        let close = format!("</{}>", tag);
+                        let s = block.find(&open)? + open.len();
+                        let e = block[s..].find(&close)? + s;
+                        let raw = &block[s..e];
+                        Some(quick_xml::escape::unescape(raw).map(|k| k.into_owned()).unwrap_or_else(|_| raw.to_string()))
+                    };
+                    let mut keys_to_delete: Vec<String> = Vec::new();
+                    let mut version_ids: Vec<Option<String>> = Vec::new();
                     let mut cursor = body_str.as_ref();
-                    while let Some(start) = cursor.find("<Key>") {
-                        let rest = &cursor[start + 5..];
-                        if let Some(end) = rest.find("</Key>") {
-                            // Keys are XML text: "&amp;" is "&" (it was used escaped before).
-                            let raw = &rest[..end];
-                            keys_to_delete.push(quick_xml::escape::unescape(raw).map(|k| k.into_owned()).unwrap_or_else(|_| raw.to_string()));
-                            cursor = &rest[end + 6..];
-                        } else {
-                            break;
+                    while let Some(start) = cursor.find("<Object>") {
+                        let rest = &cursor[start + 8..];
+                        let end = rest.find("</Object>").unwrap_or(rest.len());
+                        let block = &rest[..end];
+                        if let Some(k) = text(block, "Key") {
+                            keys_to_delete.push(k);
+                            version_ids.push(text(block, "VersionId"));
                         }
+                        cursor = &rest[end..];
                     }
 
                     let looked_up = state.engine.read().lookup_bucket(&bucket);
@@ -1860,20 +2433,28 @@ async fn handle_s3_inner(
                     // Each key goes through delete_key: tombstone logged and synced, under its key
                     // lock. Before, the rows were dropped with no tombstone, and every deleted
                     // object came back at the next restart.
-                    let mut ok_keys = Vec::new();
+                    let mut ok_keys: Vec<(&str, Option<&str>)> = Vec::new();
                     let mut failed: Vec<(String, &'static str, String)> = Vec::new();
-                    for k in &keys_to_delete {
+                    for (k, vid) in keys_to_delete.iter().zip(version_ids.iter()) {
                         // Each key is checked against the signer's policy (#53).
                         if !user_may("s3:DeleteObject", &format!("arn:aws:s3:::{}/{}", bucket, k)) {
                             failed.push((k.clone(), "AccessDenied", "Access Denied".to_string()));
                             continue;
                         }
-                        match state.delete_key(b_id, k).await {
-                            Ok(()) => ok_keys.push(k.as_str()),
+                        let result = match vid.as_deref() {
+                            Some(v) => match crate::versions::parse_id(v) {
+                                Some(id) => state.delete_version(b_id, k, id).await.map(|_| ()),
+                                None => Err("NoSuchVersion".to_string()),
+                            },
+                            None => state.delete_key(b_id, k).await.map(|_| ()),
+                        };
+                        match result {
+                            Ok(()) => ok_keys.push((k.as_str(), vid.as_deref())),
+                            Err(e) if e == "NoSuchVersion" => failed.push((k.clone(), "NoSuchVersion", "The specified version does not exist.".to_string())),
                             Err(e) => failed.push((k.clone(), "InternalError", e)),
                         }
                     }
-                    let deleted: Vec<DeleteItemResult> = ok_keys.into_iter().map(|key| DeleteItemResult { key, version_id: None }).collect();
+                    let deleted: Vec<DeleteItemResult> = ok_keys.into_iter().map(|(key, version_id)| DeleteItemResult { key, version_id }).collect();
                     let errors: Vec<DeleteErrorItem> = failed.iter().map(|(k, c, e)| DeleteErrorItem { key: k, code: c, message: e }).collect();
                     let xml = delete_objects_result_xml(&deleted, &errors);
                     Ok(Response::builder()
@@ -2172,13 +2753,16 @@ async fn handle_s3_inner(
                         }
                         // Log the part list as a manifest needle, so recovery rebuilds the object.
                         let manifest = Bytes::from(encode_extents_manifest(&state.multipart.staging_dir, total_size, &extents));
-                        let manifest_offset = match state.store_payload(
+                        let stamp = state.version_stamp(b_id, &key);
+                        let mp_flags = AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART | stamp.map_or(0, |s| s.0);
+                        let manifest_offset = match state.store_payload_at(
                             b_id,
                             &key,
                             &manifest,
-                            AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART,
+                            mp_flags,
                             hi,
                             lo,
+                            stamp.map(|s| s.1),
                         ).await {
                             Ok(off) => off,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not record the multipart object: {:?}", e))),
@@ -2193,28 +2777,38 @@ async fn handle_s3_inner(
                                 .body(full_body(Bytes::from(xml)))
                                 .unwrap());
                         }
-                        let mut engine = state.engine.write();
-                        if let Err(code) = engine.put_object(
-                            b_id,
-                            key.as_bytes(),
-                            manifest_offset,
-                            total_size,
-                            hi,
-                            lo,
-                            extents.len() as u16,
-                            AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART,
-                        ) {
-                            return Ok(engine_error_response(code, &key));
+                        let mut version_id = None;
+                        if let Some((_, ts)) = stamp {
+                            match finish_version_put(&state, b_id, &key, ts, mp_flags, manifest_offset, total_size, hi, lo, extents.len() as u16) {
+                                Ok(v) => version_id = Some(v),
+                                Err(r) => return Ok(r),
+                            }
+                        } else {
+                            let mut engine = state.engine.write();
+                            if let Err(code) = engine.put_object(
+                                b_id,
+                                key.as_bytes(),
+                                manifest_offset,
+                                total_size,
+                                hi,
+                                lo,
+                                extents.len() as u16,
+                                AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART,
+                            ) {
+                                return Ok(engine_error_response(code, &key));
+                            }
                         }
 
                         let location = format!("http://127.0.0.1:9000/{}/{}", bucket, key);
                         let xml = complete_multipart_upload_result_xml(&bucket, &key, &composite_etag, &location);
-                        return Ok(Response::builder()
+                        let mut resp = Response::builder()
                             .status(StatusCode::OK)
                             .header(CONTENT_TYPE, "application/xml")
-                            .header(ETAG, format!("\"{}\"", composite_etag))
-                            .body(full_body(Bytes::from(xml)))
-                            .unwrap());
+                            .header(ETAG, format!("\"{}\"", composite_etag));
+                        if let Some(v) = version_id {
+                            resp = resp.header("x-amz-version-id", v);
+                        }
+                        return Ok(resp.body(full_body(Bytes::from(xml))).unwrap());
                     }
                     Err(err) => {
                         let xml = s3_error_xml(err, "CompleteMultipartUpload error", &key, "req-cmp-part");
@@ -2342,10 +2936,26 @@ async fn handle_s3_inner(
                             return Ok(engine_error_response(code, &key));
                         }
                         let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset);
-                        let vol_offset = match state.store_payload(b_id, &key, &bytes, flags, src_meta.etag_hi, src_meta.etag_lo).await {
-                            Ok(off) => off,
+                        let stamp = state.version_stamp(b_id, &key);
+                        let flags = flags | stamp.map_or(0, |s| s.0);
+                        let (vol_offset, flags) = match state.store_object(b_id, &bucket, &key, &bytes, flags, src_meta.etag_hi, src_meta.etag_lo, stamp.map(|s| s.1)).await {
+                            Ok(written) => written,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not store the copy: {:?}", e))),
                         };
+                        if let Some((_, ts)) = stamp {
+                            let vid = match finish_version_put(&state, b_id, &key, ts, flags, vol_offset, src_meta.size, src_meta.etag_hi, src_meta.etag_lo, 0) {
+                                Ok(v) => v,
+                                Err(r) => return Ok(r),
+                            };
+                            let etag_hex = md5_to_etag_hex(src_meta.etag_hi, src_meta.etag_lo);
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "application/xml")
+                                .header(ETAG, format!("\"{}\"", etag_hex))
+                                .header("x-amz-version-id", vid)
+                                .body(full_body(Bytes::from(copy_object_result_xml(&etag_hex, "2026-11-10T00:00:00.000Z"))))
+                                .unwrap());
+                        }
                         if let Some(prev_off) = old_info {
                             if prev_off > 0 && prev_off != vol_offset {
                                 state.payload_cache.remove(b_id, prev_off);
@@ -2424,10 +3034,15 @@ async fn handle_s3_inner(
                             return Ok(engine_error_response(code, &key));
                         }
                         let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size));
+                        let stamp = state.version_stamp(b_id, &key);
+                        let flags = flags | stamp.map_or(0, |s| s.0);
                         let mut writer = match state.begin_needle_on_active(b_id, &key, len, flags) {
                             Ok(w) => w,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                         };
+                        if let Some((_, ts)) = stamp {
+                            writer.set_created_at(ts);
+                        }
                         let declared_sha = signed_headers
                             .get("x-amz-content-sha256")
                             .and_then(|v| v.to_str().ok())
@@ -2504,6 +3119,12 @@ async fn handle_s3_inner(
                         state.needle_crc_map.write().insert((b_id, vol_offset), loc.payload_crc32c);
                         state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                         state.hook("put_stored", &key);
+                        if let Some((_, ts)) = stamp {
+                            return Ok(match finish_version_put(&state, b_id, &key, ts, flags, vol_offset, len, etag_hi, etag_lo, 0) {
+                                Ok(vid) => put_ok_response(&etag_hex, Some(&vid)),
+                                Err(r) => r,
+                            });
+                        }
                         return Ok(finish_put(&state, b_id, &key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex));
                     }
                     let raw_bytes = match read_body(req.into_body(), MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, path).await? {
@@ -2596,15 +3217,30 @@ async fn handle_s3_inner(
                     };
 
                     // Zero-byte objects get a needle too, so they and empty overwrites survive a restart.
-                    let vol_offset = match state.store_payload(b_id, &key, &decoded_bytes, flags, etag_hi, etag_lo).await {
-                        Ok(off) => off,
+                    let stamp = state.version_stamp(b_id, &key);
+                    let flags = flags | stamp.map_or(0, |s| s.0);
+                    let (vol_offset, flags) = match state.store_object(b_id, &bucket, &key, &decoded_bytes, flags, etag_hi, etag_lo, stamp.map(|s| s.1)).await {
+                        Ok(written) => written,
                         Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                     };
                     state.hook("put_stored", &key);
+                    if let Some((_, ts)) = stamp {
+                        return Ok(match finish_version_put(&state, b_id, &key, ts, flags, vol_offset, payload_len, etag_hi, etag_lo, 0) {
+                            Ok(vid) => put_ok_response(&final_etag_hex, Some(&vid)),
+                            Err(r) => r,
+                        });
+                    }
                     Ok(finish_put(&state, b_id, &key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex))
                 }
 
                 Method::GET | Method::HEAD => {
+                    // Versions (#31): `?versionId=`, or a key with a history (its current
+                    // version may be a delete marker, and the answer carries the version id).
+                    let vid = query_map.get("versionId").map(|s| s.as_str());
+                    if vid.is_some() || state.versions.read().has(b_id, &key) {
+                        let range = req.headers().get("Range").and_then(|v| v.to_str().ok());
+                        return Ok(version_get_response(&state, b_id, &key, vid, method == Method::HEAD, range));
+                    }
                     let (meta, is_multipart) = {
                         let engine = state.engine.read();
                         let m = match engine.get_object(b_id, key.as_bytes()) {
@@ -2621,6 +3257,7 @@ async fn handle_s3_inner(
                         let flags = unpack_flags(m.bucket_flags);
                         (m, flags & AWAN_FLAG_MULTIPART != 0)
                     };
+                    let is_compressed = unpack_flags(meta.bucket_flags) & crate::meta_index::FLAG_COMPRESSED != 0;
 
                     let etag_val = if is_multipart {
                         let part_count = unpack_part_count(meta.bucket_flags);
@@ -2725,6 +3362,11 @@ async fn handle_s3_inner(
                                     } else {
                                         return Ok(internal_error_response(&key, "the multipart object's part list is missing"));
                                     }
+                                } else if is_compressed {
+                                    match state.load_compressed_range(b_id, meta.vol_offset, meta.size, range.start, range.end) {
+                                        Ok(b) => b,
+                                        Err(e) => return Ok(internal_error_response(&key, &format!("could not read the object: {:?}", e))),
+                                    }
                                 } else {
                                     let full = match state.load_payload(b_id, meta.vol_offset, meta.size as usize) {
                                         Ok(b) => b,
@@ -2805,9 +3447,11 @@ async fn handle_s3_inner(
                         state
                             .single_flight
                             .execute_or_join(&single_flight_key, || async move {
-                                state_for_read
-                                    .load_payload(b_id, meta.vol_offset, meta.size as usize)
-                                    .unwrap_or_default()
+                                if is_compressed {
+                                    state_for_read.load_compressed(b_id, meta.vol_offset, meta.size).unwrap_or_default()
+                                } else {
+                                    state_for_read.load_payload(b_id, meta.vol_offset, meta.size as usize).unwrap_or_default()
+                                }
                             })
                             .await
                     };
@@ -2829,14 +3473,30 @@ async fn handle_s3_inner(
                 }
 
                 Method::DELETE => {
-                    if let Err(e) = state.delete_key(b_id, &key).await {
-                        return Ok(internal_error_response(&key, &e));
+                    if let Some(vid) = query_map.get("versionId") {
+                        let Some(id) = crate::versions::parse_id(vid) else {
+                            return Ok(no_such_version(&key));
+                        };
+                        return Ok(match state.delete_version(b_id, &key, id).await {
+                            Ok(removed) => {
+                                let mut b = Response::builder().status(StatusCode::NO_CONTENT).header(CONTENT_LENGTH, "0").header("x-amz-version-id", vid.as_str());
+                                if removed.is_some_and(|v| v.marker) {
+                                    b = b.header("x-amz-delete-marker", "true");
+                                }
+                                b.body(empty_body()).unwrap()
+                            }
+                            Err(e) => internal_error_response(&key, &e),
+                        });
                     }
-                    Ok(Response::builder()
-                        .status(StatusCode::NO_CONTENT)
-                        .header(CONTENT_LENGTH, "0")
-                        .body(empty_body())
-                        .unwrap())
+                    let marker = match state.delete_key(b_id, &key).await {
+                        Ok(m) => m,
+                        Err(e) => return Ok(internal_error_response(&key, &e)),
+                    };
+                    let mut b = Response::builder().status(StatusCode::NO_CONTENT).header(CONTENT_LENGTH, "0");
+                    if let Some(m) = marker {
+                        b = b.header("x-amz-delete-marker", "true").header("x-amz-version-id", m);
+                    }
+                    Ok(b.body(empty_body()).unwrap())
                 }
 
                 _ => {

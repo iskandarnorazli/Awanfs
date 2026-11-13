@@ -18,6 +18,9 @@
 //! Condition, Principal, NotAction or NotResource are refused when the file is loaded, because
 //! ignoring them would grant more than written. The file is reloaded when it changes (checked
 //! every 60 s) and on SIGHUP (Unix); a reload that fails keeps the users already loaded.
+//!
+//! The same file holds per-bucket settings (#51): `[[buckets]]` with `name` and
+//! `compression = "zstd"` or `"none"` (the default).
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -30,6 +33,17 @@ use std::time::SystemTime;
 struct ConfigFile {
     #[serde(default)]
     users: Vec<UserEntry>,
+    #[serde(default)]
+    buckets: Vec<BucketEntry>,
+}
+
+/// Per-bucket settings (#51, owner decision 22): `compression = "zstd"` or `"none"`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BucketEntry {
+    name: String,
+    #[serde(default)]
+    compression: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -142,13 +156,19 @@ fn parse_policy(text: &str) -> Result<Vec<Statement>, String> {
     Ok(out)
 }
 
-/// The users of one config file, by access key.
+/// The users of one config file, by access key, and its per-bucket settings.
 #[derive(Debug, Default)]
 pub struct Iam {
     users: HashMap<String, User>,
+    compressed: std::collections::HashSet<String>,
 }
 
 impl Iam {
+    /// Whether new objects in `bucket` are compressed (#51).
+    pub fn compresses(&self, bucket: &str) -> bool {
+        self.compressed.contains(bucket)
+    }
+
     pub fn parse(text: &str) -> Result<Self, String> {
         let file: ConfigFile = toml::from_str(text).map_err(|e| format!("config: {}", e))?;
         let mut users = HashMap::new();
@@ -161,7 +181,17 @@ impl Iam {
                 return Err(format!("access key of user {} is used twice", u.name));
             }
         }
-        Ok(Iam { users })
+        let mut compressed = std::collections::HashSet::new();
+        for b in file.buckets {
+            match b.compression.as_deref() {
+                Some("zstd") => {
+                    compressed.insert(b.name);
+                }
+                None | Some("none") => {}
+                Some(other) => return Err(format!("bucket {}: compression must be \"zstd\" or \"none\", not {:?}", b.name, other)),
+            }
+        }
+        Ok(Iam { users, compressed })
     }
 
     /// Reads a config file; on Unix it must not be readable or writable by group or others.
