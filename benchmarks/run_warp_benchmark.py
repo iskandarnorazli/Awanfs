@@ -507,6 +507,11 @@ def run_workload_phase(
     lat_lock = threading.Lock()
     total_bytes = 0
     bytes_lock = threading.Lock()
+    # A response that is not a success is an error, not an operation: counting it as an op
+    # made a run in which every request answered 404 read as a fast run (#127, runs
+    # 43504508701 and 43504519493: 532 ops/s at 0.00 MiB/s).
+    errors = 0
+    error_statuses: Dict[int, int] = {}
 
     # The warm-up writes every key the workers will read: concurrency x keys PUTs, one at a
     # time. Each connection has a 10 s socket timeout and a failure used to be swallowed and the
@@ -549,9 +554,10 @@ def run_workload_phase(
           + (f", gave up after {warmup_timeout_sec:.0f}s" if warm_short else ""), flush=True)
 
     def worker(worker_id: int):
-        nonlocal total_bytes
+        nonlocal total_bytes, errors
         local_lats: List[float] = []
         local_bytes = 0
+        local_errors: Dict[int, int] = {}
         req_count = 0
         conn = http.client.HTTPConnection(host, port, timeout=10.0)
         put_headers = {"Content-Length": str(payload_size), "Connection": "keep-alive"}
@@ -569,36 +575,44 @@ def run_workload_phase(
                     conn.request("PUT", path, body=payload, headers=put_headers)
                     resp = conn.getresponse()
                     resp.read()
-                    if resp.status == 200:
+                    ok = resp.status == 200
+                    if ok:
                         local_bytes += payload_size
                 elif mode == "range_get_4k":
                     conn.request("GET", path, headers=range_headers)
                     resp = conn.getresponse()
                     data = resp.read()
-                    if resp.status in (200, 206):
+                    ok = resp.status in (200, 206)
+                    if ok:
                         local_bytes += len(data)
                 elif mode == "mixed":
                     if req_count % 5 == 0:
                         conn.request("PUT", path, body=payload, headers=put_headers)
                         resp = conn.getresponse()
                         resp.read()
-                        if resp.status == 200:
+                        ok = resp.status == 200
+                        if ok:
                             local_bytes += payload_size
                     else:
                         conn.request("GET", path, headers=get_headers)
                         resp = conn.getresponse()
                         data = resp.read()
-                        if resp.status == 200:
+                        ok = resp.status == 200
+                        if ok:
                             local_bytes += len(data)
                 else:
                     conn.request("GET", path, headers=get_headers)
                     resp = conn.getresponse()
                     data = resp.read()
-                    if resp.status == 200:
+                    ok = resp.status == 200
+                    if ok:
                         local_bytes += len(data)
 
                 t1 = time.perf_counter()
-                local_lats.append((t1 - t0) * 1000.0)
+                if ok:
+                    local_lats.append((t1 - t0) * 1000.0)
+                else:
+                    local_errors[resp.status] = local_errors.get(resp.status, 0) + 1
             except Exception:
                 try:
                     conn.close()
@@ -615,6 +629,9 @@ def run_workload_phase(
             latencies.extend(local_lats)
         with bytes_lock:
             total_bytes += local_bytes
+            for st, n in local_errors.items():
+                errors += n
+                error_statuses[st] = error_statuses.get(st, 0) + n
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(concurrency)]
     t_start = time.perf_counter()
@@ -641,9 +658,11 @@ def run_workload_phase(
         p99_ms=p99,
         p999_ms=p999,
         peak_rss_mb=peak_rss,
-        measured=not stuck and not warm_short and warm_fail == 0,
+        measured=not stuck and not warm_short and warm_fail == 0 and errors == 0,
         note=", ".join(
             x for x in (
+                f"{errors} requests failed ({', '.join(f'HTTP {k} x{v}' for k, v in sorted(error_statuses.items()))})"
+                if errors else "",
                 f"{stuck} workers did not finish their request" if stuck else "",
                 f"warm-up wrote {warm_ok} of {want} objects" if warm_short or warm_fail else "",
                 f"last warm-up error: {last_error}" if last_error else "",

@@ -232,5 +232,62 @@ class ServerOutputIsNotAPipe(unittest.TestCase):
                 self.assertEqual(src.count(bad), 0, f"{os.path.basename(path)} uses {bad}")
 
 
+
+class FailedResponsesAreErrors(unittest.TestCase):
+    """A run in which every request answered 404 was reported as 532 ops/s at 0.00 MiB/s and
+    passed a memory check (#127, runs 43504508701 and 43504519493). A failed response is an
+    error, not an operation."""
+
+    def serve(self, get_status: int):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_PUT(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(n)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self):
+                body = b"x" * 1024 if get_status == 200 else b"<Error/>"
+                self.send_response(get_status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    def run_get_phase(self, status):
+        import run_warp_benchmark as r
+        srv = self.serve(status)
+        try:
+            return r.run_workload_phase("127.0.0.1", srv.server_address[1], "bkt", 1024, 2, 0.5, "get",
+                                        server_pid=None, warmup_timeout_sec=10.0)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_a_phase_whose_requests_all_fail_reports_no_operations_and_is_not_measured(self):
+        m = self.run_get_phase(404)
+        self.assertEqual(m.ops_per_sec, 0.0, "a 404 is not an operation")
+        self.assertFalse(m.measured)
+        self.assertIn("HTTP 404", m.note)
+
+    def test_a_phase_whose_requests_succeed_is_measured(self):
+        m = self.run_get_phase(200)
+        self.assertGreater(m.ops_per_sec, 0.0)
+        self.assertGreater(m.mib_per_sec, 0.0)
+        self.assertTrue(m.measured, m.note)
+
+
 if __name__ == "__main__":
     unittest.main()
