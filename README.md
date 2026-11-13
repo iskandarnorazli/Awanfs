@@ -17,7 +17,9 @@ Read this before you run it anywhere that matters. Plan of record: the Phase 1-4
 - **Volumes** of 32 GiB, rolled over when full (#37), compacted in the background when at least 20 % is dead (#14), at most 50 MB/s (`--compaction-rate`, #28).
 - **Bodies:** a PUT or UploadPart above 4 MiB streams to disk, `aws-chunked` included (#36); bodies above 5 GiB get 400 `EntityTooLarge` before they are read. Multipart GETs stream part by part.
 - **Observability:** request logs with request IDs; OTLP/HTTP traces with `--otlp-endpoint` (#43).
-- **Not yet:** replication and erasure coding across nodes, bucket policies and ACLs, object lock.
+- **Versioning** per bucket (#31) and opt-in **zstd compression** per bucket in the config file (#51), both format 2 (`FORMAT.md`).
+- **Conformance:** the ceph s3-tests suite passes 244 of 838 tests (94 skipped), checked nightly; the tracker is #123.
+- **Not yet:** replication and erasure coding across nodes, bucket policies and ACLs, object lock, server-side encryption, tagging, CORS (all in #123's area issues).
 
 ## 1. Executive Summary
 
@@ -58,7 +60,24 @@ Read this before you run it anywhere that matters. Plan of record: the Phase 1-4
 
 ---
 
-## 2. Live Measured 3-Way Benchmark Results (Awan vs MinIO vs RustFS)
+## 2. Benchmarks
+
+### Nightly ratio to MinIO (both servers sync every PUT)
+
+GitHub-hosted ubuntu-latest, 4 CPUs, 2026-11-13: 5 runs per server in alternating order, medians of 3 s phases ([`measurements/ratio_2026-11-13.md`](measurements/ratio_2026-11-13.md), command inside).
+
+| Workload | Clients | AwanFS MiB/s | MinIO MiB/s | AwanFS / MinIO |
+|---|---|---|---|---|
+| PUT 64 KiB | 16 | 156.3 | 49.7 | 3.15x |
+| GET 64 KiB | 16 | 418.6 | 229.2 | 1.83x |
+| Range GET 4 KiB | 16 | 33.7 | 17.9 | 1.88x |
+| Mixed 64 KiB | 16 | 294.7 | 138.1 | 2.13x |
+| PUT 1 MiB | 8 | 169.0 | 155.7 | 1.08x |
+| GET 1 MiB | 8 | 4,086.9 | 2,402.6 | 1.70x |
+
+Peak RSS over the six workloads: AwanFS 117 MiB, MinIO 560 MiB (both include reclaimable pages of mapped files). One shared 4-CPU VM and short phases: these are ratios on identical hardware, not absolute numbers (#58).
+
+### Earlier laptop run (2026-11-11, before durable PUTs)
 
 > **Provisional.** These are real measurements from one laptop run, but they do not yet support a general "faster than MinIO" claim: PUT rows compare an unsynced AwanFS write with MinIO's synced one, the data set fits in memory, each phase ran 2 s once, and MinIO and RustFS ran in single-drive default setups. #58 tracks the benchmark that would support or refute the claim. The nightly CI runs (`.github/workflows/bench-full.yml`, `bench-ratio.yml`) track regressions.
 
