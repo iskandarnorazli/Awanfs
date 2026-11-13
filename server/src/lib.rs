@@ -6,6 +6,7 @@ pub mod cache;
 pub mod cluster;
 pub mod coalesce;
 pub mod compaction;
+pub mod compress;
 pub mod digest;
 pub mod direct_io;
 pub mod erasure;

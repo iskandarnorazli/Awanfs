@@ -24,7 +24,7 @@ pub const SUPERBLOCK_MAGIC: u32 = 0x53555042; // "SUPB"
 /// superblock at bytes 20..24. Volumes written before the field existed hold 0 there and are
 /// format 1. A newer version is refused, an older one read as it is; nothing is upgraded in
 /// place. Layout: FORMAT.md.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// The format a superblock records (0 = written before the field, i.e. format 1).
 pub fn superblock_format(super_buf: &[u8]) -> u32 {
@@ -363,6 +363,8 @@ pub struct VolumeManager {
     fail_next_write: std::sync::atomic::AtomicBool,
     /// Needle offsets from the `.idx` journal at open time.
     indexed: BTreeSet<u64>,
+    /// Format version in the superblock: what the needles of this volume may use (FORMAT.md).
+    format: u32,
     /// A second handle on the journal, so a sync does not hold the append lock.
     idx_sync: File,
     durability: std::sync::atomic::AtomicU8,
@@ -436,6 +438,7 @@ impl VolumeManager {
 
         // Run Crash Recovery Scan
         let mut scan_offset = SECTOR_SIZE as u64;
+        let mut format = FORMAT_VERSION;
 
         if file_len < SECTOR_SIZE as u64 {
             // Corrupt superblock or empty file, rewrite superblock
@@ -457,6 +460,7 @@ impl VolumeManager {
             if found > FORMAT_VERSION {
                 return Err(VolumeError::UnsupportedFormat { found, supported: FORMAT_VERSION });
             }
+            format = found;
 
             // Scan valid needles
             let mut read_buf = AlignedBuffer::new(SECTOR_SIZE);
@@ -546,7 +550,25 @@ impl VolumeManager {
             work: Arc::new(WorkCounters::default()),
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
             indexed,
+            format,
         })
+    }
+
+    /// The volume's format version (1 or 2). Compressed needles (#51) need 2.
+    pub fn format(&self) -> u32 {
+        self.format
+    }
+
+    /// The first `n` payload bytes of the needle at `local`, from its first sector.
+    pub fn payload_prefix(&self, local: u64, key_len: usize, n: usize) -> Result<Vec<u8>, VolumeError> {
+        let start = 64 + key_len;
+        if start + n > SECTOR_SIZE {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let mut buf = AlignedBuffer::new(SECTOR_SIZE);
+        self.work.disk_read();
+        self.file.read_aligned_at(local, &mut buf)?;
+        Ok(buf[start..start + n].to_vec())
     }
 
     /// Fault injection for tests: the next `write_needle` reserves its offset and then fails,
