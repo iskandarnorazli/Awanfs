@@ -47,5 +47,18 @@ class CompareTests(unittest.TestCase):
         self.assertTrue(md.startswith("Command: `python benchmarks/ratio_check.py --runs 5`"))
 
 
+class RssTable(unittest.TestCase):
+    def test_peak_rss_is_reported_when_both_servers_have_it(self):
+        rows = [("get_64k", 1.5, 1.4, "ok")]
+        md = rc.render(rows, {"get_64k": [150.0]}, {"get_64k": [100.0]}, "cmd", 1, {"awanfs": [80.0, 100.0, 90.0], "minio": [300.0]})
+        self.assertIn("| AwanFS | 90.0 |", md)
+        self.assertIn("| MinIO | 300.0 |", md)
+
+    def test_no_rss_table_without_numbers(self):
+        rows = [("get_64k", 1.5, 1.4, "ok")]
+        md = rc.render(rows, {"get_64k": [150.0]}, {"get_64k": [100.0]}, "cmd", 1, {"awanfs": [], "minio": [300.0]})
+        self.assertNotIn("peak RSS", md)
+
+
 if __name__ == "__main__":
     unittest.main()
