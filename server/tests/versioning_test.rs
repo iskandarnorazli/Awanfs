@@ -114,20 +114,20 @@ fn entries(xml: &str) -> Vec<(String, String, String, bool)> {
 /// What the gate checks after the delete, before and after the kill.
 async fn check_after_delete(c: &reqwest::Client, url: &str, ids: &[String], marker: &str) {
     for (i, v) in ids.iter().enumerate() {
-        let (status, body) = get_version(c, url, "vb/k", v).await;
+        let (status, body) = get_version(c, url, "vbkt/k", v).await;
         assert_eq!(status, StatusCode::OK, "version {}", v);
         assert_eq!(body, format!("body {}", i + 1).as_bytes(), "version {}", v);
     }
-    let res = c.get(format!("{}/vb/k", url)).send().await.unwrap();
+    let res = c.get(format!("{}/vbkt/k", url)).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND, "the key is deleted");
     assert_eq!(res.headers().get("x-amz-delete-marker").map(|h| h.to_str().unwrap()), Some("true"));
-    let (status, _) = get_version(c, url, "vb/k", marker).await;
+    let (status, _) = get_version(c, url, "vbkt/k", marker).await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "GET of a delete marker by id");
-    let (status, body) = get_version(c, url, "vb/k", "00000000000000000001").await;
+    let (status, body) = get_version(c, url, "vbkt/k", "00000000000000000001").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(String::from_utf8_lossy(&body).contains("NoSuchVersion"));
 
-    let listed = entries(&list_versions(c, url, "vb").await);
+    let listed = entries(&list_versions(c, url, "vbkt").await);
     let want: Vec<(String, String, String, bool)> = vec![
         ("DeleteMarker".into(), "k".into(), marker.to_string(), true),
         ("Version".into(), "k".into(), ids[2].clone(), false),
@@ -142,23 +142,23 @@ async fn three_versions_a_delete_marker_and_a_killed_process() {
     let dir = temp_dir("gate");
     let c = reqwest::Client::new();
     let (mut child, url) = start_binary(&dir).await;
-    assert_eq!(c.put(format!("{}/vb", url)).send().await.unwrap().status(), StatusCode::OK);
-    let res = c.get(format!("{}/vb?versioning", url)).send().await.unwrap();
+    assert_eq!(c.put(format!("{}/vbkt", url)).send().await.unwrap().status(), StatusCode::OK);
+    let res = c.get(format!("{}/vbkt?versioning", url)).send().await.unwrap();
     assert!(!res.text().await.unwrap().contains("<Status>"), "a new bucket has no versioning status");
-    set_versioning(&c, &url, "vb", "Enabled").await;
-    let res = c.get(format!("{}/vb?versioning", url)).send().await.unwrap();
+    set_versioning(&c, &url, "vbkt", "Enabled").await;
+    let res = c.get(format!("{}/vbkt?versioning", url)).send().await.unwrap();
     assert!(res.text().await.unwrap().contains("<Status>Enabled</Status>"));
 
     let mut ids = Vec::new();
     for i in 1..=3 {
-        ids.push(put(&c, &url, "vb/k", format!("body {}", i).as_bytes()).await);
+        ids.push(put(&c, &url, "vbkt/k", format!("body {}", i).as_bytes()).await);
     }
     assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != "null", "{:?}", ids);
-    let res = c.get(format!("{}/vb/k", url)).send().await.unwrap();
+    let res = c.get(format!("{}/vbkt/k", url)).send().await.unwrap();
     assert_eq!(version_id(&res), ids[2]);
     assert_eq!(res.bytes().await.unwrap(), &b"body 3"[..]);
 
-    let res = c.delete(format!("{}/vb/k", url)).send().await.unwrap();
+    let res = c.delete(format!("{}/vbkt/k", url)).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
     assert_eq!(res.headers().get("x-amz-delete-marker").map(|h| h.to_str().unwrap()), Some("true"));
     let marker = version_id(&res);
@@ -169,21 +169,21 @@ async fn three_versions_a_delete_marker_and_a_killed_process() {
     check_after_delete(&c, &url, &ids, &marker).await;
 
     // Deleting the marker brings version 3 back; deleting version 2 removes it for good.
-    let res = c.delete(format!("{}/vb/k?versionId={}", url, marker)).send().await.unwrap();
+    let res = c.delete(format!("{}/vbkt/k?versionId={}", url, marker)).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
     assert_eq!(version_id(&res), marker);
-    let res = c.delete(format!("{}/vb/k?versionId={}", url, ids[1])).send().await.unwrap();
+    let res = c.delete(format!("{}/vbkt/k?versionId={}", url, ids[1])).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
     let after = |url: String| {
         let c = c.clone();
         let ids = ids.clone();
         async move {
-            let res = c.get(format!("{}/vb/k", url)).send().await.unwrap();
+            let res = c.get(format!("{}/vbkt/k", url)).send().await.unwrap();
             assert_eq!(res.bytes().await.unwrap(), &b"body 3"[..], "the marker is gone");
-            let (status, body) = get_version(&c, &url, "vb/k", &ids[1]).await;
+            let (status, body) = get_version(&c, &url, "vbkt/k", &ids[1]).await;
             assert_eq!(status, StatusCode::NOT_FOUND);
             assert!(String::from_utf8_lossy(&body).contains("NoSuchVersion"));
-            let listed: Vec<String> = entries(&list_versions(&c, &url, "vb").await).into_iter().map(|e| e.2).collect();
+            let listed: Vec<String> = entries(&list_versions(&c, &url, "vbkt").await).into_iter().map(|e| e.2).collect();
             assert_eq!(listed, vec![ids[2].clone(), ids[0].clone()]);
         }
     };
@@ -200,18 +200,18 @@ async fn a_version_delete_survives_a_kill() {
     let dir = temp_dir("vdel");
     let c = reqwest::Client::new();
     let (mut child, url) = start_binary(&dir).await;
-    assert_eq!(c.put(format!("{}/vb", url)).send().await.unwrap().status(), StatusCode::OK);
-    set_versioning(&c, &url, "vb", "Enabled").await;
-    let a = put(&c, &url, "vb/k", b"a").await;
-    let b = put(&c, &url, "vb/k", b"b").await;
-    let res = c.delete(format!("{}/vb/k?versionId={}", url, b)).send().await.unwrap();
+    assert_eq!(c.put(format!("{}/vbkt", url)).send().await.unwrap().status(), StatusCode::OK);
+    set_versioning(&c, &url, "vbkt", "Enabled").await;
+    let a = put(&c, &url, "vbkt/k", b"a").await;
+    let b = put(&c, &url, "vbkt/k", b"b").await;
+    let res = c.delete(format!("{}/vbkt/k?versionId={}", url, b)).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
     child.kill();
     let (mut child, url) = start_binary(&dir).await;
-    let res = c.get(format!("{}/vb/k", url)).send().await.unwrap();
+    let res = c.get(format!("{}/vbkt/k", url)).send().await.unwrap();
     assert_eq!(version_id(&res), a, "deleting the latest version makes the one before it current");
     assert_eq!(res.bytes().await.unwrap(), &b"a"[..]);
-    assert_eq!(get_version(&c, &url, "vb/k", &b).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(get_version(&c, &url, "vbkt/k", &b).await.0, StatusCode::NOT_FOUND);
     child.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -231,14 +231,14 @@ async fn compaction_keeps_every_version_and_their_order() {
     {
         let (url, handle, st) = spawn(&dir).await;
         st.set_volume_span(64 * 1024);
-        assert_eq!(c.put(format!("{}/vb", url)).send().await.unwrap().status(), StatusCode::OK);
-        set_versioning(&c, &url, "vb", "Enabled").await;
+        assert_eq!(c.put(format!("{}/vbkt", url)).send().await.unwrap().status(), StatusCode::OK);
+        set_versioning(&c, &url, "vbkt", "Enabled").await;
         // 6 versions of 20 KB: they spread over several volumes.
         for i in 0..6 {
-            ids.push(put(&c, &url, "vb/k", &vec![b'a' + i as u8; 20_000]).await);
+            ids.push(put(&c, &url, "vbkt/k", &vec![b'a' + i as u8; 20_000]).await);
         }
         // An unrelated overwrite leaves dead needles to reclaim.
-        put(&c, &url, "vb/other", b"x").await;
+        put(&c, &url, "vbkt/other", b"x").await;
         // Compact every volume that existed before the active one. With all versions live,
         // each compaction fills new volumes, so "until nothing is left" would never end.
         let volumes = std::fs::read_dir(&dir).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".dat")).count();
@@ -247,18 +247,18 @@ async fn compaction_keeps_every_version_and_their_order() {
             assert!(st.compact_oldest_volume().await.unwrap().volume_removed, "compaction {} removed its volume", i);
         }
         for (i, v) in ids.iter().enumerate() {
-            assert_eq!(get_version(&c, &url, "vb/k", v).await.1, vec![b'a' + i as u8; 20_000], "version {} after compaction", i);
+            assert_eq!(get_version(&c, &url, "vbkt/k", v).await.1, vec![b'a' + i as u8; 20_000], "version {} after compaction", i);
         }
         handle.shutdown();
     }
     // Recovery orders versions by id, not by where compaction left their needles.
     let (url, handle, _) = spawn(&dir).await;
-    let res = c.get(format!("{}/vb/k", url)).send().await.unwrap();
+    let res = c.get(format!("{}/vbkt/k", url)).send().await.unwrap();
     assert_eq!(version_id(&res), ids[5], "the newest version is current after the restart");
-    let listed: Vec<String> = entries(&list_versions(&c, &url, "vb").await).into_iter().filter(|e| e.1 == "k").map(|e| e.2).collect();
+    let listed: Vec<String> = entries(&list_versions(&c, &url, "vbkt").await).into_iter().filter(|e| e.1 == "k").map(|e| e.2).collect();
     assert_eq!(listed, ids.iter().rev().cloned().collect::<Vec<_>>());
     for (i, v) in ids.iter().enumerate() {
-        assert_eq!(get_version(&c, &url, "vb/k", v).await.1, vec![b'a' + i as u8; 20_000], "version {} after the restart", i);
+        assert_eq!(get_version(&c, &url, "vbkt/k", v).await.1, vec![b'a' + i as u8; 20_000], "version {} after the restart", i);
     }
     handle.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
@@ -269,24 +269,24 @@ async fn unversioned_and_suspended_buckets_use_the_null_version() {
     let dir = temp_dir("null");
     let c = reqwest::Client::new();
     let (url, handle, _) = spawn(&dir).await;
-    assert_eq!(c.put(format!("{}/nb", url)).send().await.unwrap().status(), StatusCode::OK);
-    let res = c.put(format!("{}/nb/k", url)).body("one").send().await.unwrap();
+    assert_eq!(c.put(format!("{}/nbkt", url)).send().await.unwrap().status(), StatusCode::OK);
+    let res = c.put(format!("{}/nbkt/k", url)).body("one").send().await.unwrap();
     assert!(res.headers().get("x-amz-version-id").is_none(), "no version id before versioning is set");
-    c.put(format!("{}/nb/k", url)).body("two").send().await.unwrap();
-    assert_eq!(get_version(&c, &url, "nb/k", "null").await.1, b"two");
-    let listed = entries(&list_versions(&c, &url, "nb").await);
+    c.put(format!("{}/nbkt/k", url)).body("two").send().await.unwrap();
+    assert_eq!(get_version(&c, &url, "nbkt/k", "null").await.1, b"two");
+    let listed = entries(&list_versions(&c, &url, "nbkt").await);
     assert_eq!(listed, vec![("Version".to_string(), "k".to_string(), "null".to_string(), true)]);
 
     // Enable, write a version, suspend: new writes are the null version and replace only it.
-    set_versioning(&c, &url, "nb", "Enabled").await;
-    let v = put(&c, &url, "nb/k", b"three").await;
-    set_versioning(&c, &url, "nb", "Suspended").await;
-    assert_eq!(put(&c, &url, "nb/k", b"four").await, "null");
-    assert_eq!(put(&c, &url, "nb/k", b"five").await, "null");
-    let listed: Vec<(String, bool)> = entries(&list_versions(&c, &url, "nb").await).into_iter().map(|e| (e.2, e.3)).collect();
+    set_versioning(&c, &url, "nbkt", "Enabled").await;
+    let v = put(&c, &url, "nbkt/k", b"three").await;
+    set_versioning(&c, &url, "nbkt", "Suspended").await;
+    assert_eq!(put(&c, &url, "nbkt/k", b"four").await, "null");
+    assert_eq!(put(&c, &url, "nbkt/k", b"five").await, "null");
+    let listed: Vec<(String, bool)> = entries(&list_versions(&c, &url, "nbkt").await).into_iter().map(|e| (e.2, e.3)).collect();
     assert_eq!(listed, vec![("null".to_string(), true), (v.clone(), false)], "one null version, the enabled-era version kept");
-    assert_eq!(get_version(&c, &url, "nb/k", &v).await.1, b"three");
-    assert_eq!(get_version(&c, &url, "nb/k", "null").await.1, b"five");
+    assert_eq!(get_version(&c, &url, "nbkt/k", &v).await.1, b"three");
+    assert_eq!(get_version(&c, &url, "nbkt/k", "null").await.1, b"five");
     handle.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
