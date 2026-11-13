@@ -36,7 +36,10 @@ jobs:
           for i in $(seq 1 50); do curl -sf http://127.0.0.1:9000/_awanfs/health/ready && break; sleep 0.2; done
       - name: Get s3-tests
         run: |
-          git clone -q --depth 1 https://github.com/ceph/s3-tests /tmp/s3-tests
+          # Pinned: the ratchet (tests/s3tests/passing.txt) names tests of this commit. Bump it on
+          # purpose, in its own PR, and re-record the list from that run.
+          S3TESTS_COMMIT=5b3987116eca0b4b8fa57d6b10f3db57bab196b6
+          git init -q /tmp/s3-tests && git -C /tmp/s3-tests fetch -q --depth 1 https://github.com/ceph/s3-tests "$S3TESTS_COMMIT" && git -C /tmp/s3-tests checkout -q FETCH_HEAD
           echo "s3-tests commit: $(git -C /tmp/s3-tests rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
           python3 -m venv /tmp/venv
           /tmp/venv/bin/pip install -q -r /tmp/s3-tests/requirements.txt pytest-timeout
