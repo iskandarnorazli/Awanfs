@@ -89,15 +89,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // config restricts. Refuse the combination rather than serve that. --allow-anonymous on its
     // own is still allowed: the startup message below says what it means. A policy model for
     // public access is #122.
-    if has_users && auth.allow_anonymous {
-        eprintln!(
-            "--allow-anonymous with users in --config: unsigned requests are not checked against \
-             any policy, so anyone who can reach the port would get more access than the users \
-             you restricted. Serve the users without --allow-anonymous, or drop --config to run \
-             an open server."
-        );
-        std::process::exit(2);
-    }
     if auth.credentials.is_none() && !has_users && !auth.allow_anonymous {
         eprintln!("No credentials: set AWANFS_ACCESS_KEY and AWANFS_SECRET_KEY, give users in --config, or pass --allow-anonymous to let anyone who can reach the port read, write and delete.");
         std::process::exit(2);
