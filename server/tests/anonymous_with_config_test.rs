@@ -62,7 +62,7 @@ fn run_until_exit(dir: &Path, extra: &[&str], env: &[(&str, &str)]) -> Option<(i
     }
     // A server that starts stays up forever, so poll and kill instead of waiting.
     let mut child = Server(cmd.spawn().expect("spawn s3-server"));
-    let deadline = Instant::now() + Duration::from_secs(25);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         match child.0.try_wait().expect("try_wait") {
             Some(st) => break Some(st),
@@ -70,6 +70,13 @@ fn run_until_exit(dir: &Path, extra: &[&str], env: &[(&str, &str)]) -> Option<(i
             None => std::thread::sleep(Duration::from_millis(50)),
         }
     };
+    // A server that is still running holds its stderr open, so reading it to the end would wait
+    // for an exit that only Drop brings: the first version of this helper deadlocked here and
+    // both Test jobs hit their 30-minute timeout. Kill it first, then read what it wrote.
+    if status.is_none() {
+        let _ = child.0.kill();
+        let _ = child.0.wait();
+    }
     let mut err = String::new();
     if let Some(mut pipe) = child.0.stderr.take() {
         let _ = pipe.read_to_string(&mut err);
