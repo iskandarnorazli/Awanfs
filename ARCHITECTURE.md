@@ -72,10 +72,21 @@ Owner decisions after the 2026-11-12 unattended run (#64-#83), each the recommen
 
 | # | Decision | Issues |
 |---|---|---|
-| 36 | **Memory plan first:** payload cache as mmap views, not heap copies; one `--memory-budget`; a cap on request bytes held in memory. Measured by the nightly peak RSS and ratio. Conformance quick wins (#111-#114) come after. | #57, #111-#114 |
+| 36 | **Memory plan first:** one `--memory-budget`; a cap on request bytes held in memory; the nightly ratio run enforces an RSS ceiling. Conformance quick wins (#111-#114) come after. | #57, #111-#114 |
 | 37 | **Object lock: governance and compliance modes, plus legal hold**, as S3 defines them, on top of versioning (#31). | #120 |
 | 38 | **Encryption: SSE-S3 with a local master key that wraps per-object keys, and SSE-C;** SSE-KMS through an external service later. | #121 |
 | 39 | **Access: bucket policies (on the #53 evaluator), canned ACLs and the public access block;** no per-grantee ACL grants. | #122 |
+
+**Correction to 36 (2026-11-13, measured).** The plan's first item, a payload cache holding views
+of the volume mapping instead of heap copies of request bodies, was implemented (#126), merged and
+then reverted. Its premise was wrong: AwanFS writes volumes with direct I/O, so written bytes are
+not in the OS page cache, and reading a payload back through the mapping to cache a view of it
+faults every byte in from disk. Peak RSS over the ratio workloads went from 117.0 MiB
+(run 43400978818) to 2258.9 MiB (run 43413585215) on github `ubuntu-latest`. The cache keeps the
+request's buffer, bounded per object and in total. The lesson is in the gate: #126's gate checked
+the mechanism (a pointer inside the mapping) and not the outcome (RSS), and the nightly run
+recorded peak RSS without checking it. `benchmarks/ratio_baseline.json` now carries
+`rss_ceiling_mib` and the run fails over it.
 
 Tests follow two rules: no wall-clock thresholds, and a test that fails before the change it guards.
 

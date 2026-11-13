@@ -60,5 +60,50 @@ class RssTable(unittest.TestCase):
         self.assertNotIn("peak RSS", md)
 
 
+
+class RssCeiling(unittest.TestCase):
+    """The ceiling the nightly ratio run enforces. The numbers are the measured ones: 117.0 MiB
+    on github ubuntu-latest (run 43400978818), and 2258.9 MiB with the PUT path caching views of
+    the volume mapping (#126, reverted; run 43413585215)."""
+
+    CEIL = {"tolerance": 0.20, "rss_ceiling_mib": 250, "ratios": {"get_64k": 1.5}}
+
+    def test_measured_rss_is_under_the_ceiling(self):
+        med, ceiling, bad = rc.check_rss({"awanfs": [117.0, 117.9], "minio": [559.8]}, self.CEIL)
+        self.assertEqual(bad, [])
+        self.assertEqual(ceiling, 250)
+        self.assertAlmostEqual(med, 117.45)
+
+    def test_the_126_regression_fails_the_run(self):
+        _, _, bad = rc.check_rss({"awanfs": [2258.9], "minio": [569.5]}, self.CEIL)
+        self.assertEqual(len(bad), 1)
+        self.assertIn("2258.9", bad[0])
+        self.assertIn("250.0", bad[0])
+
+    def test_a_baseline_without_a_ceiling_only_reports(self):
+        med, ceiling, bad = rc.check_rss({"awanfs": [9999.0], "minio": [1.0]}, {"tolerance": 0.2})
+        self.assertEqual((ceiling, bad), (None, []))
+        self.assertEqual(med, 9999.0)
+
+    def test_the_report_names_the_verdict_and_the_ceiling(self):
+        rows = [("get_64k", 1.5, 1.4, "ok")]
+        over = rc.render(rows, {"get_64k": [150.0]}, {"get_64k": [100.0]}, "cmd", 1,
+                         {"awanfs": [2258.9], "minio": [569.5]}, 250)
+        self.assertIn("| AwanFS | 2258.9 | OVER THE CEILING |", over)
+        under = rc.render(rows, {"get_64k": [150.0]}, {"get_64k": [100.0]}, "cmd", 1,
+                          {"awanfs": [117.0], "minio": [559.8]}, 250)
+        self.assertIn("| AwanFS | 117.0 | ok |", under)
+        self.assertIn("Ceiling 250.0 MiB", under)
+
+    def test_the_committed_baseline_carries_a_ceiling(self):
+        import json
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "ratio_baseline.json"), encoding="utf-8") as fh:
+            base = json.load(fh)
+        self.assertIn("rss_ceiling_mib", base)
+        _, _, bad = rc.check_rss({"awanfs": [2258.9], "minio": [1.0]}, base)
+        self.assertEqual(len(bad), 1, "the committed ceiling must catch the measured regression")
+
+
 if __name__ == "__main__":
     unittest.main()
