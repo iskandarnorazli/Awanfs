@@ -8,7 +8,7 @@ volume from this document, byte by byte, and checks the server still serves it.
 | Version | Adds |
 |---|---|
 | 1 | The layout below. |
-| 2 | Compressed needles (flag 0x20, #51). New volumes are written as format 2; a compressed needle is never written to a format 1 volume (the server opens a new volume first), so an older AwanFS never serves compressed bytes as an object. |
+| 2 | Compressed needles (flag 0x20, #51) and versions (flags 0x40, 0x80, 0x100, #31). New volumes are written as format 2; a needle with any of these flags is never written to a format 1 volume (the server opens a new volume first), so an older AwanFS never misreads one. |
 
 All integers are little-endian. Sectors are 4096 bytes.
 
@@ -40,7 +40,7 @@ All integers are little-endian. Sectors are 4096 bytes.
 | 0..4 | magic `0x41574E33` ("AWN3") |
 | 4..8 | CRC32C of header bytes 8..64 |
 | 8..12 | CRC32C of the payload |
-| 12..14 | flags: 0x1 active, 0x2 tombstone, 0x4 multipart, 0x8 shared, 0x10 zero-byte, 0x20 compressed (`meta_index.rs`) |
+| 12..14 | flags: 0x1 active, 0x2 tombstone, 0x4 multipart, 0x8 shared, 0x10 zero-byte, 0x20 compressed, 0x40 versioned, 0x80 null version, 0x100 version delete (`meta_index.rs`) |
 | 14..16 | bucket id |
 | 16..18 | key length |
 | 18..20 | reserved |
@@ -77,6 +77,22 @@ index row holds the object's size, which recovery reads from bytes 8..16.
 | then | the blocks, each one zstd frame (level 1), with nothing after the last |
 
 A range GET decodes only the blocks it overlaps.
+
+## Versions (flags 0x40, 0x80, 0x100, format 2)
+
+In a bucket whose versioning was set (`~<id>:Enabled` or `~<id>:Suspended` in
+`buckets.manifest`), every write is a version (#31, `server/src/versions.rs`):
+
+- An object or multipart manifest flagged 0x40 is a version. Its creation time (header bytes
+  36..44, ns) is its id, written as 16 hex digits; compaction keeps that time when it copies
+  the needle. With 0x80 too it is the null version (Suspended buckets) and replaces the
+  previous null version only.
+- A tombstone flagged 0x40 is a delete marker (0x80: the null delete marker).
+- A tombstone flagged 0x100 removes one version: its 8-byte payload is the id (0 for null).
+
+Replay orders the versions of a key by creation time, not by log position: compaction moves
+old versions into newer volumes. A plain needle (none of these flags) of a key with versions
+is its null version.
 
 ## Multipart manifest (payload of a needle flagged multipart)
 
