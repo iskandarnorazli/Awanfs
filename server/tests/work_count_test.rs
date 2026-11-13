@@ -161,3 +161,23 @@ async fn multipart_upload_and_reads() {
     assert_eq!(&body[100..], &p2[..100]);
     assert_eq!(s.since(&before), WorkSnapshot::default(), "range_get across two parts: two slices, no copy");
 }
+
+#[tokio::test]
+async fn streamed_put_is_digested_while_it_is_written() {
+    // #23 (decision 3A): a PUT above 4 MiB with a Content-Length streams to disk in 1 MiB
+    // chunks, digested (MD5, CRC32C) as it goes: no whole-body buffer, one copy into the
+    // aligned chunk buffer. 8 MiB with the key "big": 4029 bytes share sector 0 with the
+    // header, the rest goes out as 8 chunk writes (the last padded to a sector), then the
+    // header sector: 9 writes.
+    let s = Server::start("streamed").await;
+    let len = 8 * 1024 * 1024;
+    let payload = pattern(len, 3);
+
+    let before = s.snap();
+    let res = s.client.put(format!("{}/bkt/big", s.url)).body(payload.clone()).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(s.since(&before), work(9, needle_bytes(3, len as u64), 2, 1, len as u64), "put_8m_streamed");
+
+    let res = s.client.get(format!("{}/bkt/big", s.url)).send().await.unwrap();
+    assert!(res.bytes().await.unwrap() == payload, "the streamed object reads back");
+}
