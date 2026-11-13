@@ -1,0 +1,14 @@
+# Users for the ceph s3-tests run (#47). The main user is the root key from the environment;
+# alt and tenant sign with their own keys (#53). AwanFS has no bucket owners, so both may do
+# everything: tests that expect one user to be kept out of another's bucket fail, as they should.
+[[users]]
+name = "alt"
+access_key = "AWANFSALTKEY00000000"
+secret_key = "awanfs-alt-secret-for-s3-tests-00000000000"
+policy = '{"Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}}'
+
+[[users]]
+name = "tenant"
+access_key = "AWANFSTENANTKEY00000"
+secret_key = "awanfs-tenant-secret-for-s3-tests-0000000"
+policy = '{"Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}}'

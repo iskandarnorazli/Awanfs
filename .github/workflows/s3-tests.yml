@@ -30,8 +30,9 @@ jobs:
       - name: Start AwanFS
         run: |
           mkdir -p /tmp/awanfs-data
+          install -m 600 tests/s3tests/users.toml /tmp/awanfs-users.toml
           AWANFS_ACCESS_KEY=AWANFSMAINKEY0000000 AWANFS_SECRET_KEY=awanfs-main-secret-for-s3-tests-0000000000 AWANFS_LOG=off \
-            nohup server/target/release/s3-server --port 9000 --data-dir /tmp/awanfs-data --auto-compaction off > /tmp/awanfs.log 2>&1 &
+            nohup server/target/release/s3-server --port 9000 --data-dir /tmp/awanfs-data --auto-compaction off --config /tmp/awanfs-users.toml > /tmp/awanfs.log 2>&1 &
           for i in $(seq 1 50); do curl -sf http://127.0.0.1:9000/_awanfs/health/ready && break; sleep 0.2; done
       - name: Get s3-tests
         run: |
