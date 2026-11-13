@@ -262,6 +262,22 @@ def format_markdown_report(
     return "\n".join(lines) + "\n"
 
 
+def start_logged(argv: List[str], log_path: str) -> subprocess.Popen:
+    """Starts `argv` with stdout and stderr appended to `log_path`.
+
+    Never a pipe: a pipe nobody drains fills, and the child blocks on its next write. AwanFS
+    writes one JSON line per request to stderr (main.rs, AWANFS_LOG), about 230 bytes each, so a
+    64 KiB Linux pipe filled after about 271 requests and a 4 KiB Windows pipe after about 16,
+    and the server stopped answering while still holding its port. That was #135. The log file
+    is kept so a failed run can be read.
+    """
+    log = open(log_path, "ab")
+    try:
+        return subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT)
+    finally:
+        log.close()  # the child holds its own handle
+
+
 def get_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -1064,11 +1080,12 @@ def main():
     # Measure S3 Storage Server with Columnar SoA Metadata Index and Needle Volume
     s3_data_dir = tempfile.mkdtemp(prefix="s3_server_bench_")
     port = get_free_port()
-    server_proc = subprocess.Popen(
+    server_log = os.path.join(tempfile.gettempdir(), f"awanfs_bench_{port}.log")
+    server_proc = start_logged(
         [server_bin, "--port", str(port), "--data-dir", s3_data_dir, "--allow-anonymous"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        server_log,
     )
+    print(f"AwanFS log: {server_log}", flush=True)
     set_affinity_mask(server_proc.pid, 0x0F)
     time.sleep(0.8)
 

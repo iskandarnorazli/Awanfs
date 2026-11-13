@@ -189,5 +189,48 @@ class BoundedWarmup(unittest.TestCase):
         self.assertIn("if time.perf_counter() > warm_deadline:", __import__("inspect").getsource(r))
 
 
+
+class ServerOutputIsNotAPipe(unittest.TestCase):
+    """#135's cause: AwanFS logs a line per request to stderr, and the harness piped stderr
+    without reading it. The pipe filled after about 271 requests on Linux and 16 on Windows,
+    and the server stopped answering while it held its port."""
+
+    def test_a_child_that_writes_more_than_a_pipe_holds_is_not_blocked(self):
+        import os
+        import subprocess
+        import sys
+        import tempfile
+        import time
+        import run_warp_benchmark as r
+
+        n = 300_000  # several times a 64 KiB Linux pipe, many times a 4 KiB Windows one
+        code = f"import sys; sys.stderr.write('x' * {n}); sys.stderr.flush(); print('done')"
+        log = os.path.join(tempfile.mkdtemp(prefix="startlogged_"), "server.log")
+        p = r.start_logged([sys.executable, "-c", code], log)
+        try:
+            p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+            self.fail("the child blocked writing its output: a pipe nobody reads")
+        self.assertEqual(p.returncode, 0)
+        with open(log, "rb") as fh:
+            data = fh.read()
+        self.assertGreaterEqual(data.count(b"x"), n, "everything it wrote is in the log")
+        self.assertIn(b"done", data, "stdout goes to the same log")
+
+    def test_no_benchmark_script_pipes_a_server_it_does_not_read(self):
+        import glob
+        import os
+        here = os.path.dirname(os.path.abspath(__file__))
+        for path in sorted(glob.glob(os.path.join(here, "*.py"))):
+            if os.path.basename(path).startswith("test_"):
+                continue
+            with open(path, encoding="utf-8") as fh:
+                src = fh.read()
+            for bad in ("stdout=subprocess.PIPE", "stderr=subprocess.PIPE"):
+                self.assertEqual(src.count(bad), 0, f"{os.path.basename(path)} uses {bad}")
+
+
 if __name__ == "__main__":
     unittest.main()
