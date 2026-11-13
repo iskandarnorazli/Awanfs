@@ -33,6 +33,8 @@ pub const FLAG_TOMBSTONE: u16 = 0x0002;
 pub const FLAG_MULTIPART: u16 = 0x0004;
 pub const FLAG_SHARED_REF: u16 = 0x0008;
 pub const FLAG_ZERO_BYTE: u16 = 0x0010;
+/// The payload is compressed (`compress.rs`, #51); only in format 2 volumes.
+pub const FLAG_COMPRESSED: u16 = 0x0020;
 
 pub const AWAN_FLAG_ACTIVE: u16 = FLAG_ACTIVE;
 pub const AWAN_FLAG_TOMBSTONE: u16 = FLAG_TOMBSTONE;
