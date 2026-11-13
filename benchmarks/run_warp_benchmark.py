@@ -239,7 +239,7 @@ def format_markdown_report(
 
     lines.extend([
         "",
-        f"## {section_num}. Open-Source S3 Alternatives Reference Comparison (`COMPETITIVE_LANDSCAPE.md`)",
+        f"## {section_num}. Open-Source S3 Alternatives Reference Comparison",
         "",
         f"> **Provenance Note (Audit Rule 3):** MinIO ({hw_info.get('minio_status', 'not measured')}) and RustFS ({hw_info.get('rustfs_status', 'not measured')}) ran on this machine ({hw_info.get('os', platform.platform())}) with anonymous access enabled via `mc`, receiving the same persistent HTTP/1.1 keep-alive requests as `s3-server`. Server pinning: {hw_info.get('affinity_server', 'not recorded')}. Peak RSS comes from the OS (`GetProcessMemoryInfo` on Windows, `/proc/<pid>/status` VmHWM on Linux). Note that for 1 MiB multipart upload with 256 KiB parts, both MinIO and RustFS strictly reject parts smaller than 5 MiB with HTTP 400 `EntityTooSmall` per AWS S3 RFC specification, whereas `s3-server` accepts them, which does not conform to S3. Reference figures for SeaweedFS, Garage and Ceph RGW are not measured here and are left out.",
         "",
