@@ -44,13 +44,15 @@ jobs:
       # job that measured nothing would otherwise print a committed report as its own output
       # (that happened in run 43398517562; see bench-full.yml).
       - name: Ratio check against MinIO (builds the server, fetches MinIO if missing)
+        timeout-minutes: 120
         run: |
           rm -f selfhosted_ratio.md
-          python benchmarks/bench.py --runs ${{ inputs.runs || '3' }} --duration ${{ inputs.duration || '30' }} --output selfhosted_ratio.md
+          python -u benchmarks/bench.py --runs ${{ inputs.runs || '3' }} --duration ${{ inputs.duration || '30' }} --output selfhosted_ratio.md
       - name: Full matrix (AwanFS, MinIO, RustFS where present)
+        timeout-minutes: 180
         run: |
           rm -f selfhosted_full.md
-          python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB --concurrent 64 --duration ${{ inputs.duration || '30' }}s --output selfhosted_full.md
+          python -u benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB --concurrent 64 --duration ${{ inputs.duration || '30' }}s --output selfhosted_full.md
       - name: Report
         if: always()
         shell: python

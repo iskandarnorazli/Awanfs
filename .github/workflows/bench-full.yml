@@ -104,10 +104,15 @@ jobs:
       # run 43398517562 hit the 150-minute timeout on both platforms and measured nothing.
       # The output path is this run's own, never the committed measurement file, so a run that
       # measures nothing cannot print the committed numbers as if it had produced them.
+      # python -u, because a buffered stdout reaches the log only when the process exits: run
+      # 43398517562 was cancelled at its job timeout and its log held not one phase marker, so
+      # there was no way to see where it had got to. The step timeout is below the job's, so a
+      # run that wedges fails with its log instead of being cancelled with nothing.
       - name: Run the full matrix
+        timeout-minutes: 45
         run: |
           rm -f ci_full_matrix.md
-          python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB --concurrent 64 --duration 2 --output ci_full_matrix.md
+          python -u benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB --concurrent 64 --duration 2 --output ci_full_matrix.md
       - name: Report to the job summary
         if: always()
         run: |
