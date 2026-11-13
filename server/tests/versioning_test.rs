@@ -20,7 +20,24 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-async fn start_binary(dir: &Path) -> (Child, String) {
+/// Kills the server when dropped, also when an assertion fails.
+struct Server(Child);
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Server {
+    fn kill(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+async fn start_binary(dir: &Path) -> (Server, String) {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let child = Command::new(env!("CARGO_BIN_EXE_s3-server"))
         .args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous", "--auto-compaction", "off"])
@@ -29,6 +46,7 @@ async fn start_binary(dir: &Path) -> (Child, String) {
         .spawn()
         .expect("spawn s3-server");
     let url = format!("http://127.0.0.1:{}", port);
+    let child = Server(child);
     let c = reqwest::Client::new();
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
@@ -146,8 +164,7 @@ async fn three_versions_a_delete_marker_and_a_killed_process() {
     let marker = version_id(&res);
     check_after_delete(&c, &url, &ids, &marker).await;
 
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.kill();
     let (mut child, url) = start_binary(&dir).await;
     check_after_delete(&c, &url, &ids, &marker).await;
 
@@ -171,12 +188,10 @@ async fn three_versions_a_delete_marker_and_a_killed_process() {
         }
     };
     after(url.clone()).await;
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.kill();
     let (mut child, url) = start_binary(&dir).await;
     after(url).await;
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -191,15 +206,13 @@ async fn a_version_delete_survives_a_kill() {
     let b = put(&c, &url, "vb/k", b"b").await;
     let res = c.delete(format!("{}/vb/k?versionId={}", url, b)).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.kill();
     let (mut child, url) = start_binary(&dir).await;
     let res = c.get(format!("{}/vb/k", url)).send().await.unwrap();
     assert_eq!(version_id(&res), a, "deleting the latest version makes the one before it current");
     assert_eq!(res.bytes().await.unwrap(), &b"a"[..]);
     assert_eq!(get_version(&c, &url, "vb/k", &b).await.0, StatusCode::NOT_FOUND);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
