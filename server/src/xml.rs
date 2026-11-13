@@ -102,6 +102,57 @@ pub fn list_object_versions_xml(bucket: &str, prefix: &str, key_marker: &str, ma
     out
 }
 
+/// One entry of a ListObjectVersions answer (#31).
+pub struct VersionListing {
+    pub key: String,
+    pub version_id: String,
+    pub latest: bool,
+    pub marker: bool,
+    pub last_modified: String,
+    pub etag: String,
+    pub size: u64,
+}
+
+/// ListObjectVersions with real version ids and delete markers (#31). Keys are already
+/// url-encoded when the request asked for it.
+#[allow(clippy::too_many_arguments)]
+pub fn list_versions_xml(bucket: &str, prefix: &str, key_marker: &str, max_keys: u32, truncated: bool, next_key_marker: Option<&str>, url: bool, entries: &[VersionListing]) -> String {
+    let mut out = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+        <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  \
+          <Name>{}</Name>\n  <Prefix>{}</Prefix>\n  <KeyMarker>{}</KeyMarker>\n  <VersionIdMarker></VersionIdMarker>\n  \
+          <MaxKeys>{}</MaxKeys>\n  <IsTruncated>{}</IsTruncated>\n",
+        xml_escape(bucket),
+        xml_escape(prefix),
+        xml_escape(key_marker),
+        max_keys,
+        truncated
+    );
+    if url {
+        out.push_str("  <EncodingType>url</EncodingType>\n");
+    }
+    if let Some(n) = next_key_marker {
+        out.push_str(&format!("  <NextKeyMarker>{}</NextKeyMarker>\n", xml_escape(n)));
+    }
+    for e in entries {
+        let tag = if e.marker { "DeleteMarker" } else { "Version" };
+        out.push_str(&format!("  <{}>\n", tag));
+        out.push_str(&format!("    <Key>{}</Key>\n", xml_escape(&e.key)));
+        out.push_str(&format!("    <VersionId>{}</VersionId>\n", xml_escape(&e.version_id)));
+        out.push_str(&format!("    <IsLatest>{}</IsLatest>\n", e.latest));
+        out.push_str(&format!("    <LastModified>{}</LastModified>\n", e.last_modified));
+        if !e.marker {
+            out.push_str(&format!("    <ETag>\"{}\"</ETag>\n", e.etag));
+            out.push_str(&format!("    <Size>{}</Size>\n", e.size));
+            out.push_str("    <StorageClass>STANDARD</StorageClass>\n");
+        }
+        out.push_str("    <Owner><ID>awanfs</ID><DisplayName>awanfs</DisplayName></Owner>\n");
+        out.push_str(&format!("  </{}>\n", tag));
+    }
+    out.push_str("</ListVersionsResult>");
+    out
+}
+
 /// Everything a ListObjectsV2 answer carries.
 pub struct ListV2<'a> {
     pub bucket: &'a str,
