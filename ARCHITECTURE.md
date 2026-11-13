@@ -50,6 +50,18 @@ Owner decisions after the 2026-11-12 unattended run (#64-#83), each the recommen
 | 26 | **Benchmark hardware:** the owner's machine as a self-hosted runner (`benchmarks/RUNNER.md`); paid runners only for published numbers. | #58 |
 | 27 | **Invalid ranges** (`bytes=5-3`): whatever ceph s3-tests expects, once #47 runs. | #47 |
 
+### Decisions (2026-11-13, third set: CI without hosted runners)
+
+| # | Decision | Issues |
+|---|---|---|
+| 28 | **#96 and #97 stay merged.** They went in while hosted jobs could not start (billing); the Linux try run of the stack confirms them. | #96, #97 |
+| 29 | **The merge gate while hosted CI is down:** `try/*` runs on the owner's self-hosted Windows and Linux runners, with their output (suite and negative control) posted on the PR. | all PRs |
+| 30 | **Hosted Actions:** fix the payment and set a monthly cap. | CI |
+| 31 | **The Linux runner installs its own Rust** (`dtolnay/rust-toolchain` in the user's home). System packages (`build-essential`) are the owner's. | CI |
+| 32 | **#28's gate** becomes "throttle_test passes and compaction_safety_test is unchanged"; copy-on-write cloning moves to its own `unmeasured` issue. | #28 |
+| 33 | **Benchmarks run on the owner's laptop** (Windows runner and `awanfs-bench`) through try runs, one job at a time; the numbers track changes, they are not for publication (#58). | #23, #36, #57, #58 |
+| 34 | **Branch clean-up** is the owner's, in one pass after the open PRs merge. | — |
+
 Tests follow two rules: no wall-clock thresholds, and a test that fails before the change it guards.
 
 ---
