@@ -73,9 +73,10 @@ jobs:
       # RSS under the budget plus the overhead this step states.
       - name: Does --memory-budget hold?
         id: budget
+        timeout-minutes: 15
         run: |
           set +e
-          python benchmarks/budget_rss.py --server-bin server/target/release/s3-server \
+          python -u benchmarks/budget_rss.py --server-bin server/target/release/s3-server \
             --budget 256MiB --budget-mib 256 --concurrency 64 --size 1MiB --duration 10 \
             --overhead 200 --report budget_report.md
           code=$?

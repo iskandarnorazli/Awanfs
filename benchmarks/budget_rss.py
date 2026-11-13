@@ -30,11 +30,17 @@ SIZES = {"4KiB": 4096, "64KiB": 65536, "1MiB": 1 << 20, "4MiB": 4 << 20, "16MiB"
 
 def start_server(server_bin: str, budget: str, data_dir: str) -> "tuple[subprocess.Popen, int]":
     port = get_free_port()
-    proc = subprocess.Popen(
-        [server_bin, "--port", str(port), "--data-dir", data_dir, "--allow-anonymous",
-         "--memory-budget", budget, "--auto-compaction", "off"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
+    # The server's output goes to a file in its data directory, never a pipe: it writes one JSON
+    # line per request to stderr, and a pipe nobody reads fills and stops the server (#135).
+    # The first two runs of this script hung exactly that way (43433893855, 43433917911).
+    log_path = os.path.join(data_dir, "server.log")
+    with open(log_path, "ab") as log:
+        proc = subprocess.Popen(
+            [server_bin, "--port", str(port), "--data-dir", data_dir, "--allow-anonymous",
+             "--memory-budget", budget, "--auto-compaction", "off"],
+            stdout=log, stderr=subprocess.STDOUT,
+        )
+    print(f"server log: {log_path}", flush=True)
     if not wait_port(port, timeout=40.0):
         proc.kill()
         sys.exit(f"the server did not answer on port {port}")
