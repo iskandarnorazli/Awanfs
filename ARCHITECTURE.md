@@ -86,6 +86,15 @@ says anyone who can reach the port can read, write and delete. A config that set
 is #122 (decision 39), which replaces this guard when it lands. Found by an adversarial review of
 #53, filed as #130.
 
+**Decision 41 (2026-11-14): the request log never stalls requests.** The per-request JSON line
+on stderr is written by a background thread through a bounded queue of 4,096 lines; when the
+queue is full the line is dropped and `awanfs_log_lines_dropped_total` counts it, and the
+`AwanFSLogLinesDropped` alert fires. Before, `eprintln!` ran inline in the request handler, so a
+stderr nobody read (a stalled container log driver or journald) stopped every request while the
+server kept its port: measured at 271 requests on a 64 KiB Linux pipe and 16 on a 4 KiB Windows
+one (#135, run 43450981256). The S3 access log written by `--access-log` (`state.audit_log`) still
+writes inline: whether it may drop lines is a separate owner decision, not taken. #138.
+
 **Correction to 36 (2026-11-13, measured).** The plan's first item, a payload cache holding views
 of the volume mapping instead of heap copies of request bodies, was implemented (#126), merged and
 then reverted. Its premise was wrong: AwanFS writes volumes with direct I/O, so written bytes are

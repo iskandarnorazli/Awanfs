@@ -38,3 +38,10 @@ groups:
           severity: ticket
         annotations:
           summary: "Writes without syncs on {{ $labels.instance }}: is it running with --durability fast?"
+      - alert: AwanFSLogLinesDropped
+        expr: increase(awanfs_log_lines_dropped_total[10m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "AwanFS {{ $labels.instance }} is dropping request-log lines"
+          description: "Whatever reads the server's stderr (a container log driver, journald) is not keeping up, so request-log lines are dropped rather than stalling requests (#138). Requests are unaffected; the log has gaps."
