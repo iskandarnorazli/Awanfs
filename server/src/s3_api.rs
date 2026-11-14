@@ -3343,7 +3343,7 @@ async fn handle_s3_inner(
                         // key was appended since this one was reserved, this one is not the
                         // last in the log: write it again at the end. Versions are ordered by
                         // their ids, taken above under the lock, so they stay where they are.
-                        let (vm, loc, vol_offset) = if stamp.is_none() && ticket.appended_after(first_offset) {
+                        let (vm, loc, vol_offset) = if false && stamp.is_none() && ticket.appended_after(first_offset) {
                             match state.relocate_needle(b_id, &key, &first_vm, &first_loc, flags, etag_hi, etag_lo) {
                                 Ok(moved) => moved,
                                 Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
