@@ -16,6 +16,17 @@ fresh file and reports the median and P90 milliseconds per append:
 - unbuffered (Windows only): the file is opened with FILE_FLAG_NO_BUFFERING, as the server
   opens its volumes.
 
+Then two variants with a second thread that flushes the file in a loop while the first
+appends without flushing, which is what a server with several writers and one group commit
+does:
+
+- writes during flushes, same handle: the flusher uses a duplicate of the writer's handle
+  (`File::try_clone` in the server: one file object).
+- writes during flushes, second handle: the flusher opens the file again.
+
+If writes wait for flushes in the first and not in the second, a flush stalls every writer
+of that file, and opening a second handle for flushing fixes it.
+
 Run it on every directory that matters: on GitHub's Windows runners the temp directory is on
 C: and the workspace on D:, and they are different disks.
 """
@@ -91,6 +102,61 @@ def run_variant(directory: str, name: str, count: int, flushes: int, preallocate
     return out
 
 
+def run_contended(directory: str, name: str, count: int, second_handle: bool, unbuffered: bool):
+    """Latencies in ms of appends (no flush) while another thread flushes the file in a
+    loop, through a duplicate of the writer's handle or through a second open of the file.
+    Also returns how many flushes ran."""
+    import threading
+    if unbuffered and os.name != "nt":
+        return None, 0
+    path = os.path.join(directory, f"probe_{name}.dat")
+    if os.path.exists(path):
+        os.remove(path)
+    fd = open_unbuffered(path) if unbuffered else os.open(path, os.O_RDWR | os.O_CREAT | O_BINARY)
+    sync_fd = os.open(path, os.O_RDWR | O_BINARY) if second_handle else os.dup(fd)
+    block = mmap.mmap(-1, BLOCK)
+    block.write(os.urandom(BLOCK))
+    stop = threading.Event()
+    flushes = [0]
+
+    def flusher():
+        while not stop.is_set():
+            os.fsync(sync_fd)
+            flushes[0] += 1
+
+    out = []
+    t = threading.Thread(target=flusher, daemon=True)
+    try:
+        os.write(fd, block)  # something to flush
+        t.start()
+        time.sleep(0.05)
+        for _ in range(count):
+            t0 = time.perf_counter()
+            os.write(fd, block)
+            out.append((time.perf_counter() - t0) * 1000.0)
+            time.sleep(0.001)  # spread the writes over many flushes
+    finally:
+        stop.set()
+        t.join(timeout=10)
+        os.close(fd)
+        os.close(sync_fd)
+        block.close()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return out, flushes[0]
+
+
+CONTENDED = [
+    # name, label, second handle, unbuffered
+    ("c_same", "writes during flushes, same handle", False, False),
+    ("c_second", "writes during flushes, second handle", True, False),
+    ("c_u_same", "unbuffered writes during flushes, same handle (what the server does)", False, True),
+    ("c_u_second", "unbuffered writes during flushes, second handle", True, True),
+]
+
+
 VARIANTS = [
     # name, label, flushes, preallocate, unbuffered
     ("w_grow", "write only, growing", 0, False, False),
@@ -145,6 +211,10 @@ def main(argv=None):
             for name, label, flushes, pre, unbuf in VARIANTS:
                 print(f"{d}: {label} ...", flush=True)
                 rows.append((label, run_variant(work, name, a.count, flushes, pre, unbuf)))
+            for name, label, second, unbuf in CONTENDED:
+                print(f"{d}: {label} ...", flush=True)
+                lat, flushes = run_contended(work, name, a.count, second, unbuf)
+                rows.append((f"{label} [{flushes} flushes ran]" if lat is not None else label, lat))
             results[d] = rows
         finally:
             try:
