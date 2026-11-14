@@ -24,9 +24,9 @@ from typing import Dict, List, Optional, Tuple
 # (area, issue, design section, name regex or None, markers). First match wins, so the order
 # is part of the map: narrow areas come before the broad ones that would also match.
 AREAS: List[Tuple[str, str, str, Optional[str], frozenset]] = [
-    ("rgw-only", "decision R1", "9", r"^test_(head_bucket_usage|account_usage|bucket_head_extended|get_object_torrent)$|_unordered$|_tenant$", frozenset()),
+    ("rgw-only", "out of scope", "9", r"^test_(head_bucket_usage|account_usage|bucket_head_extended|get_object_torrent)$|_unordered$|_tenant$", frozenset()),
     ("bucket-logging", "#153", "8.4", r"logging", frozenset({"bucket_logging", "bucket_logging_cleanup", "fails_without_logging_rollover"})),
-    ("storage-classes", "decision R2", "9", r"transition|cloud|restore|storage_class", frozenset({"lifecycle_transition", "cloud_transition", "cloud_restore"})),
+    ("storage-classes", "out of scope", "9", r"transition|cloud|restore|storage_class", frozenset({"lifecycle_transition", "cloud_transition", "cloud_restore"})),
     ("encryption", "#121", "8.2", r"sse|encrypt|kms", frozenset({"encryption", "sse_s3", "bucket_encryption"})),
     ("lifecycle", "#118", "8.3", r"lifecycle", frozenset({"lifecycle", "lifecycle_expiration"})),
     ("object-lock", "#120", "8.1", r"object_lock|legal_hold|retention", frozenset()),

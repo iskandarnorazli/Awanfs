@@ -380,8 +380,8 @@ wave 3 (decision 45).
 | RGW-only | 11 | `X-RGW-*` usage headers, account usage, unordered listing, torrents, tenants: ceph extensions, not S3 |
 | Storage classes and cloud tiering | 19 | Need more than one storage class or a remote tier. AwanFS has one |
 
-A test left out goes into `tests/s3tests/out_of_scope.txt` with its reason, and the map
-reports it as such instead of as a failure.
+The map lists them under the areas `rgw-only` and `storage-classes`, owner "out of scope", so
+they are counted apart from the work that is left.
 
 ## 10. Order
 
