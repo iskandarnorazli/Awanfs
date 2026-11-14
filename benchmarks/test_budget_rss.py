@@ -111,6 +111,21 @@ class HeapAndFilePages(unittest.TestCase):
         self.assertEqual(br.mib_or_nm(None), "not measured")
 
 
+class CacheShare(unittest.TestCase):
+    PAGE = ("# HELP awanfs_payload_cache_bytes Bytes held by the payload cache.\n"
+            "# TYPE awanfs_payload_cache_bytes gauge\nawanfs_payload_cache_bytes 134217728\n"
+            "awanfs_payload_cache_bytes_total 7\n")
+
+    def test_a_metric_is_read_by_its_exact_name(self):
+        self.assertEqual(br.metric(self.PAGE, "awanfs_payload_cache_bytes"), 134217728.0)
+        self.assertIsNone(br.metric(self.PAGE, "awanfs_missing"))
+        self.assertEqual(br.metric("awanfs_payload_cache_bytes_total 7\n", "awanfs_payload_cache_bytes"), None,
+                         "a longer name with the same prefix is not the metric")
+
+    def test_no_server_means_not_measured(self):
+        self.assertIsNone(br.cache_mib(1))
+
+
 class Cli(unittest.TestCase):
     def test_the_parsers_defaults_are_the_workflow_steps_values(self):
         a = br.build_parser().parse_args(["--server-bin", "x"])

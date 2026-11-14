@@ -147,6 +147,33 @@ def verdict(rows, peak_mib: float, budget_mib: float, overhead: float, size_byte
     return "ok", []
 
 
+def metric(text: str, name: str):
+    """The value of `name` in a Prometheus text page, or None."""
+    for line in text.splitlines():
+        if line.startswith(name + " "):
+            try:
+                return float(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def cache_mib(port: int):
+    """awanfs_payload_cache_bytes in MiB, or None when the page cannot be read. Read at the end of
+    a phase: the cache only grows during one, up to its cap, so that is its peak."""
+    import http.client
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10.0)
+        conn.request("GET", "/_awanfs/metrics")
+        resp = conn.getresponse()
+        text = resp.read().decode("utf-8", "replace")
+        conn.close()
+    except OSError:
+        return None
+    v = metric(text, "awanfs_payload_cache_bytes")
+    return None if v is None else v / (1 << 20)
+
+
 def create_bucket(port: int, bucket: str) -> None:
     """The phases write into `bucket`, so it has to exist, or every request answers 404."""
     import http.client
@@ -172,7 +199,7 @@ def main(argv=None) -> int:
                 m = run_workload_phase("127.0.0.1", port, "budget", SIZES[a.size], a.concurrency,
                                        a.duration, mode, server_pid=proc.pid)
             peak = max(peak, get_process_peak_rss_mb(proc.pid))
-            rows.append((mode, m.mib_per_sec, m.ops_per_sec, m.p99_ms, peak, split.anon, split.file))
+            rows.append((mode, m.mib_per_sec, m.ops_per_sec, m.p99_ms, peak, split.anon, split.file, cache_mib(port)))
     finally:
         proc.kill()
         proc.wait()
@@ -187,11 +214,13 @@ def main(argv=None) -> int:
         "",
         f"Machine: {platform.node()} ({platform.platform()}, {os.cpu_count()} CPUs).",
         "",
-        "| phase | MiB/s | ops/s | P99 ms | peak RSS MiB | peak heap (RssAnon) MiB | peak file pages (RssFile) MiB |",
-        "|---|---|---|---|---|---|---|",
+        "| phase | MiB/s | ops/s | P99 ms | peak RSS MiB | peak heap (RssAnon) MiB | peak file pages (RssFile) MiB | payload cache MiB | heap less cache MiB |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
-    for mode, mib, ops, p99, rss, anon, filep in rows:
-        lines.append(f"| {mode} | {mib:.2f} | {ops:.1f} | {p99:.2f} | {rss:.1f} | {mib_or_nm(anon)} | {mib_or_nm(filep)} |")
+    for mode, mib, ops, p99, rss, anon, filep, cache in rows:
+        rest = None if anon is None or cache is None else anon - cache
+        lines.append(f"| {mode} | {mib:.2f} | {ops:.1f} | {p99:.2f} | {rss:.1f} | {mib_or_nm(anon)} | {mib_or_nm(filep)} "
+                     f"| {mib_or_nm(cache)} | {mib_or_nm(rest)} |")
     lines += [
         "",
         f"Peak RSS {peak:.1f} MiB against a ceiling of {ceiling:.1f} MiB "
