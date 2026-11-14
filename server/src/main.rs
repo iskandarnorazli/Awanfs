@@ -189,28 +189,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
     // S3 server access log (#46): --access-log <file> or -, or AWANFS_ACCESS_LOG; off by default.
+    // Written like the request log below, through a bounded queue by a background thread: a
+    // full or slow log target costs lines, counted in awanfs_log_lines_dropped_total, and
+    // never stops requests (decision 54). An access log is therefore not an audit record.
     if let Some(target) = access_log.or_else(|| std::env::var("AWANFS_ACCESS_LOG").ok()).filter(|t| !t.is_empty()) {
+        let dropped = Arc::clone(&state.log_lines_dropped);
         let sink: s3_server::request_log::LogSink = if target == "-" {
-            Arc::new(|line: &str| println!("{}", line))
+            s3_server::request_log::bounded_sink(4096, dropped, |line: &str| {
+                use std::io::Write;
+                let _ = writeln!(std::io::stdout().lock(), "{}", line);
+            })
         } else {
-            let file = std::fs::OpenOptions::new().create(true).append(true).open(&target).unwrap_or_else(|e| {
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&target).unwrap_or_else(|e| {
                 eprintln!("cannot open the access log {}: {}", target, e);
                 std::process::exit(2);
             });
-            let file = std::sync::Mutex::new(file);
-            Arc::new(move |line: &str| {
+            s3_server::request_log::bounded_sink(4096, dropped, move |line: &str| {
                 use std::io::Write;
-                if let Ok(mut f) = file.lock() {
-                    let _ = writeln!(f, "{}", line);
-                }
+                let _ = writeln!(file, "{}", line);
             })
         };
         *state.audit_log.write() = Some(sink);
     }
     // One JSON line per request on stderr; AWANFS_LOG=off turns it off. Written by a background
     // thread through a bounded queue, so a stderr nobody reads costs lines, counted in
-    // awanfs_log_lines_dropped_total, and never stops requests (#138). The --access-log sink
-    // above still writes inline: whether it may drop lines is an open owner decision.
+    // awanfs_log_lines_dropped_total, and never stops requests (#138).
     if std::env::var("AWANFS_LOG").ok().as_deref() != Some("off") {
         let sink = s3_server::request_log::bounded_sink(4096, Arc::clone(&state.log_lines_dropped), |line: &str| {
             use std::io::Write;
