@@ -805,7 +805,7 @@ impl S3ServiceState {
         for id in ids {
             // Only a brand-new volume 1 is created sparse; volumes from rollover stay as they are.
             let new_volume = !dir.join(format!("volume_{:04}.dat", id)).exists();
-            let mut vm = VolumeManager::open_mode(dir, id, new_volume && id == 1 && !cfg!(windows)).map_err(|e| format!("volume {}: {}", id, e))?;
+            let mut vm = VolumeManager::open_mode(dir, id, false).map_err(|e| format!("volume {}: {}", id, e))?;
             vm.attach_work_counters(Arc::clone(&work));
             volumes.insert(id, Arc::new(vm));
         }
