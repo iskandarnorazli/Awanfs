@@ -1,0 +1,70 @@
+name: Sync probe (experiment)
+
+# benchmarks/sync_probe.py: what one durable 64 KiB append costs on the runner's disks, without
+# the server. Splits a slow PUT into write, flush and file growth. On demand, and on pull
+# requests that change the probe.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "benchmarks/sync_probe.py"
+      - "benchmarks/put_path_probe.py"
+      - "server/tests/commit_cost_probe.rs"
+      - ".github/workflows/probe-sync.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Where the disks are
+        shell: bash
+        run: |
+          echo "temp: ${RUNNER_TEMP}  workspace: ${GITHUB_WORKSPACE}"
+          python -c "import tempfile; print('python temp:', tempfile.gettempdir())"
+          df -h . "${RUNNER_TEMP}" 2>/dev/null || true
+      - name: Run the probe
+        shell: bash
+        run: |
+          mkdir -p .tmp/probe
+          python -u benchmarks/sync_probe.py --count 200 \
+            --dir "$(python -c 'import tempfile; print(tempfile.gettempdir())')" \
+            --dir "$PWD/.tmp/probe" --report sync_probe.md
+          cat sync_probe.md >> "$GITHUB_STEP_SUMMARY"
+
+      # The same question through the server: 64 KiB PUTs with and without the commit, and
+      # with and without a growing volume file. Data on the runner's temp directory.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Build s3-server
+        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Where a PUT's time goes
+        shell: bash
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          bin=server/target/release/s3-server
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          python -u benchmarks/put_path_probe.py --server-bin "$bin" --report put_path_probe.md
+          cat put_path_probe.md >> "$GITHUB_STEP_SUMMARY"
+      - name: What one commit costs at the volume layer
+        shell: bash
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          cargo test --locked --release --manifest-path server/Cargo.toml --test commit_cost_probe -- --ignored --nocapture | tee commit_cost.txt
+          grep -E '^(Data under|\|)' commit_cost.txt >> "$GITHUB_STEP_SUMMARY"
