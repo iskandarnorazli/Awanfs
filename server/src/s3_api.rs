@@ -2520,22 +2520,6 @@ async fn handle_s3_inner(
 
             // 2. Multipart PUT /{bucket}/{key}?partNumber=N&uploadId=ID -> UploadPart
             if method == Method::PUT && query_map.contains_key("uploadId") && query_map.contains_key("partNumber") {
-                // UploadPartCopy is not implemented (#111). Its request has no body, so without this
-                // the part was stored empty and answered 200 with the ETag of empty input, and a
-                // client completing the upload built an object missing the copied range.
-                if req.headers().contains_key("x-amz-copy-source") {
-                    let xml = s3_error_xml(
-                        "NotImplemented",
-                        "UploadPartCopy is not implemented: upload the part's bytes with UploadPart.",
-                        &key,
-                        "req-up-part-copy",
-                    );
-                    return Ok(Response::builder()
-                        .status(StatusCode::NOT_IMPLEMENTED)
-                        .header(CONTENT_TYPE, "application/xml")
-                        .body(full_body(Bytes::from(xml)))
-                        .unwrap());
-                }
                 let upload_id = &query_map["uploadId"];
                 let part_num: u32 = match query_map["partNumber"].parse() {
                     Ok(n) => n,
