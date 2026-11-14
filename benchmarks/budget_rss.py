@@ -29,8 +29,9 @@ from ratio_check import wait_port  # noqa: E402
 SIZES = {"4KiB": 4096, "64KiB": 65536, "1MiB": 1 << 20, "4MiB": 4 << 20, "16MiB": 16 << 20}
 
 
-def start_server(server_bin: str, budget: str, data_dir: str) -> "tuple[subprocess.Popen, int]":
+def start_server(server_bin: str, budget: str, data_dir: str, env_extra=None) -> "tuple[subprocess.Popen, int]":
     port = get_free_port()
+    env = dict(os.environ, **(env_extra or {}))
     # The server's output goes to a file in its data directory, never a pipe: it writes one JSON
     # line per request to stderr, and a pipe nobody reads fills and stops the server (#135).
     # The first two runs of this script hung exactly that way (43433893855, 43433917911).
@@ -39,7 +40,7 @@ def start_server(server_bin: str, budget: str, data_dir: str) -> "tuple[subproce
         proc = subprocess.Popen(
             [server_bin, "--port", str(port), "--data-dir", data_dir, "--allow-anonymous",
              "--memory-budget", budget, "--auto-compaction", "off"],
-            stdout=log, stderr=subprocess.STDOUT,
+            stdout=log, stderr=subprocess.STDOUT, env=env,
         )
     print(f"server log: {log_path}", flush=True)
     if not wait_port(port, timeout=40.0):
@@ -105,6 +106,21 @@ class RssSplit:
         return False
 
 
+def process_env(pid: int, name: str):
+    """The value of `name` in a running process's environment (Linux /proc), "unset" when it is
+    not there, or None when it cannot be read. Proves an experiment's variable reached the server."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as fh:
+            items = fh.read().split(b"\0")
+    except OSError:
+        return None
+    for it in items:
+        k, _, v = it.partition(b"=")
+        if k.decode(errors="replace") == name:
+            return v.decode(errors="replace")
+    return "unset"
+
+
 def mib_or_nm(x) -> str:
     return "not measured" if x is None else f"{x:.1f}"
 
@@ -120,6 +136,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--overhead", type=float, default=200.0, help="MiB outside the budget; state what you measured")
     ap.add_argument("--data-dir", default=os.path.join(".tmp", "budget_rss"))
     ap.add_argument("--report", default="")
+    ap.add_argument("--malloc-arena-max", type=int, default=0,
+                    help="run the server with glibc's MALLOC_ARENA_MAX set to this (0: unset). An experiment "
+                         "for #127: does the heap the cache does not explain come from allocator arenas?")
     return ap
 
 
@@ -190,7 +209,9 @@ def main(argv=None) -> int:
     a = build_parser().parse_args(argv)
 
     os.makedirs(a.data_dir, exist_ok=True)
-    proc, port = start_server(a.server_bin, a.budget, a.data_dir)
+    env_extra = {"MALLOC_ARENA_MAX": str(a.malloc_arena_max)} if a.malloc_arena_max > 0 else None
+    proc, port = start_server(a.server_bin, a.budget, a.data_dir, env_extra)
+    seen_arena = process_env(proc.pid, "MALLOC_ARENA_MAX")
     rows, peak = [], 0.0
     try:
         create_bucket(port, "budget")
@@ -213,6 +234,9 @@ def main(argv=None) -> int:
         f"# Does --memory-budget {a.budget} hold? ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
         "",
         f"Machine: {platform.node()} ({platform.platform()}, {os.cpu_count()} CPUs).",
+        "",
+        f"Allocator: MALLOC_ARENA_MAX={a.malloc_arena_max if a.malloc_arena_max > 0 else 'unset'} asked; "
+        f"the server's own environment has it {'not measured' if seen_arena is None else seen_arena}.",
         "",
         "| phase | MiB/s | ops/s | P99 ms | peak RSS MiB | peak heap (RssAnon) MiB | peak file pages (RssFile) MiB | payload cache MiB | heap less cache MiB |",
         "|---|---|---|---|---|---|---|---|---|",

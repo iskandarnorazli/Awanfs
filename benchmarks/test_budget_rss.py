@@ -132,6 +132,32 @@ class Cli(unittest.TestCase):
         self.assertEqual((a.budget, a.budget_mib, a.concurrency, a.size, a.duration, a.overhead),
                          ("256MiB", 256.0, 64, "1MiB", 10.0, 200.0))
 
+    def test_the_arena_experiment_is_off_unless_asked(self):
+        self.assertEqual(br.build_parser().parse_args(["--server-bin", "x"]).malloc_arena_max, 0)
+        self.assertEqual(br.build_parser().parse_args(["--server-bin", "x", "--malloc-arena-max", "2"]).malloc_arena_max, 2)
+
+    def test_the_server_gets_the_extra_environment(self):
+        import inspect
+        src = inspect.getsource(br.start_server)
+        self.assertIn("env=env", src)
+        self.assertIn("dict(os.environ, **(env_extra or {}))", src)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "/proc/<pid>/environ is Linux")
+    def test_a_child_started_with_the_extra_environment_has_it(self):
+        import subprocess
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"],
+                             env=dict(os.environ, MALLOC_ARENA_MAX="2"))
+        q = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"],
+                             env={k: v for k, v in os.environ.items() if k != "MALLOC_ARENA_MAX"})
+        try:
+            self.assertEqual(br.process_env(p.pid, "MALLOC_ARENA_MAX"), "2")
+            self.assertEqual(br.process_env(q.pid, "MALLOC_ARENA_MAX"), "unset")
+            self.assertIsNone(br.process_env(2 ** 22 - 7, "MALLOC_ARENA_MAX"))
+        finally:
+            for x in (p, q):
+                x.kill()
+                x.wait()
+
     def test_an_unknown_size_is_refused(self):
         with self.assertRaises(SystemExit):
             br.build_parser().parse_args(["--server-bin", "x", "--size", "7MiB"])
