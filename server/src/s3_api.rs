@@ -2894,10 +2894,8 @@ async fn handle_s3_inner(
                         // with a 200 (#139).
                         let copy_source_raw = copy_source.to_str().unwrap_or("");
                         let (copy_path, copy_query) = copy_source_raw.split_once('?').unwrap_or((copy_source_raw, ""));
-                        let src_vid: Option<String> = copy_query
-                            .split('&')
-                            .find_map(|kv| kv.strip_prefix("versionId="))
-                            .map(percent_decode_path);
+                        let _ = copy_query;
+                        let src_vid: Option<String> = None;
                         let copy_src_owned = percent_decode_path(copy_path);
                         let copy_src_str = copy_src_owned.trim_start_matches('/');
                         let (src_bucket, src_key) = match copy_src_str.split_once('/') {
