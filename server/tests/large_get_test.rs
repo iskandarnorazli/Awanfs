@@ -85,9 +85,23 @@ async fn an_object_up_to_4_mib_is_still_verified_before_it_is_sent() {
     assert_eq!(state.work.payload_verified() - verified, data.len() as u64, "the path for small objects is unchanged");
 }
 
-/// Flips the byte of `data[at]` in the first volume file and returns nothing; panics if the
-/// bytes around it are not found.
+/// Bytes with no repeats to speak of (xorshift64): any 64 of them occur once.
+fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+/// Flips the byte of `data[at]` in the first volume file; panics if the 64 bytes from `at`
+/// are not there, or occur earlier in `data` (the flip would land somewhere else).
 fn corrupt(dir: &std::path::Path, data: &[u8], at: usize) {
+    assert_eq!(data.windows(64).position(|w| w == &data[at..at + 64]), Some(at), "the bytes at {} must not occur earlier", at);
     let dat = dir.join("volume_0001.dat");
     let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&dat).unwrap();
     let mut head = vec![0u8; data.len() + 2 * MIB];
@@ -103,8 +117,7 @@ async fn a_corrupted_large_object_cannot_be_received_whole() {
     for (name, at) in [("first", 10_000usize), ("middle", 3 * MIB + 5), ("last", 6 * MIB - 100)] {
         let (dir, state, url, _h) = start(name).await;
         let c = reqwest::Client::new();
-        // Each 64-byte window of the pattern must be unique for `corrupt` to find its place.
-        let data: Vec<u8> = (0..6 * MIB + 3).map(|i| ((i as u64).wrapping_mul(2654435761) >> 13) as u8).collect();
+        let data = noise(6 * MIB + 3, 0x9E3779B97F4A7C15);
         let key = format!("{}/lg-bkt/obj", url);
         assert_eq!(c.put(&key).body(data.clone()).send().await.unwrap().status(), StatusCode::OK);
         corrupt(&dir, &data, at);
