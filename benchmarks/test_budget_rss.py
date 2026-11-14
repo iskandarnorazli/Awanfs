@@ -61,6 +61,56 @@ class Verdict(unittest.TestCase):
         self.assertLess(src.index("create_bucket(port"), src.index("run_workload_phase("))
 
 
+class HeapAndFilePages(unittest.TestCase):
+    """#127: peak RSS split into heap (RssAnon) and pages of mapped files (RssFile)."""
+
+    STATUS = ("Name:\ts3-server\nVmHWM:\t  555000 kB\nVmRSS:\t  540000 kB\n"
+              "RssAnon:\t  262144 kB\nRssFile:\t  276480 kB\nRssShmem:\t       0 kB\n")
+
+    def test_the_status_fields_parse_to_mib(self):
+        got = br.parse_status(self.STATUS)
+        self.assertEqual(got, {"RssAnon": 256.0, "RssFile": 270.0, "RssShmem": 0.0})
+        self.assertEqual(br.parse_status("RssAnon:\t12 MB\nRssFile: x kB\n"), {}, "only kB counts are read")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "/proc/<pid>/status is Linux")
+    def test_a_process_that_maps_a_file_shows_it_as_file_pages_not_heap(self):
+        import subprocess
+        import tempfile
+        import time
+        d = tempfile.mkdtemp(prefix="rsssplit_")
+        data = os.path.join(d, "f.bin")
+        with open(data, "wb") as fh:
+            fh.write(os.urandom(48 << 20))
+        code = (
+            "import mmap,sys,time\n"
+            "heap = bytearray(96 << 20)\n"
+            "for i in range(0, len(heap), 4096): heap[i] = 1\n"
+            "f = open(sys.argv[1], 'rb'); m = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)\n"
+            "s = 0\n"
+            "for i in range(0, len(m), 4096): s += m[i]\n"
+            "print('ready', flush=True); time.sleep(30)\n"
+        )
+        p = subprocess.Popen([sys.executable, "-c", code, data], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(p.stdout.readline().strip(), "ready")
+            with br.RssSplit(p.pid) as split:
+                time.sleep(0.3)
+            self.assertGreaterEqual(split.anon, 90.0, f"heap: {split.anon}")
+            self.assertGreaterEqual(split.file, 44.0, f"file pages: {split.file}")
+            self.assertLess(split.file, split.anon, "the 48 MiB mapping is not counted as the 96 MiB heap")
+        finally:
+            p.kill()
+            p.wait()
+
+    def test_without_proc_the_split_is_not_measured(self):
+        split = br.RssSplit(2 ** 22 - 7)  # a pid that does not exist
+        with split:
+            pass
+        self.assertIsNone(split.anon)
+        self.assertIsNone(split.file)
+        self.assertEqual(br.mib_or_nm(None), "not measured")
+
+
 class Cli(unittest.TestCase):
     def test_the_parsers_defaults_are_the_workflow_steps_values(self):
         a = br.build_parser().parse_args(["--server-bin", "x"])

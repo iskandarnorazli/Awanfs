@@ -48,6 +48,67 @@ def start_server(server_bin: str, budget: str, data_dir: str) -> "tuple[subproce
     return proc, port
 
 
+def parse_status(text: str) -> dict:
+    """RssAnon, RssFile and RssShmem in MiB from the text of /proc/<pid>/status (Linux)."""
+    out = {}
+    for line in text.splitlines():
+        name, _, rest = line.partition(":")
+        if name in ("RssAnon", "RssFile", "RssShmem"):
+            fields = rest.split()
+            if len(fields) == 2 and fields[1] == "kB" and fields[0].isdigit():
+                out[name] = int(fields[0]) / 1024.0
+    return out
+
+
+class RssSplit:
+    """The highest RssAnon (heap) and RssFile (pages of mapped files, here the volume mapping)
+    seen while a phase runs. Peak RSS (VmHWM) has no per-kind peak, so this samples. On a
+    platform without /proc both stay None and the report says "not measured" (#127: the owner
+    asked for this split before deciding what the budget covers)."""
+
+    def __init__(self, pid: int, every: float = 0.05):
+        self.path = f"/proc/{pid}/status"
+        self.every = every
+        self.anon = None
+        self.file = None
+        self._stop = None
+        self._thread = None
+
+    def sample(self) -> None:
+        try:
+            with open(self.path, encoding="ascii") as fh:
+                got = parse_status(fh.read())
+        except OSError:
+            return
+        if "RssAnon" in got:
+            self.anon = max(self.anon or 0.0, got["RssAnon"])
+        if "RssFile" in got:
+            self.file = max(self.file or 0.0, got["RssFile"])
+
+    def __enter__(self):
+        import threading
+        self.sample()
+        self._stop = threading.Event()
+
+        def loop():
+            while not self._stop.wait(self.every):
+                self.sample()
+
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join(timeout=5)
+        self.sample()
+        return False
+
+
+def mib_or_nm(x) -> str:
+    return "not measured" if x is None else f"{x:.1f}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--server-bin", required=True)
@@ -76,7 +137,7 @@ def verdict(rows, peak_mib: float, budget_mib: float, overhead: float, size_byte
     did not measure anything: the first runs of this script answered every request 404
     (no bucket) and reported 532 ops/s, 0.00 MiB/s and an idle server's 17 MiB as "ok"."""
     reasons = []
-    for mode, mib, ops, _p99, _rss in rows:
+    for mode, mib, ops, _p99, _rss, *_ in rows:
         if mib * (1 << 20) < size_bytes:
             reasons.append(f"{mode} moved {mib:.2f} MiB/s at {ops:.1f} ops/s: the requests failed")
     if reasons:
@@ -107,10 +168,11 @@ def main(argv=None) -> int:
     try:
         create_bucket(port, "budget")
         for mode in ("put", "get"):
-            m = run_workload_phase("127.0.0.1", port, "budget", SIZES[a.size], a.concurrency,
-                                   a.duration, mode, server_pid=proc.pid)
+            with RssSplit(proc.pid) as split:
+                m = run_workload_phase("127.0.0.1", port, "budget", SIZES[a.size], a.concurrency,
+                                       a.duration, mode, server_pid=proc.pid)
             peak = max(peak, get_process_peak_rss_mb(proc.pid))
-            rows.append((mode, m.mib_per_sec, m.ops_per_sec, m.p99_ms, peak))
+            rows.append((mode, m.mib_per_sec, m.ops_per_sec, m.p99_ms, peak, split.anon, split.file))
     finally:
         proc.kill()
         proc.wait()
@@ -125,11 +187,11 @@ def main(argv=None) -> int:
         "",
         f"Machine: {platform.node()} ({platform.platform()}, {os.cpu_count()} CPUs).",
         "",
-        "| phase | MiB/s | ops/s | P99 ms | peak RSS MiB |",
-        "|---|---|---|---|---|",
+        "| phase | MiB/s | ops/s | P99 ms | peak RSS MiB | peak heap (RssAnon) MiB | peak file pages (RssFile) MiB |",
+        "|---|---|---|---|---|---|---|",
     ]
-    for mode, mib, ops, p99, rss in rows:
-        lines.append(f"| {mode} | {mib:.2f} | {ops:.1f} | {p99:.2f} | {rss:.1f} |")
+    for mode, mib, ops, p99, rss, anon, filep in rows:
+        lines.append(f"| {mode} | {mib:.2f} | {ops:.1f} | {p99:.2f} | {rss:.1f} | {mib_or_nm(anon)} | {mib_or_nm(filep)} |")
     lines += [
         "",
         f"Peak RSS {peak:.1f} MiB against a ceiling of {ceiling:.1f} MiB "
