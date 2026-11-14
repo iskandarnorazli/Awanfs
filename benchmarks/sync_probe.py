@@ -15,6 +15,9 @@ fresh file and reports the median and P90 milliseconds per append:
   first so appends never move the end of the file.
 - unbuffered (Windows only): the file is opened with FILE_FLAG_NO_BUFFERING, as the server
   opens its volumes.
+- mapped: a read-only memory mapping of the file is open while it is written and flushed,
+  as the server keeps one of each volume for reads, and each append is read back through
+  the mapping the way a GET would.
 
 Then two variants with a second thread that flushes the file in a loop while the first
 appends without flushing, which is what a server with several writers and one group commit
@@ -61,7 +64,7 @@ def open_unbuffered(path: str) -> int:
     return msvcrt.open_osfhandle(handle, O_BINARY)
 
 
-def run_variant(directory: str, name: str, count: int, flushes: int, preallocate: bool, unbuffered: bool):
+def run_variant(directory: str, name: str, count: int, flushes: int, preallocate: bool, unbuffered: bool, mapped: bool = False):
     """Per-append latencies in ms for one variant, or None when it does not apply here."""
     if unbuffered and os.name != "nt":
         return None
@@ -81,7 +84,12 @@ def run_variant(directory: str, name: str, count: int, flushes: int, preallocate
             os.ftruncate(fd, BLOCK * count)
             os.fsync(fd)
         os.lseek(fd, 0, os.SEEK_SET)
-        for _ in range(count):
+        view = None
+        if mapped:
+            read_fd = os.open(data_path, os.O_RDONLY | O_BINARY)
+            view = mmap.mmap(read_fd, BLOCK * count, access=mmap.ACCESS_READ)
+            os.close(read_fd)
+        for i in range(count):
             t0 = time.perf_counter()
             os.write(fd, block)
             if flushes >= 1:
@@ -90,6 +98,10 @@ def run_variant(directory: str, name: str, count: int, flushes: int, preallocate
                 os.write(idx, record)
                 os.fsync(idx)
             out.append((time.perf_counter() - t0) * 1000.0)
+            if view is not None:
+                _ = view[i * BLOCK:i * BLOCK + 4096]  # a GET of what was just written
+        if view is not None:
+            view.close()
     finally:
         os.close(fd)
         os.close(idx)
@@ -168,6 +180,9 @@ VARIANTS = [
     ("u_f2_grow", "unbuffered, flush x2, growing (what the server does)", 2, False, True),
     ("u_f1_pre", "unbuffered, flush, preallocated", 1, True, True),
     ("u_f2_pre", "unbuffered, flush x2, preallocated", 2, True, True),
+    ("m_f2_pre", "mapped, flush x2, preallocated", 2, True, False),
+    ("m_u_f2_pre", "mapped, unbuffered, flush x2, preallocated (the server with a sparse volume)", 2, True, True),
+    ("m_u_w_pre", "mapped, unbuffered, write only, preallocated", 0, True, True),
 ]
 
 
@@ -210,7 +225,7 @@ def main(argv=None):
             rows = []
             for name, label, flushes, pre, unbuf in VARIANTS:
                 print(f"{d}: {label} ...", flush=True)
-                rows.append((label, run_variant(work, name, a.count, flushes, pre, unbuf)))
+                rows.append((label, run_variant(work, name, a.count, flushes, pre, unbuf, mapped=name.startswith("m_"))))
             for name, label, second, unbuf in CONTENDED:
                 print(f"{d}: {label} ...", flush=True)
                 lat, flushes = run_contended(work, name, a.count, second, unbuf)
