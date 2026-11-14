@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::s3_api::S3ServiceState;
-use crate::xml::xml_escape;
+use crate::xml::xml_escape_exact;
 
 static FAULT_DISABLE_PREFIX_CHECK: AtomicBool = AtomicBool::new(false);
 
@@ -163,9 +163,9 @@ pub fn lifecycle_config_xml(rules: &[LifecycleRule]) -> String {
     );
     for r in rules {
         out.push_str("  <Rule>\n");
-        out.push_str(&format!("    <ID>{}</ID>\n", xml_escape(&r.id)));
+        out.push_str(&format!("    <ID>{}</ID>\n", xml_escape_exact(&r.id)));
         out.push_str(&format!("    <Status>{}</Status>\n", if r.status { "Enabled" } else { "Disabled" }));
-        out.push_str(&format!("    <Filter><Prefix>{}</Prefix></Filter>\n", xml_escape(&r.prefix)));
+        out.push_str(&format!("    <Filter><Prefix>{}</Prefix></Filter>\n", xml_escape_exact(&r.prefix)));
         if let Some(days) = r.expiration_days {
             out.push_str(&format!("    <Expiration><Days>{}</Days></Expiration>\n", days));
         }

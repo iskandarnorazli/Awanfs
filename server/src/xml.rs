@@ -2,6 +2,33 @@
 //! S3 XML Serialization for Service, Bucket, Object, Batch and Error responses
 //! Reference: awan-storage/API_SPECIFICATION.md Section 2 and awan-storage/EDGE_CASES_AND_CONTRACTS.md Section 3
 
+/// `xml_escape` for text that must read back exactly from a parser that trims whitespace
+/// around element text (ours does): tabs, newlines and carriage returns anywhere, and spaces
+/// at either end, are written as character references, which are decoded after the trim.
+/// Without this a lifecycle rule id ending in a newline came back without it (found by the
+/// `lifecycle_xml` fuzz target, 2026-11-14).
+pub fn xml_escape_exact(s: &str) -> String {
+    let lead = s.len() - s.trim_start_matches(' ').len();
+    let trail = if lead == s.len() { 0 } else { s.len() - s.trim_end_matches(' ').len() };
+    let mut out = String::with_capacity(s.len() + 8);
+    out.push_str(&"&#32;".repeat(lead));
+    for c in s[lead..s.len() - trail].chars() {
+        match c {
+            '\t' => out.push_str("&#9;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out.push_str(&"&#32;".repeat(trail));
+    out
+}
+
 pub fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {

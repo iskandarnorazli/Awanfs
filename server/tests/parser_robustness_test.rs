@@ -159,10 +159,29 @@ fn authenticate_never_panics_on_generated_headers() {
     }
 }
 
+/// The input the `lifecycle_xml` fuzz target crashed on in CI run 43575 (job 132378686962),
+/// reduced: a rule id whose last character is a newline written as a character reference.
+#[test]
+fn a_rule_id_and_prefix_keep_their_whitespace_through_the_serialiser() {
+    let xml = "<LifecycleConfiguration><Rule><ID>IL&gt;S&#10;</ID><Status>Enabled</Status><Filter><Prefix>&#32;logs/&#9;x&#32;</Prefix></Filter></Rule></LifecycleConfiguration>";
+    let rules = parse_lifecycle_xml(xml).unwrap();
+    assert_eq!(rules[0].id, "IL>S\n");
+    assert_eq!(rules[0].prefix, " logs/\tx ");
+    let again = parse_lifecycle_xml(&s3_server::lifecycle_config_xml(&rules)).unwrap();
+    assert_eq!(again, rules);
+    for exact in ["", " ", "  ", " a", "a ", " a b ", "\n", "a\r\nb", "\t&<>\"'"] {
+        let one = vec![s3_server::LifecycleRule { id: "r".to_string(), status: true, prefix: exact.to_string(), expiration_days: Some(1), abort_multipart_days: None }];
+        let back = parse_lifecycle_xml(&s3_server::lifecycle_config_xml(&one)).unwrap();
+        assert_eq!(back, one, "prefix {:?}", exact);
+    }
+}
+
 #[test]
 fn lifecycle_xml_round_trips_through_its_serialiser() {
     let mut r = Rng(1234);
-    let bits = ["a", "logs/", "&", "&amp;", "<Status>Disabled</Status>", "&lt;", "\"", "'", " ", "é", "]]>", "x"];
+    // Whitespace at the ends and line breaks inside are part of the value: the generator used
+    // to trim them away, which hid that the serialiser lost them (fuzz finding, 2026-11-14).
+    let bits = ["a", "logs/", "&", "&amp;", "<Status>Disabled</Status>", "&lt;", "\"", "'", " ", "é", "]]>", "x", "\n", "\t", "\r", "  "];
     for _ in 0..5_000 {
         let mut rules = Vec::new();
         for i in 0..(1 + r.below(3)) {
@@ -173,9 +192,9 @@ fn lifecycle_xml_round_trips_through_its_serialiser() {
                 prefix.push_str(r.pick(&bits));
             }
             rules.push(s3_server::LifecycleRule {
-                id: if id.trim().is_empty() { format!("rule-{}", i + 1) } else { id.trim().to_string() },
+                id: if id.trim().is_empty() { format!("rule-{}", i + 1) } else { id },
                 status: r.below(2) == 0,
-                prefix: prefix.trim().to_string(),
+                prefix,
                 expiration_days: if r.below(2) == 0 { Some(r.below(1000) as u32) } else { None },
                 abort_multipart_days: if r.below(2) == 0 { Some(r.below(30) as u32) } else { None },
             });
