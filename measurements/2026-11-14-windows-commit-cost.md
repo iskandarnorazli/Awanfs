@@ -49,3 +49,36 @@ ubuntu-latest:
 
 Not yet measured: the server with growing volumes on Windows, end to end. That is the next
 experiment, and whether to change the volume layout on Windows is a decision after it.
+
+## The experiment: the first volume grows on Windows (branch `try/windows-growing-volume`)
+
+One line changed: a new data directory's first volume is opened growing, not sparse, on
+Windows. Data on D:, as above.
+
+Through the server alone (run 43599934385), ops/s (P50, P90 ms):
+
+| | 1 client | 8 clients | 64 clients |
+|---|---|---|---|
+| sparse first volume (today) | 116 (8.54, 8.84) | 295 (26.64, 34.95) | 404 (152.20, 219.02) |
+| growing first volume | 2212 (0.43, 0.49) | 3625 (1.39, 4.33) | 3633 (17.13, 25.30) |
+
+Full matrix on windows-latest, 64 clients (run 43600434246), next to the run that started
+this (43579954027: sparse, data on C:) and the one with only the disk changed (43597407482:
+sparse, data on D:). AwanFS ops/s, with MinIO and RustFS from the last run:
+
+| workload | sparse, C: | sparse, D: | growing, D: | MinIO | RustFS |
+|---|---|---|---|---|---|
+| 64 KiB PUT | 118 | 416 | 3685 | 772 | 189 |
+| 64 KiB GET | 2842 | 3074 | 4808 | 3342 | 4009 |
+| 64 KiB mixed | 532 | 788 | 4487 | 2656 | 848 |
+| 1 MiB PUT | 74 | 179 | 243 | 214 | 65 |
+| 1 MiB GET | 2156 | not copied | 3119 | 1917 | 1192 |
+| mixed sweep, 8 clients | 336 | 374 | 4804 | 2979 | 668 |
+| mixed sweep, 128 clients | 441 | not copied | 4377 | 1394 | 801 |
+
+With the first volume growing, AwanFS is ahead of both on every row of that run, and GETs did
+not get slower. MinIO's PUT rows on Windows are not durable writes (its fdatasync is a no-op
+there); AwanFS's are.
+
+Not measured: a volume larger than these short runs fill (the mapping is redone as the file
+grows, and the cost of that at tens of GiB is unknown), and PR #172 together with this.
