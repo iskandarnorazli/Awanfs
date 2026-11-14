@@ -400,6 +400,12 @@ pub struct VolumeManager {
     format: u32,
     /// A second handle on the journal, so a sync does not hold the append lock.
     idx_sync: File,
+    /// A second open of the volume file, used only to flush it. On Windows a write waits for
+    /// a flush made through the same handle (a duplicate counts as the same), so flushing
+    /// through the handle the writers use stops every writer for the length of the flush:
+    /// 2.5 ms a write against 0.02 ms (`measurements/2026-11-14-sync-probe.md`). A flush
+    /// covers the file, whichever handle asks for it.
+    file_sync: File,
     durability: std::sync::atomic::AtomicU8,
     /// Sequence number of the last write whose needle and journal record are written.
     written_seq: AtomicU64,
@@ -564,13 +570,16 @@ impl VolumeManager {
             None
         };
 
-        let idx_sync = idx_file.try_clone()?;
+        // Second opens, not `try_clone`: see `file_sync`.
+        let idx_sync = OpenOptions::new().write(true).open(&idx_path)?;
+        let file_sync = OpenOptions::new().write(true).open(&dat_path)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             volume_id,
             file: aligned_file,
             idx_file: Mutex::new(idx_file),
             idx_sync,
+            file_sync,
             durability: std::sync::atomic::AtomicU8::new(Durability::Group.code()),
             written_seq: AtomicU64::new(0),
             sync_state: std::sync::Mutex::new(SyncState::default()),
@@ -637,7 +646,7 @@ impl VolumeManager {
     /// finished before the sync started as durable.
     fn sync_files(&self) -> Result<(), VolumeError> {
         let target = self.written_seq.load(Ordering::SeqCst);
-        self.file.sync_data()?;
+        self.file_sync.sync_data()?;
         self.work.disk_sync();
         self.idx_sync.sync_data()?;
         self.work.disk_sync();
