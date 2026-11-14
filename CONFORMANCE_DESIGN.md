@@ -106,7 +106,7 @@ client sees when several apply, and the suite checks it:
 - Limits: 20 KiB per policy, 64 KiB for any other kind. Over the limit: 400.
 - An unknown kind in the manifest stops startup, like a newer volume format does.
 
-### 3.3 Clock and background work (#118, #140)
+### 3.3 Clock and background work (issue #158)
 
 Lifecycle and bucket logging are tested by waiting. The suite's lifecycle tests assume a
 "day" lasts `lc_debug_interval` seconds (10 in our configuration).
@@ -118,7 +118,7 @@ Lifecycle and bucket logging are tested by waiting. The suite's lifecycle tests 
 - One scheduler runs sweeps (lifecycle expiration, incomplete multipart uploads, log
   delivery). A sweep runs off the request path, does a bounded amount of work per tick and
   takes the same key locks as a client DELETE. Its cost is checked by the ratio run.
-- **Last-Modified is real.** Responses send a constant date today (#140). It comes from the
+- **Last-Modified is real.** Responses send a constant date today. It comes from the
   needle's creation time through the `Clock`. Conditional requests, lifecycle and listing
   depend on it.
 
@@ -271,6 +271,12 @@ Each area is one issue. Section 10 gives the order. Section 6.1 is the contract 
 
 - **Gate:** every test the map lists under the area is in `tests/s3tests/passing.txt`, the
   nightly ratchet line shows them, and no listed test stopped passing.
+- **No indirect state machines** (owner, 2026-11-14). Anything with states and rules for
+  moving between them is a pure function in `server/src/fsm.rs` with a test over every
+  (state, event) pair and a row in [`STATE_MACHINES.md`](STATE_MACHINES.md), checked in CI.
+  State shared between concurrent requests or rebuilt by recovery is also modelled in
+  `verification/tla`, with a broken variant the model checker must reject. Access decisions
+  and request classification are tables, tested as tables.
 - **Tests first.** Each behaviour gets a Rust test in `server/tests/` that fails before the
   change, and a journey line in `scripts/verify_drive.sh` when a user can see it. The suite
   is the acceptance check, not the only test.
@@ -306,7 +312,9 @@ creation dates, bucket naming rules, the 1,000-key limit of DeleteObjects, answe
 
 `test_atomic_dual_write_8mb` times out, and it points at a real fault, tracked as #154:
 a streamed PUT holds its key's lock while it reads the body, so a client that stops sending
-blocks every other writer of that key. The lock is needed only around the commit.
+blocks every other writer of that key. Taking the lock only at commit is the fix, but the
+TLA+ model shows it is unsafe while recovery orders an unversioned key's needles by offset:
+#154 moves recovery to commit-stamp order for every key, model first.
 
 ## 7. Areas: new request features
 
@@ -387,14 +395,19 @@ they are counted apart from the work that is left.
 
 | Wave | Work | Runs in parallel | Unlocks (test functions not passing today) |
 |---|---|---|---|
-| 0 | #148 operation table, #149 bucket configuration, #150 attributes, real Last-Modified, #154 | no: each touches the core once | none directly |
-| 1 | object metadata and copy (#152), tagging, conditional, multipart, versioning, listing, basics, checksums, CORS | yes | about 140 |
+| 0 | #148 operation table, #149 bucket configuration, #150 attributes, #158 clock and Last-Modified, #154 commit point, #159 commit events and counters | no: each touches the core once | none directly |
+| 1 | object metadata and copy (#152), tagging, conditional, multipart, versioning, listing, basics, checksums, CORS, request headers (#160), the conformance profile (#161) | yes | about 140, plus `test_headers.py` |
 | 2 | #151, then policies, ACLs, ownership, anonymous and presigned (#122), POST object | #122's parts in parallel after #151 | about 130 |
 | 3 | object lock, encryption, lifecycle | yes | about 115 |
-| 4 | bucket logging, if in scope | | 113 |
+| 4 | bucket logging (#153), storage classes (#162), RGW-only behaviours (#163), the suite's other files (#164): outlines until the owner sets the scope | | 113 + 19 + 11 + 171 |
 
 Wave 0 is small in code and decides everything after it, so it is built and reviewed with
 the most care. Waves 1 to 3 are where parallel work pays.
+
+## 10a. Milestones
+
+Each wave is a GitHub milestone: "Conformance 0: foundations" to "Conformance 4: beyond S3
+(decide first)". Every issue named in this file is in one.
 
 ## 11. Decisions
 
@@ -414,3 +427,42 @@ Still open:
 | D4 | Reject multipart parts under 5 MiB except the last | Yes, with the benchmark moved to 5 MiB parts |
 | D5 | Per-grantee ACL grants, which decision 39 ruled out | Yes: the suite cannot pass without them. New buckets default to `BucketOwnerEnforced`, where ACLs are off, so the extra surface is opt-in |
 | D6 | SSE-KMS from a local key file, where decision 38 says an external service later | Yes, as the first step: the stored format (key id plus wrapped data key) is the same when an external KMS replaces the file |
+
+## 12. What a 100% target would add
+
+The suite is written for ceph's gateway (RGW). Three things follow.
+
+**It contains ceph-only API.** 11 tests need RGW extensions: `X-RGW-Object-Count` and
+`X-RGW-Bytes-Used` headers, `GET /?usage`, `allow-unordered` listing, torrents and tenants
+(`tenant:bucket`). 13 bucket-logging tests skip unless ceph's extension to the client's
+service model is installed, and much of bucket logging tests RGW's journal mode and flush
+call. 200 of the 760 tests are marked `fails_on_aws`: they assert RGW behaviour that AWS
+does not have (ACLs working on new buckets, conditional deletes, RGW's naming rules, a
+shortened lifecycle day). Most of those are still reasonable S3-style behaviour and are in
+the areas above; the 11 RGW-only tests are not (#163).
+
+**Some tests only run under settings.** 94 tests are skipped today because the configuration
+lacks something: KMS key ids, two or three storage classes, a cloud tier endpoint, the ceph
+client extension. The pass count is therefore always "under a profile" (#161).
+
+**The suite has more files.** `test_s3.py` is 760 of 980 test functions. `test_headers.py`
+(48) is plain S3 and joins the target (#160). IAM (90), STS (37), S3 Select (38), SNS (5) and
+S3 Control (1) are separate services (#164).
+
+What the decisions already made cover, and what 100% of `test_s3.py` would add:
+
+| Need | Covered by D1 to D4? | Architecture consequence |
+|---|---|---|
+| Per-grantee ACLs, ACLs on by default | No: D5, and decision 39 says no | None beyond section 5; a default setting |
+| SSE-KMS key ids | No: D6, and decision 38 says later | None: the attribute group already holds a key id |
+| 5 MiB minimum part | D4, open | None |
+| Storage class changes after write | No | The storage class is a **replaceable** attribute group, not write-time. Changed in #150 now, so format 3 does not need a successor |
+| Usage headers and account usage | No | Durable per-bucket counters, rebuilt by recovery (#159) |
+| Tenants | No | Bucket identity is (namespace, name). The field is reserved now in the manifest record (#159), empty for all buckets |
+| Bucket logging, later notifications and replication | No | One ordered commit event per change, from the single commit point (#159). No consumer yet |
+| Cloud tiering | No | An S3 client inside the server, stub objects, restore state: a new subsystem (#162). Not reserved for |
+| IAM and STS | No | The identity store changes from a file to a durable store behind an API. Section 5 does not depend on where users come from, so it does not block this |
+
+The three reservations (replaceable storage class, bucket counters, namespace field) and the
+commit event are cheap while the foundations are being built and expensive after, so they
+are in wave 0 whatever target is chosen. Nothing else in D1 to D4 changes.
