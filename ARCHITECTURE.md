@@ -148,6 +148,27 @@ that overlap another write of the same key. Versioned keys are ordered by versio
 commit, and are never copied. Ordering recovery by a commit stamp instead was weighed and not
 chosen: it changes a recovery rule for every key and makes it depend on the clock. #154.
 
+**Decision 52 (2026-11-15): every new volume grows as it is written; none is created sparse.**
+The first volume of a data directory was a 32 GiB sparse file mapped once, and volumes made by
+rollover already grew. On Windows, flushing a sparse file takes 7.75 ms against 0.59 ms for one
+that grows, and every commit paid it: a 64 KiB PUT ran at 416 a second with 64 clients and at
+3,685 with a growing first volume, on the same runner and disk
+(`measurements/2026-11-14-windows-commit-cost.md`). On Linux the two measure the same. One
+layout on every platform was chosen over growing on Windows only. A volume that is already
+sparse stays sparse (it is recognised by its length), and `AWAN_SPARSE_VOLUME=1` still creates
+sparse ones, for comparison. This replaces the "32 GiB sparse virtual volume" design below,
+whose reason was to map each volume once: a growing volume's mapping is redone when a read
+reaches past it.
+
+**Decision 53 (2026-11-15): `--memory-budget` bounds the heap, not the mapped pages.** It covers
+the payload cache and the bytes request bodies hold. Pages of the mapped volume files are
+outside it; they are bounded by taking large reads out of the mapping (#155, step two), not by
+asking the system to drop pages. #127.
+
+**Decision 54 (2026-11-15): the `--access-log` file may drop lines, and counts them,** like the
+stderr request log (decision 41): a slow or full log disk must not stall requests. An access
+log is therefore not an audit record. #138.
+
 **Decision 42 (2026-11-14): on Linux with glibc the server fixes the allocator's mmap threshold
 at startup.** glibc raises its mmap threshold after a large block is freed, so later 1 MiB buffers
 come from the heap and stay there once freed. Measured under `--memory-budget 256MiB` and 64
@@ -188,7 +209,7 @@ Tests follow two rules: no wall-clock thresholds, and a test that fails before t
 Awan Storage is built on six non-negotiable systems engineering invariants:
 1. **Zero Dynamic Allocation on the Hot Path:** Every network packet, HTTP header, chunk buffer, and metadata record operates within preallocated `@arena` slabs and bounded LRU caches (<= 16 MiB) initialized at startup.
 2. **Columnar Metadata Layout (`@flat`):** All object metadata is lowered automatically into contiguous primitive arrays (Struct-of-Arrays) paired with an append-only Key String Arena and an Adaptive Radix Tree (ART) prefix index.
-3. **32 GiB Sparse Virtual Volume Pre-Allocation (`FSCTL_SET_SPARSE`):** Volumes are initialized as 32 GiB virtual sparse files (`FSCTL_SET_SPARSE` on Windows NTFS, sparse holes on Linux) without allocating physical disk clusters upfront. They are mapped once at startup via `memmap2::Mmap` (`open_sparse`), completely eliminating runtime `remap()` latency stalls, page table invalidation, and reader lock serialization.
+3. **32 GiB Sparse Virtual Volume Pre-Allocation (`FSCTL_SET_SPARSE`), no longer the default (decision 52, 2026-11-15: new volumes grow as they are written; what follows describes volumes created before it, and `AWAN_SPARSE_VOLUME=1`):** Volumes are initialized as 32 GiB virtual sparse files (`FSCTL_SET_SPARSE` on Windows NTFS, sparse holes on Linux) without allocating physical disk clusters upfront. They are mapped once at startup via `memmap2::Mmap` (`open_sparse`), completely eliminating runtime `remap()` latency stalls, page table invalidation, and reader lock serialization.
 4. **Staged Parallel Part Files for Multipart Uploads:** Parts upload to independent file handles under `.staging/<upload-id>/part_<num>.dat`, eliminating Windows kernel `FO_SYNCHRONOUS_IO` lock serialization across parallel multipart workers.
 5. **Zero-Copy Kernel Handoff & Direct Extent Slicing:** Range GETs directly slice memory-mapped volume and part extents via `Bytes::from_owner(MmapOwner(mmap)).slice(...)`, bypassing heap allocations and disk read syscalls.
 6. **Deterministic Shard Ownership & Lock-Free MVCC Reads:** The metadata index is partitioned into $S$ cache-line-aligned shards by keyed hash. Point reads execute lock-free via optimistic epoch/seqlock pins, ensuring in-flight `GET` streams never observe torn writes during concurrent `PUT` overwrites.
@@ -295,6 +316,9 @@ Each object or multipart segment written to a Volume Slab is encapsulated in a s
 - Followed by `key_bytes` (`key_len` bytes), `payload_bytes` (`payload_size` bytes), and zero-padding to the next 4096-byte boundary.
 
 ### B. 32 GiB Sparse Pre-Allocation, Durability Modes & Crash Recovery
+
+> Since decision 52 (2026-11-15) a new volume is not sparse: it grows as it is written, on every platform, and its mapping is redone when a read reaches past it. Item 1 describes volumes created before that decision, which stay sparse, and what `AWAN_SPARSE_VOLUME=1` still creates. Recovery (item 3) is the same for both: the scan stops at the first sector that is not a valid needle.
+
 1. **32 GiB Sparse Pre-Allocation (`FSCTL_SET_SPARSE`):**
    - Volume `.dat` files are pre-allocated with a 32 GiB virtual size using `FSCTL_SET_SPARSE` on Windows NTFS and `fallocate` sparse holes on Linux.
    - Physical disk blocks are allocated on-demand by the filesystem as sequential needles are written; unwritten regions consume zero physical bytes.

@@ -86,8 +86,9 @@ async fn get_of_a_corrupted_payload_is_an_error_not_zeros() {
     // Flip one payload byte on disk, then drop the cached copy so the GET reads the volume.
     let dat = dir.join("volume_0001.dat");
     let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&dat).unwrap();
-    let mut head = vec![0u8; 1 << 20];
-    f.read_exact(&mut head).unwrap();
+    // The volume grows as it is written (decision 52), so it may be shorter than 1 MiB.
+    let mut head = Vec::new();
+    std::io::Read::by_ref(&mut f).take(1 << 20).read_to_end(&mut head).unwrap();
     // Search after the 4 KiB superblock: needles start at offset 4096.
     let pos = 4096
         + head[4096..]

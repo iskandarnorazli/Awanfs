@@ -4,7 +4,7 @@ Split from `awan-lang/awan-storage` on 2026-11-12, with its git history. Measure
 
 > **High-Performance, S3-Compatible Object Storage Daemon in Pure Rust**  
 > Engineered for microsecond-latency compute, AI agent sandboxes, and high-throughput checkpointing.  
-> Zero garbage collection pauses. Columnar Struct-of-Arrays (SoA) metadata indexing. 32 GiB sparse virtual volume pre-allocation. 4096B WORM needle storage with direct memory-mapped zero-copy slicing.
+> Zero garbage collection pauses. Columnar Struct-of-Arrays (SoA) metadata indexing. Append-only volumes of up to 32 GiB. 4096B WORM needle storage with direct memory-mapped zero-copy slicing.
 
 ---
 
@@ -30,9 +30,9 @@ Read this before you run it anywhere that matters. Plan of record: the Phase 1-4
    - $O(1)$ hash lookup via `xxh3` hash slots and arena-backed string deduplication.
    - BTree-backed lexicographical prefix and range scans (`ListObjectsV2`).
 
-2. **32 GiB Sparse Virtual Volume Pre-Allocation (`FSCTL_SET_SPARSE`):**
-   - Volume files are initialized as 32 GiB sparse files (`FSCTL_SET_SPARSE` on Windows NTFS, native sparse holes on Unix) without allocating physical disk clusters upfront.
-   - Mapped once into a 32 GiB virtual address space at server startup via `memmap2::Mmap`, completely eliminating runtime `remap()` latency stalls and lock contention.
+2. **Append-only volumes that grow as they are written:**
+   - A volume file holds up to 32 GiB and grows with each write; a new one is started when it is full. The same layout on every platform (decision 52).
+   - Reads go through a memory mapping of the volume, redone when a read reaches past it. The first volume used to be a 32 GiB sparse file mapped once; flushing a sparse file cost 7.75 ms per commit on Windows, so it was dropped. Data directories that already have a sparse volume keep it.
 
 3. **4096-Byte Sector-Aligned WORM Needle Volume Storage:**
    - Sequential append-only write path eliminating filesystem inode exhaustion.
@@ -175,7 +175,7 @@ python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB,10GiB --concurre
 ## 4. Architecture Overview & Module Index
 
 - **`server/src/meta_index.rs`**: Columnar Struct-of-Arrays (SoA) table storing 64-byte packed metadata records (`key_hash`, `bucket_flags`, `vol_offset`, `size`, `etag_hi`, `etag_lo`, `created_at`, `key_slice`) with open-addressing lookup and contiguous key arena.
-- **`server/src/volume.rs`**: 4096B sector-aligned WORM needle volume manager with 32 GiB sparse virtual pre-allocation (`open_sparse`), crash recovery scanner, and needle verification.
+- **`server/src/volume.rs`**: 4096B sector-aligned WORM needle volume manager (growing volumes; `open_sparse` for volumes made sparse before decision 52), crash recovery scanner, and needle verification.
 - **`server/src/direct_io.rs`**: Sector-aligned buffer allocations (`AlignedBuffer`), Windows `FSCTL_SET_SPARSE` direct controls, and lock-free positional I/O (`seek_read` / `seek_write`).
 - **`server/src/multipart.rs`**: High-concurrency S3 Multipart Upload manager tracking parallel staged part files (`.staging/<upload-id>/part_<num>.dat`), memory-mapped extent caches, and zero-copy part concatenation.
 - **`server/src/digest.rs`**: Real-time dual-hasher pipeline concurrently calculating MD5 and Castagnoli CRC32C over streaming TCP frames with AVX2/SSE4.2 detection and software table fallback.
