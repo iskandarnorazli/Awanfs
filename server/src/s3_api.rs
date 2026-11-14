@@ -743,7 +743,7 @@ impl S3ServiceState {
         ));
         let _ = std::fs::create_dir_all(&default_dir);
         let work = Arc::new(WorkCounters::default());
-        let vol_mgr = VolumeManager::open_sparse(&default_dir, 1).ok().map(|mut vm| {
+        let vol_mgr = VolumeManager::open(&default_dir, 1).ok().map(|mut vm| {
             vm.attach_work_counters(Arc::clone(&work));
             Arc::new(vm)
         });
@@ -803,9 +803,10 @@ impl S3ServiceState {
             ids.push(1);
         }
         for id in ids {
-            // Only a brand-new volume 1 is created sparse; volumes from rollover stay as they are.
-            let new_volume = !dir.join(format!("volume_{:04}.dat", id)).exists();
-            let mut vm = VolumeManager::open_mode(dir, id, new_volume && id == 1).map_err(|e| format!("volume {}: {}", id, e))?;
+            // Every new volume grows as it is written (decision 52). A volume that is already a
+            // 32 GiB sparse file, from before that decision, is recognised by its length and
+            // stays sparse. `AWAN_SPARSE_VOLUME=1` still makes new ones sparse, for comparison.
+            let mut vm = VolumeManager::open(dir, id).map_err(|e| format!("volume {}: {}", id, e))?;
             vm.attach_work_counters(Arc::clone(&work));
             volumes.insert(id, Arc::new(vm));
         }

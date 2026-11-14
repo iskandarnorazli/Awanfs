@@ -6,10 +6,15 @@ name: Sync probe (experiment)
 
 on:
   workflow_dispatch:
+    inputs:
+      fill_gib:
+        description: "GiB to fill a volume with before measuring it (large_volume_probe.py)"
+        default: "10"
   pull_request:
     paths:
       - "benchmarks/sync_probe.py"
       - "benchmarks/put_path_probe.py"
+      - "benchmarks/large_volume_probe.py"
       - "server/tests/commit_cost_probe.rs"
       - ".github/workflows/probe-sync.yml"
 
@@ -25,6 +30,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v4
       - name: Where the disks are
         shell: bash
@@ -68,3 +76,16 @@ jobs:
         run: |
           cargo test --locked --release --manifest-path server/Cargo.toml --test commit_cost_probe -- --ignored --nocapture | tee commit_cost.txt
           grep -E '^(Data under|\|)' commit_cost.txt >> "$GITHUB_STEP_SUMMARY"
+      # Decision 52: new volumes grow. Does that cost anything once the volume is large?
+      - name: A large volume, growing against sparse
+        shell: bash
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+          FILL_GIB: ${{ inputs.fill_gib || '10' }}
+        run: |
+          bin=server/target/release/s3-server
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          python -u benchmarks/large_volume_probe.py --server-bin "$bin" --fill-gib "$FILL_GIB" --report large_volume_probe.md
+          cat large_volume_probe.md >> "$GITHUB_STEP_SUMMARY"
