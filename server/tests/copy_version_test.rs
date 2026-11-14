@@ -72,42 +72,42 @@ fn error_code(body: &str) -> &str {
 #[tokio::test]
 async fn a_copy_names_its_source_version_and_gets_that_version() {
     let s = Srv::new("named").await;
-    s.versioned_bucket("vb").await;
-    let v1 = s.put("vb/src", b"first version").await;
-    let v2 = s.put("vb/src", b"second version").await;
+    s.versioned_bucket("vbkt").await;
+    let v1 = s.put("vbkt/src", b"first version").await;
+    let v2 = s.put("vbkt/src", b"second version").await;
     assert_ne!(v1, v2);
 
-    let res = s.copy("vb/from-v1", &format!("/vb/src?versionId={}", v1)).await;
+    let res = s.copy("vbkt/from-v1", &format!("/vbkt/src?versionId={}", v1)).await;
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.headers()["x-amz-copy-source-version-id"].to_str().unwrap(), v1, "says which version it copied");
-    assert_eq!(s.get("vb/from-v1").await, (StatusCode::OK, b"first version".to_vec()), "the named version, not the current one");
+    assert_eq!(s.get("vbkt/from-v1").await, (StatusCode::OK, b"first version".to_vec()), "the named version, not the current one");
 
-    let res = s.copy("vb/from-v2", &format!("vb/src?versionId={}", v2)).await;
+    let res = s.copy("vbkt/from-v2", &format!("vbkt/src?versionId={}", v2)).await;
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(s.get("vb/from-v2").await.1, b"second version");
+    assert_eq!(s.get("vbkt/from-v2").await.1, b"second version");
 
     // Without a version id the current version is copied, as before.
-    assert_eq!(s.copy("vb/current", "vb/src").await.status(), StatusCode::OK);
-    assert_eq!(s.get("vb/current").await.1, b"second version");
+    assert_eq!(s.copy("vbkt/current", "vbkt/src").await.status(), StatusCode::OK);
+    assert_eq!(s.get("vbkt/current").await.1, b"second version");
     s.done();
 }
 
 #[tokio::test]
 async fn an_old_version_can_be_copied_when_the_key_is_deleted() {
     let s = Srv::new("marker").await;
-    s.versioned_bucket("vb").await;
-    let v1 = s.put("vb/src", b"kept").await;
-    let res = s.c.delete(format!("{}/vb/src", s.base)).send().await.unwrap();
+    s.versioned_bucket("vbkt").await;
+    let v1 = s.put("vbkt/src", b"kept").await;
+    let res = s.c.delete(format!("{}/vbkt/src", s.base)).send().await.unwrap();
     let marker = res.headers()["x-amz-version-id"].to_str().unwrap().to_string();
-    assert_eq!(s.get("vb/src").await.0, StatusCode::NOT_FOUND, "the key is deleted");
+    assert_eq!(s.get("vbkt/src").await.0, StatusCode::NOT_FOUND, "the key is deleted");
 
     // The current version is a delete marker, but the old one is still there by id.
-    let res = s.copy("vb/restored", &format!("vb/src?versionId={}", v1)).await;
+    let res = s.copy("vbkt/restored", &format!("vbkt/src?versionId={}", v1)).await;
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(s.get("vb/restored").await.1, b"kept");
+    assert_eq!(s.get("vbkt/restored").await.1, b"kept");
 
     // Naming the delete marker itself is refused.
-    let res = s.copy("vb/x", &format!("vb/src?versionId={}", marker)).await;
+    let res = s.copy("vbkt/x", &format!("vbkt/src?versionId={}", marker)).await;
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     assert_eq!(error_code(&res.text().await.unwrap()), "InvalidRequest");
     s.done();
@@ -116,13 +116,13 @@ async fn an_old_version_can_be_copied_when_the_key_is_deleted() {
 #[tokio::test]
 async fn an_id_that_names_no_version_answers_no_such_version() {
     let s = Srv::new("missing").await;
-    s.versioned_bucket("vb").await;
-    s.put("vb/src", b"only").await;
+    s.versioned_bucket("vbkt").await;
+    s.put("vbkt/src", b"only").await;
     for bad in ["0000000000000001", "zzz"] {
-        let res = s.copy("vb/x", &format!("vb/src?versionId={}", bad)).await;
+        let res = s.copy("vbkt/x", &format!("vbkt/src?versionId={}", bad)).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND, "versionId={}", bad);
         assert_eq!(error_code(&res.text().await.unwrap()), "NoSuchVersion", "versionId={}", bad);
     }
-    assert_eq!(s.get("vb/x").await.0, StatusCode::NOT_FOUND, "nothing was written");
+    assert_eq!(s.get("vbkt/x").await.0, StatusCode::NOT_FOUND, "nothing was written");
     s.done();
 }
