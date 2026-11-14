@@ -162,6 +162,10 @@ def format_markdown_report(
         m = minio_or_baseline.get(key, BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0, measured=False))
         r = rust_fb.get(key, BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0, measured=False))
 
+        # A phase that did not finish is not a slow phase: say so in the row (#135).
+        if not a.measured and a.note:
+            lines.append(f"| **{label}** | **S3 Storage Server** | did not finish: {a.note} | | | | | | |")
+
         lines.append(
             f"| **{label}** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **{a.mib_per_sec:.1f}** | **{a.ops_per_sec:.1f}** | **{a.p50_ms:.2f}** | **{a.p90_ms:.2f}** | **{a.p99_ms:.2f}** | **{a.p999_ms:.2f}** | **{a.peak_rss_mb:.1f} MB** |"
         )
@@ -256,6 +260,22 @@ def format_markdown_report(
     ])
 
     return "\n".join(lines) + "\n"
+
+
+def start_logged(argv: List[str], log_path: str) -> subprocess.Popen:
+    """Starts `argv` with stdout and stderr appended to `log_path`.
+
+    Never a pipe: a pipe nobody drains fills, and the child blocks on its next write. AwanFS
+    writes one JSON line per request to stderr (main.rs, AWANFS_LOG), about 230 bytes each, so a
+    64 KiB Linux pipe filled after about 271 requests and a 4 KiB Windows pipe after about 16,
+    and the server stopped answering while still holding its port. That was #135. The log file
+    is kept so a failed run can be read.
+    """
+    log = open(log_path, "ab")
+    try:
+        return subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT)
+    finally:
+        log.close()  # the child holds its own handle
 
 
 def get_free_port() -> int:
@@ -446,6 +466,29 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+PHASE_JOIN_TIMEOUT_SEC = 120.0
+# The warm-up is sequential, so it gets its own bound: a phase whose objects are not all
+# written is reported, not waited on.
+WARMUP_TIMEOUT_SEC = 120.0
+
+
+def join_all(threads: List[threading.Thread], label: str, timeout_sec: float = PHASE_JOIN_TIMEOUT_SEC) -> int:
+    """Waits for `threads` up to `timeout_sec` in total; returns how many are still running.
+
+    A phase worker leaves its loop only between requests, so one stuck request used to hang the
+    phase, the job and the whole run with nothing in the log (#135). Bounded here, and the
+    threads are daemons, so a stuck one cannot keep the process alive either.
+    """
+    deadline = time.perf_counter() + timeout_sec
+    for t in threads:
+        t.join(timeout=max(0.0, deadline - time.perf_counter()))
+    stuck = sum(1 for t in threads if t.is_alive())
+    if stuck:
+        print(f"    {label}: {stuck} of {len(threads)} workers still in a request "
+              f"{timeout_sec:.0f}s after the stop; this phase did not finish", flush=True)
+    return stuck
+
+
 def run_workload_phase(
     host: str,
     port: int,
@@ -455,32 +498,66 @@ def run_workload_phase(
     duration_sec: float,
     mode: str,  # "put", "get", or "range_get_4k"
     server_pid: Optional[int] = None,
+    warmup_timeout_sec: float = WARMUP_TIMEOUT_SEC,
 ) -> BenchmarkMetrics:
     payload = os.urandom(payload_size)
+    phase_label = f"{mode} {payload_size}B c={concurrency}"
     stop_event = threading.Event()
     latencies: List[float] = []
     lat_lock = threading.Lock()
     total_bytes = 0
     bytes_lock = threading.Lock()
+    # A response that is not a success is an error, not an operation: counting it as an op
+    # made a run in which every request answered 404 read as a fast run (#127, runs
+    # 43504508701 and 43504519493: 532 ops/s at 0.00 MiB/s).
+    errors = 0
+    error_statuses: Dict[int, int] = {}
 
+    # The warm-up writes every key the workers will read: concurrency x keys PUTs, one at a
+    # time. Each connection has a 10 s socket timeout and a failure used to be swallowed and the
+    # loop continued, so a server that had stopped answering turned this into
+    # concurrency x keys x 10 s of silence: 85 minutes at 64 workers and 8 keys. Bounded here,
+    # and what happened is reported, because the phase cannot be measured without it (#135).
     pool_keys_per_worker = 4 if payload_size >= 1024 * 1024 else 8
+    want = concurrency * pool_keys_per_worker
+    warm_start = time.perf_counter()
+    warm_deadline = warm_start + warmup_timeout_sec
+    warm_ok, warm_fail, last_error = 0, 0, ""
+    warm_sock_timeout = min(10.0, max(1.0, warmup_timeout_sec / 4.0))
     for w in range(concurrency):
-        conn = http.client.HTTPConnection(host, port, timeout=10.0)
+        conn = http.client.HTTPConnection(host, port, timeout=warm_sock_timeout)
         for k in range(pool_keys_per_worker):
+            if time.perf_counter() > warm_deadline:
+                break
             path = f"/{bucket}/worker_{w}_obj_{k}.dat"
             try:
                 conn.request("PUT", path, body=payload, headers={"Content-Length": str(payload_size), "Connection": "keep-alive"})
                 resp = conn.getresponse()
                 resp.read()
-            except Exception:
+                if resp.status == 200:
+                    warm_ok += 1
+                else:
+                    warm_fail += 1
+                    last_error = f"HTTP {resp.status}"
+            except Exception as e:
+                warm_fail += 1
+                last_error = f"{type(e).__name__}: {e}"
                 conn.close()
-                conn = http.client.HTTPConnection(host, port, timeout=10.0)
+                conn = http.client.HTTPConnection(host, port, timeout=warm_sock_timeout)
         conn.close()
+        if time.perf_counter() > warm_deadline:
+            break
+    warm_took = time.perf_counter() - warm_start
+    warm_short = warm_ok + warm_fail < want
+    print(f"    {phase_label}: warm-up wrote {warm_ok} of {want} objects in {warm_took:.1f}s"
+          + (f", {warm_fail} failed, last: {last_error}" if warm_fail else "")
+          + (f", gave up after {warmup_timeout_sec:.0f}s" if warm_short else ""), flush=True)
 
     def worker(worker_id: int):
-        nonlocal total_bytes
+        nonlocal total_bytes, errors
         local_lats: List[float] = []
         local_bytes = 0
+        local_errors: Dict[int, int] = {}
         req_count = 0
         conn = http.client.HTTPConnection(host, port, timeout=10.0)
         put_headers = {"Content-Length": str(payload_size), "Connection": "keep-alive"}
@@ -498,36 +575,44 @@ def run_workload_phase(
                     conn.request("PUT", path, body=payload, headers=put_headers)
                     resp = conn.getresponse()
                     resp.read()
-                    if resp.status == 200:
+                    ok = resp.status == 200
+                    if ok:
                         local_bytes += payload_size
                 elif mode == "range_get_4k":
                     conn.request("GET", path, headers=range_headers)
                     resp = conn.getresponse()
                     data = resp.read()
-                    if resp.status in (200, 206):
+                    ok = resp.status in (200, 206)
+                    if ok:
                         local_bytes += len(data)
                 elif mode == "mixed":
                     if req_count % 5 == 0:
                         conn.request("PUT", path, body=payload, headers=put_headers)
                         resp = conn.getresponse()
                         resp.read()
-                        if resp.status == 200:
+                        ok = resp.status == 200
+                        if ok:
                             local_bytes += payload_size
                     else:
                         conn.request("GET", path, headers=get_headers)
                         resp = conn.getresponse()
                         data = resp.read()
-                        if resp.status == 200:
+                        ok = resp.status == 200
+                        if ok:
                             local_bytes += len(data)
                 else:
                     conn.request("GET", path, headers=get_headers)
                     resp = conn.getresponse()
                     data = resp.read()
-                    if resp.status == 200:
+                    ok = resp.status == 200
+                    if ok:
                         local_bytes += len(data)
 
                 t1 = time.perf_counter()
-                local_lats.append((t1 - t0) * 1000.0)
+                if ok:
+                    local_lats.append((t1 - t0) * 1000.0)
+                else:
+                    local_errors[resp.status] = local_errors.get(resp.status, 0) + 1
             except Exception:
                 try:
                     conn.close()
@@ -544,8 +629,11 @@ def run_workload_phase(
             latencies.extend(local_lats)
         with bytes_lock:
             total_bytes += local_bytes
+            for st, n in local_errors.items():
+                errors += n
+                error_statuses[st] = error_statuses.get(st, 0) + n
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(concurrency)]
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(concurrency)]
     t_start = time.perf_counter()
     for t in threads:
         t.start()
@@ -553,8 +641,7 @@ def run_workload_phase(
     time.sleep(duration_sec)
     stop_event.set()
 
-    for t in threads:
-        t.join()
+    stuck = join_all(threads, phase_label)
     t_total = time.perf_counter() - t_start
 
     ops = len(latencies)
@@ -571,7 +658,16 @@ def run_workload_phase(
         p99_ms=p99,
         p999_ms=p999,
         peak_rss_mb=peak_rss,
-        measured=True,
+        measured=not stuck and not warm_short and warm_fail == 0 and errors == 0,
+        note=", ".join(
+            x for x in (
+                f"{errors} requests failed ({', '.join(f'HTTP {k} x{v}' for k, v in sorted(error_statuses.items()))})"
+                if errors else "",
+                f"{stuck} workers did not finish their request" if stuck else "",
+                f"warm-up wrote {warm_ok} of {want} objects" if warm_short or warm_fail else "",
+                f"last warm-up error: {last_error}" if last_error else "",
+            ) if x
+        ),
     )
 
 
@@ -587,6 +683,7 @@ def run_multipart_upload_duration_phase(
 ) -> BenchmarkMetrics:
     """Runs complete S3 Multipart Upload lifecycles (?uploads -> UploadPart x K -> CompleteMultipartUpload)."""
     part_payload = os.urandom(part_size)
+    phase_label = f"multipart {parts_per_object}x{part_size}B c={concurrency}"
     stop_event = threading.Event()
     latencies: List[float] = []
     lat_lock = threading.Lock()
@@ -660,14 +757,13 @@ def run_multipart_upload_duration_phase(
         with bytes_lock:
             total_bytes += local_bytes
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(concurrency)]
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(concurrency)]
     t_start = time.perf_counter()
     for t in threads:
         t.start()
     time.sleep(duration_sec)
     stop_event.set()
-    for t in threads:
-        t.join()
+    stuck = join_all(threads, phase_label)
     t_total = time.perf_counter() - t_start
 
     ops = len(latencies)
@@ -684,7 +780,8 @@ def run_multipart_upload_duration_phase(
         p99_ms=p99,
         p999_ms=p999,
         peak_rss_mb=peak_rss,
-        measured=True,
+        measured=not stuck,
+        note=(f"{stuck} workers did not finish their request" if stuck else ""),
     )
 
 
@@ -705,6 +802,7 @@ def run_large_multipart_object_phase(
     """
     num_parts = total_size_bytes // part_size_bytes
     part_payload = os.urandom(part_size_bytes)
+    phase_label = f"large multipart {total_size_bytes}B parts {part_size_bytes}B c={concurrency}"
     obj_path = f"/{bucket}/{key}"
 
     # --- Phase A: Multipart Upload ---
@@ -750,11 +848,10 @@ def run_large_multipart_object_phase(
                     up_bytes += part_size_bytes
         w_conn.close()
 
-    threads = [threading.Thread(target=upload_worker) for _ in range(concurrency)]
+    threads = [threading.Thread(target=upload_worker, daemon=True) for _ in range(concurrency)]
     for t in threads:
         t.start()
-    for t in threads:
-        t.join()
+    stuck = join_all(threads, phase_label)
 
     parts_xml = "".join(
         f"<Part><PartNumber>{p}</PartNumber><ETag>{etags[p]}</ETag></Part>"
@@ -782,7 +879,8 @@ def run_large_multipart_object_phase(
         p99_ms=up_p99,
         p999_ms=up_p999,
         peak_rss_mb=up_rss,
-        measured=True,
+        measured=not stuck,
+        note=(f"{stuck} workers did not finish their request" if stuck else ""),
     )
 
     # --- Phase B: Parallel RFC 9110 Range GET over the 1 GiB Multipart Object ---
@@ -817,11 +915,10 @@ def run_large_multipart_object_phase(
         w_conn.close()
 
     t_down_start = time.perf_counter()
-    threads = [threading.Thread(target=range_get_worker) for _ in range(concurrency)]
+    threads = [threading.Thread(target=range_get_worker, daemon=True) for _ in range(concurrency)]
     for t in threads:
         t.start()
-    for t in threads:
-        t.join()
+    stuck = join_all(threads, phase_label)
     t_down_total = time.perf_counter() - t_down_start
 
     d_p50, d_p90, d_p99, d_p999 = calculate_percentiles(down_lats)
@@ -834,7 +931,8 @@ def run_large_multipart_object_phase(
         p99_ms=d_p99,
         p999_ms=d_p999,
         peak_rss_mb=down_rss,
-        measured=True,
+        measured=not stuck,
+        note=(f"{stuck} workers did not finish their request" if stuck else ""),
     )
     return put_metrics, get_metrics
 
@@ -852,6 +950,7 @@ def run_fixed_volume_phase(
 ) -> BenchmarkMetrics:
     """Streams an exact total volume (e.g. 10 GiB) in 64 MiB chunks across concurrent workers."""
     payload = os.urandom(part_size_bytes)
+    phase_label = f"fixed volume {total_volume_bytes}B parts {part_size_bytes}B c={concurrency}"
     total_parts = total_volume_bytes // part_size_bytes
     next_part_idx = 0
     idx_lock = threading.Lock()
@@ -911,12 +1010,11 @@ def run_fixed_volume_phase(
         with bytes_lock:
             total_bytes += local_bytes
 
-    threads = [threading.Thread(target=worker) for _ in range(concurrency)]
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(concurrency)]
     t_start = time.perf_counter()
     for t in threads:
         t.start()
-    for t in threads:
-        t.join()
+    stuck = join_all(threads, phase_label)
     t_total = time.perf_counter() - t_start
 
     ops = len(latencies)
@@ -933,7 +1031,8 @@ def run_fixed_volume_phase(
         p99_ms=p99,
         p999_ms=p999,
         peak_rss_mb=peak_rss,
-        measured=True,
+        measured=not stuck,
+        note=(f"{stuck} workers did not finish their request" if stuck else ""),
     )
 
 
@@ -1000,11 +1099,12 @@ def main():
     # Measure S3 Storage Server with Columnar SoA Metadata Index and Needle Volume
     s3_data_dir = tempfile.mkdtemp(prefix="s3_server_bench_")
     port = get_free_port()
-    server_proc = subprocess.Popen(
+    server_log = os.path.join(tempfile.gettempdir(), f"awanfs_bench_{port}.log")
+    server_proc = start_logged(
         [server_bin, "--port", str(port), "--data-dir", s3_data_dir, "--allow-anonymous"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        server_log,
     )
+    print(f"AwanFS log: {server_log}", flush=True)
     set_affinity_mask(server_proc.pid, 0x0F)
     time.sleep(0.8)
 
