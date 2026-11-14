@@ -15,6 +15,9 @@ on:
       runs:
         description: "Rounds per server (ratio check)"
         default: "3"
+      sizes:
+        description: "Object sizes for the full matrix (64KiB,1MiB,1GiB,10GiB). 10GiB needs about 60 GB free and adds a long time"
+        default: "64KiB,1MiB,1GiB"
   schedule:
     - cron: "17 18 * * 6" # Sunday 02:17 in Malaysia; skipped if the runner is offline
 
@@ -65,7 +68,7 @@ jobs:
         timeout-minutes: 180
         run: |
           python -c "import os; os.path.exists('selfhosted_full.md') and os.remove('selfhosted_full.md')"
-          python -u benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB --concurrent 64 --duration ${{ inputs.duration || '30' }}s --output selfhosted_full.md
+          python -u benchmarks/run_warp_benchmark.py --sizes ${{ inputs.sizes || '64KiB,1MiB,1GiB' }} --concurrent 64 --duration ${{ inputs.duration || '30' }}s --output selfhosted_full.md
       - name: Report
         if: always()
         shell: python
