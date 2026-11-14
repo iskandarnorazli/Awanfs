@@ -159,10 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // awanfs_log_lines_dropped_total, and never stops requests (#138). The --access-log sink
     // above still writes inline: whether it may drop lines is an open owner decision.
     if std::env::var("AWANFS_LOG").ok().as_deref() != Some("off") {
-        let sink = s3_server::request_log::bounded_sink(4096, Arc::clone(&state.log_lines_dropped), |line: &str| {
-            use std::io::Write;
-            let _ = writeln!(std::io::stderr().lock(), "{}", line);
-        });
+        let sink: s3_server::request_log::LogSink = Arc::new(|line: &str| eprintln!("{}", line));
         *state.access_log.write() = Some(sink);
     }
     let state = Arc::new(state);
