@@ -128,6 +128,17 @@ impl NeedleWriter {
         &self.vm
     }
 
+    /// The header flags. The header is written last, so a streamed PUT sets them when it
+    /// commits, from the bucket's versioning status at that moment (#154).
+    pub fn set_flags(&mut self, flags: u16) {
+        self.flags = flags;
+    }
+
+    /// Where the needle starts inside its volume: reserved when the writer was made.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
     pub fn written(&self) -> u64 {
         self.written
     }

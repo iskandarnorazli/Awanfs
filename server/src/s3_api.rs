@@ -213,6 +213,80 @@ async fn drain_body(body: &mut hyper::body::Incoming, limit: u64) {
 
 /// The end of a PutObject once the needle is durable: index row, bookkeeping, answer.
 #[allow(clippy::too_many_arguments)]
+/// Streamed PUTs in flight, by key (#154).
+///
+/// A streamed PUT reserves its needle before its body arrives and takes the key lock only to
+/// commit. Recovery replays an unversioned key in offset order, so if any needle of that key
+/// was appended while the body arrived, the streamed needle is no longer the last one in the
+/// log and has to be written again at the end (`verification/tla/ObjectVersions.tla`,
+/// `Relocate`). This records, for keys with a PUT in flight, the highest offset appended.
+///
+/// Order matters and is what makes the check sound: a PUT enters before it reserves its
+/// offset, and every append notes itself after it reserved its own. So an append at a later
+/// offset than the PUT's always finds the PUT's entry. Keys are tracked by a 64-bit hash: a
+/// collision can only cause a copy that was not needed.
+#[derive(Default)]
+pub struct StreamsInFlight {
+    count: std::sync::atomic::AtomicUsize,
+    keys: parking_lot::Mutex<HashMap<(u32, u64), (u32, u64)>>,
+}
+
+impl StreamsInFlight {
+    fn slot(b_id: u32, key: &str) -> (u32, u64) {
+        (b_id, xxhash_rust::xxh3::xxh3_64(key.as_bytes()))
+    }
+
+    /// Starts tracking `key`. Call before reserving the needle; dropping the ticket stops.
+    pub fn enter(self: &Arc<Self>, b_id: u32, key: &str) -> StreamTicket {
+        let slot = Self::slot(b_id, key);
+        self.count.fetch_add(1, Ordering::SeqCst);
+        self.keys.lock().entry(slot).or_insert((0, 0)).0 += 1;
+        StreamTicket { streams: Arc::clone(self), slot }
+    }
+
+    /// A needle of `key` was appended at global offset `g`. Call after the reservation.
+    pub fn note_append(&self, b_id: u32, key: &str, g: u64) {
+        if self.count.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        if let Some(e) = self.keys.lock().get_mut(&Self::slot(b_id, key)) {
+            e.1 = e.1.max(g);
+        }
+    }
+
+    /// How many streamed PUTs are in flight.
+    pub fn in_flight(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+/// One streamed PUT in flight; see `StreamsInFlight`.
+pub struct StreamTicket {
+    streams: Arc<StreamsInFlight>,
+    slot: (u32, u64),
+}
+
+impl StreamTicket {
+    /// Whether a needle of this key was appended after global offset `g`.
+    pub fn appended_after(&self, g: u64) -> bool {
+        self.streams.keys.lock().get(&self.slot).is_some_and(|e| e.1 > g)
+    }
+}
+
+impl Drop for StreamTicket {
+    fn drop(&mut self) {
+        let mut keys = self.streams.keys.lock();
+        if let Some(e) = keys.get_mut(&self.slot) {
+            e.0 -= 1;
+            if e.0 == 0 {
+                keys.remove(&self.slot);
+            }
+        }
+        drop(keys);
+        self.streams.count.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn finish_put(
     state: &S3ServiceState,
     b_id: u32,
@@ -628,10 +702,16 @@ pub struct S3ServiceState {
     pub test_hook: Arc<RwLock<Option<TestHook>>>,
     /// Striped per-key locks: requests that change one key take its lock from before the
     /// volume write until the engine row is updated, so log order equals index order
-    /// (`verification/tla/ObjectVersions.tla`, `UseKeyLock`).
+    /// (`verification/tla/ObjectVersions.tla`, `UseKeyLock`). A streamed PUT takes it only to
+    /// commit and uses `streams` to keep that order (#154).
     pub key_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
     /// Large objects whose bytes failed their checksum while being sent (#155).
     pub read_checksum_failures: Arc<AtomicU64>,
+    /// Streamed PUTs in flight, and what was appended for their keys meanwhile (#154).
+    pub streams: Arc<StreamsInFlight>,
+    /// Streamed PUTs written a second time because their key was written or deleted while
+    /// their body arrived (#154).
+    pub stream_relocations: Arc<AtomicU64>,
     /// Who may call; `AuthConfig::open()` by default, the binary sets it from flags and env.
     pub auth: crate::auth::AuthConfig,
     /// Why the server is not ready yet (`None` when it is); see `/_awanfs/health/ready` (#44).
@@ -692,6 +772,8 @@ impl S3ServiceState {
             test_hook: Arc::new(RwLock::new(None)),
             key_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
             read_checksum_failures: Arc::new(AtomicU64::new(0)),
+            streams: Arc::new(StreamsInFlight::default()),
+            stream_relocations: Arc::new(AtomicU64::new(0)),
             auth: crate::auth::AuthConfig::open(),
             not_ready: Arc::new(RwLock::new(None)),
             metrics: Arc::new(crate::metrics::Metrics::default()),
@@ -929,6 +1011,8 @@ impl S3ServiceState {
             test_hook: Arc::new(RwLock::new(None)),
             key_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
             read_checksum_failures: Arc::new(AtomicU64::new(0)),
+            streams: Arc::new(StreamsInFlight::default()),
+            stream_relocations: Arc::new(AtomicU64::new(0)),
             auth: crate::auth::AuthConfig::open(),
             not_ready: Arc::new(RwLock::new(None)),
             metrics: Arc::new(crate::metrics::Metrics::default()),
@@ -1468,6 +1552,7 @@ impl S3ServiceState {
             match vm.write_needle_at(b_id as u16, key, data, flags, etag_hi, etag_lo, created_at) {
                 Ok(loc) => {
                     let g = global_offset(vm.id(), loc.offset);
+                    self.streams.note_append(b_id, key, g);
                     return Ok((vm, loc, g));
                 }
                 // A needle bigger than a whole volume would roll forever: refuse it.
@@ -1484,6 +1569,34 @@ impl S3ServiceState {
     }
 
     /// Starts a streamed needle on the active volume, rolling over when it is full (#36, #37).
+    /// Writes the needle at `from` again at the end of the log, in `STREAM_CHUNK` pieces, and
+    /// returns the copy's place. The first needle stays in the log as dead space: recovery
+    /// replays it and then whatever came after it, the copy last (#154).
+    #[allow(clippy::too_many_arguments)]
+    pub fn relocate_needle(
+        &self,
+        b_id: u32,
+        key: &str,
+        from_vm: &Arc<VolumeManager>,
+        from: &NeedleLocation,
+        flags: u16,
+        etag_hi: u64,
+        etag_lo: u64,
+    ) -> Result<(Arc<VolumeManager>, NeedleLocation, u64), VolumeError> {
+        let bytes = from_vm.read_needle_bytes(from_vm.id(), from.offset, from.payload_crc32c)?;
+        let mut writer = self.begin_needle_on_active(b_id, key, bytes.len() as u64, flags)?;
+        for piece in bytes.chunks(crate::volume::STREAM_CHUNK) {
+            writer.write(piece)?;
+        }
+        let vm = Arc::clone(writer.volume());
+        let g = global_offset(vm.id(), writer.offset());
+        let loc = writer.finish(etag_hi, etag_lo)?;
+        self.total_volume_bytes.fetch_add(from.total_len, Ordering::Relaxed);
+        self.tombstone_bytes.fetch_add(from.total_len, Ordering::Relaxed);
+        self.stream_relocations.fetch_add(1, Ordering::SeqCst);
+        Ok((vm, loc, g))
+    }
+
     pub fn begin_needle_on_active(&self, b_id: u32, key: &str, len: u64, flags: u16) -> Result<crate::volume::NeedleWriter, VolumeError> {
         let mut attempts = 0;
         loop {
@@ -1494,7 +1607,10 @@ impl S3ServiceState {
                 continue;
             }
             match vm.begin_needle(b_id as u16, key, len, flags) {
-                Ok(w) => return Ok(w),
+                Ok(w) => {
+                    self.streams.note_append(b_id, key, global_offset(vm.id(), w.offset()));
+                    return Ok(w);
+                }
                 Err(VolumeError::VolumeFull { len, .. }) if len + crate::direct_io::SECTOR_SIZE as u64 > vm.max_span() => {
                     return Err(VolumeError::VolumeFull { offset: 0, len })
                 }
@@ -3184,11 +3300,11 @@ async fn handle_s3_inner(
                         expected_len.map(|n| n as u64)
                     };
                     if let Some(len) = stream_len.filter(|&n| n > STREAM_PUT_MIN) {
-                        // Large body: write it to the volume as it arrives (#36). The key lock is
-                        // held from the reservation to the index update, so log order stays
-                        // index order for this key.
-                        let flags = if key.ends_with('/') { AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE } else { AWAN_FLAG_ACTIVE };
-                        let _key_guard = state.lock_key(b_id, &key).await;
+                        // Large body: write it to the volume as it arrives (#36), without the
+                        // key lock, so a client that stops sending blocks no other writer of
+                        // the key (#154). The lock is taken to commit, below. These two checks
+                        // are repeated there; here they refuse before the body is read.
+                        let base_flags = if key.ends_with('/') { AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE } else { AWAN_FLAG_ACTIVE };
                         if if_none_match_star && state.engine.read().get_object(b_id, key.as_bytes()).is_ok() {
                             let xml = s3_error_xml("PreconditionFailed", "At least one of the pre-conditions you specified did not hold.", &key, "req-inm");
                             return Ok(Response::builder()
@@ -3200,16 +3316,15 @@ async fn handle_s3_inner(
                         if let Err(code) = state.engine.read().has_room_for(b_id, key.as_bytes()) {
                             return Ok(engine_error_response(code, &key));
                         }
-                        let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size));
-                        let stamp = state.version_stamp(b_id, &key);
-                        let flags = flags | stamp.map_or(0, |s| s.0);
-                        let mut writer = match state.begin_needle_on_active(b_id, &key, len, flags) {
+                        // The versioning flags picked here only choose a volume that can hold
+                        // them; the ones written are decided at commit. The ticket comes
+                        // before the reservation: see `StreamsInFlight`.
+                        let ticket = state.streams.enter(b_id, &key);
+                        let begin_flags = base_flags | state.version_stamp(b_id, &key).map_or(0, |s| s.0);
+                        let mut writer = match state.begin_needle_on_active(b_id, &key, len, begin_flags) {
                             Ok(w) => w,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                         };
-                        if let Some((_, ts)) = stamp {
-                            writer.set_created_at(ts);
-                        }
                         let declared_sha = signed_headers
                             .get("x-amz-content-sha256")
                             .and_then(|v| v.to_str().ok())
@@ -3274,15 +3389,51 @@ async fn handle_s3_inner(
                                 return Ok(bad_request("BadDigest", "The Content-MD5 you specified did not match what we received.", &key));
                             }
                         }
-                        let vm = Arc::clone(writer.volume());
-                        let loc = match writer.finish(etag_hi, etag_lo) {
+                        // Commit. The body is on the volume; the header sector, which makes
+                        // the needle a record recovery can see, is written under the key lock.
+                        let _key_guard = state.lock_key(b_id, &key).await;
+                        if if_none_match_star && state.engine.read().get_object(b_id, key.as_bytes()).is_ok() {
+                            return Ok(Response::builder()
+                                .status(StatusCode::PRECONDITION_FAILED)
+                                .header(CONTENT_TYPE, "application/xml")
+                                .body(full_body(Bytes::from(s3_error_xml("PreconditionFailed", "At least one of the pre-conditions you specified did not hold.", &key, "req-inm"))))
+                                .unwrap());
+                        }
+                        if let Err(code) = state.engine.read().has_room_for(b_id, key.as_bytes()) {
+                            return Ok(engine_error_response(code, &key));
+                        }
+                        let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size));
+                        let stamp = state.version_stamp(b_id, &key);
+                        let flags = base_flags | stamp.map_or(0, |s| s.0);
+                        if flags & FORMAT_2_FLAGS != 0 && writer.volume().format() < 2 {
+                            return Ok(internal_error_response(&key, "the bucket's versioning changed while the object was uploaded; send it again"));
+                        }
+                        writer.set_flags(flags);
+                        if let Some((_, ts)) = stamp {
+                            writer.set_created_at(ts);
+                        }
+                        let first_vm = Arc::clone(writer.volume());
+                        let first_offset = global_offset(first_vm.id(), writer.offset());
+                        let first_loc = match writer.finish(etag_hi, etag_lo) {
                             Ok(l) => l,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
+                        };
+                        // An unversioned key is replayed in offset order. If a needle of this
+                        // key was appended since this one was reserved, this one is not the
+                        // last in the log: write it again at the end. Versions are ordered by
+                        // their ids, taken above under the lock, so they stay where they are.
+                        let (vm, loc, vol_offset) = if stamp.is_none() && ticket.appended_after(first_offset) {
+                            match state.relocate_needle(b_id, &key, &first_vm, &first_loc, flags, etag_hi, etag_lo) {
+                                Ok(moved) => moved,
+                                Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
+                            }
+                        } else {
+                            (first_vm, first_loc, first_offset)
                         };
                         if let Err(e) = state.make_durable(&vm, loc.seq).await {
                             return Ok(internal_error_response(&key, &format!("could not sync the object: {:?}", e)));
                         }
-                        let vol_offset = global_offset(vm.id(), loc.offset);
+                        drop(ticket);
                         state.needle_crc_map.write().insert((b_id, vol_offset), loc.payload_crc32c);
                         state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                         state.hook("put_stored", &key);
