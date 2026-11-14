@@ -107,14 +107,16 @@ async fn a_stalled_put_does_not_block_other_writers_and_the_last_commit_wins_aft
     // The first PUT commits last: it is the object now...
     assert_eq!(stalled.finish().await, 200);
     assert!(body_of(&c, &key).await.as_deref() == Some(&first[..]), "the last PUT to commit is the object");
-    assert_eq!(state.stream_relocations.load(Ordering::SeqCst), 1, "its needle was reserved before the other two were logged");
+    let relocations = state.stream_relocations.load(Ordering::SeqCst);
     handle.shutdown();
     drop(state);
 
     // ...and after a restart, although its first needle sits before the other two in the log.
+    // This is the assertion that matters; the count after it says how it was kept true.
     let (_state, url, _h) = start(&dir).await;
     let key = format!("{}/stall-bkt/k", url);
     assert!(body_of(&c, &key).await.as_deref() == Some(&first[..]), "the same object after the restart");
+    assert_eq!(relocations, 1, "its needle was reserved before the other two were logged");
 }
 
 #[tokio::test]
@@ -134,13 +136,14 @@ async fn a_delete_during_a_stalled_put_does_not_win_after_a_restart() {
 
     assert_eq!(stalled.finish().await, 200);
     assert!(body_of(&c, &key).await.as_deref() == Some(&first[..]));
-    assert_eq!(state.stream_relocations.load(Ordering::SeqCst), 1, "a tombstone was logged after the reservation");
+    let relocations = state.stream_relocations.load(Ordering::SeqCst);
     handle.shutdown();
     drop(state);
 
     let (_state, url, _h) = start(&dir).await;
     let key = format!("{}/stall-bkt/k", url);
     assert!(body_of(&c, &key).await.as_deref() == Some(&first[..]), "the tombstone must not win after the restart");
+    assert_eq!(relocations, 1, "a tombstone was logged after the reservation");
 }
 
 #[tokio::test]
