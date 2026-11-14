@@ -1,8 +1,8 @@
 # Design: passing the ceph s3-tests suite
 
 Status: **plan of record, 2026-11-14.** The owner decided D1, D2, D3 and the large-GET rule
-on 2026-11-14 (section 11, `ARCHITECTURE.md` decisions 43 to 46). D4, D5 and D6 are still
-open, and the parts that depend on them say so.
+on 2026-11-14, then D4, D5, D6 and the target the same day (section 11, `ARCHITECTURE.md`
+decisions 43 to 50). Nothing is open.
 
 The companion file [`tests/s3tests/CONFORMANCE_MAP.md`](tests/s3tests/CONFORMANCE_MAP.md)
 assigns every test in the pinned suite to one area below, with its current status and failure
@@ -247,12 +247,11 @@ ACL or a policy.
   as `x-amz-acl` and `x-amz-server-side-encryption`, `s3:prefix`, existing and requested
   object tags, the copy source). The area issue lists the keys the suite uses.
 - ACLs: canned ACLs and grant headers on PUT, `?acl` documents on buckets and objects, the
-  three grantee kinds. *Decision needed (D5):* decision 39 says "no per-grantee ACL grants",
-  and most of the 61 `acl-ownership` tests grant to a named user. Until D5 is decided, #122
-  builds canned ACLs only. `BlockPublicAcls` rejects a PUT that sets a public ACL;
+  three grantee kinds. Per-grantee grants are built (decision 48). `BlockPublicAcls` rejects a PUT that sets a public ACL;
   `BlockPublicPolicy` rejects a public policy.
-- Ownership controls: `BucketOwnerEnforced` (default for new buckets), `BucketOwnerPreferred`,
-  `ObjectWriter`.
+- Ownership controls: `BucketOwnerEnforced` (default for new buckets, decision 48),
+  `BucketOwnerPreferred`, `ObjectWriter`. The suite's profile (#161) sets the default to
+  `ObjectWriter`, because its ACL tests expect ACLs to work on a new bucket.
 
 ### 5.4 Tests this foundation ships with
 
@@ -300,9 +299,9 @@ source conditions. Needs real Last-Modified (section 3.3).
 
 ### 6.4 Multipart (#111)
 UploadPartCopy with a range and a source version; `GET ?partNumber`; resending a part;
-Content-Type and metadata from create; the version id in the Complete response. *Decision
-needed (D4):* S3 rejects parts under 5 MiB except the last (`EntityTooSmall`); AwanFS accepts
-them, and its own benchmark uploads 256 KiB parts.
+Content-Type and metadata from create; the version id in the Complete response. Parts under
+5 MiB, except the last, are rejected at Complete (decision 50); the benchmarks move to 5 MiB
+parts.
 
 ### 6.5 Versioning (#113), 6.6 Listing (#114), 6.7 Basics (#140)
 Edge cases with no storage design: delete-marker headers, `encoding-type=url`, `max-keys` 0
@@ -356,9 +355,7 @@ Order: SSE-C, then SSE-S3, then SSE-KMS.
   or reordering chunks fails authentication. `ring` is already a dependency (TLS).
 - **Keys.** SSE-C: the key arrives with each request and is never stored; its MD5 is. SSE-S3:
   a master key from a file wraps a per-object data key. SSE-KMS: named keys in a local key
-  file stand in for a KMS; the key id is stored and checked. *Decision needed (D6):* decision
-  38 says SSE-KMS comes later "through an external service". The suite's KMS tests need a key
-  id the server accepts, which a local key file gives without an external service.
+  file stand in for a KMS; the key id is stored and checked. (Decision 49.)
 - **Layout.** The stored payload is longer than the object (one tag per chunk). The index
   keeps the object's size and the attributes keep the chunk size, the pattern compressed
   payloads already use. A range GET decrypts only the chunks it covers.
@@ -419,14 +416,10 @@ Decided by the owner on 2026-11-14:
 | D2 | Accounts and owners are enforced: each user is its own account unless it names one, and reaches another account's buckets only through a grant (section 5) | decision 44 |
 | D3 | Out of scope: RGW-only tests and storage classes or cloud tiering. Bucket logging is built last and its scope decided after wave 3 | decision 45 |
 | | Large GETs stream. A full GET is checksummed as it streams and the connection is aborted on a mismatch; a range GET is not verified and a background scrub checks whole objects (#155) | decision 46 |
-
-Still open:
-
-| | Decision | Recommendation |
-|---|---|---|
-| D4 | Reject multipart parts under 5 MiB except the last | Yes, with the benchmark moved to 5 MiB parts |
-| D5 | Per-grantee ACL grants, which decision 39 ruled out | Yes: the suite cannot pass without them. New buckets default to `BucketOwnerEnforced`, where ACLs are off, so the extra surface is opt-in |
-| D6 | SSE-KMS from a local key file, where decision 38 says an external service later | Yes, as the first step: the stored format (key id plus wrapped data key) is the same when an external KMS replaces the file |
+| D4 | Parts under 5 MiB, except the last, are rejected at Complete | decision 50 |
+| D5 | Per-grantee ACL grants are built; new buckets have ACLs off (`BucketOwnerEnforced`), and the suite's profile turns them on | decision 48 (replaces part of 39) |
+| D6 | SSE-KMS from a local key file of named keys | decision 49 (replaces part of 38) |
+| | The target is S3 behaviour only: `test_s3.py` and `test_headers.py`, without RGW-only tests, storage classes and the suite's other files | decision 47 |
 
 ## 12. What a 100% target would add
 
@@ -453,9 +446,9 @@ What the decisions already made cover, and what 100% of `test_s3.py` would add:
 
 | Need | Covered by D1 to D4? | Architecture consequence |
 |---|---|---|
-| Per-grantee ACLs, ACLs on by default | No: D5, and decision 39 says no | None beyond section 5; a default setting |
-| SSE-KMS key ids | No: D6, and decision 38 says later | None: the attribute group already holds a key id |
-| 5 MiB minimum part | D4, open | None |
+| Per-grantee ACLs, ACLs on by default | Decided since: decision 48 (grants yes, off by default, on in the profile) | None beyond section 5; a default setting |
+| SSE-KMS key ids | Decided since: decision 49 (local key file) | None: the attribute group already holds a key id |
+| 5 MiB minimum part | Decided since: decision 50 | None |
 | Storage class changes after write | No | The storage class is a **replaceable** attribute group, not write-time. Changed in #150 now, so format 3 does not need a successor |
 | Usage headers and account usage | No | Durable per-bucket counters, rebuilt by recovery (#159) |
 | Tenants | No | Bucket identity is (namespace, name). The field is reserved now in the manifest record (#159), empty for all buckets |
@@ -466,3 +459,5 @@ What the decisions already made cover, and what 100% of `test_s3.py` would add:
 The three reservations (replaceable storage class, bucket counters, namespace field) and the
 commit event are cheap while the foundations are being built and expensive after, so they
 are in wave 0 whatever target is chosen. Nothing else in D1 to D4 changes.
+
+The owner chose the S3-only target (decision 47): #162, #163 and #164 stay outlines.

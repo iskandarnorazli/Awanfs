@@ -74,8 +74,8 @@ Owner decisions after the 2026-11-12 unattended run (#64-#83), each the recommen
 |---|---|---|
 | 36 | **Memory plan first:** one `--memory-budget`; a cap on request bytes held in memory; the nightly ratio run enforces an RSS ceiling. Conformance quick wins (#111-#114) come after. | #57, #111-#114 |
 | 37 | **Object lock: governance and compliance modes, plus legal hold**, as S3 defines them, on top of versioning (#31). | #120 |
-| 38 | **Encryption: SSE-S3 with a local master key that wraps per-object keys, and SSE-C;** SSE-KMS through an external service later. | #121 |
-| 39 | **Access: bucket policies (on the #53 evaluator), canned ACLs and the public access block;** no per-grantee ACL grants. | #122 |
+| 38 | **Encryption: SSE-S3 with a local master key that wraps per-object keys, and SSE-C;** SSE-KMS first from a local key file of named keys (decision 49, 2026-11-14, replacing "through an external service later"); an external KMS can replace the file without a format change. | #121 |
+| 39 | **Access: bucket policies (on the #53 evaluator), canned ACLs, per-grantee ACL grants and the public access block.** Per-grantee grants were ruled out here at first and allowed by decision 48 (2026-11-14); new buckets have ACLs off. | #122 |
 
 **Decision 40 (2026-11-13): `--allow-anonymous` is refused together with users in `--config`.**
 Policies are checked for `Principal::User` only, so an unsigned request accepted by
@@ -110,6 +110,27 @@ range GET is not verified, and a background scrub checks whole objects. Today ev
 checksums the whole object before the first byte (measured: 20.7 ms to headers and 29.6 ms per
 1 MiB range at 256 MiB, 4.4 GiB of resident file pages; `measurements/2026-11-14-large-objects.md`).
 Per-block checksums, which would verify ranges, were not chosen now. #155.
+
+**Decision 47 (2026-11-14): the conformance target is S3 behaviour only.** It is `test_s3.py`
+and `test_headers.py` of the ceph suite, without the RGW-only tests and storage classes
+(decision 45). The suite's IAM, STS, S3 Select, SNS and S3 Control files are not part of it.
+A 100% target was weighed (`CONFORMANCE_DESIGN.md` section 12): it adds ceph-specific API and a
+tiering subsystem. The cheap hooks it would need (a replaceable storage class, bucket usage
+counters, a bucket namespace field, commit events) are built in wave 0 anyway. #123, #162, #163,
+#164.
+
+**Decision 48 (2026-11-14): per-grantee ACL grants are built, and ACLs are off on new buckets.**
+This replaces "no per-grantee ACL grants" in decision 39: most of the suite's ACL tests grant
+to a named user. New buckets default to `BucketOwnerEnforced`, as on AWS since 2023, so the
+extra surface is opt-in; the suite's profile turns ACLs on (#161). #122, #151.
+
+**Decision 49 (2026-11-14): SSE-KMS starts with a local key file.** Named keys in a file stand
+in for a KMS, replacing "through an external service later" in decision 38. The stored form (key
+id plus wrapped data key) is what an external KMS would use. #121.
+
+**Decision 50 (2026-11-14): CompleteMultipartUpload rejects parts under 5 MiB, except the
+last,** with 400 `EntityTooSmall`, as S3 does. AwanFS accepted any size. The benchmarks move to
+5 MiB parts in the same change. #111.
 
 **Decision 42 (2026-11-14): on Linux with glibc the server fixes the allocator's mmap threshold
 at startup.** glibc raises its mmap threshold after a large block is freed, so later 1 MiB buffers
