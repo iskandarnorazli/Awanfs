@@ -132,6 +132,18 @@ id plus wrapped data key) is what an external KMS would use. #121.
 last,** with 400 `EntityTooSmall`, as S3 does. AwanFS accepted any size. The benchmarks move to
 5 MiB parts in the same change. #111.
 
+**Decision 51 (2026-11-14): a streamed PUT takes its key's lock only to commit, and is written
+again when its key changed meanwhile.** A PUT above 4 MiB held the key lock from before its body
+arrived, so a client that stopped sending blocked every other writer of that key (and of the
+keys sharing its lock slot). Taking the lock late is unsafe by itself: the needle's offset is
+reserved before the body, and recovery replays an unversioned key in offset order
+(`verification/tla`, `stream_no_relocate.cfg` fails). So at commit, under the lock, the server
+asks whether any needle of the key was appended since the reservation (`StreamsInFlight`), and
+if so writes the object again at the end of the log. The cost is one extra copy, only for PUTs
+that overlap another write of the same key. Versioned keys are ordered by version id, taken at
+commit, and are never copied. Ordering recovery by a commit stamp instead was weighed and not
+chosen: it changes a recovery rule for every key and makes it depend on the clock. #154.
+
 **Decision 42 (2026-11-14): on Linux with glibc the server fixes the allocator's mmap threshold
 at startup.** glibc raises its mmap threshold after a large block is freed, so later 1 MiB buffers
 come from the heap and stay there once freed. Measured under `--memory-budget 256MiB` and 64

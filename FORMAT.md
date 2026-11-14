@@ -59,6 +59,17 @@ leaves a needle that fails its header check, never one that passes with missing 
 key hash (8), volume id (4), offset (8), total length (8), payload length (8), flags (2),
 payload CRC32C (4). Recovery uses it to step over gaps left by writes that did not finish.
 
+### Replay order
+
+Recovery replays the volumes oldest first and each volume's needles in offset order. For a key
+without versions the last needle or tombstone wins. A needle's offset is reserved when its
+write starts, and a streamed PUT (above 4 MiB) reserves before its body arrives, so the server
+keeps one rule when it writes: among the committed records of a key, a later commit has a
+later offset. A streamed PUT that finds a record of its key logged after its reservation is
+written again at the end of the log before it is indexed, and its first needle stays behind as
+an older record of the same object (decision 51). Versions are ordered by their creation
+times instead; see Versions.
+
 ## Compressed payload (flag 0x20, format 2)
 
 Buckets with `compression = "zstd"` in the config file (`[[buckets]]`, decision 22) store a
