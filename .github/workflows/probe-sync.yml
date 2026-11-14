@@ -28,7 +28,9 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # The large-volume step stores 10 GiB twice; with a sparse volume on Windows that alone
+    # took over 9 minutes (run 43628997538 was cancelled at the old 15-minute limit).
+    timeout-minutes: 60
     steps:
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'

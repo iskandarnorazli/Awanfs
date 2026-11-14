@@ -119,9 +119,12 @@ def main(argv=None):
     if fill < a.fill_gib:
         print(f"{free_gib:.1f} GiB free under {tempfile.gettempdir()}: filling {fill:.1f} GiB, not {a.fill_gib:g}", flush=True)
     results = []
-    for label, env in CONFIGS:
-        print(f"{label} ...", flush=True)
-        results.append((label, measure(a.server_bin, env, fill, a.seconds, a.rounds)))
+    # Twice, in opposite orders: one pass cannot tell a difference from the runner's drift.
+    for round_no, order in enumerate((CONFIGS, list(reversed(CONFIGS))), 1):
+        for label, env in order:
+            print(f"round {round_no}: {label} ...", flush=True)
+            results.append((f"{label}, round {round_no}", measure(a.server_bin, env, fill, a.seconds, a.rounds)))
+            print(render(results[-1:], fill, "(partial)"), flush=True)
     cmd = "python benchmarks/large_volume_probe.py " + " ".join(argv if argv is not None else sys.argv[1:])
     text = render(results, fill, cmd)
     print(text)
