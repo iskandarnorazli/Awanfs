@@ -191,3 +191,27 @@ fn a_budget_that_cannot_work_stops_the_server_with_a_message() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+#[test]
+fn the_startup_line_says_what_was_done_to_the_allocator() {
+    let dir = temp_dir("alloc");
+    let (_s, _url, startup) = start(&dir, &[], &[]);
+    let gnu_linux = cfg!(all(target_os = "linux", target_env = "gnu"));
+    let want = if gnu_linux {
+        "Allocator: glibc mmap threshold fixed at 128 KiB"
+    } else {
+        "Allocator: the platform's allocator, unchanged"
+    };
+    assert!(startup.contains(want), "startup said:\n{}", startup);
+    drop(_s);
+
+    // An operator's own setting wins.
+    if gnu_linux {
+        let dir2 = temp_dir("alloc_env");
+        let (_s2, _u2, startup2) = start(&dir2, &[], &[("MALLOC_MMAP_THRESHOLD_", "262144")]);
+        assert!(startup2.contains("Allocator: glibc mmap threshold left as MALLOC_MMAP_THRESHOLD_ sets it"), "startup said:\n{}", startup2);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
