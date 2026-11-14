@@ -9,6 +9,7 @@ on:
   pull_request:
     paths:
       - "benchmarks/sync_probe.py"
+      - "benchmarks/put_path_probe.py"
       - ".github/workflows/probe-sync.yml"
 
 permissions:
@@ -38,3 +39,22 @@ jobs:
             --dir "$(python -c 'import tempfile; print(tempfile.gettempdir())')" \
             --dir "$PWD/.tmp/probe" --report sync_probe.md
           cat sync_probe.md >> "$GITHUB_STEP_SUMMARY"
+
+      # The same question through the server: 64 KiB PUTs with and without the commit, and
+      # with and without a growing volume file. Data on the runner's temp directory.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Build s3-server
+        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Where a PUT's time goes
+        shell: bash
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          bin=server/target/release/s3-server
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          python -u benchmarks/put_path_probe.py --server-bin "$bin" --report put_path_probe.md
+          cat put_path_probe.md >> "$GITHUB_STEP_SUMMARY"
