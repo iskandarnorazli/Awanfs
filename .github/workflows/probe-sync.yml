@@ -10,6 +10,7 @@ on:
     paths:
       - "benchmarks/sync_probe.py"
       - "benchmarks/put_path_probe.py"
+      - "server/tests/commit_cost_probe.rs"
       - ".github/workflows/probe-sync.yml"
 
 permissions:
@@ -58,3 +59,12 @@ jobs:
           [ -f "$bin.exe" ] && bin="$bin.exe"
           python -u benchmarks/put_path_probe.py --server-bin "$bin" --report put_path_probe.md
           cat put_path_probe.md >> "$GITHUB_STEP_SUMMARY"
+      - name: What one commit costs at the volume layer
+        shell: bash
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          cargo test --locked --release --manifest-path server/Cargo.toml --test commit_cost_probe -- --ignored --nocapture | tee commit_cost.txt
+          grep -E '^(Data under|\|)' commit_cost.txt >> "$GITHUB_STEP_SUMMARY"
