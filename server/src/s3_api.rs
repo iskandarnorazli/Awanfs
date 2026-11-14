@@ -1810,7 +1810,8 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
     };
     let (hits, misses) = state.payload_cache.hit_counts();
     let w = state.work.snapshot();
-    let gauges: [(&str, &str, &str, u64); 15] = [
+    let budget = crate::memory::effective();
+    let gauges: [(&str, &str, &str, u64); 18] = [
         ("awanfs_volume_used_bytes", "gauge", "Bytes written into all open volumes, including dead needles.", used),
         ("awanfs_volume_free_span_bytes", "gauge", "Span left in the active volume before it rolls over.", free),
         ("awanfs_volumes_open", "gauge", "Open volumes.", state.volumes.read().len() as u64),
@@ -1825,6 +1826,9 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
         ("awanfs_payload_copies_total", "counter", "Copies of payload bytes into server buffers.", w.payload_copies),
         ("awanfs_payload_copy_bytes_total", "counter", "Payload bytes copied.", w.payload_copy_bytes),
         ("awanfs_ready", "gauge", "1 when /_awanfs/health/ready answers 200.", state.readiness().is_none() as u64),
+        ("awanfs_memory_budget_bytes", "gauge", "Memory the server may hold (--memory-budget).", budget.total),
+        ("awanfs_memory_budget_cache_bytes", "gauge", "The budget's half for the payload cache.", budget.cache),
+        ("awanfs_memory_budget_bodies_bytes", "gauge", "The budget's half for in-flight request bodies.", budget.bodies),
         (
             "awanfs_log_lines_dropped_total",
             "counter",

@@ -6,8 +6,32 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// glibc raises its mmap threshold after a large block is freed, so later 1 MiB buffers come from
+/// the heap and stay there once freed. Under 64 clients writing then reading 1 MiB objects that
+/// kept about 140 MiB: peak RSS 539.8 MiB by default, 291.2 MiB with the threshold fixed, at the
+/// same throughput (#127, run 43535764903). Owner decision 2026-11-14: fix it in the process, at
+/// glibc's own starting value, unless the operator set MALLOC_MMAP_THRESHOLD_.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn fix_mmap_threshold() -> &'static str {
+    if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_some() {
+        return "glibc mmap threshold left as MALLOC_MMAP_THRESHOLD_ sets it";
+    }
+    // SAFETY: mallopt only sets an allocator parameter; it is called once, first thing in main.
+    if unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, 128 * 1024) } == 1 {
+        "glibc mmap threshold fixed at 128 KiB, so freed large buffers go back to the OS"
+    } else {
+        "glibc mmap threshold could not be fixed: freed large buffers may stay in the heap"
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn fix_mmap_threshold() -> &'static str {
+    "the platform's allocator, unchanged"
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let allocator = fix_mmap_threshold();
     let mut port: u16 = std::env::var("S3_PORT")
         .or_else(|_| std::env::var("AWAN_S3_PORT"))
         .ok()
@@ -29,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut otlp: Option<String> = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().filter(|s| !s.is_empty());
     let mut auto_compaction = std::env::var("AWANFS_AUTO_COMPACTION").ok().as_deref() != Some("off");
     let mut durability = std::env::var("AWANFS_DURABILITY").unwrap_or_else(|_| "group".to_string());
+    let mut memory_budget: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -62,6 +87,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             access_log = args.next();
         } else if arg == "--config" {
             config_path = args.next().map(PathBuf::from);
+        } else if arg == "--memory-budget" {
+            memory_budget = args.next();
         } else if arg == "--allow-anonymous" {
             allow_anonymous = true;
         } else if arg == "--data-dir" || arg == "-d" {
@@ -70,6 +97,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
     }
+
+    // One budget for the cache and for in-flight bodies (#127). Set before the server is
+    // built, because the cache is sized from it.
+    let budget = match s3_server::memory::resolve(
+        memory_budget.as_deref(),
+        std::env::var("AWANFS_MEMORY_BUDGET").ok().as_deref(),
+        s3_server::memory::detect(),
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }
+    };
+    if let Err(in_force) = s3_server::memory::configure(budget) {
+        eprintln!("memory budget was already set to {} bytes", in_force.total);
+    }
+    let mib = |n: u64| n / (1 << 20);
+    println!(
+        "Memory budget {} MiB ({}): payload cache {} MiB, in-flight request bodies {} MiB",
+        mib(budget.total),
+        budget.source.as_str(),
+        mib(budget.cache),
+        mib(budget.bodies)
+    );
+    println!("Allocator: {}", allocator);
 
     let auth = AuthConfig::from_env(allow_anonymous);
     // Users and policies (#53): --config <file> or AWANFS_CONFIG.

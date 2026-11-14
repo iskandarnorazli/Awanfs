@@ -56,7 +56,7 @@ Read this before you run it anywhere that matters. Plan of record: the Phase 1-4
 7. **High-Concurrency Async Reactor:**
    - Powered by Tokio, Hyper 1.0, and HTTP/1.1 persistent keep-alive connections.
    - Single-flight read coalescing barrier protecting disk storage from thundering-herd traffic.
-   - Byte-bounded LRU payload cache (1 GiB default) for objects up to 4 MiB.
+   - Byte-bounded LRU payload cache for objects up to 4 MiB, sized from `--memory-budget` (half of it; 1 GiB when nothing is detected).
 
 ---
 
@@ -141,6 +141,7 @@ AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
                               "Resource": ["arn:aws:s3:::photos", "arn:aws:s3:::photos/*"]}]}'''
   ```
 - `--allow-anonymous` (or `AWANFS_ALLOW_ANONYMOUS=1`) also accepts unsigned requests, for local tests and benchmarks. Without keys and without that flag the server refuses to start (exit code 2). It is refused together with users in `--config` (also exit code 2): unsigned requests are not checked against any policy, so anyone reaching the port would get more access than the users you restricted (#130).
+- `--memory-budget 256MiB` (or `AWANFS_MEMORY_BUDGET`) caps what the server holds in memory: half bounds the payload cache, half is for in-flight request bodies. Without it the budget is a quarter of the container's `memory.max` or the machine's `MemTotal`, held between 128 MiB and 2 GiB; where neither is readable it is 2 GiB, which leaves the cache at the 1 GiB it had before. The startup line and `awanfs_memory_budget_bytes` in `GET /_awanfs/metrics` say which it was. On Linux with glibc the server also fixes the allocator's mmap threshold at 128 KiB, so freed large buffers go back to the OS instead of staying in the heap (set `MALLOC_MMAP_THRESHOLD_` to choose your own); the startup line says so.
 
 ### Docker and systemd
 ```bash
