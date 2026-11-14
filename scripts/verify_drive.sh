@@ -73,6 +73,8 @@ j_multipart() { local id e1 e2 et id2; head -c 6000000 /dev/urandom >"$EVID/p1" 
   cat "$EVID/p1" "$EVID/p2" >"$EVID/mp.expect" && S3 get-object --bucket verify-bkt --key mp "$EVID/mp.out" >/dev/null && same "$EVID/mp.expect" "$EVID/mp.out" &&
   id2=$(S3 create-multipart-upload --bucket verify-bkt --key mp-gone --query UploadId --output text) &&
   S3 upload-part --bucket verify-bkt --key mp-gone --part-number 1 --upload-id "$id2" --body "$EVID/p2" >/dev/null &&
+  ! S3 upload-part-copy --bucket verify-bkt --key mp-gone --part-number 2 --upload-id "$id2" --copy-source verify-bkt/mp 2>"$EVID/upc.err" &&
+  grep -q NotImplemented "$EVID/upc.err" &&
   S3 abort-multipart-upload --bucket verify-bkt --key mp-gone --upload-id "$id2" &&
   ! S3 list-parts --bucket verify-bkt --key mp-gone --upload-id "$id2" 2>"$EVID/mp.err" && grep -q NoSuchUpload "$EVID/mp.err"; }
 j_copy() { echo "copy me" >"$EVID/c.bin" && S3 put-object --bucket verify-bkt --key c-src --body "$EVID/c.bin" >/dev/null &&
