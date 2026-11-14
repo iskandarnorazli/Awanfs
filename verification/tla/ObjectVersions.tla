@@ -23,10 +23,25 @@ Switches, so the same model checks the current code and the fixes:
   RecoverSkipsGaps  recovery steps over reserved-but-unwritten offsets (#38)
   DeleteLogsFirst   DELETE writes its tombstone before removing the engine row, and
                     answers 500 without removing it when the write fails (#39)
+  Streamers         the writers whose body is streamed (PUT above 4 MiB, #154). A streamer
+                    reserves its offset and receives its body WITHOUT the key lock, so a
+                    client that stops sending blocks nobody. It takes the lock only to commit:
+                      Finish    volume.rs  NeedleWriter::finish writes the header sector; only
+                                           now is the needle a record recovery can see
+                      Relocate  s3_api.rs  if a record of this key was logged at a later
+                                           offset while the body arrived, the object is copied
+                                           to a new needle at the end of the log
+                      Index     as above
+  Relocate          the Relocate step exists. Without it the streamer's needle sits at an
+                    early offset: it is the live object, and after a restart an older write at
+                    a later offset wins.
 *)
 EXTENDS Naturals, FiniteSets
 
-CONSTANTS Writers, Deleters, UseKeyLock, WriteCanFail, RecoverSkipsGaps, DeleteLogsFirst
+CONSTANTS Writers, Deleters, UseKeyLock, WriteCanFail, RecoverSkipsGaps, DeleteLogsFirst,
+          Streamers, Relocate
+
+ASSUME Streamers \subseteq Writers
 
 Procs == Writers \cup Deleters
 Gone == [present |-> FALSE, val |-> "none"]
@@ -34,6 +49,8 @@ Gone == [present |-> FALSE, val |-> "none"]
 \* The order of a request's steps after it takes the lock.
 Steps(p) == IF p \in Deleters /\ ~DeleteLogsFirst
             THEN <<"index", "reserve", "write">>
+            ELSE IF p \in Streamers
+            THEN <<"write", "relocate", "index">>
             ELSE <<"reserve", "write", "index">>
 
 VARIABLES pc, step, off, nextOff, log, engine, lock
@@ -66,8 +83,18 @@ Init ==
     /\ engine = Gone
     /\ lock = "free"
 
-Acquire(p) ==
+\* A streamer reserves before it has the lock: the body arrives next, for as long as the
+\* client takes. Nothing is in the log yet (the header sector is written last).
+StreamReserve(p) ==
+    /\ p \in Streamers
     /\ pc[p] = "start"
+    /\ off' = [off EXCEPT ![p] = nextOff]
+    /\ nextOff' = nextOff + 1
+    /\ pc' = [pc EXCEPT ![p] = "body"]
+    /\ UNCHANGED <<step, log, engine, lock>>
+
+Acquire(p) ==
+    /\ pc[p] = IF p \in Streamers THEN "body" ELSE "start"
     /\ IF UseKeyLock THEN lock = "free" /\ lock' = p ELSE UNCHANGED lock
     /\ step' = [step EXCEPT ![p] = 1]
     /\ pc' = [pc EXCEPT ![p] = Steps(p)[1]]
@@ -92,6 +119,28 @@ Fail(p) ==
     /\ pc' = [pc EXCEPT ![p] = "release"]
     /\ UNCHANGED <<step, off, nextOff, log, engine, lock>>
 
+\* Under the lock, after the streamer's own record is in the log: a record of this key at a
+\* later offset means offset order no longer says this write is the newest, so it is written
+\* again at the end of the log. The copy can fail like any write.
+LaterRecord(p) == \E r \in log : r.o > off[p]
+
+RelocateStep(p) ==
+    /\ pc[p] = "relocate"
+    /\ IF Relocate /\ LaterRecord(p)
+       THEN /\ off' = [off EXCEPT ![p] = nextOff]
+            /\ nextOff' = nextOff + 1
+            /\ log' = log \cup {[o |-> nextOff, kind |-> "put", val |-> p]}
+       ELSE UNCHANGED <<off, nextOff, log>>
+    /\ Advance(p)
+    /\ UNCHANGED <<engine, lock>>
+
+RelocateFail(p) ==
+    /\ WriteCanFail
+    /\ pc[p] = "relocate"
+    /\ Relocate /\ LaterRecord(p)
+    /\ pc' = [pc EXCEPT ![p] = "release"]
+    /\ UNCHANGED <<step, off, nextOff, log, engine, lock>>
+
 Index(p) ==
     /\ pc[p] = "index"
     /\ engine' = IF p \in Writers THEN [present |-> TRUE, val |-> p] ELSE Gone
@@ -109,7 +158,10 @@ AllDone == \A p \in Procs : pc[p] = "done"
 Finished == AllDone /\ UNCHANGED vars
 
 Next ==
+    \/ \E p \in Procs : StreamReserve(p)
     \/ \E p \in Procs : Acquire(p)
+    \/ \E p \in Procs : RelocateStep(p)
+    \/ \E p \in Procs : RelocateFail(p)
     \/ \E p \in Procs : Reserve(p)
     \/ \E p \in Procs : Write(p)
     \/ \E p \in Procs : Fail(p)
@@ -122,7 +174,7 @@ Spec == Init /\ [][Next]_vars
 AckedStateSurvivesRestart == AllDone => Recovered = engine
 
 TypeOK ==
-    /\ pc \in [Procs -> {"start", "reserve", "write", "index", "release", "done"}]
+    /\ pc \in [Procs -> {"start", "body", "reserve", "write", "relocate", "index", "release", "done"}]
     /\ step \in [Procs -> 0..4]
-    /\ nextOff \in 1..(Cardinality(Procs) + 1)
+    /\ nextOff \in 1..(Cardinality(Procs) + Cardinality(Streamers) + 1)
 ====
