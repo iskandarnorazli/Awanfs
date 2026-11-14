@@ -77,13 +77,19 @@ j_multipart() { local id e1 e2 et id2; head -c 6000000 /dev/urandom >"$EVID/p1" 
   grep -q NotImplemented "$EVID/upc.err" &&
   S3 abort-multipart-upload --bucket verify-bkt --key mp-gone --upload-id "$id2" &&
   ! S3 list-parts --bucket verify-bkt --key mp-gone --upload-id "$id2" 2>"$EVID/mp.err" && grep -q NoSuchUpload "$EVID/mp.err"; }
-j_copy() { echo "copy me" >"$EVID/c.bin" && S3 put-object --bucket verify-bkt --key c-src --body "$EVID/c.bin" >/dev/null &&
+j_copy() { local v1; echo "copy me" >"$EVID/c.bin" && S3 put-object --bucket verify-bkt --key c-src --body "$EVID/c.bin" >/dev/null &&
   S3 copy-object --bucket verify-bkt --key c-dst --copy-source verify-bkt/c-src >/dev/null &&
   S3 get-object --bucket verify-bkt --key c-dst "$EVID/c.out" >/dev/null && same "$EVID/c.bin" "$EVID/c.out" &&
   S3 create-bucket --bucket verify-cp && S3 copy-object --bucket verify-cp --key c --copy-source verify-bkt/c-src >/dev/null &&
   S3 delete-object --bucket verify-bkt --key c-src &&
   S3 get-object --bucket verify-cp --key c "$EVID/c2.out" >/dev/null && same "$EVID/c.bin" "$EVID/c2.out" &&
-  ! S3 copy-object --bucket verify-bkt --key c-x --copy-source verify-bkt/c-missing 2>"$EVID/c.err" && grep -q NoSuchKey "$EVID/c.err"; }
+  ! S3 copy-object --bucket verify-bkt --key c-x --copy-source verify-bkt/c-missing 2>"$EVID/c.err" && grep -q NoSuchKey "$EVID/c.err" &&
+  S3 create-bucket --bucket verify-cv && S3 put-bucket-versioning --bucket verify-cv --versioning-configuration Status=Enabled &&
+  echo "old" >"$EVID/cv1.bin" && echo "new" >"$EVID/cv2.bin" &&
+  v1=$(S3 put-object --bucket verify-cv --key s --body "$EVID/cv1.bin" --query VersionId --output text) &&
+  S3 put-object --bucket verify-cv --key s --body "$EVID/cv2.bin" >/dev/null &&
+  S3 copy-object --bucket verify-cv --key from-v1 --copy-source "verify-cv/s?versionId=$v1" | grep -q "\"CopySourceVersionId\": \"$v1\"" &&
+  S3 get-object --bucket verify-cv --key from-v1 "$EVID/cv.out" >/dev/null && same "$EVID/cv1.bin" "$EVID/cv.out"; }
 j_versioning() { local a b; S3 create-bucket --bucket verify-ver &&
   S3 put-bucket-versioning --bucket verify-ver --versioning-configuration Status=Enabled &&
   S3 get-bucket-versioning --bucket verify-ver --query Status --output text | grep -qx Enabled &&
