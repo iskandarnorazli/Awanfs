@@ -137,6 +137,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None => None,
     };
     let has_users = iam.as_ref().is_some_and(|r| !r.current().is_empty());
+    // #130 (owner decision, 2026-11-13): policies are checked for Principal::User only, so an
+    // unsigned request accepted by --allow-anonymous would get more access than any user the
+    // config restricts. Refuse the combination rather than serve that. --allow-anonymous on its
+    // own is still allowed: the startup message below says what it means. A policy model for
+    // public access is #122.
+    if has_users && auth.allow_anonymous {
+        eprintln!(
+            "--allow-anonymous with users in --config: unsigned requests are not checked against \
+             any policy, so anyone who can reach the port would get more access than the users \
+             you restricted. Serve the users without --allow-anonymous, or drop --config to run \
+             an open server."
+        );
+        std::process::exit(2);
+    }
     if auth.credentials.is_none() && !has_users && !auth.allow_anonymous {
         eprintln!("No credentials: set AWANFS_ACCESS_KEY and AWANFS_SECRET_KEY, give users in --config, or pass --allow-anonymous to let anyone who can reach the port read, write and delete.");
         std::process::exit(2);
@@ -193,9 +207,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
         *state.audit_log.write() = Some(sink);
     }
-    // One JSON line per request on stderr; AWANFS_LOG=off turns it off.
+    // One JSON line per request on stderr; AWANFS_LOG=off turns it off. Written by a background
+    // thread through a bounded queue, so a stderr nobody reads costs lines, counted in
+    // awanfs_log_lines_dropped_total, and never stops requests (#138). The --access-log sink
+    // above still writes inline: whether it may drop lines is an open owner decision.
     if std::env::var("AWANFS_LOG").ok().as_deref() != Some("off") {
-        let sink: s3_server::request_log::LogSink = Arc::new(|line: &str| eprintln!("{}", line));
+        let sink = s3_server::request_log::bounded_sink(4096, Arc::clone(&state.log_lines_dropped), |line: &str| {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr().lock(), "{}", line);
+        });
         *state.access_log.write() = Some(sink);
     }
     let state = Arc::new(state);

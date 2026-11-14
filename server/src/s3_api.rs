@@ -579,6 +579,8 @@ pub struct S3ServiceState {
     pub metrics: Arc<crate::metrics::Metrics>,
     /// Where the per-request JSON log lines go; `None` logs nothing (#41).
     pub access_log: Arc<RwLock<Option<crate::request_log::LogSink>>>,
+    /// Request-log lines dropped because the log writer could not keep up (#138).
+    pub log_lines_dropped: Arc<AtomicU64>,
     /// Where S3-format server access log lines go; `None` (the default) writes none (#46).
     pub audit_log: Arc<RwLock<Option<crate::request_log::LogSink>>>,
     /// Users and policies from the config file (#53); `None` = only the root key pair.
@@ -632,6 +634,7 @@ impl S3ServiceState {
             not_ready: Arc::new(RwLock::new(None)),
             metrics: Arc::new(crate::metrics::Metrics::default()),
             access_log: Arc::new(RwLock::new(None)),
+            log_lines_dropped: Arc::new(AtomicU64::new(0)),
             audit_log: Arc::new(RwLock::new(None)),
             iam: Arc::new(RwLock::new(None)),
             versioning: Arc::new(RwLock::new(HashMap::new())),
@@ -867,6 +870,7 @@ impl S3ServiceState {
             not_ready: Arc::new(RwLock::new(None)),
             metrics: Arc::new(crate::metrics::Metrics::default()),
             access_log: Arc::new(RwLock::new(None)),
+            log_lines_dropped: Arc::new(AtomicU64::new(0)),
             audit_log: Arc::new(RwLock::new(None)),
             iam: Arc::new(RwLock::new(None)),
             versioning: Arc::new(RwLock::new(versioning_map)),
@@ -1576,6 +1580,20 @@ fn finish_version_put(state: &S3ServiceState, b_id: u32, key: &str, ts: u64, fla
 }
 
 /// GET or HEAD of a key with a version history, or of `?versionId=` (#31).
+/// The version `id` names (`None`: the current one), or `None` when there is no such version.
+/// GET and CopyObject both look versions up here, so they cannot disagree (#139). A key with no
+/// history has only its index row, which is the null version.
+fn find_version(state: &S3ServiceState, b_id: u32, key: &str, id: Option<u64>) -> Option<crate::versions::Version> {
+    let row = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| null_version_of(&m));
+    let vs = state.versions.read();
+    match id {
+        None => vs.current(b_id, key),
+        Some(i) if vs.has(b_id, key) => vs.find(b_id, key, i),
+        Some(0) => row,
+        Some(_) => None,
+    }
+}
+
 fn version_get_response(state: &S3ServiceState, b_id: u32, key: &str, vid: Option<&str>, head: bool, range: Option<&str>) -> Response<ResponseBody> {
     let id = match vid {
         Some(s) => match crate::versions::parse_id(s) {
@@ -1584,16 +1602,7 @@ fn version_get_response(state: &S3ServiceState, b_id: u32, key: &str, vid: Optio
         },
         None => None,
     };
-    let row = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| null_version_of(&m));
-    let v = {
-        let vs = state.versions.read();
-        match id {
-            None => vs.current(b_id, key),
-            Some(i) if vs.has(b_id, key) => vs.find(b_id, key, i),
-            Some(0) => row,
-            Some(_) => None,
-        }
-    };
+    let v = find_version(state, b_id, key, id);
     let Some(v) = v else {
         if id.is_some() {
             return no_such_version(key);
@@ -1802,7 +1811,7 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
     let (hits, misses) = state.payload_cache.hit_counts();
     let w = state.work.snapshot();
     let budget = crate::memory::effective();
-    let gauges: [(&str, &str, &str, u64); 17] = [
+    let gauges: [(&str, &str, &str, u64); 18] = [
         ("awanfs_volume_used_bytes", "gauge", "Bytes written into all open volumes, including dead needles.", used),
         ("awanfs_volume_free_span_bytes", "gauge", "Span left in the active volume before it rolls over.", free),
         ("awanfs_volumes_open", "gauge", "Open volumes.", state.volumes.read().len() as u64),
@@ -1820,6 +1829,12 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
         ("awanfs_memory_budget_bytes", "gauge", "Memory the server may hold (--memory-budget).", budget.total),
         ("awanfs_memory_budget_cache_bytes", "gauge", "The budget's half for the payload cache.", budget.cache),
         ("awanfs_memory_budget_bodies_bytes", "gauge", "The budget's half for in-flight request bodies.", budget.bodies),
+        (
+            "awanfs_log_lines_dropped_total",
+            "counter",
+            "Request-log lines dropped because the log writer could not keep up.",
+            state.log_lines_dropped.load(Ordering::Relaxed),
+        ),
     ];
     for (name, kind, help, v) in gauges {
         let _ = writeln!(out, "# HELP {} {}\n# TYPE {} {}\n{} {}", name, help, name, kind, name, v);
@@ -2524,6 +2539,22 @@ async fn handle_s3_inner(
 
             // 2. Multipart PUT /{bucket}/{key}?partNumber=N&uploadId=ID -> UploadPart
             if method == Method::PUT && query_map.contains_key("uploadId") && query_map.contains_key("partNumber") {
+                // UploadPartCopy is not implemented (#111). Its request has no body, so without this
+                // the part was stored empty and answered 200 with the ETag of empty input, and a
+                // client completing the upload built an object missing the copied range.
+                if req.headers().contains_key("x-amz-copy-source") {
+                    let xml = s3_error_xml(
+                        "NotImplemented",
+                        "UploadPartCopy is not implemented: upload the part's bytes with UploadPart.",
+                        &key,
+                        "req-up-part-copy",
+                    );
+                    return Ok(Response::builder()
+                        .status(StatusCode::NOT_IMPLEMENTED)
+                        .header(CONTENT_TYPE, "application/xml")
+                        .body(full_body(Bytes::from(xml)))
+                        .unwrap());
+                }
                 let upload_id = &query_map["uploadId"];
                 let part_num: u32 = match query_map["partNumber"].parse() {
                     Ok(n) => n,
@@ -2888,8 +2919,16 @@ async fn handle_s3_inner(
                 Method::PUT => {
                     // Check copy source
                     if let Some(copy_source) = req.headers().get("x-amz-copy-source") {
-                        // x-amz-copy-source is URL-encoded and may end in ?versionId=.
-                        let copy_src_owned = percent_decode_path(copy_source.to_str().unwrap_or("").split('?').next().unwrap_or(""));
+                        // x-amz-copy-source is URL-encoded and may end in ?versionId=, which names the
+                        // version to copy. It used to be cut off here and the current version copied
+                        // with a 200 (#139).
+                        let copy_source_raw = copy_source.to_str().unwrap_or("");
+                        let (copy_path, copy_query) = copy_source_raw.split_once('?').unwrap_or((copy_source_raw, ""));
+                        let src_vid: Option<String> = copy_query
+                            .split('&')
+                            .find_map(|kv| kv.strip_prefix("versionId="))
+                            .map(percent_decode_path);
+                        let copy_src_owned = percent_decode_path(copy_path);
                         let copy_src_str = copy_src_owned.trim_start_matches('/');
                         let (src_bucket, src_key) = match copy_src_str.split_once('/') {
                             Some((b, k)) => (b, k),
@@ -2917,15 +2956,20 @@ async fn handle_s3_inner(
                                     .unwrap());
                             }
                         };
-                        let src_meta = match engine.get_object(src_b_id, src_key.as_bytes()) {
-                            Ok(m) => m,
-                            Err(_) => {
-                                let xml = s3_error_xml("NoSuchKey", "Source object does not exist", src_key, "req-cp");
-                                return Ok(Response::builder()
-                                    .status(StatusCode::NOT_FOUND)
-                                    .header(CONTENT_TYPE, "application/xml")
-                                    .body(full_body(Bytes::from(xml)))
-                                    .unwrap());
+                        // A named version need not be the current one: the key may even be deleted.
+                        let src_meta = if src_vid.is_some() {
+                            None
+                        } else {
+                            match engine.get_object(src_b_id, src_key.as_bytes()) {
+                                Ok(m) => Some(m),
+                                Err(_) => {
+                                    let xml = s3_error_xml("NoSuchKey", "Source object does not exist", src_key, "req-cp");
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::NOT_FOUND)
+                                        .header(CONTENT_TYPE, "application/xml")
+                                        .body(full_body(Bytes::from(xml)))
+                                        .unwrap());
+                                }
                             }
                         };
                         (src_b_id, src_meta)
@@ -2933,9 +2977,37 @@ async fn handle_s3_inner(
 
                         // The copy gets a needle of its own: it must survive a restart and an
                         // overwrite or delete of its source.
-                        let src_flags = unpack_flags(src_meta.bucket_flags);
-                        let bytes = match state.read_object_bytes(src_b_id, src_key, src_meta.vol_offset, src_meta.size, src_flags) {
-                            Ok(b) => b,
+                        let read = match (&src_vid, &src_meta) {
+                            (Some(vid), _) => {
+                                // The same lookup as a versioned GET, so the two cannot disagree.
+                                let Some(id) = crate::versions::parse_id(vid) else {
+                                    return Ok(no_such_version(src_key));
+                                };
+                                let Some(v) = find_version(&state, src_b_id, src_key, Some(id)) else {
+                                    return Ok(no_such_version(src_key));
+                                };
+                                if v.marker {
+                                    let xml = s3_error_xml(
+                                        "InvalidRequest",
+                                        "The source of a copy request may not specifically refer to a delete marker by version id.",
+                                        src_key,
+                                        "req-cp",
+                                    );
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::BAD_REQUEST)
+                                        .header(CONTENT_TYPE, "application/xml")
+                                        .body(full_body(Bytes::from(xml)))
+                                        .unwrap());
+                                }
+                                state.read_version_bytes(src_b_id, src_key, &v).map(|b| (b, v.size, v.etag_hi, v.etag_lo, Some(v.id_string())))
+                            }
+                            (None, Some(m)) => state
+                                .read_object_bytes(src_b_id, src_key, m.vol_offset, m.size, unpack_flags(m.bucket_flags))
+                                .map(|b| (b, m.size, m.etag_hi, m.etag_lo, None)),
+                            (None, None) => unreachable!("src_meta is read whenever no version is named"),
+                        };
+                        let (bytes, src_size, src_etag_hi, src_etag_lo, copied_vid) = match read {
+                            Ok(r) => r,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not read the copy source: {:?}", e))),
                         };
                         let flags = if bytes.is_empty() { AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE } else { AWAN_FLAG_ACTIVE };
@@ -2946,21 +3018,26 @@ async fn handle_s3_inner(
                         let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset);
                         let stamp = state.version_stamp(b_id, &key);
                         let flags = flags | stamp.map_or(0, |s| s.0);
-                        let (vol_offset, flags) = match state.store_object(b_id, &bucket, &key, &bytes, flags, src_meta.etag_hi, src_meta.etag_lo, stamp.map(|s| s.1)).await {
+                        let (vol_offset, flags) = match state.store_object(b_id, &bucket, &key, &bytes, flags, src_etag_hi, src_etag_lo, stamp.map(|s| s.1)).await {
                             Ok(written) => written,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not store the copy: {:?}", e))),
                         };
                         if let Some((_, ts)) = stamp {
-                            let vid = match finish_version_put(&state, b_id, &key, ts, flags, vol_offset, src_meta.size, src_meta.etag_hi, src_meta.etag_lo, 0) {
+                            let vid = match finish_version_put(&state, b_id, &key, ts, flags, vol_offset, src_size, src_etag_hi, src_etag_lo, 0) {
                                 Ok(v) => v,
                                 Err(r) => return Ok(r),
                             };
-                            let etag_hex = md5_to_etag_hex(src_meta.etag_hi, src_meta.etag_lo);
-                            return Ok(Response::builder()
+                            let etag_hex = md5_to_etag_hex(src_etag_hi, src_etag_lo);
+                            let resp = Response::builder()
                                 .status(StatusCode::OK)
                                 .header(CONTENT_TYPE, "application/xml")
                                 .header(ETAG, format!("\"{}\"", etag_hex))
-                                .header("x-amz-version-id", vid)
+                                .header("x-amz-version-id", vid);
+                            let resp = match &copied_vid {
+                                Some(v) => resp.header("x-amz-copy-source-version-id", v.as_str()),
+                                None => resp,
+                            };
+                            return Ok(resp
                                 .body(full_body(Bytes::from(copy_object_result_xml(&etag_hex, "2026-11-10T00:00:00.000Z"))))
                                 .unwrap());
                         }
@@ -2974,23 +3051,26 @@ async fn handle_s3_inner(
                             b_id,
                             key.as_bytes(),
                             vol_offset,
-                            src_meta.size,
-                            src_meta.etag_hi,
-                            src_meta.etag_lo,
+                            src_size,
+                            src_etag_hi,
+                            src_etag_lo,
                             0,
                             flags,
                         ) {
                             return Ok(engine_error_response(code, &key));
                         }
 
-                        let etag_hex = md5_to_etag_hex(src_meta.etag_hi, src_meta.etag_lo);
+                        let etag_hex = md5_to_etag_hex(src_etag_hi, src_etag_lo);
                         let xml = copy_object_result_xml(&etag_hex, "2026-11-10T00:00:00.000Z");
-                        return Ok(Response::builder()
+                        let resp = Response::builder()
                             .status(StatusCode::OK)
                             .header(CONTENT_TYPE, "application/xml")
-                            .header(ETAG, format!("\"{}\"", etag_hex))
-                            .body(full_body(Bytes::from(xml)))
-                            .unwrap());
+                            .header(ETAG, format!("\"{}\"", etag_hex));
+                        let resp = match &copied_vid {
+                            Some(v) => resp.header("x-amz-copy-source-version-id", v.as_str()),
+                            None => resp,
+                        };
+                        return Ok(resp.body(full_body(Bytes::from(xml))).unwrap());
                     }
 
                     let if_none_match_star = req

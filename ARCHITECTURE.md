@@ -77,6 +77,35 @@ Owner decisions after the 2026-11-12 unattended run (#64-#83), each the recommen
 | 38 | **Encryption: SSE-S3 with a local master key that wraps per-object keys, and SSE-C;** SSE-KMS through an external service later. | #121 |
 | 39 | **Access: bucket policies (on the #53 evaluator), canned ACLs and the public access block;** no per-grantee ACL grants. | #122 |
 
+**Decision 40 (2026-11-13): `--allow-anonymous` is refused together with users in `--config`.**
+Policies are checked for `Principal::User` only, so an unsigned request accepted by
+`--allow-anonymous` would get more access than any user the config restricts. The server exits 2
+and names both flags. `--allow-anonymous` on its own is unchanged: the startup message already
+says anyone who can reach the port can read, write and delete. A config that sets only
+`[[buckets]]` restricts nobody, so it is not the combination. The policy model for public access
+is #122 (decision 39), which replaces this guard when it lands. Found by an adversarial review of
+#53, filed as #130.
+
+**Decision 42 (2026-11-14): on Linux with glibc the server fixes the allocator's mmap threshold
+at startup.** glibc raises its mmap threshold after a large block is freed, so later 1 MiB buffers
+come from the heap and stay there once freed. Measured under `--memory-budget 256MiB` and 64
+clients writing then reading 1 MiB objects (run 43535764903, same runner, back to back): peak RSS
+539.8 MiB by default and 291.2 MiB with the threshold fixed, heap left over in the read phase
+169.7 MiB against 27.4 MiB, throughput unchanged (put 401.5 against 398.2 MiB/s, get 2924 against
+2953). The server calls `mallopt(M_MMAP_THRESHOLD, 128 KiB)`, glibc's own starting value, unless
+`MALLOC_MMAP_THRESHOLD_` is set, and says which on its startup line. Other platforms keep their
+allocator; Windows is measured separately. `MALLOC_ARENA_MAX=2` was tried first and recovered a
+tenth of it. #127.
+
+**Decision 41 (2026-11-14): the request log never stalls requests.** The per-request JSON line
+on stderr is written by a background thread through a bounded queue of 4,096 lines; when the
+queue is full the line is dropped and `awanfs_log_lines_dropped_total` counts it, and the
+`AwanFSLogLinesDropped` alert fires. Before, `eprintln!` ran inline in the request handler, so a
+stderr nobody read (a stalled container log driver or journald) stopped every request while the
+server kept its port: measured at 271 requests on a 64 KiB Linux pipe and 16 on a 4 KiB Windows
+one (#135, run 43450981256). The S3 access log written by `--access-log` (`state.audit_log`) still
+writes inline: whether it may drop lines is a separate owner decision, not taken. #138.
+
 **Correction to 36 (2026-11-13, measured).** The plan's first item, a payload cache holding views
 of the volume mapping instead of heap copies of request bodies, was implemented (#126), merged and
 then reverted. Its premise was wrong: AwanFS writes volumes with direct I/O, so written bytes are

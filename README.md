@@ -126,7 +126,7 @@ AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
   - `strict`: each write is synced on its own before the answer. Slowest; no batching.
   A killed process (no power cut) loses nothing acknowledged in any mode.
 - Health probes, without authentication: `GET /_awanfs/health/live` (200 while the process serves) and `GET /_awanfs/health/ready` (200, or 503 with the reason). `_` cannot appear in a bucket name, so these paths never shadow a bucket.
-- Prometheus metrics, without authentication: `GET /_awanfs/metrics` (requests and latency per S3 operation, bytes in and out, volume use, payload cache hits, and the disk and copy counters from `server/src/work.rs`).
+- Prometheus metrics, without authentication: `GET /_awanfs/metrics` (requests and latency per S3 operation, bytes in and out, volume use, payload cache hits, the disk and copy counters from `server/src/work.rs`, and `awanfs_log_lines_dropped_total`: the per-request log on stderr is written by a background thread, so a stderr nobody reads costs log lines, counted there, and never stalls requests).
 - Dashboards and alerts: `deploy/grafana/awanfs-dashboard.json` (Grafana) and `deploy/prometheus/alerts.yml` (Prometheus rules), both built on `/_awanfs/metrics`.
 - Access log (off by default): `--access-log <file>` or `--access-log -` for stdout (or `AWANFS_ACCESS_LOG`) writes one line per request in the Amazon S3 server access log format: requester access key, operation, bucket, key, status, error code, bytes, time, request ID.
 - Traces (off by default): `--otlp-endpoint http://collector:4318` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) exports a span per request, with child spans for volume writes and syncs, over OTLP/HTTP JSON to Tempo, Jaeger or an OpenTelemetry Collector. A W3C `traceparent` header continues the caller's trace.
@@ -140,8 +140,8 @@ AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
   policy = '''{"Statement": [{"Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"],
                               "Resource": ["arn:aws:s3:::photos", "arn:aws:s3:::photos/*"]}]}'''
   ```
-- `--allow-anonymous` (or `AWANFS_ALLOW_ANONYMOUS=1`) also accepts unsigned requests, for local tests and benchmarks. Without keys and without that flag the server refuses to start (exit code 2).
-- `--memory-budget 256MiB` (or `AWANFS_MEMORY_BUDGET`) caps what the server holds in memory: half bounds the payload cache, half is for in-flight request bodies. Without it the budget is a quarter of the container's `memory.max` or the machine's `MemTotal`, held between 128 MiB and 2 GiB; where neither is readable it is 2 GiB, which leaves the cache at the 1 GiB it had before. The startup line and `awanfs_memory_budget_bytes` in `GET /_awanfs/metrics` say which it was.
+- `--allow-anonymous` (or `AWANFS_ALLOW_ANONYMOUS=1`) also accepts unsigned requests, for local tests and benchmarks. Without keys and without that flag the server refuses to start (exit code 2). It is refused together with users in `--config` (also exit code 2): unsigned requests are not checked against any policy, so anyone reaching the port would get more access than the users you restricted (#130).
+- `--memory-budget 256MiB` (or `AWANFS_MEMORY_BUDGET`) caps what the server holds in memory: half bounds the payload cache, half is for in-flight request bodies. Without it the budget is a quarter of the container's `memory.max` or the machine's `MemTotal`, held between 128 MiB and 2 GiB; where neither is readable it is 2 GiB, which leaves the cache at the 1 GiB it had before. The startup line and `awanfs_memory_budget_bytes` in `GET /_awanfs/metrics` say which it was. On Linux with glibc the server also fixes the allocator's mmap threshold at 128 KiB, so freed large buffers go back to the OS instead of staying in the heap (set `MALLOC_MMAP_THRESHOLD_` to choose your own); the startup line says so.
 
 ### Docker and systemd
 ```bash

@@ -20,6 +20,30 @@ pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// A sink that never makes its caller wait (#138, owner decision 2026-11-14). Lines go into a
+/// queue of `capacity` lines that one background thread drains with `write`; when the queue is
+/// full the line is dropped and `dropped` counts it. The request log used to call eprintln!
+/// inline, so a stderr nobody read stopped every request behind it.
+pub fn bounded_sink<W>(capacity: usize, dropped: Arc<AtomicU64>, mut write: W) -> LogSink
+where
+    W: FnMut(&str) + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(capacity);
+    std::thread::Builder::new()
+        .name("awanfs-log".to_string())
+        .spawn(move || {
+            for line in rx {
+                write(&line);
+            }
+        })
+        .expect("spawn the log writer thread");
+    Arc::new(move |line: &str| {
+        if tx.try_send(line.to_string()).is_err() {
+            dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    })
+}
+
 /// 24 upper-case hex digits: the process start time in seconds and a counter, so IDs are
 /// unique within a process and do not repeat across restarts.
 pub fn new_request_id() -> String {
@@ -176,5 +200,48 @@ impl RequestRecord<'_> {
             self.bytes_out,
             self.duration_us
         )
+    }
+}
+
+
+#[cfg(test)]
+mod bounded_sink_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_writer_that_never_returns_does_not_make_the_caller_wait() {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (_hold, gate) = mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        // Takes the first line and then blocks forever, like a write into a full pipe.
+        let sink = bounded_sink(8, Arc::clone(&dropped), move |_line: &str| {
+            let _ = gate.lock().unwrap().recv();
+        });
+        let t0 = Instant::now();
+        for i in 0..1000 {
+            sink(&format!("line {}", i));
+        }
+        assert!(t0.elapsed() < Duration::from_secs(5), "1000 lines took {:?}", t0.elapsed());
+        // At most 8 queued and 1 in the writer; every other line is dropped and counted.
+        let d = dropped.load(Ordering::Relaxed);
+        assert!((991..=1000).contains(&d), "dropped {}", d);
+    }
+
+    #[test]
+    fn a_writer_that_keeps_up_gets_every_line_in_order() {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel::<String>();
+        let tx = std::sync::Mutex::new(tx);
+        let sink = bounded_sink(1024, Arc::clone(&dropped), move |line: &str| {
+            let _ = tx.lock().unwrap().send(line.to_string());
+        });
+        for i in 0..500 {
+            sink(&format!("{}", i));
+        }
+        let got: Vec<String> = (0..500).map(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
+        assert_eq!(got, (0..500).map(|i| i.to_string()).collect::<Vec<_>>());
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
     }
 }
