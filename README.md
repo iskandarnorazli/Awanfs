@@ -77,6 +77,8 @@ GitHub-hosted ubuntu-latest, 4 CPUs, 2026-11-13: 5 runs per server in alternatin
 
 Peak RSS over the six workloads: AwanFS 117 MiB, MinIO 560 MiB (both include reclaimable pages of mapped files). One shared 4-CPU VM and short phases: these are ratios on identical hardware, not absolute numbers (#58).
 
+The nightly full matrix adds RustFS, latency percentiles and a concurrency sweep, on both Linux and Windows runners, one 2 s run per phase ([`measurements/2026-11-14-ci-full-matrix.md`](measurements/2026-11-14-ci-full-matrix.md)).
+
 ### Earlier laptop run (2026-11-11, before durable PUTs)
 
 > **Provisional.** These are real measurements from one laptop run, but they do not yet support a general "faster than MinIO" claim: PUT rows compare an unsynced AwanFS write with MinIO's synced one, the data set fits in memory, each phase ran 2 s once, and MinIO and RustFS ran in single-drive default setups. #58 tracks the benchmark that would support or refute the claim. The nightly CI runs (`.github/workflows/bench-full.yml`, `bench-ratio.yml`) track regressions.

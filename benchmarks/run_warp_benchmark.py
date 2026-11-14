@@ -132,7 +132,7 @@ def format_markdown_report(
         f"- **Client Affinity Pin:** {hw_info.get('affinity_client', 'Cores 4..7 (Mask 0xF0)')}",
         f"- **Live MinIO Binary Status:** {hw_info.get('minio_status', 'not measured')}",
         f"- **Live RustFS Binary Status:** {hw_info.get('rustfs_status', 'not measured')}",
-        "- **Durability per PUT:** `s3-server` acknowledges a PUT before it is flushed to disk (no fsync on the write path; group commit is #29). MinIO syncs each PUT (O_DSYNC), so PUT and mixed rows against MinIO compare a non-durable write with a durable one. RustFS's sync behaviour is not verified here.",
+        "- **Durability per PUT:** `s3-server` runs with its default, group commit (#29): a 200 means the bytes are on stable storage, and concurrent PUTs share one sync. MinIO syncs each PUT (O_DSYNC). RustFS's sync behaviour is not verified here.",
         "",
         "## 2. Live Measured HTTP/1.1 Keep-Alive Throughput & Latency Matrix (64 KiB – 10 GiB)",
         "",
