@@ -51,10 +51,18 @@ jobs:
           test -s /tmp/s3tests-results.xml
       - name: Ratchet
         run: python3 tests/s3tests/ratchet.py /tmp/s3tests-results.xml tests/s3tests/passing.txt --report /tmp/s3tests-report.md
+      - name: Conformance map (every test has an owner; CONFORMANCE_DESIGN.md)
+        if: always()
+        run: |
+          python3 tests/s3tests/test_conformance_map.py
+          python3 tests/s3tests/conformance_map.py /tmp/s3-tests/s3tests/functional/test_s3.py tests/s3tests/passing.txt \
+            --junit /tmp/s3tests-results.xml --suite-ref "ceph/s3-tests $(git -C /tmp/s3-tests rev-parse --short HEAD), run $GITHUB_RUN_ID" \
+            --report /tmp/CONFORMANCE_MAP.md
       - name: Summary
         if: always()
         run: |
           [ -f /tmp/s3tests-report.md ] && cat /tmp/s3tests-report.md >> "$GITHUB_STEP_SUMMARY"
+          [ -f /tmp/CONFORMANCE_MAP.md ] && sed -n '1,/^## /p' /tmp/CONFORMANCE_MAP.md | sed '$d' | tee -a "$GITHUB_STEP_SUMMARY"
           tail -20 /tmp/awanfs.log || true
       - uses: actions/upload-artifact@v4
         if: always()
@@ -63,3 +71,4 @@ jobs:
           path: |
             /tmp/s3tests-results.xml
             /tmp/s3tests-report.md
+            /tmp/CONFORMANCE_MAP.md

@@ -18,7 +18,7 @@ Read this before you run it anywhere that matters. Plan of record: the Phase 1-4
 - **Bodies:** a PUT or UploadPart above 4 MiB streams to disk, `aws-chunked` included (#36); bodies above 5 GiB get 400 `EntityTooLarge` before they are read. Multipart GETs stream part by part.
 - **Observability:** request logs with request IDs; OTLP/HTTP traces with `--otlp-endpoint` (#43).
 - **Versioning** per bucket (#31) and opt-in **zstd compression** per bucket in the config file (#51), both format 2 (`FORMAT.md`).
-- **Conformance:** the ceph s3-tests suite passes 244 of 838 tests (94 skipped), checked nightly; the tracker is #123.
+- **Conformance:** the ceph s3-tests suite passes 246 of 838 tests (94 skipped), checked nightly; the tracker is #123. The plan to pass the rest is [`CONFORMANCE_DESIGN.md`](CONFORMANCE_DESIGN.md), and [`tests/s3tests/CONFORMANCE_MAP.md`](tests/s3tests/CONFORMANCE_MAP.md) gives every test its area and owner.
 - **Not yet:** replication and erasure coding across nodes, bucket policies and ACLs, object lock, server-side encryption, tagging, CORS (all in #123's area issues).
 
 ## 1. Executive Summary
