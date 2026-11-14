@@ -1,0 +1,40 @@
+name: Sync probe (experiment)
+
+# benchmarks/sync_probe.py: what one durable 64 KiB append costs on the runner's disks, without
+# the server. Splits a slow PUT into write, flush and file growth. On demand, and on pull
+# requests that change the probe.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "benchmarks/sync_probe.py"
+      - ".github/workflows/probe-sync.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Where the disks are
+        shell: bash
+        run: |
+          echo "temp: ${RUNNER_TEMP}  workspace: ${GITHUB_WORKSPACE}"
+          python -c "import tempfile; print('python temp:', tempfile.gettempdir())"
+          df -h . "${RUNNER_TEMP}" 2>/dev/null || true
+      - name: Run the probe
+        shell: bash
+        run: |
+          mkdir -p .tmp/probe
+          python -u benchmarks/sync_probe.py --count 200 \
+            --dir "$(python -c 'import tempfile; print(tempfile.gettempdir())')" \
+            --dir "$PWD/.tmp/probe" --report sync_probe.md
+          cat sync_probe.md >> "$GITHUB_STEP_SUMMARY"
