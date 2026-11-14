@@ -86,3 +86,54 @@ fn a_server_whose_stderr_nobody_reads_keeps_answering() {
     assert!(dropped > 0, "the lines that did not fit are counted, got {}", dropped);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Decision 54 (owner, 2026-11-15): the `--access-log` sink may drop lines too. `--access-log -`
+/// writes to stdout; here stdout is a pipe nobody reads and stderr logging is off, so the only
+/// thing that can fill is the access log. Before, its lines were written inline by the request
+/// handler and the server stopped answering once the pipe was full.
+#[test]
+fn a_server_whose_access_log_nobody_reads_keeps_answering() {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("awanfs_stalledaccess_{}_{}", std::process::id(), nanos));
+    std::fs::create_dir_all(&dir).unwrap();
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let child = Command::new(env!("CARGO_BIN_EXE_s3-server"))
+        .args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous", "--access-log", "-"])
+        .env("AWANFS_LOG", "off")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn s3-server");
+    let _server = Server(child);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while request(port, "GET", "/_awanfs/health/live").map(|r| r.0) != Some(200) {
+        assert!(Instant::now() < deadline, "the server did not start");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(request(port, "PUT", "/logbkt").map(|r| r.0), Some(200), "create the bucket");
+
+    // The startup banner already sits in the stdout pipe; an access log line is a few hundred
+    // bytes, so the pipe and the 4,096-line queue are both full well before 6,000 requests.
+    const N: usize = 6000;
+    for i in 0..N {
+        match request(port, "HEAD", "/logbkt") {
+            Some((200, _)) => {}
+            other => panic!("request {} of {} got {:?}: the server stopped answering behind its access log", i, N, other.map(|r| r.0)),
+        }
+    }
+
+    let (code, metrics) = request(port, "GET", "/_awanfs/metrics").expect("metrics");
+    assert_eq!(code, 200);
+    let dropped: u64 = metrics
+        .lines()
+        .find(|l| l.starts_with("awanfs_log_lines_dropped_total "))
+        .unwrap_or_else(|| panic!("no awanfs_log_lines_dropped_total in:\n{}", metrics))
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(dropped > 0, "dropped access log lines are counted, got {}", dropped);
+    let _ = std::fs::remove_dir_all(&dir);
+}
