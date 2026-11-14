@@ -579,6 +579,8 @@ pub struct S3ServiceState {
     pub metrics: Arc<crate::metrics::Metrics>,
     /// Where the per-request JSON log lines go; `None` logs nothing (#41).
     pub access_log: Arc<RwLock<Option<crate::request_log::LogSink>>>,
+    /// Request-log lines dropped because the log writer could not keep up (#138).
+    pub log_lines_dropped: Arc<AtomicU64>,
     /// Where S3-format server access log lines go; `None` (the default) writes none (#46).
     pub audit_log: Arc<RwLock<Option<crate::request_log::LogSink>>>,
     /// Users and policies from the config file (#53); `None` = only the root key pair.
@@ -632,6 +634,7 @@ impl S3ServiceState {
             not_ready: Arc::new(RwLock::new(None)),
             metrics: Arc::new(crate::metrics::Metrics::default()),
             access_log: Arc::new(RwLock::new(None)),
+            log_lines_dropped: Arc::new(AtomicU64::new(0)),
             audit_log: Arc::new(RwLock::new(None)),
             iam: Arc::new(RwLock::new(None)),
             versioning: Arc::new(RwLock::new(HashMap::new())),
@@ -867,6 +870,7 @@ impl S3ServiceState {
             not_ready: Arc::new(RwLock::new(None)),
             metrics: Arc::new(crate::metrics::Metrics::default()),
             access_log: Arc::new(RwLock::new(None)),
+            log_lines_dropped: Arc::new(AtomicU64::new(0)),
             audit_log: Arc::new(RwLock::new(None)),
             iam: Arc::new(RwLock::new(None)),
             versioning: Arc::new(RwLock::new(versioning_map)),
@@ -1806,7 +1810,7 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
     };
     let (hits, misses) = state.payload_cache.hit_counts();
     let w = state.work.snapshot();
-    let gauges: [(&str, &str, &str, u64); 14] = [
+    let gauges: [(&str, &str, &str, u64); 15] = [
         ("awanfs_volume_used_bytes", "gauge", "Bytes written into all open volumes, including dead needles.", used),
         ("awanfs_volume_free_span_bytes", "gauge", "Span left in the active volume before it rolls over.", free),
         ("awanfs_volumes_open", "gauge", "Open volumes.", state.volumes.read().len() as u64),
@@ -1821,6 +1825,12 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
         ("awanfs_payload_copies_total", "counter", "Copies of payload bytes into server buffers.", w.payload_copies),
         ("awanfs_payload_copy_bytes_total", "counter", "Payload bytes copied.", w.payload_copy_bytes),
         ("awanfs_ready", "gauge", "1 when /_awanfs/health/ready answers 200.", state.readiness().is_none() as u64),
+        (
+            "awanfs_log_lines_dropped_total",
+            "counter",
+            "Request-log lines dropped because the log writer could not keep up.",
+            state.log_lines_dropped.load(Ordering::Relaxed),
+        ),
     ];
     for (name, kind, help, v) in gauges {
         let _ = writeln!(out, "# HELP {} {}\n# TYPE {} {}\n{} {}", name, help, name, kind, name, v);
