@@ -1,0 +1,98 @@
+name: Large objects (experiment)
+
+# benchmarks/large_object_check.py: objects above 4 MiB against AwanFS and MinIO on the same
+# GitHub-hosted runner. An experiment with no baseline; it fails only when a phase did not
+# measure. Runs on demand, and on pull requests that change the script or this file.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sizes:
+        description: "Object sizes (8MiB,16MiB,64MiB,256MiB,1GiB)"
+        default: "16MiB,64MiB,256MiB"
+      runs:
+        description: "Runs per server"
+        default: "3"
+  pull_request:
+    paths:
+      - "benchmarks/large_object_check.py"
+      - ".github/workflows/bench-large.yml"
+
+permissions:
+  contents: read
+
+env:
+  MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+
+jobs:
+  large:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / /tmp
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Build s3-server
+        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+
+      - uses: actions/cache@v4
+        id: minio-cache
+        with:
+          path: .tmp/minio
+          key: minio-${{ env.MINIO_RELEASE }}-mc-v1-${{ runner.os }}
+      - uses: actions/setup-go@v5
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        with:
+          go-version: stable
+          cache: false
+      - name: Fetch MinIO and mc
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        # dl.min.io answers 410 for the archived binaries and Docker Hub no longer has minio/minio
+        # (checked 2026-11-12), so try quay.io, then build the pinned release from source.
+        run: |
+          mkdir -p .tmp/minio
+          from_image() { # image, path in image, output
+            docker pull "$1" >/dev/null 2>&1 || return 1
+            id=$(docker create "$1") && docker cp "$id:$2" "$3" && docker rm "$id" >/dev/null
+          }
+          if ! from_image "quay.io/minio/minio:${MINIO_RELEASE}" /usr/bin/minio .tmp/minio/minio; then
+            git clone -q --depth 1 --branch "${MINIO_RELEASE}" https://github.com/minio/minio /tmp/minio-src
+            (cd /tmp/minio-src && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/minio" .)
+          fi
+          if ! from_image quay.io/minio/mc:latest /usr/bin/mc .tmp/minio/mc; then
+            git clone -q --depth 1 https://github.com/minio/mc /tmp/mc-src
+            (cd /tmp/mc-src && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/mc" .)
+          fi
+          chmod +x .tmp/minio/minio .tmp/minio/mc
+      - name: MinIO versions
+        run: .tmp/minio/minio --version && .tmp/minio/mc --version
+
+      - name: Self-tests
+        run: python benchmarks/test_large_object_check.py
+
+      - name: Run the large-object check
+        timeout-minutes: 40
+        env:
+          SIZES: ${{ inputs.sizes || '16MiB,64MiB,256MiB' }}
+          RUNS: ${{ inputs.runs || '3' }}
+        run: |
+          set +e
+          python -u benchmarks/large_object_check.py --server-bin server/target/release/s3-server \
+            --minio-bin .tmp/minio/minio --mc-bin .tmp/minio/mc \
+            --sizes "$SIZES" --runs "$RUNS" \
+            --report large_report.md
+          code=$?
+          [ -f large_report.md ] && cat large_report.md >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: large-report
+          path: large_report.md
+          if-no-files-found: ignore
