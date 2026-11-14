@@ -86,6 +86,31 @@ says anyone who can reach the port can read, write and delete. A config that set
 is #122 (decision 39), which replaces this guard when it lands. Found by an adversarial review of
 #53, filed as #130.
 
+**Decision 43 (2026-11-14): volume format 3 stores object attributes in the needle.** The
+reserved header bytes 18..20 become the length of an attributes block between the key and the
+payload; tags, ACLs, retention and legal hold change later through attribute-update needles
+(flag 0x200) replayed in creation-time order. Format 2 needles are valid format 3 needles and
+are never rewritten. Chosen over a separate attribute database, which would be a second source
+of truth for recovery, compaction and replication. `CONFORMANCE_DESIGN.md` section 4, #150.
+
+**Decision 44 (2026-11-14): accounts and owners are enforced.** Each user in the users file is
+its own account unless it names one; a bucket belongs to the account that created it, an object
+to its writer. One function decides every request, and an identity policy reaches only the
+caller's own account's resources: another account's bucket needs a bucket policy or an ACL
+grant. Setups with only the root key do not change. `CONFORMANCE_DESIGN.md` section 5, #151.
+
+**Decision 45 (2026-11-14): the conformance target is the ceph s3-tests suite without its
+RGW-only tests and without storage classes or cloud tiering.** Bucket logging is built last, and
+whether it is built at all is decided after object lock, encryption and lifecycle are done.
+`CONFORMANCE_DESIGN.md` section 9, #123, #153.
+
+**Decision 46 (2026-11-14): objects above 4 MiB are streamed, and verified as they stream.** A
+full GET computes the payload checksum while it sends and aborts the connection on a mismatch; a
+range GET is not verified, and a background scrub checks whole objects. Today every GET or range
+checksums the whole object before the first byte (measured: 20.7 ms to headers and 29.6 ms per
+1 MiB range at 256 MiB, 4.4 GiB of resident file pages; `measurements/2026-11-14-large-objects.md`).
+Per-block checksums, which would verify ranges, were not chosen now. #155.
+
 **Decision 42 (2026-11-14): on Linux with glibc the server fixes the allocator's mmap threshold
 at startup.** glibc raises its mmap threshold after a large block is freed, so later 1 MiB buffers
 come from the heap and stay there once freed. Measured under `--memory-budget 256MiB` and 64

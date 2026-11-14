@@ -1,7 +1,8 @@
 # Design: passing the ceph s3-tests suite
 
-Status: **proposal, 2026-11-14.** Sections marked *decision needed* wait for the owner
-(section 11). Everything else is the plan of record once this file merges.
+Status: **plan of record, 2026-11-14.** The owner decided D1, D2, D3 and the large-GET rule
+on 2026-11-14 (section 11, `ARCHITECTURE.md` decisions 43 to 46). D4, D5 and D6 are still
+open, and the parts that depend on them say so.
 
 The companion file [`tests/s3tests/CONFORMANCE_MAP.md`](tests/s3tests/CONFORMANCE_MAP.md)
 assigns every test in the pinned suite to one area below, with its current status and failure
@@ -121,7 +122,7 @@ Lifecycle and bucket logging are tested by waiting. The suite's lifecycle tests 
   needle's creation time through the `Clock`. Conditional requests, lifecycle and listing
   depend on it.
 
-## 4. Foundation: object attributes (issue #150) — *decision needed (D1)*
+## 4. Foundation: object attributes (issue #150)
 
 ### 4.1 What is stored
 
@@ -196,7 +197,7 @@ format 3 volume. There is no migration: old needles are read as they are.
   takes the request's. The ACL is never copied. Tags follow `x-amz-tagging-directive`.
   Copying an object onto itself without REPLACE is 400.
 
-## 5. Foundation: owners and authorization (issue #151) — *decision needed (D2)*
+## 5. Foundation: owners and authorization (issue #151)
 
 This section is security. A mistake here passes tests and still exposes data, so it gets a
 decision-table test, a default-deny property test and a review by someone who did not write it.
@@ -246,7 +247,9 @@ ACL or a policy.
   as `x-amz-acl` and `x-amz-server-side-encryption`, `s3:prefix`, existing and requested
   object tags, the copy source). The area issue lists the keys the suite uses.
 - ACLs: canned ACLs and grant headers on PUT, `?acl` documents on buckets and objects, the
-  three grantee kinds. `BlockPublicAcls` rejects a PUT that sets a public ACL;
+  three grantee kinds. *Decision needed (D5):* decision 39 says "no per-grantee ACL grants",
+  and most of the 61 `acl-ownership` tests grant to a named user. Until D5 is decided, #122
+  builds canned ACLs only. `BlockPublicAcls` rejects a PUT that sets a public ACL;
   `BlockPublicPolicy` rejects a public policy.
 - Ownership controls: `BucketOwnerEnforced` (default for new buckets), `BucketOwnerPreferred`,
   `ObjectWriter`.
@@ -345,7 +348,9 @@ Order: SSE-C, then SSE-S3, then SSE-KMS.
   or reordering chunks fails authentication. `ring` is already a dependency (TLS).
 - **Keys.** SSE-C: the key arrives with each request and is never stored; its MD5 is. SSE-S3:
   a master key from a file wraps a per-object data key. SSE-KMS: named keys in a local key
-  file stand in for a KMS; the key id is stored and checked.
+  file stand in for a KMS; the key id is stored and checked. *Decision needed (D6):* decision
+  38 says SSE-KMS comes later "through an external service". The suite's KMS tests need a key
+  id the server accepts, which a local key file gives without an external service.
 - **Layout.** The stored payload is longer than the object (one tag per chunk). The index
   keeps the object's size and the attributes keep the chunk size, the pattern compressed
   payloads already use. A range GET decrypts only the chunks it covers.
@@ -363,11 +368,12 @@ versions; expired delete markers; incomplete uploads), validated at PUT. The sch
 section 3.3 runs it. `x-amz-expiration` on GET, HEAD and PUT. Needs #149, the clock of section 3.3,
 tags from #150.
 
-### 8.4 Bucket logging (#153) — *decision needed (D3)*
+### 8.4 Bucket logging (#153)
 113 tests, the largest area, none passing. They cover S3 server access logging plus RGW's
-additions (journal mode, rollover, a flush call). Proposed last.
+additions (journal mode, rollover, a flush call). Built last; its scope is decided after
+wave 3 (decision 45).
 
-## 9. Out of scope — *decision needed (D3)*
+## 9. Out of scope (decision 45)
 
 | Group | Tests | Why |
 |---|---|---|
@@ -390,11 +396,21 @@ reports it as such instead of as a failure.
 Wave 0 is small in code and decides everything after it, so it is built and reviewed with
 the most care. Waves 1 to 3 are where parallel work pays.
 
-## 11. Decisions for the owner
+## 11. Decisions
+
+Decided by the owner on 2026-11-14:
+
+| | Decision | Recorded as |
+|---|---|---|
+| D1 | Volume format 3: attributes inside the needle, changes as attribute-update needles (section 4) | `ARCHITECTURE.md` decision 43 |
+| D2 | Accounts and owners are enforced: each user is its own account unless it names one, and reaches another account's buckets only through a grant (section 5) | decision 44 |
+| D3 | Out of scope: RGW-only tests and storage classes or cloud tiering. Bucket logging is built last and its scope decided after wave 3 | decision 45 |
+| | Large GETs stream. A full GET is checksummed as it streams and the connection is aborted on a mismatch; a range GET is not verified and a background scrub checks whole objects (#155) | decision 46 |
+
+Still open:
 
 | | Decision | Recommendation |
 |---|---|---|
-| D1 | Volume format 3: attributes inside the needle, changes as attribute-update needles (section 4) | Yes. The alternative, a separate attribute database, is a second source of truth that recovery, compaction and replication would each have to keep in step |
-| D2 | Accounts and owners: a user no longer reaches another account's buckets without a grant (section 5) | Yes. About 100 tests need it and it is what S3 does. Existing single-key setups do not change |
-| D3 | Scope: leave out RGW-only tests and storage classes; bucket logging last | Yes to both exclusions. Decide logging when wave 3 is done |
 | D4 | Reject multipart parts under 5 MiB except the last | Yes, with the benchmark moved to 5 MiB parts |
+| D5 | Per-grantee ACL grants, which decision 39 ruled out | Yes: the suite cannot pass without them. New buckets default to `BucketOwnerEnforced`, where ACLs are off, so the extra surface is opt-in |
+| D6 | SSE-KMS from a local key file, where decision 38 says an external service later | Yes, as the first step: the stored format (key id plus wrapped data key) is the same when an external KMS replaces the file |
