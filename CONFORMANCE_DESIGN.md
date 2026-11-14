@@ -30,7 +30,7 @@ Constraints that hold for every change:
 
 ## 2. Where it stands
 
-Run 43537724429 (main, 2026-11-14): 838 test cases, 246 pass, 498 fail, 94 skipped. By test
+Run 43592288427 (main, 2026-11-14): 838 test cases, 247 pass, 497 fail, 94 skipped. By test
 function (760), the map's table gives the split by area. Three facts explain most failures:
 
 1. **Objects carry no attributes.** Content-Type, user metadata, Cache-Control, tags, ACLs,
@@ -309,7 +309,8 @@ and invalid values, owners in listings (needs #151), paginated ListBuckets with 
 creation dates, bucket naming rules, the 1,000-key limit of DeleteObjects, answering
 `Expect: 100-continue` with the error instead of 100 when the request will be refused.
 
-`test_atomic_dual_write_8mb` times out, and it points at a real fault, tracked as #154:
+`test_atomic_dual_write_8mb` timed out, and it pointed at a real fault, fixed in #154 (the test
+passes since run 43592288427; decision 51 says how):
 a streamed PUT holds its key's lock while it reads the body, so a client that stops sending
 blocks every other writer of that key. Taking the lock only at commit is the fix, but the
 TLA+ model shows it is unsafe while recovery orders an unversioned key's needles by offset:
