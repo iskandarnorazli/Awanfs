@@ -106,6 +106,18 @@ class RssSplit:
         return False
 
 
+def server_env(pairs) -> dict:
+    """NAME=VALUE strings to a dict; anything without '=' is an error, so a typo cannot pass as a
+    variable that was never set."""
+    out = {}
+    for p in pairs:
+        k, sep, v = p.partition("=")
+        if not sep or not k:
+            raise SystemExit(f"--server-env {p!r}: give NAME=VALUE")
+        out[k] = v
+    return out
+
+
 def process_env(pid: int, name: str):
     """The value of `name` in a running process's environment (Linux /proc), "unset" when it is
     not there, or None when it cannot be read. Proves an experiment's variable reached the server."""
@@ -136,9 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--overhead", type=float, default=200.0, help="MiB outside the budget; state what you measured")
     ap.add_argument("--data-dir", default=os.path.join(".tmp", "budget_rss"))
     ap.add_argument("--report", default="")
-    ap.add_argument("--malloc-arena-max", type=int, default=0,
-                    help="run the server with glibc's MALLOC_ARENA_MAX set to this (0: unset). An experiment "
-                         "for #127: does the heap the cache does not explain come from allocator arenas?")
+    ap.add_argument("--server-env", action="append", default=[], metavar="NAME=VALUE",
+                    help="set NAME=VALUE in the server's environment; repeatable. For allocator experiments "
+                         "(#127), e.g. MALLOC_ARENA_MAX=2 or MALLOC_MMAP_THRESHOLD_=131072")
     return ap
 
 
@@ -209,9 +221,9 @@ def main(argv=None) -> int:
     a = build_parser().parse_args(argv)
 
     os.makedirs(a.data_dir, exist_ok=True)
-    env_extra = {"MALLOC_ARENA_MAX": str(a.malloc_arena_max)} if a.malloc_arena_max > 0 else None
+    env_extra = server_env(a.server_env)
     proc, port = start_server(a.server_bin, a.budget, a.data_dir, env_extra)
-    seen_arena = process_env(proc.pid, "MALLOC_ARENA_MAX")
+    seen_env = {k: process_env(proc.pid, k) for k in env_extra}
     rows, peak = [], 0.0
     try:
         create_bucket(port, "budget")
@@ -235,8 +247,9 @@ def main(argv=None) -> int:
         "",
         f"Machine: {platform.node()} ({platform.platform()}, {os.cpu_count()} CPUs).",
         "",
-        f"Allocator: MALLOC_ARENA_MAX={a.malloc_arena_max if a.malloc_arena_max > 0 else 'unset'} asked; "
-        f"the server's own environment has it {'not measured' if seen_arena is None else seen_arena}.",
+        "Server environment: " + ("; ".join(
+            f"{k}={v} asked, the server's own environment has {'not measured' if seen_env[k] is None else seen_env[k]}"
+            for k, v in env_extra.items()) or "nothing extra") + ".",
         "",
         "| phase | MiB/s | ops/s | P99 ms | peak RSS MiB | peak heap (RssAnon) MiB | peak file pages (RssFile) MiB | payload cache MiB | heap less cache MiB |",
         "|---|---|---|---|---|---|---|---|---|",

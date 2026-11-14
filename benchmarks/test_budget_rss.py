@@ -132,9 +132,14 @@ class Cli(unittest.TestCase):
         self.assertEqual((a.budget, a.budget_mib, a.concurrency, a.size, a.duration, a.overhead),
                          ("256MiB", 256.0, 64, "1MiB", 10.0, 200.0))
 
-    def test_the_arena_experiment_is_off_unless_asked(self):
-        self.assertEqual(br.build_parser().parse_args(["--server-bin", "x"]).malloc_arena_max, 0)
-        self.assertEqual(br.build_parser().parse_args(["--server-bin", "x", "--malloc-arena-max", "2"]).malloc_arena_max, 2)
+    def test_server_env_is_off_unless_asked_and_refuses_a_malformed_pair(self):
+        self.assertEqual(br.build_parser().parse_args(["--server-bin", "x"]).server_env, [])
+        a = br.build_parser().parse_args(["--server-bin", "x", "--server-env", "MALLOC_ARENA_MAX=2",
+                                          "--server-env", "MALLOC_MMAP_THRESHOLD_=131072"])
+        self.assertEqual(br.server_env(a.server_env), {"MALLOC_ARENA_MAX": "2", "MALLOC_MMAP_THRESHOLD_": "131072"})
+        for bad in (["MALLOC_ARENA_MAX"], ["=2"]):
+            with self.assertRaises(SystemExit):
+                br.server_env(bad)
 
     def test_the_server_gets_the_extra_environment(self):
         import inspect

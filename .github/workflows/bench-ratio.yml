@@ -97,13 +97,15 @@ jobs:
           code=$?
           echo "code=$code" >> "$GITHUB_OUTPUT"
           [ -f budget_report.md ] && cat budget_report.md >> "$GITHUB_STEP_SUMMARY"
-          # Experiment for #127, reported only: the same load with glibc's MALLOC_ARENA_MAX=2.
-          # About 179 MiB of heap is neither the cache nor request bodies, and stays through the GET
-          # phase; if allocator arenas keep it, this run shows a smaller "heap less cache".
+          # Experiment for #127, reported only, to be removed before #134 merges. About 160-180 MiB
+          # of heap is neither the cache nor request bodies and stays through the GET phase.
+          # MALLOC_ARENA_MAX=2 recovered 16-20 MiB of it (run 43535050890); this tests glibc's dynamic
+          # mmap threshold, which a fixed MALLOC_MMAP_THRESHOLD_ turns off.
           python -u benchmarks/budget_rss.py --server-bin server/target/release/s3-server \
             --budget 256MiB --budget-mib 256 --concurrency 64 --size 1MiB --duration 10 \
-            --overhead 200 --malloc-arena-max 2 --data-dir .tmp/budget_rss_arena2 --report budget_report_arena2.md || true
-          [ -f budget_report_arena2.md ] && { echo; echo "### Experiment: MALLOC_ARENA_MAX=2 (reported, not checked)"; cat budget_report_arena2.md; } >> "$GITHUB_STEP_SUMMARY"
+            --overhead 200 --server-env MALLOC_MMAP_THRESHOLD_=131072 \
+            --data-dir .tmp/budget_rss_mmap --report budget_report_mmap.md || true
+          [ -f budget_report_mmap.md ] && { echo; echo "### Experiment: MALLOC_MMAP_THRESHOLD_=131072 (reported, not checked)"; cat budget_report_mmap.md; } >> "$GITHUB_STEP_SUMMARY"
           exit $code
 
       - uses: actions/upload-artifact@v4
@@ -113,7 +115,7 @@ jobs:
           path: |
             ratio_report.md
             budget_report.md
-            budget_report_arena2.md
+            budget_report_mmap.md
           if-no-files-found: ignore
 
       - name: Open or update a perf-regression issue
