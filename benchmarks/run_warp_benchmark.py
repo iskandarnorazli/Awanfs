@@ -100,6 +100,17 @@ def get_process_peak_rss_mb(pid: int) -> float:
     return 0.0
 
 
+def minio_durability_note(os_name: str = os.name) -> str:
+    """What a MinIO PUT waits for on this platform, read from MinIO's source at the pinned
+    release: on Linux it opens with O_DSYNC or calls fdatasync; on Windows its fdatasync is a
+    no-op (internal/disk/fdatasync_unsupported.go) and only files up to 4 KiB are opened
+    write-through, so a PUT of 64 KiB or 1 MiB there does not wait for the disk."""
+    if os_name == "nt":
+        return ("MinIO does not flush these PUTs on Windows (its fdatasync is a no-op there), "
+                "so its PUT and mixed rows on this machine are not durable writes and are not like for like.")
+    return "MinIO syncs each PUT (O_DSYNC)."
+
+
 def format_markdown_report(
     cmd: str,
     hw_info: Dict[str, str],
@@ -132,7 +143,7 @@ def format_markdown_report(
         f"- **Client Affinity Pin:** {hw_info.get('affinity_client', 'Cores 4..7 (Mask 0xF0)')}",
         f"- **Live MinIO Binary Status:** {hw_info.get('minio_status', 'not measured')}",
         f"- **Live RustFS Binary Status:** {hw_info.get('rustfs_status', 'not measured')}",
-        "- **Durability per PUT:** `s3-server` runs with its default, group commit (#29): a 200 means the bytes are on stable storage, and concurrent PUTs share one sync. MinIO syncs each PUT (O_DSYNC). RustFS's sync behaviour is not verified here.",
+        "- **Durability per PUT:** `s3-server` runs with its default, group commit (#29): a 200 means the bytes are on stable storage, and concurrent PUTs share one sync. " + minio_durability_note() + " RustFS's sync behaviour is not verified here.",
         "",
         "## 2. Live Measured HTTP/1.1 Keep-Alive Throughput & Latency Matrix (64 KiB – 10 GiB)",
         "",
