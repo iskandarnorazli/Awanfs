@@ -16,6 +16,7 @@ pub struct WorkCounters {
     disk_reads: AtomicU64,
     payload_copies: AtomicU64,
     payload_copy_bytes: AtomicU64,
+    payload_verify_bytes: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,17 @@ impl WorkCounters {
             self.payload_copies.fetch_add(1, Ordering::Relaxed);
             self.payload_copy_bytes.fetch_add(bytes, Ordering::Relaxed);
         }
+    }
+
+    /// Payload bytes run through the CRC on a read: before the response for objects up to
+    /// 4 MiB, as they are sent for larger ones (#155). Kept out of `WorkSnapshot`, whose
+    /// tests compare whole snapshots; read it with `payload_verified`.
+    pub fn payload_verify(&self, bytes: u64) {
+        self.payload_verify_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn payload_verified(&self) -> u64 {
+        self.payload_verify_bytes.load(Ordering::Relaxed)
     }
 
     pub fn snapshot(&self) -> WorkSnapshot {

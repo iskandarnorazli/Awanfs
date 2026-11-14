@@ -896,6 +896,23 @@ impl VolumeManager {
         offset: u64,
         expected_payload_crc: u32,
     ) -> Result<Bytes, VolumeError> {
+        let payload = self.needle_payload_unverified(offset)?;
+        let actual_crc = crc32c::crc32c(&payload);
+        self.work.payload_verify(payload.len() as u64);
+        if actual_crc != expected_payload_crc {
+            return Err(VolumeError::CrcMismatch {
+                expected: expected_payload_crc,
+                actual: actual_crc,
+            });
+        }
+        Ok(payload)
+    }
+
+    /// A needle's payload as a slice of the mapping, with its header checked and its bytes
+    /// not: nothing of the payload is read. For objects above 4 MiB, which are checksummed
+    /// while they are sent, and for ranges of them, which are not checksummed (#155,
+    /// decision 46). Everything else reads through `read_needle_bytes`.
+    pub fn needle_payload_unverified(&self, offset: u64) -> Result<Bytes, VolumeError> {
         let mmap = self.get_or_remap(offset + SECTOR_SIZE as u64)?;
         if (offset as usize + 64) > mmap.len() {
             return Err(VolumeError::TornNeedleAtOffset(offset));
@@ -918,15 +935,6 @@ impl VolumeManager {
         let p_end = p_start + header.payload_size as usize;
         if p_end > mmap.len() {
             return Err(VolumeError::TornNeedleAtOffset(offset));
-        }
-
-        let payload_slice = &mmap[p_start..p_end];
-        let actual_crc = crc32c::crc32c(payload_slice);
-        if actual_crc != expected_payload_crc {
-            return Err(VolumeError::CrcMismatch {
-                expected: expected_payload_crc,
-                actual: actual_crc,
-            });
         }
 
         let full_bytes = Bytes::from_owner(MmapOwner(mmap));
