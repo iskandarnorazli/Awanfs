@@ -13,6 +13,7 @@ pub mod direct_io;
 pub mod erasure;
 pub mod error;
 pub mod ffi_bridge;
+pub mod fsm;
 pub mod lifecycle;
 pub mod memory;
 pub mod meta_index;

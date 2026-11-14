@@ -50,6 +50,8 @@ jobs:
         run: python3 -m json.tool deploy/grafana/awanfs-dashboard.json > /dev/null
       - name: No benchmark job writes over a committed measurement
         run: python3 scripts/check_workflow_outputs.py
+      - name: STATE_MACHINES.md names functions and tests that exist
+        run: python3 scripts/test_check_state_machines.py && python3 scripts/check_state_machines.py
       - name: promtool check rules
         run: |
           v=3.5.0
