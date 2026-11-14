@@ -58,6 +58,14 @@ class TestRunWarpBenchmark(unittest.TestCase):
         self.assertIn("Durability per PUT", report)
         self.assertIn("#29", report)  # AwanFS issue number (was awan-lang #490 before the split)
 
+    def test_report_durability_matches_the_server_default(self):
+        # The benchmark starts s3-server without --durability, so it runs with group commit, the
+        # default since #29 (ARCHITECTURE.md decision 1): a 200 means the bytes are on stable
+        # storage. The report said "no fsync on the write path" until 2026-11-14.
+        report = format_markdown_report("cmd", {}, {}, {})
+        self.assertNotIn("no fsync on the write path", report)
+        self.assertIn("group commit", report)
+
     def test_report_has_no_unsourced_reference_ranges(self):
         report = format_markdown_report("cmd", {}, {}, {})
         self.assertNotIn("Published Ref", report)
