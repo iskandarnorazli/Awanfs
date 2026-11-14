@@ -108,10 +108,26 @@ jobs:
       # 43398517562 was cancelled at its job timeout and its log held not one phase marker, so
       # there was no way to see where it had got to. The step timeout is below the job's, so a
       # run that wedges fails with its log instead of being cancelled with nothing.
+      # Every server's data goes under the runner's temp directory. On the Windows runner
+      # that is on D:, where a flush takes about 0.1 ms; Python's default temp directory is on
+      # C:, where one takes about 4 ms (measurements/2026-11-14-sync-probe.md), and the first
+      # runs of this job measured that disk more than the servers.
+      - name: What a durable append costs on the data disk
+        shell: bash
+        env:
+          DATA_TMP: ${{ runner.temp }}
+        run: |
+          python -u benchmarks/sync_probe.py --count 100 --dir "$DATA_TMP" --report sync_probe.md
+          cat sync_probe.md >> "$GITHUB_STEP_SUMMARY"
       - name: Run the full matrix
         timeout-minutes: 45
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
         run: |
           rm -f ci_full_matrix.md
+          python -c "import tempfile; print('data under', tempfile.gettempdir())"
           python -u benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB --concurrent 64 --duration 2 --output ci_full_matrix.md
       - name: Report to the job summary
         if: always()

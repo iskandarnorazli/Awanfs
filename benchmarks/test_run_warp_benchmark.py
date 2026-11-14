@@ -66,6 +66,12 @@ class TestRunWarpBenchmark(unittest.TestCase):
         self.assertNotIn("no fsync on the write path", report)
         self.assertIn("group commit", report)
 
+    def test_the_minio_note_says_what_minio_does_on_each_platform(self):
+        from run_warp_benchmark import minio_durability_note
+        self.assertIn("syncs each PUT", minio_durability_note("posix"))
+        self.assertIn("does not flush", minio_durability_note("nt"))
+        self.assertIn("not like for like", minio_durability_note("nt"))
+
     def test_report_has_no_unsourced_reference_ranges(self):
         report = format_markdown_report("cmd", {}, {}, {})
         self.assertNotIn("Published Ref", report)
