@@ -3,7 +3,8 @@
 //! The server writes one JSON line per request to stderr. That write used to happen inline in
 //! the request handler with eprintln!, so when nothing read stderr, the pipe filled and every
 //! request blocked behind it: the server kept its port and answered nothing. It stopped after
-//! 271 requests on a 64 KiB Linux pipe and 16 on a 4 KiB Windows one (#135, run 43450981256).
+//! 271 requests on a 64 KiB Linux pipe and 16 on a 4 KiB Windows one (#135, run 43450981256),
+//! and at request 319 and 320 in this test with the old code.
 //!
 //! Now lines go through a bounded queue to a background writer, and a full queue drops the line
 //! and counts it in `awanfs_log_lines_dropped_total`.
@@ -58,12 +59,16 @@ fn a_server_whose_stderr_nobody_reads_keeps_answering() {
     }
     assert_eq!(request(port, "PUT", "/logbkt").map(|r| r.0), Some(200), "create the bucket");
 
-    // Each answered request writes a line of about 200 bytes: 2,000 of them is several times
-    // what a 64 KiB pipe holds, and over a hundred times a 4 KiB one.
-    for i in 0..2000 {
+    // Each answered request writes a line of about 200 bytes. With eprintln! inline the server
+    // stopped answering at request 319 on Linux and 320 on Windows (scratch/neg-138, run
+    // 43534067327). Now the pipe takes about that many lines and the queue 4,096 more before
+    // anything is dropped, so 6,000 requests both keep going past the old stall and overflow
+    // the queue: the first version of this test sent 2,000, all answered, and dropped none.
+    const N: usize = 6000;
+    for i in 0..N {
         match request(port, "HEAD", "/logbkt") {
             Some((200, _)) => {}
-            other => panic!("request {} of 2000 got {:?}: the server stopped answering behind its log", i, other.map(|r| r.0)),
+            other => panic!("request {} of {} got {:?}: the server stopped answering behind its log", i, N, other.map(|r| r.0)),
         }
     }
 
