@@ -110,6 +110,10 @@ range GET is not verified, and a background scrub checks whole objects. Today ev
 checksums the whole object before the first byte (measured: 20.7 ms to headers and 29.6 ms per
 1 MiB range at 256 MiB, 4.4 GiB of resident file pages; `measurements/2026-11-14-large-objects.md`).
 Per-block checksums, which would verify ranges, were not chosen now. #155.
+Step one (PR #169) checksums a full GET while it is sent and leaves ranges unchecked: time to
+headers is 0.4 ms and a 1 MiB range 1.6 ms at 16, 64 and 256 MiB
+(`measurements/2026-11-14-large-objects-after-155-step1.md`). The bounded reader outside the
+mapping and the scrub are still to build.
 
 **Decision 47 (2026-11-14): the conformance target is S3 behaviour only.** It is `test_s3.py`
 and `test_headers.py` of the ceph suite, without the RGW-only tests and storage classes
