@@ -29,11 +29,53 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # MinIO and mc for the laptop, built on a hosted Windows runner. MinIO's archived binaries
+  # are no longer downloadable, so they are built from source, which needs Go; the laptop has
+  # none, and run 43628483789 measured AwanFS alone because of it (RustFS needs mc as well).
+  # The self-hosted runner is a Windows machine; a Linux one would need its own build here.
+  tools:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+    steps:
+      - uses: actions/cache@v4
+        id: tools
+        with:
+          path: .tmp/minio
+          key: selfhosted-tools-Windows-${{ env.MINIO_RELEASE }}-v1
+      - uses: actions/setup-go@v5
+        if: steps.tools.outputs.cache-hit != 'true'
+        with:
+          go-version: stable
+          cache: false
+      - name: Build MinIO and mc from source (pinned release)
+        if: steps.tools.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p .tmp/minio
+          git clone -q --depth 1 --branch "$MINIO_RELEASE" https://github.com/minio/minio "$RUNNER_TEMP/minio-src"
+          (cd "$RUNNER_TEMP/minio-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/minio.exe" .)
+          git clone -q --depth 1 https://github.com/minio/mc "$RUNNER_TEMP/mc-src"
+          (cd "$RUNNER_TEMP/mc-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/mc.exe" .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minio-windows
+          path: .tmp/minio
+          retention-days: 3
+
   bench:
+    needs: tools
     runs-on: [ self-hosted, bench ]
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: minio-windows
+          path: .tmp/minio
+      - name: MinIO and mc are here
+        run: python -c "import os,sys; m=[f for f in ('minio.exe','mc.exe') if not os.path.isfile(os.path.join('.tmp','minio',f))]; print('missing:', m) if m else print('minio.exe and mc.exe are in .tmp/minio'); sys.exit(1 if m else 0)"
       - name: Machine (more than 8 cores, or this belongs on a hosted runner)
         shell: python
         run: |
