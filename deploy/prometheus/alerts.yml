@@ -43,5 +43,5 @@ groups:
         labels:
           severity: ticket
         annotations:
-          summary: "AwanFS {{ $labels.instance }} is dropping request-log lines"
-          description: "Whatever reads the server's stderr (a container log driver, journald) is not keeping up, so request-log lines are dropped rather than stalling requests (#138). Requests are unaffected; the log has gaps."
+          summary: "AwanFS {{ $labels.instance }} is dropping log lines"
+          description: "Whatever reads the server's stderr (a container log driver, journald), or the --access-log target, is not keeping up, so lines are dropped rather than stalling requests (#138). Requests are unaffected; the request log or the access log has gaps."
