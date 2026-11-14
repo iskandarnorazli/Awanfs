@@ -7,6 +7,7 @@ test_s3::test_abort_multipart_upload_not_found
 test_s3::test_atomic_conditional_write_1mb
 test_s3::test_atomic_dual_write_1mb
 test_s3::test_atomic_dual_write_4mb
+test_s3::test_atomic_dual_write_8mb
 test_s3::test_atomic_multipart_upload_write
 test_s3::test_atomic_read_1mb
 test_s3::test_atomic_read_4mb
