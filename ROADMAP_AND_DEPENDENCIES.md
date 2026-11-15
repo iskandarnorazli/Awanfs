@@ -8,7 +8,7 @@ Plan of record since 2026-11-12. The GitHub milestones Phase 1-4 hold the issues
 |---|---|---|
 | 1. Correctness and security | Acknowledged data is kept and readable; only authorised clients get in; failures are errors | #35 auth, #38 recovery gaps, #29 durability modes, #37 volume rollover, #36 streaming bodies and size limit, #39 DELETE errors, #40 index full, #14 safe compaction; closing #12, #17, #18, #19, #22, #24 after #33, and #23 after #36 |
 | 2. Production operations | What an operator needs to run it | #41 logs and request IDs, #42 `/metrics`, #43 tracing, #44 health, #45 Grafana and alerts, #46 access log, #47 s3-tests, #48 fuzzing, #49 packaging, #30 TLS, #53 IAM, #123 S3 conformance (#111-#122) |
-| 3. Scale and efficiency | Grow past one disk's worth of metadata and data without losing speed | #50 format version, #26 tiered metadata and Bloom filter, #13 redb review, #51 compression, #28 compaction throttle, #104 copy-on-write cloning, #31 versioning |
+| 3. Scale and efficiency | Grow past one disk's worth of metadata and data without losing speed | #50 format version, #207 redb against segments at 10M keys, then #26 tiered metadata segments and Bloom filter (replacing redb, decision 59), #51 compression, #28 compaction throttle, #104 copy-on-write cloning, #31 versioning |
 | 4. Multi-node (future) | High availability across machines | #52 clustering design, #27 multi-drive erasure coding, #15 erasure and heartbeat code |
 
 Since 2026-11-14 the conformance work has its own milestones, "Conformance 0: foundations" to
@@ -48,11 +48,11 @@ flowchart LR
         I48["#48 fuzzing"]
     end
     subgraph P3["Phase 3"]
-        I50["#50 format version"] --> I26["#26 tiered metadata"]
+        I207["#207 redb vs segments"] --> I26["#26 metadata segments"]
+        I50["#50 format version"] --> I26
         I50 --> I51["#51 compression"]
         I50 --> I31["#31 versioning"]
         I28["#28 CoW compaction"]
-        I13["#13 redb review"]
     end
     subgraph P4["Phase 4"]
         I52["#52 clustering design"] --> I27["#27 multi-drive EC"]

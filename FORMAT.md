@@ -20,7 +20,7 @@ All integers are little-endian. Sectors are 4096 bytes.
 | `volume_NNNN.dat` | A volume: superblock, then needles. Writes go to the highest id (#37). A growing volume's file may end in zeros past its last needle: past 64 MiB it is extended ahead of its writes (#178), and the next open trims it to its last needle. Its length is never exactly 32 GiB, the length that marks a sparse volume. |
 | `volume_NNNN.idx` | The volume's journal: one 42-byte record per needle. |
 | `buckets.manifest` | One line per bucket event: `+<id>:<name>` created, `-<id>:<name>` deleted. |
-| `metadata.db` | redb spill index (rebuilt from the volumes if lost). |
+| `metadata.db` | redb spill index (rebuilt from the volumes if lost). To be replaced by metadata segment files and their manifest (#26, decision 59), documented here before they are written. |
 | `.staging/upload-<hex>/part_NNNNN.dat` | Multipart part files; the parts of completed objects stay here. |
 
 ## Superblock (sector 0 of a volume)

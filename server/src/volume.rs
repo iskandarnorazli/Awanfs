@@ -505,6 +505,8 @@ pub struct VolumeManager {
     /// 2.5 ms a write against 0.02 ms (`measurements/2026-11-14-sync-probe.md`). A flush
     /// covers the file, whichever handle asks for it.
     file_sync: File,
+    /// A read-only handle without direct I/O, for GETs read through the page cache (#155).
+    file_cached: File,
     durability: std::sync::atomic::AtomicU8,
     /// Sequence number of the last write whose needle and journal record are written.
     written_seq: AtomicU64,
@@ -672,6 +674,7 @@ impl VolumeManager {
         // Second opens, not `try_clone`: see `file_sync`.
         let idx_sync = OpenOptions::new().write(true).open(&idx_path)?;
         let file_sync = OpenOptions::new().write(true).open(&dat_path)?;
+        let file_cached = OpenOptions::new().read(true).open(&dat_path)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             volume_id,
@@ -679,6 +682,7 @@ impl VolumeManager {
             idx_file: Mutex::new(idx_file),
             idx_sync,
             file_sync,
+            file_cached,
             durability: std::sync::atomic::AtomicU8::new(Durability::Group.code()),
             written_seq: AtomicU64::new(0),
             sync_state: std::sync::Mutex::new(SyncState::default()),
@@ -1192,6 +1196,35 @@ impl VolumeManager {
             });
         }
         Ok(payload)
+    }
+
+    /// Where the payload of the needle at `local` starts in the file, and its length, from
+    /// one aligned read of its header sector: no mapping (#155).
+    pub fn payload_extent(&self, local: u64) -> Result<(u64, u64), VolumeError> {
+        let mut buf = AlignedBuffer::new(SECTOR_SIZE);
+        self.read_aligned(local, &mut buf)?;
+        let mut hdr_bytes = [0u8; 64];
+        hdr_bytes.copy_from_slice(&buf[0..64]);
+        let header = NeedleHeader::decode(&hdr_bytes)?;
+        Ok((local + header.payload_start() as u64, header.payload_size))
+    }
+
+    /// A positioned read of `buf.len()` bytes at `offset` through the page cache: any offset
+    /// and length. Repeat reads of a hot object come from memory, and the pages do not count
+    /// in the RSS as mapped pages do (#155).
+    pub fn read_cached(&self, offset: u64, buf: &mut [u8]) -> Result<(), VolumeError> {
+        self.work.disk_read();
+        crate::direct_io::read_exact_at(&self.file_cached, offset, buf)?;
+        Ok(())
+    }
+
+    /// A positioned read of `buf.len()` bytes at `offset`, both sector aligned, with direct
+    /// I/O: the bytes do not stay in the page cache, so they do not add to the RSS (#155).
+    /// Concurrent reads do not share a file cursor.
+    pub fn read_aligned(&self, offset: u64, buf: &mut [u8]) -> Result<(), VolumeError> {
+        self.work.disk_read();
+        self.file.read_aligned_at(offset, buf)?;
+        Ok(())
     }
 
     /// Calls `f` with the payload of the needle at `offset`, in pieces of at most
