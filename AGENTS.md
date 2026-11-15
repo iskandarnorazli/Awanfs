@@ -67,4 +67,5 @@ function; they do not decide transitions.
 - **Windows runners have two disks.** Python's temp directory is on C:, where a flush takes 3.9 ms; the runner's temp directory is on D:, where one takes 0.09 ms. Benchmarks put data under `runner.temp`.
 - **In `scripts/verify_drive.sh`, `A && local x; x=... && B` is two lists:** a failure in A is masked. The script refuses that pattern at startup.
 - **MinIO does not flush PUTs on Windows** (its fdatasync is a no-op there). Its Windows PUT rows are not durable writes.
+- **The laptop's checkout has the self-hosted runner inside it** (`actions-runner/`, with its credentials and private key). It is in `.gitignore`; still stage files by name, never with `git add -A` or `git add .`.
 - **This repository's workflows run under PowerShell on the self-hosted runner.** Use python for file work in steps without `shell: bash`.
