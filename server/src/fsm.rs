@@ -17,10 +17,17 @@ use crate::versions::Versioning;
 pub struct Refusal {
     pub code: &'static str,
     pub status: u16,
+    /// Which rule refused, so two refusals with the same S3 code stay distinct (and a test
+    /// can tell one rule from another).
+    pub why: &'static str,
 }
 
 const fn refuse(code: &'static str, status: u16) -> Refusal {
-    Refusal { code, status }
+    Refusal { code, status, why: code }
+}
+
+const fn refuse_because(code: &'static str, status: u16, why: &'static str) -> Refusal {
+    Refusal { code, status, why }
 }
 
 pub const INVALID_BUCKET_STATE: Refusal = refuse("InvalidBucketState", 409);
@@ -119,6 +126,57 @@ pub fn lock_step(current: Lock, event: LockEvent, now: u64) -> Result<Lock, Refu
             Some((RetentionMode::Governance, _)) if bypass_governance => Ok(Lock { retention: None, ..current }),
             Some(_) => Err(ACCESS_DENIED),
         },
+    }
+}
+
+pub const BODY_TOO_LONG: Refusal = refuse_because("IncompleteBody", 400, "more bytes than the declared length");
+pub const BODY_TOO_SHORT: Refusal = refuse_because("IncompleteBody", 400, "fewer bytes than the declared length");
+pub const WRITER_FAILED: Refusal = refuse_because("InternalError", 500, "a disk write of this needle failed");
+pub const WRITER_COMMITTED: Refusal = refuse_because("InternalError", 500, "the needle's header is already written");
+
+/// One needle written as its payload arrives (`volume::NeedleWriter`, #36, #154).
+///
+/// Its offset is reserved when the writer is made; the payload is written in pieces; the
+/// header sector, which makes the needle visible to recovery, is written last, by `Finish`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NeedleState {
+    /// Receiving the payload: `written` of `declared` bytes so far.
+    Receiving { declared: u64, written: u64 },
+    /// A disk write failed. Its header was never written, so recovery steps over it; nothing
+    /// more may be written or committed.
+    Failed,
+    /// The header is written: the needle is complete and journaled.
+    Committed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NeedleEvent {
+    /// `n` more payload bytes.
+    Write(u64),
+    /// A write to disk returned an error.
+    WriteFailed,
+    /// Write the header.
+    Finish,
+}
+
+/// A writer that has failed or committed takes nothing more. A payload never grows past its
+/// declared length, and the header is written only when the payload is all there.
+pub fn needle_step(state: NeedleState, event: NeedleEvent) -> Result<NeedleState, Refusal> {
+    match (state, event) {
+        (NeedleState::Receiving { declared, written }, NeedleEvent::Write(n)) => match written.checked_add(n) {
+            Some(total) if total <= declared => Ok(NeedleState::Receiving { declared, written: total }),
+            _ => Err(BODY_TOO_LONG),
+        },
+        (NeedleState::Receiving { .. }, NeedleEvent::WriteFailed) => Ok(NeedleState::Failed),
+        (NeedleState::Receiving { declared, written }, NeedleEvent::Finish) => {
+            if written == declared {
+                Ok(NeedleState::Committed)
+            } else {
+                Err(BODY_TOO_SHORT)
+            }
+        }
+        (NeedleState::Failed, _) => Err(WRITER_FAILED),
+        (NeedleState::Committed, _) => Err(WRITER_COMMITTED),
     }
 }
 
@@ -319,5 +377,85 @@ mod tests {
         let held = lock_step(gov, LockEvent::PutLegalHold { on: true }, 3).unwrap();
         assert_eq!(held, Lock { retention: gov.retention, legal_hold: true });
         assert_eq!(lock_step(held, LockEvent::PutLegalHold { on: false }, 3).unwrap(), gov);
+    }
+
+    #[test]
+    fn the_needle_refusals_are_distinct() {
+        let all = [BODY_TOO_LONG, BODY_TOO_SHORT, WRITER_FAILED, WRITER_COMMITTED];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn needle_every_pair_is_decided() {
+        use NeedleEvent::{Finish, Write, WriteFailed};
+        use NeedleState::{Committed, Failed, Receiving};
+        let r = |written| Receiving { declared: 10, written };
+        // (state, event) -> result. Every state kind against every event kind, with the byte
+        // counts at, below and past the declared length.
+        let table = [
+            (r(0), Write(0), Ok(r(0))),
+            (r(0), Write(4), Ok(r(4))),
+            (r(4), Write(6), Ok(r(10))),
+            (r(4), Write(7), Err(BODY_TOO_LONG)),
+            (r(10), Write(1), Err(BODY_TOO_LONG)),
+            (r(4), Write(u64::MAX), Err(BODY_TOO_LONG)),
+            (r(4), WriteFailed, Ok(Failed)),
+            (r(10), WriteFailed, Ok(Failed)),
+            (r(10), Finish, Ok(Committed)),
+            (r(9), Finish, Err(BODY_TOO_SHORT)),
+            (r(0), Finish, Err(BODY_TOO_SHORT)),
+            (Failed, Write(1), Err(WRITER_FAILED)),
+            (Failed, WriteFailed, Err(WRITER_FAILED)),
+            (Failed, Finish, Err(WRITER_FAILED)),
+            (Committed, Write(1), Err(WRITER_COMMITTED)),
+            (Committed, WriteFailed, Err(WRITER_COMMITTED)),
+            (Committed, Finish, Err(WRITER_COMMITTED)),
+        ];
+        for (state, event, want) in table {
+            assert_eq!(needle_step(state, event), want, "{:?} + {:?}", state, event);
+        }
+        // Each (state kind, event kind) pair appears at least once.
+        let kind = |s: &NeedleState| match s { Receiving { .. } => 0, Failed => 1, Committed => 2 };
+        let ev = |e: &NeedleEvent| match e { Write(_) => 0, WriteFailed => 1, Finish => 2 };
+        for k in 0..3 {
+            for e in 0..3 {
+                assert!(table.iter().any(|(s, x, _)| kind(s) == k && ev(x) == e), "state kind {} with event kind {} is not in the table", k, e);
+            }
+        }
+    }
+
+    #[test]
+    fn a_needle_is_committed_only_with_exactly_its_declared_bytes() {
+        // Any sequence of writes, in a small domain: committed iff the writes add up exactly.
+        for declared in 0..6u64 {
+            for a in 0..7u64 {
+                for b in 0..7u64 {
+                    let mut st = NeedleState::Receiving { declared, written: 0 };
+                    let mut refused = false;
+                    for n in [a, b] {
+                        match needle_step(st, NeedleEvent::Write(n)) {
+                            Ok(next) => st = next,
+                            Err(e) => {
+                                assert!(!refused || e == WRITER_FAILED, "{:?}", e);
+                                assert!(refused || e == BODY_TOO_LONG, "{:?}", e);
+                                // The writer stops at its first refusal (NeedleWriter::write).
+                                st = NeedleState::Failed;
+                                refused = true;
+                            }
+                        }
+                    }
+                    let done = needle_step(st, NeedleEvent::Finish);
+                    let sent = if refused { None } else { Some(a + b) };
+                    assert_eq!(done.is_ok(), sent == Some(declared), "declared {} writes {} {} -> {:?}", declared, a, b, done);
+                    if let Ok(c) = done {
+                        assert_eq!(needle_step(c, NeedleEvent::Write(0)), Err(WRITER_COMMITTED), "nothing after the header");
+                    }
+                }
+            }
+        }
     }
 }

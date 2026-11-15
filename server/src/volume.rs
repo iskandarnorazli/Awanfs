@@ -119,6 +119,13 @@ pub struct NeedleWriter {
     chunk_fill: usize,
     /// Creation time for the header; now when unset (a version id, #31).
     created_at: Option<u64>,
+    /// Where the writer is: `crate::fsm::needle_step` decides every move (STATE_MACHINES.md).
+    state: crate::fsm::NeedleState,
+}
+
+fn refused(r: crate::fsm::Refusal, what: &str) -> VolumeError {
+    let kind = if r.status == 400 { std::io::ErrorKind::InvalidInput } else { std::io::ErrorKind::Other };
+    VolumeError::Io(std::io::Error::new(kind, what.to_string()))
 }
 
 impl NeedleWriter {
@@ -149,9 +156,14 @@ impl NeedleWriter {
     }
 
     pub fn write(&mut self, mut data: &[u8]) -> Result<(), VolumeError> {
-        if self.written + data.len() as u64 > self.payload_size {
-            return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "more bytes than the declared length")));
-        }
+        self.state = match crate::fsm::needle_step(self.state, crate::fsm::NeedleEvent::Write(data.len() as u64)) {
+            Ok(next) => next,
+            Err(r) => {
+                // A refused write ends the needle: nothing after it may commit.
+                self.state = crate::fsm::NeedleState::Failed;
+                return Err(refused(r, r.why));
+            }
+        };
         self.crc = crc32c::crc32c_append(self.crc, data);
         let pos = self.data_start + self.written;
         self.written += data.len() as u64;
@@ -176,7 +188,10 @@ impl NeedleWriter {
             data = &data[n..];
             pos += n as u64;
             if self.chunk_fill == STREAM_CHUNK {
-                self.flush_chunk()?;
+                if let Err(e) = self.flush_chunk() {
+                    self.state = crate::fsm::NeedleState::Failed;
+                    return Err(e);
+                }
             }
         }
         Ok(())
@@ -198,9 +213,14 @@ impl NeedleWriter {
 
     /// Writes what is left and then the header; the needle is complete and journaled.
     pub fn finish(mut self, etag_hi: u64, etag_lo: u64) -> Result<NeedleLocation, VolumeError> {
-        if self.written != self.payload_size {
-            return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "fewer bytes than the declared length")));
-        }
+        // Checked before the header is written; the header itself is the move to Committed.
+        crate::fsm::needle_step(self.state, crate::fsm::NeedleEvent::Finish).map_err(|r| {
+            if r == crate::fsm::BODY_TOO_SHORT {
+                VolumeError::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, r.why))
+            } else {
+                refused(r, r.why)
+            }
+        })?;
         self.flush_chunk()?;
         let now = self.created_at.unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64);
         let key_bytes = self.key.as_bytes();
@@ -1045,6 +1065,7 @@ impl VolumeManager {
             chunk_start: SECTOR_SIZE as u64,
             chunk_fill: 0,
             created_at: None,
+            state: crate::fsm::NeedleState::Receiving { declared: payload_size, written: 0 },
         };
         // The writer now owns the count: its `Drop` gives it back.
         std::mem::forget(in_flight);
