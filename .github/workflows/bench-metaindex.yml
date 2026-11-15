@@ -5,6 +5,14 @@ name: Metadata index (experiment)
 # baseline: it fails only when the two stores did not answer alike or a phase did not run.
 
 on:
+  # A new workflow can be dispatched only once it is on the default branch; until then a push
+  # to the measurement branch runs it with the default inputs.
+  push:
+    branches: [ "measure/207-*" ]
+    paths:
+      - "server/examples/meta_index_bench.rs"
+      - "benchmarks/meta_index_report.py"
+      - ".github/workflows/bench-metaindex.yml"
   workflow_dispatch:
     inputs:
       keys:
