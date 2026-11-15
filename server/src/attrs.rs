@@ -84,7 +84,9 @@ impl Attrs {
         if block.is_empty() {
             return Ok(Self::default());
         }
-        if block.len() < 4 || block.len() > MAX_BLOCK {
+        // A block with no entries is written as no block at all (length 0), so one that
+        // holds only its CRC is not one this format writes.
+        if block.len() <= 4 || block.len() > MAX_BLOCK {
             return Err(AttrsError::Corrupt("block length"));
         }
         let stored = u32::from_le_bytes(block[0..4].try_into().unwrap());
@@ -171,6 +173,14 @@ mod tests {
         for n in 1..block.len() {
             assert!(Attrs::decode(&block[..n]).is_err(), "a block cut to {} bytes is caught", n);
         }
+    }
+
+    #[test]
+    fn a_block_with_only_its_crc_is_corrupt() {
+        // Found by the attrs_block fuzz target: [0, 0, 0, 0] is the CRC of nothing, and
+        // decoding it as "no attributes" meant it did not write back the same bytes.
+        let block = crc32c::crc32c(&[]).to_le_bytes();
+        assert_eq!(Attrs::decode(&block), Err(AttrsError::Corrupt("block length")));
     }
 
     #[test]
