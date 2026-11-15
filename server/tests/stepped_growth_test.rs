@@ -38,33 +38,37 @@ fn reading_each_object_right_after_its_write_remaps_once_per_extension() {
         let got = vm.read_needle_bytes(1, loc.offset, loc.payload_crc32c).unwrap();
         assert!(got[..] == body[..]);
     }
-    // 64 objects of 128 KiB plus headers are a little over 8 MiB: about nine 1 MiB steps.
+    // 64 objects of 128 KiB plus headers are a little over 8 MiB: about nine 1 MiB steps,
+    // plus one remap per object below a quarter of the step (256 KiB: two objects).
     // Before, every read of a new object redid the mapping: one remap per object.
     let written = vm.offset();
-    let bound = written.div_ceil(MIB) + 1;
+    let bound = written.div_ceil(MIB) + 3;
     assert!(vm.remap_count() <= bound, "{} remaps for {} bytes written (at most {})", vm.remap_count(), written, bound);
     assert!(vm.allocated_len() >= written, "the file covers what was written");
     assert!(vm.allocated_len() - written <= MIB, "and at most one step more: {} allocated, {} written", vm.allocated_len(), written);
 }
 
 #[test]
-fn a_volume_grows_by_a_quarter_of_its_length_up_to_the_step() {
+fn a_small_volume_grows_by_its_writes_and_a_large_one_by_a_quarter_of_its_length() {
     let dir = temp_dir("geometric");
     let vm = VolumeManager::open(&dir, 1).unwrap();
     vm.set_growth_step(64 * MIB);
+    let file = dir.join("volume_0001.dat");
     let mut lengths = Vec::new();
     for i in 0..400 {
         vm.write_needle(1, &format!("k{}", i), &pattern(256 * 1024, i), AWAN_FLAG_ACTIVE, 0, 0).unwrap();
-        if lengths.last() != Some(&vm.allocated_len()) {
+        if vm.offset() <= 16 * MIB {
+            // Below a quarter of the step: nothing is allocated ahead of the writes.
+            assert_eq!(std::fs::metadata(&file).unwrap().len(), vm.offset(), "a small volume's file is what it holds");
+        } else if lengths.last() != Some(&vm.allocated_len()) {
             lengths.push(vm.allocated_len());
         }
     }
-    // A small volume does not take a whole step of disk: it starts with 1 MiB extensions.
-    assert!(lengths[0] <= 2 * MIB, "{:?}", lengths);
+    assert!(lengths.len() >= 3, "{:?}", lengths);
     for w in lengths.windows(2) {
         let grew = w[1] - w[0];
         assert!(grew <= 64 * MIB + 512 * 1024, "never more than the step past a write: {:?}", lengths);
-        assert!(grew >= (w[0] / 4).min(64 * MIB).max(MIB) - 4096, "at least a quarter (or 1 MiB): {:?}", lengths);
+        assert!(grew >= (w[0] / 4).clamp(MIB, 64 * MIB) - 4096, "at least a quarter (or 1 MiB): {:?}", lengths);
     }
 }
 
@@ -74,7 +78,8 @@ fn a_restart_after_an_extension_recovers_to_the_written_end() {
     let written = {
         let vm = VolumeManager::open(&dir, 1).unwrap();
         vm.set_growth_step(4 * MIB);
-        for i in 0..3 {
+        // Past a quarter of the step (1 MiB), so the file is extended ahead.
+        for i in 0..6 {
             vm.write_needle(1, &format!("k{}", i), &pattern(300_000, i), AWAN_FLAG_ACTIVE, 0, 0).unwrap();
         }
         vm.sync_now().unwrap();
@@ -86,14 +91,14 @@ fn a_restart_after_an_extension_recovers_to_the_written_end() {
     assert!(std::fs::metadata(&file).unwrap().len() > written);
 
     let vm = VolumeManager::open(&dir, 1).unwrap();
-    assert_eq!(keys(&vm), vec!["k0", "k1", "k2"], "the zero tail is not data and not corruption");
+    assert_eq!(keys(&vm), vec!["k0", "k1", "k2", "k3", "k4", "k5"], "the zero tail is not data and not corruption");
     assert_eq!(vm.offset(), written, "writing resumes at the written end");
     assert_eq!(std::fs::metadata(&file).unwrap().len(), written, "the open trimmed the tail");
-    vm.write_needle(1, "k3", &pattern(1000, 3), AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+    vm.write_needle(1, "k6", &pattern(1000, 6), AWAN_FLAG_ACTIVE, 0, 0).unwrap();
     vm.sync_now().unwrap();
     drop(vm);
     let vm = VolumeManager::open(&dir, 1).unwrap();
-    assert_eq!(keys(&vm), vec!["k0", "k1", "k2", "k3"]);
+    assert_eq!(keys(&vm), vec!["k0", "k1", "k2", "k3", "k4", "k5", "k6"]);
 }
 
 #[test]

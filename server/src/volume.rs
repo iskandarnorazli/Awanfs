@@ -715,22 +715,25 @@ impl VolumeManager {
         self.allocated.load(Ordering::SeqCst)
     }
 
-    /// Makes the file at least `end` bytes long. It grows by a quarter of its length, at
-    /// least 1 MiB and at most the growth step, so a small volume stays small and a large
-    /// one is remapped once per step (#178). Not past the span, and never to exactly
-    /// `MAX_VOLUME_SPAN`, which is how a sparse volume is recognised. The extension is a
-    /// plain length change, not a sparse file, so a flush costs what it costs for a file
+    /// Makes the file at least `end` bytes long (#178). Up to a quarter of the growth step
+    /// (64 MiB by default) a volume grows by its writes, as before: remapping a small volume
+    /// is cheap, and a small deployment pays no disk for space it has not written. Past that
+    /// the file is extended ahead, by a quarter of its length, at least 1 MiB and at most the
+    /// step, so the mapping is redone once per extension. Not past the span, and never to
+    /// exactly `MAX_VOLUME_SPAN`, which is how a sparse volume is recognised. The extension
+    /// is a plain length change, not a sparse file, so a flush costs what it costs for a file
     /// that grows by writing (decision 52).
     fn ensure_allocated(&self, end: u64) -> Result<(), VolumeError> {
-        if self.is_sparse || end <= self.allocated.load(Ordering::SeqCst) {
+        let step = self.growth_step.load(Ordering::SeqCst);
+        if self.is_sparse || end <= step / 4 || end <= self.allocated.load(Ordering::SeqCst) {
             return Ok(());
         }
         let _g = self.grow_lock.lock();
-        let current = self.allocated.load(Ordering::SeqCst);
-        if end <= current {
+        // Below the threshold the file grew by its writes; it is at least that long now.
+        let current = self.allocated.load(Ordering::SeqCst).max(step / 4);
+        if end <= self.allocated.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let step = self.growth_step.load(Ordering::SeqCst);
         let grow = (current / 4).clamp(step.min(1 << 20), step);
         let limit = self.max_span().min(MAX_VOLUME_SPAN - SECTOR_SIZE as u64);
         let target = end.max(current + grow).div_ceil(SECTOR_SIZE as u64).saturating_mul(SECTOR_SIZE as u64).min(limit).max(end);

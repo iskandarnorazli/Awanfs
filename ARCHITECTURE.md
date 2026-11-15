@@ -172,9 +172,10 @@ layout on every platform was chosen over growing on Windows only. A volume that 
 sparse stays sparse (it is recognised by its length), and `AWAN_SPARSE_VOLUME=1` still creates
 sparse ones, for comparison. This replaces the "32 GiB sparse virtual volume" design below,
 whose reason was to map each volume once: a growing volume's mapping is redone when a read
-reaches past it. Since #178 the file is extended ahead of its writes, by a quarter of its length,
-at least 1 MiB and at most 256 MiB (`AWAN_VOLUME_GROWTH_STEP`), with a plain length change, not
-a sparse file. The mapping covers the whole file, so it is redone once per extension, not once
+reaches past it. Since #178 a volume past 64 MiB (a quarter of the step) is extended ahead of its
+writes, by a quarter of its length, at least 1 MiB and at most 256 MiB
+(`AWAN_VOLUME_GROWTH_STEP`), with a plain length change, not a sparse file; a smaller one grows
+by its writes as before, so a small deployment pays no disk for space it has not written. The mapping covers the whole file, so it is redone once per extension, not once
 per read of new data. The zeros past the written end are not data: recovery stops at them and
 the next open trims them, so only the active volume holds up to one extension of unused space.
 
