@@ -32,6 +32,7 @@ pub mod spill;
 pub mod auth;
 pub mod volume;
 pub mod stream_read;
+pub mod attrs;
 pub mod work;
 pub mod xml;
 

@@ -159,3 +159,22 @@ async fn a_corrupted_byte_in_the_first_a_middle_or_the_last_chunk_cuts_a_full_ge
     let got = c.get(format!("{}/pbkt/big", url)).send().await.unwrap().bytes().await.unwrap();
     assert!(got[..] == body[..], "restored, the object is whole again");
 }
+
+/// #155 with #150: the positioned-read paths render the object's stored Content-Type, on a
+/// full GET and on a range.
+#[tokio::test]
+async fn a_large_object_keeps_its_content_type_on_full_and_range_gets() {
+    let dir = temp_dir("ctype");
+    let c = reqwest::Client::new();
+    let (_state, url, _h) = start(&dir).await;
+    let body = noise(LEN, 4);
+    assert_eq!(c.put(format!("{}/pbkt", url)).send().await.unwrap().status(), StatusCode::OK);
+    let res = c.put(format!("{}/pbkt/typed", url)).header("content-type", "video/mp4").body(body.clone()).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = c.get(format!("{}/pbkt/typed", url)).send().await.unwrap();
+    assert_eq!(res.headers()["content-type"], "video/mp4", "full GET");
+    let res = c.get(format!("{}/pbkt/typed", url)).header("range", "bytes=100-2000000").send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(res.headers()["content-type"], "video/mp4", "range GET");
+    assert!(res.bytes().await.unwrap()[..] == body[100..=2_000_000]);
+}

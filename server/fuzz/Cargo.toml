@@ -37,3 +37,9 @@ name = "lifecycle_xml"
 path = "fuzz_targets/lifecycle_xml.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "attrs_block"
+path = "fuzz_targets/attrs_block.rs"
+test = false
+doc = false

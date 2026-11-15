@@ -1286,7 +1286,13 @@ impl S3ServiceState {
             let bytes = if size == 0 { Bytes::new() } else { old.read_needle_bytes(old_id, local, crc)? };
             let copied = bytes.len() as u64;
             // The creation time moves with the needle: it is a version's id (#31).
-            let (vm, loc, g_new) = self.write_to_active_at(b_id, &key, &bytes, flags, etag_hi, etag_lo, Some(created_at))?;
+            // The attributes block moves with the needle, unknown tags included (#150).
+            let attrs = if flags & crate::meta_index::FLAG_ATTRS != 0 {
+                old.read_attrs(local)?.encode().map_err(|_| VolumeError::CorruptIndex)?
+            } else {
+                Vec::new()
+            };
+            let (vm, loc, g_new) = self.write_to_active_with(b_id, &key, &attrs, &bytes, flags, etag_hi, etag_lo, Some(created_at))?;
             written.insert(vm.id(), Arc::clone(&vm));
             self.versions.write().move_offset(b_id, &key, g_old, g_new);
             if current {
@@ -1407,16 +1413,17 @@ impl S3ServiceState {
     /// `store_payload` for a whole object: compressed when its bucket asks for it and the
     /// bytes shrink (#51). Returns the offset and the flags the needle was written with.
     #[allow(clippy::too_many_arguments)]
-    pub async fn store_object(&self, b_id: u32, bucket: &str, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64, created_at: Option<u64>) -> Result<(u64, u16), VolumeError> {
+    pub async fn store_object(&self, b_id: u32, bucket: &str, key: &str, attrs: &[u8], data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64, created_at: Option<u64>) -> Result<(u64, u16), VolumeError> {
+        let flags = if attrs.is_empty() { flags } else { flags | crate::meta_index::FLAG_ATTRS };
         let plain = flags & (AWAN_FLAG_MULTIPART | AWAN_FLAG_ZERO_BYTE | AWAN_FLAG_TOMBSTONE) == 0;
         if plain && self.compresses(bucket) {
             if let Some(enc) = crate::compress::encode(data) {
                 let f = flags | crate::meta_index::FLAG_COMPRESSED;
-                let off = self.store_payload_at(b_id, key, &Bytes::from(enc), f, etag_hi, etag_lo, created_at).await?;
+                let off = self.store_payload_with(b_id, key, attrs, &Bytes::from(enc), f, etag_hi, etag_lo, created_at).await?;
                 return Ok((off, f));
             }
         }
-        Ok((self.store_payload_at(b_id, key, data, flags, etag_hi, etag_lo, created_at).await?, flags))
+        Ok((self.store_payload_with(b_id, key, attrs, data, flags, etag_hi, etag_lo, created_at).await?, flags))
     }
 
     /// The payload bytes as stored, verified against their CRC.
@@ -1468,7 +1475,13 @@ impl S3ServiceState {
     /// `store_payload` with a given needle creation time (a version id, #31).
     #[allow(clippy::too_many_arguments)]
     pub async fn store_payload_at(&self, b_id: u32, key: &str, data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64, created_at: Option<u64>) -> Result<u64, VolumeError> {
-        let (vm, loc, offset) = tracing::info_span!("volume.write", bytes = data.len() as u64).in_scope(|| self.write_to_active_at(b_id, key, data, flags, etag_hi, etag_lo, created_at))?;
+        self.store_payload_with(b_id, key, &[], data, flags, etag_hi, etag_lo, created_at).await
+    }
+
+    /// `store_payload_at` with an attributes block (#150).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_payload_with(&self, b_id: u32, key: &str, attrs: &[u8], data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64, created_at: Option<u64>) -> Result<u64, VolumeError> {
+        let (vm, loc, offset) = tracing::info_span!("volume.write", bytes = data.len() as u64).in_scope(|| self.write_to_active_with(b_id, key, attrs, data, flags, etag_hi, etag_lo, created_at))?;
         self.make_durable(&vm, loc.seq).instrument(tracing::info_span!("volume.sync")).await?;
         self.needle_crc_map.write().insert((b_id, offset), loc.payload_crc32c);
         self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
@@ -1510,17 +1523,34 @@ impl S3ServiceState {
         etag_lo: u64,
         created_at: Option<u64>,
     ) -> Result<(Arc<VolumeManager>, NeedleLocation, u64), VolumeError> {
+        self.write_to_active_with(b_id, key, &[], data, flags, etag_hi, etag_lo, created_at)
+    }
+
+    /// `write_to_active_at` with an attributes block (`crate::attrs`, #150).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_to_active_with(
+        &self,
+        b_id: u32,
+        key: &str,
+        attrs: &[u8],
+        data: &[u8],
+        flags: u16,
+        etag_hi: u64,
+        etag_lo: u64,
+        created_at: Option<u64>,
+    ) -> Result<(Arc<VolumeManager>, NeedleLocation, u64), VolumeError> {
         let mut attempts = 0;
         loop {
             let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
             // An older AwanFS reads a format 1 volume and would serve compressed bytes as the
-            // object: compressed needles go to a format 2 volume (decision 20, #51).
-            if flags & FORMAT_2_FLAGS != 0 && vm.format() < 2 && attempts < 8 {
+            // object: compressed needles go to a format 2 volume (decision 20, #51), and
+            // needles with attributes to a format 3 one (#150).
+            if vm.format() < needed_format(flags, attrs) && attempts < 8 {
                 attempts += 1;
                 self.roll_volume(&vm)?;
                 continue;
             }
-            match vm.write_needle_at(b_id as u16, key, data, flags, etag_hi, etag_lo, created_at) {
+            match vm.write_needle_with_attrs(b_id as u16, key, attrs, data, flags, etag_hi, etag_lo, created_at) {
                 Ok(loc) => {
                     let g = global_offset(vm.id(), loc.offset);
                     self.streams.note_append(b_id, key, g);
@@ -1534,7 +1564,16 @@ impl S3ServiceState {
                     attempts += 1;
                     self.roll_volume(&vm)?;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // The write reserved an offset and may have left a complete record there
+                    // (header written, then the journal or the disk failed). Its offset is
+                    // later than every reservation made before it, so noting the largest
+                    // offset makes a streamed PUT of this key in flight relocate: a spurious
+                    // copy costs time, a missed one lets this failed write win after a
+                    // restart (#184).
+                    self.streams.note_append(b_id, key, u64::MAX);
+                    return Err(e);
+                }
             }
         }
     }
@@ -1554,34 +1593,43 @@ impl S3ServiceState {
         etag_hi: u64,
         etag_lo: u64,
     ) -> Result<(Arc<VolumeManager>, NeedleLocation, u64), VolumeError> {
-        let bytes = from_vm.read_needle_bytes(from_vm.id(), from.offset, from.payload_crc32c)?;
-        let mut writer = self.begin_needle_on_active(b_id, key, bytes.len() as u64, flags)?;
-        for piece in bytes.chunks(crate::volume::STREAM_CHUNK) {
-            writer.write(piece)?;
-        }
+        // Read in chunks, not through the mapping (#185); a CRC mismatch drops the writer
+        // before its header is written, so the copy leaves only a gap. The copy carries the
+        // same attributes block, byte for byte (#150).
+        let attrs = from_vm.read_attrs(from.offset)?.encode().map_err(|_| VolumeError::CorruptIndex)?;
+        let mut writer = self.begin_needle_on_active(b_id, key, &attrs, from.payload_size, flags)?;
+        from_vm.copy_payload(from.offset, from.payload_crc32c, |piece| writer.write(piece))?;
         let vm = Arc::clone(writer.volume());
         let g = global_offset(vm.id(), writer.offset());
-        let loc = writer.finish(etag_hi, etag_lo)?;
+        let loc = match writer.finish(etag_hi, etag_lo) {
+            Ok(loc) => loc,
+            Err(e) => {
+                // The header may be on disk (see `write_to_active_at`).
+                self.streams.note_append(b_id, key, u64::MAX);
+                return Err(e);
+            }
+        };
+        self.streams.note_append(b_id, key, g);
         self.total_volume_bytes.fetch_add(from.total_len, Ordering::Relaxed);
         self.tombstone_bytes.fetch_add(from.total_len, Ordering::Relaxed);
         self.stream_relocations.fetch_add(1, Ordering::SeqCst);
         Ok((vm, loc, g))
     }
 
-    pub fn begin_needle_on_active(&self, b_id: u32, key: &str, len: u64, flags: u16) -> Result<crate::volume::NeedleWriter, VolumeError> {
+    pub fn begin_needle_on_active(&self, b_id: u32, key: &str, attrs: &[u8], len: u64, flags: u16) -> Result<crate::volume::NeedleWriter, VolumeError> {
         let mut attempts = 0;
         loop {
             let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
-            if flags & FORMAT_2_FLAGS != 0 && vm.format() < 2 && attempts < 8 {
+            if vm.format() < needed_format(flags, attrs) && attempts < 8 {
                 attempts += 1;
                 self.roll_volume(&vm)?;
                 continue;
             }
-            match vm.begin_needle(b_id as u16, key, len, flags) {
-                Ok(w) => {
-                    self.streams.note_append(b_id, key, global_offset(vm.id(), w.offset()));
-                    return Ok(w);
-                }
+            match vm.begin_needle_with_attrs(b_id as u16, key, attrs, len, flags) {
+                // Not noted here: a reservation is not a record until its header is written.
+                // The streamed PUT and the relocation note at commit, under the key lock
+                // (#184, requirement 4).
+                Ok(w) => return Ok(w),
                 Err(VolumeError::VolumeFull { len, .. }) if len + crate::direct_io::SECTOR_SIZE as u64 > vm.max_span() => {
                     return Err(VolumeError::VolumeFull { offset: 0, len })
                 }
@@ -1621,6 +1669,21 @@ impl S3ServiceState {
         *self.volume_manager.write() = Some(vm);
         self.active_volume_id.store(next_id, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// The attributes of the needle at global offset `vol_offset`: none, without a disk or
+    /// mapping read, unless its flags say it has a block (#150).
+    pub fn object_attrs(&self, vol_offset: u64, flags: u16) -> Result<crate::attrs::Attrs, VolumeError> {
+        if flags & crate::meta_index::FLAG_ATTRS == 0 {
+            return Ok(crate::attrs::Attrs::new());
+        }
+        let (vm, local) = self.volume_for(vol_offset)?;
+        vm.read_attrs(local)
+    }
+
+    /// The `ObjectView` of an object, from its index row's offset and flags.
+    pub fn object_view(&self, vol_offset: u64, flags: u16) -> Result<ObjectView, VolumeError> {
+        Ok(ObjectView { attrs: self.object_attrs(vol_offset, flags)? })
     }
 
     /// The volume holding a global offset, and the offset inside it.
@@ -1745,6 +1808,39 @@ impl Default for S3ServiceState {
 /// Needle flags that only format 2 volumes may hold (FORMAT.md).
 const FORMAT_2_FLAGS: u16 = crate::meta_index::FLAG_COMPRESSED | crate::meta_index::FLAG_VERSIONED | crate::meta_index::FLAG_NULL_ID | crate::meta_index::FLAG_VERSION_DELETE;
 
+/// The oldest volume format that can hold a needle with these flags and attributes.
+fn needed_format(flags: u16, attrs: &[u8]) -> u32 {
+    if !attrs.is_empty() || flags & crate::meta_index::FLAG_ATTRS != 0 {
+        3
+    } else if flags & FORMAT_2_FLAGS != 0 {
+        2
+    } else {
+        1
+    }
+}
+
+/// The attributes a PUT stores with its object: today its `Content-Type` (#150; the other
+/// groups come with their issues). Empty when the request sends none, so the needle stays
+/// a format 2 needle. A block that would not fit is 400 `MetadataTooLarge`.
+fn request_attrs(headers: &hyper::HeaderMap, key: &str) -> Result<Vec<u8>, Response<ResponseBody>> {
+    let mut attrs = crate::attrs::Attrs::new();
+    if let Some(ct) = headers.get(CONTENT_TYPE) {
+        attrs.set(crate::attrs::TAG_CONTENT_TYPE, ct.as_bytes());
+    }
+    attrs.encode().map_err(|_| bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key))
+}
+
+/// What GET and HEAD say about an object besides its bytes, read once per request (#150).
+pub struct ObjectView {
+    pub attrs: crate::attrs::Attrs,
+}
+
+impl ObjectView {
+    pub fn content_type(&self) -> &str {
+        self.attrs.content_type().unwrap_or("application/octet-stream")
+    }
+}
+
 /// An index row as the null version of its key (#31).
 fn null_version_of(m: &crate::meta_index::ObjectMeta) -> crate::versions::Version {
     crate::versions::Version {
@@ -1838,8 +1934,12 @@ fn version_get_response(state: &S3ServiceState, b_id: u32, key: &str, vid: Optio
             Err(e) => return internal_error_response(key, &format!("could not read the version: {:?}", e)),
         }
     };
+    let view = match state.object_view(v.vol_offset, v.flags) {
+        Ok(view) => view,
+        Err(e) => return internal_error_response(key, &format!("could not read the version's attributes: {:?}", e)),
+    };
     let builder = Response::builder()
-        .header(CONTENT_TYPE, "application/octet-stream")
+        .header(CONTENT_TYPE, view.content_type())
         .header(ETAG, version_etag(&v))
         .header(ACCEPT_RANGES, "bytes")
         .header("x-amz-version-id", v.id_string())
@@ -3182,6 +3282,9 @@ async fn handle_s3_inner(
 
                         // The copy gets a needle of its own: it must survive a restart and an
                         // overwrite or delete of its source.
+                        // The copy keeps the source's attributes (S3's default COPY directive);
+                        // REPLACE takes the request's (#150; the other headers come with #152).
+                        let mut src_view: Result<crate::attrs::Attrs, VolumeError> = Ok(crate::attrs::Attrs::new());
                         let read = match (&src_vid, &src_meta) {
                             (Some(vid), _) => {
                                 // The same lookup as a versioned GET, so the two cannot disagree.
@@ -3204,16 +3307,32 @@ async fn handle_s3_inner(
                                         .body(full_body(Bytes::from(xml)))
                                         .unwrap());
                                 }
+                                src_view = state.object_attrs(v.vol_offset, v.flags);
                                 state.read_version_bytes(src_b_id, src_key, &v).map(|b| (b, v.size, v.etag_hi, v.etag_lo, Some(v.id_string())))
                             }
-                            (None, Some(m)) => state
-                                .read_object_bytes(src_b_id, src_key, m.vol_offset, m.size, unpack_flags(m.bucket_flags))
-                                .map(|b| (b, m.size, m.etag_hi, m.etag_lo, None)),
+                            (None, Some(m)) => {
+                                src_view = state.object_attrs(m.vol_offset, unpack_flags(m.bucket_flags));
+                                state
+                                    .read_object_bytes(src_b_id, src_key, m.vol_offset, m.size, unpack_flags(m.bucket_flags))
+                                    .map(|b| (b, m.size, m.etag_hi, m.etag_lo, None))
+                            }
                             (None, None) => unreachable!("src_meta is read whenever no version is named"),
                         };
                         let (bytes, src_size, src_etag_hi, src_etag_lo, copied_vid) = match read {
                             Ok(r) => r,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not read the copy source: {:?}", e))),
+                        };
+                        let replace = req.headers().get("x-amz-metadata-directive").is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"REPLACE"));
+                        let copy_attrs = if replace {
+                            match request_attrs(req.headers(), &key) {
+                                Ok(a) => a,
+                                Err(resp) => return Ok(resp),
+                            }
+                        } else {
+                            match src_view.and_then(|a| a.encode().map_err(|_| VolumeError::CorruptIndex)) {
+                                Ok(a) => a,
+                                Err(e) => return Ok(internal_error_response(&key, &format!("could not read the copy source's attributes: {:?}", e))),
+                            }
                         };
                         let flags = if bytes.is_empty() { AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE } else { AWAN_FLAG_ACTIVE };
                         let _key_guard = state.lock_key(b_id, &key).await;
@@ -3223,7 +3342,7 @@ async fn handle_s3_inner(
                         let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset);
                         let stamp = state.version_stamp(b_id, &key);
                         let flags = flags | stamp.map_or(0, |s| s.0);
-                        let (vol_offset, flags) = match state.store_object(b_id, &bucket, &key, &bytes, flags, src_etag_hi, src_etag_lo, stamp.map(|s| s.1)).await {
+                        let (vol_offset, flags) = match state.store_object(b_id, &bucket, &key, &copy_attrs, &bytes, flags, src_etag_hi, src_etag_lo, stamp.map(|s| s.1)).await {
                             Ok(written) => written,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not store the copy: {:?}", e))),
                         };
@@ -3304,6 +3423,10 @@ async fn handle_s3_inner(
                     let is_chunked = crate::auth::is_aws_chunked(req.headers());
                     let content_md5_hdr = req.headers().get("content-md5").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
                     let signed_headers = req.headers().clone();
+                    let put_attrs = match request_attrs(&signed_headers, &key) {
+                        Ok(a) => a,
+                        Err(resp) => return Ok(resp),
+                    };
                     let stream_len = if is_chunked {
                         signed_headers.get("x-amz-decoded-content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok())
                     } else {
@@ -3331,7 +3454,7 @@ async fn handle_s3_inner(
                         // before the reservation: see `StreamsInFlight`.
                         let ticket = state.streams.enter(b_id, &key);
                         let begin_flags = base_flags | state.version_stamp(b_id, &key).map_or(0, |s| s.0);
-                        let mut writer = match state.begin_needle_on_active(b_id, &key, len, begin_flags) {
+                        let mut writer = match state.begin_needle_on_active(b_id, &key, &put_attrs, len, begin_flags) {
                             Ok(w) => w,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                         };
@@ -3414,7 +3537,8 @@ async fn handle_s3_inner(
                         }
                         let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size));
                         let stamp = state.version_stamp(b_id, &key);
-                        let flags = base_flags | stamp.map_or(0, |s| s.0);
+                        let attrs_flag = if put_attrs.is_empty() { 0 } else { crate::meta_index::FLAG_ATTRS };
+                        let flags = base_flags | attrs_flag | stamp.map_or(0, |s| s.0);
                         if flags & FORMAT_2_FLAGS != 0 && writer.volume().format() < 2 {
                             return Ok(internal_error_response(&key, "the bucket's versioning changed while the object was uploaded; send it again"));
                         }
@@ -3426,15 +3550,29 @@ async fn handle_s3_inner(
                         let first_offset = global_offset(first_vm.id(), writer.offset());
                         let first_loc = match writer.finish(etag_hi, etag_lo) {
                             Ok(l) => l,
-                            Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
+                            Err(e) => {
+                                // The header may be on disk (see `write_to_active_at`).
+                                state.streams.note_append(b_id, &key, u64::MAX);
+                                return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e)));
+                            }
                         };
+                        // Its record is in the log now: a streamed PUT of this key that
+                        // reserved before it must not end up before it at replay.
+                        state.streams.note_append(b_id, &key, first_offset);
                         // An unversioned key is replayed in offset order. If a needle of this
                         // key was appended since this one was reserved, this one is not the
                         // last in the log: write it again at the end. Versions are ordered by
                         // their ids, taken above under the lock, so they stay where they are.
                         let (vm, loc, vol_offset) = if stamp.is_none() && ticket.appended_after(first_offset) {
-                            match state.relocate_needle(b_id, &key, &first_vm, &first_loc, flags, etag_hi, etag_lo) {
-                                Ok(moved) => moved,
+                            // Up to 5 GiB of reads and writes: on the blocking pool, not on an
+                            // executor thread (#185). The key lock is held across the await.
+                            let moved = {
+                                let (st, k, fvm) = (Arc::clone(&state), key.clone(), Arc::clone(&first_vm));
+                                tokio::task::spawn_blocking(move || st.relocate_needle(b_id, &k, &fvm, &first_loc, flags, etag_hi, etag_lo)).await
+                            };
+                            match moved {
+                                Ok(Ok(moved)) => moved,
+                                Ok(Err(e)) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                                 Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                             }
                         } else {
@@ -3547,7 +3685,7 @@ async fn handle_s3_inner(
                     // Zero-byte objects get a needle too, so they and empty overwrites survive a restart.
                     let stamp = state.version_stamp(b_id, &key);
                     let flags = flags | stamp.map_or(0, |s| s.0);
-                    let (vol_offset, flags) = match state.store_object(b_id, &bucket, &key, &decoded_bytes, flags, etag_hi, etag_lo, stamp.map(|s| s.1)).await {
+                    let (vol_offset, flags) = match state.store_object(b_id, &bucket, &key, &put_attrs, &decoded_bytes, flags, etag_hi, etag_lo, stamp.map(|s| s.1)).await {
                         Ok(written) => written,
                         Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                     };
@@ -3584,6 +3722,10 @@ async fn handle_s3_inner(
                         };
                         let flags = unpack_flags(m.bucket_flags);
                         (m, flags & AWAN_FLAG_MULTIPART != 0)
+                    };
+                    let view = match state.object_view(meta.vol_offset, unpack_flags(meta.bucket_flags)) {
+                        Ok(v) => v,
+                        Err(e) => return Ok(internal_error_response(&key, &format!("could not read the object's attributes: {:?}", e))),
                     };
                     let is_compressed = unpack_flags(meta.bucket_flags) & crate::meta_index::FLAG_COMPRESSED != 0;
 
@@ -3637,7 +3779,7 @@ async fn handle_s3_inner(
                                     };
                                     return Ok(Response::builder()
                                         .status(StatusCode::PARTIAL_CONTENT)
-                                        .header(CONTENT_TYPE, "application/octet-stream")
+                                        .header(CONTENT_TYPE, view.content_type())
                                         .header(ETAG, etag_val)
                                         .header(ACCEPT_RANGES, "bytes")
                                         .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
@@ -3697,7 +3839,7 @@ async fn handle_s3_inner(
                                             }
                                             return Ok(Response::builder()
                                                 .status(StatusCode::PARTIAL_CONTENT)
-                                                .header(CONTENT_TYPE, "application/octet-stream")
+                                                .header(CONTENT_TYPE, view.content_type())
                                                 .header(ETAG, etag_val)
                                                 .header(ACCEPT_RANGES, "bytes")
                                                 .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
@@ -3738,7 +3880,7 @@ async fn handle_s3_inner(
 
                                 let resp = Response::builder()
                                     .status(StatusCode::PARTIAL_CONTENT)
-                                    .header(CONTENT_TYPE, "application/octet-stream")
+                                    .header(CONTENT_TYPE, view.content_type())
                                     .header(ETAG, etag_val)
                                     .header(ACCEPT_RANGES, "bytes")
                                     .header(CONTENT_RANGE, content_range)
@@ -3782,7 +3924,7 @@ async fn handle_s3_inner(
                         }
                         return Ok(Response::builder()
                             .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "application/octet-stream")
+                            .header(CONTENT_TYPE, view.content_type())
                             .header(ETAG, etag_val)
                             .header(ACCEPT_RANGES, "bytes")
                             .header(CONTENT_LENGTH, meta.size.to_string())
@@ -3799,7 +3941,7 @@ async fn handle_s3_inner(
                         };
                         return Ok(Response::builder()
                             .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "application/octet-stream")
+                            .header(CONTENT_TYPE, view.content_type())
                             .header(ETAG, etag_val)
                             .header(ACCEPT_RANGES, "bytes")
                             .header(CONTENT_LENGTH, meta.size.to_string())
@@ -3832,7 +3974,7 @@ async fn handle_s3_inner(
                     let body = if is_head { empty_body() } else { full_body(payload) };
                     let resp = Response::builder()
                         .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, "application/octet-stream")
+                        .header(CONTENT_TYPE, view.content_type())
                         .header(ETAG, etag_val)
                         .header(ACCEPT_RANGES, "bytes")
                         .header(CONTENT_LENGTH, meta.size.to_string())

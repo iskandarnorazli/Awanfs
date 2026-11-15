@@ -48,38 +48,37 @@ pub fn compact_volume(
             Err(_) => break, // Reached end of valid needles
         };
 
-        let raw_len = 64 + hdr.key_len as usize + hdr.payload_size as usize;
-        let total_len = (((raw_len + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE) as u64;
+        let total_len = hdr.total_len();
 
         if scan_offset + total_len > file_len {
             break;
         }
 
         // Read full needle if multi-sector
-        let (key_str, payload) = if total_len <= SECTOR_SIZE as u64 {
-            let k_bytes = &read_buf[64..64 + hdr.key_len as usize];
+        // The attributes block is copied as it is: unknown tags included (#150).
+        let (a_start, p_start) = (hdr.attrs_start(), hdr.payload_start());
+        let (key_str, attrs, payload) = if total_len <= SECTOR_SIZE as u64 {
+            let k_bytes = &read_buf[64..a_start];
             let key = String::from_utf8_lossy(k_bytes).to_string();
-            let p_start = 64 + hdr.key_len as usize;
-            let payload = read_buf[p_start..p_start + hdr.payload_size as usize].to_vec();
-            (key, payload)
+            (key, read_buf[a_start..p_start].to_vec(), read_buf[p_start..p_start + hdr.payload_size as usize].to_vec())
         } else {
             let mut full_buf = AlignedBuffer::new(total_len as usize);
             src_file.read_aligned_at(scan_offset, &mut full_buf)?;
-            let k_bytes = &full_buf[64..64 + hdr.key_len as usize];
+            let k_bytes = &full_buf[64..a_start];
             let key = String::from_utf8_lossy(k_bytes).to_string();
-            let p_start = 64 + hdr.key_len as usize;
-            let payload = full_buf[p_start..p_start + hdr.payload_size as usize].to_vec();
-            (key, payload)
+            (key, full_buf[a_start..p_start].to_vec(), full_buf[p_start..p_start + hdr.payload_size as usize].to_vec())
         };
 
         if live_keys.contains(&key_str) {
-            let new_loc = target_mgr.write_needle(
+            let new_loc = target_mgr.write_needle_with_attrs(
                 hdr.bucket_id,
                 &key_str,
+                &attrs,
                 &payload,
                 hdr.flags,
                 hdr.etag_hi,
                 hdr.etag_lo,
+                None,
             )?;
             report.new_locations.insert(key_str, new_loc);
             report.live_needles_copied += 1;

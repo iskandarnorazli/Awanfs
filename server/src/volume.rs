@@ -24,7 +24,7 @@ pub const SUPERBLOCK_MAGIC: u32 = 0x53555042; // "SUPB"
 /// superblock at bytes 20..24. Volumes written before the field existed hold 0 there and are
 /// format 1. A newer version is refused, an older one read as it is; nothing is upgraded in
 /// place. Layout: FORMAT.md.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The format a superblock records (0 = written before the field, i.e. format 1).
 pub fn superblock_format(super_buf: &[u8]) -> u32 {
@@ -97,6 +97,19 @@ pub struct NeedleLocation {
 /// Size of the pieces a streamed needle is written in.
 pub const STREAM_CHUNK: usize = 1 << 20;
 
+/// How far a growing volume's file is extended at a time (#178): `AWAN_VOLUME_GROWTH_STEP` in
+/// bytes, for measurements, or 256 MiB.
+pub const DEFAULT_GROWTH_STEP: u64 = 256 * 1024 * 1024;
+
+fn growth_step_from_env() -> u64 {
+    std::env::var("AWAN_VOLUME_GROWTH_STEP")
+        .ok()
+        .and_then(|v| crate::memory::parse_size(&v))
+        .filter(|&n| n >= SECTOR_SIZE as u64)
+        .map(|n| n / SECTOR_SIZE as u64 * SECTOR_SIZE as u64)
+        .unwrap_or(DEFAULT_GROWTH_STEP)
+}
+
 /// A needle being written as its payload arrives; see `VolumeManager::begin_needle`.
 pub struct NeedleWriter {
     vm: Arc<VolumeManager>,
@@ -106,6 +119,9 @@ pub struct NeedleWriter {
     offset: u64,
     total_len: u64,
     payload_size: u64,
+    attrs_len: u16,
+    /// Where the payload starts in the needle image: after the header, key and attributes.
+    data_start: u64,
     written: u64,
     crc: u32,
     /// Sector 0 of the needle: header, key, start of the payload. Written last.
@@ -138,7 +154,9 @@ impl NeedleWriter {
     /// The header flags. The header is written last, so a streamed PUT sets them when it
     /// commits, from the bucket's versioning status at that moment (#154).
     pub fn set_flags(&mut self, flags: u16) {
-        self.flags = flags;
+        // A writer started with an attributes block keeps saying so (#150).
+        let attrs = if self.attrs_len > 0 { crate::meta_index::FLAG_ATTRS } else { 0 };
+        self.flags = flags | attrs;
     }
 
     /// Where the needle starts inside its volume: reserved when the writer was made.
@@ -150,7 +168,7 @@ impl NeedleWriter {
         self.written
     }
 
-    pub fn write(&mut self, mut data: &[u8]) -> Result<(), VolumeError> {
+    pub fn write(&mut self, data: &[u8]) -> Result<(), VolumeError> {
         self.state = match crate::fsm::needle_step(self.state, crate::fsm::NeedleEvent::Write(data.len() as u64)) {
             Ok(next) => next,
             Err(r) => {
@@ -160,8 +178,14 @@ impl NeedleWriter {
             }
         };
         self.crc = crc32c::crc32c_append(self.crc, data);
-        let mut pos = 64 + self.key.len() as u64 + self.written;
+        let pos = self.data_start + self.written;
         self.written += data.len() as u64;
+        self.place(pos, data)
+    }
+
+    /// Puts `data` at `pos` of the needle image: sector 0 is kept for the end, later bytes
+    /// go through the chunk buffer, which must have reached `pos`.
+    fn place(&mut self, mut pos: u64, mut data: &[u8]) -> Result<(), VolumeError> {
         // Bytes that land in sector 0.
         if pos < SECTOR_SIZE as u64 {
             let n = ((SECTOR_SIZE as u64 - pos) as usize).min(data.len());
@@ -220,7 +244,7 @@ impl NeedleWriter {
             flags: self.flags,
             bucket_id: self.bucket_id,
             key_len: key_bytes.len() as u16,
-            reserved: 0,
+            attrs_len: self.attrs_len,
             key_hash: xxh3_64(key_bytes),
             payload_size: self.payload_size,
             created_at_ns: now,
@@ -323,7 +347,9 @@ pub struct NeedleHeader {
     pub flags: u16,
     pub bucket_id: u16,
     pub key_len: u16,
-    pub reserved: u16,
+    /// Length of the attributes block between the key and the payload (format 3, #150).
+    /// 0 for none: such a needle is byte for byte a format 2 needle.
+    pub attrs_len: u16,
     pub key_hash: u64,
     pub payload_size: u64,
     pub created_at_ns: u64,
@@ -333,9 +359,19 @@ pub struct NeedleHeader {
 }
 
 impl NeedleHeader {
+    /// Where the attributes block starts, from the needle's start.
+    pub fn attrs_start(&self) -> usize {
+        64 + self.key_len as usize
+    }
+
     /// Where the payload starts, from the needle's start.
     pub fn payload_start(&self) -> usize {
-        64 + self.key_len as usize
+        64 + self.key_len as usize + self.attrs_len as usize
+    }
+
+    /// The needle's length on disk, padded to a sector.
+    pub fn total_len(&self) -> u64 {
+        ((self.payload_start() + self.payload_size as usize).div_ceil(SECTOR_SIZE) * SECTOR_SIZE) as u64
     }
 
     pub fn encode(&self, buf: &mut [u8; 64]) {
@@ -345,7 +381,7 @@ impl NeedleHeader {
         buf[12..14].copy_from_slice(&self.flags.to_le_bytes());
         buf[14..16].copy_from_slice(&self.bucket_id.to_le_bytes());
         buf[16..18].copy_from_slice(&self.key_len.to_le_bytes());
-        buf[18..20].copy_from_slice(&self.reserved.to_le_bytes());
+        buf[18..20].copy_from_slice(&self.attrs_len.to_le_bytes());
         buf[20..28].copy_from_slice(&self.key_hash.to_le_bytes());
         buf[28..36].copy_from_slice(&self.payload_size.to_le_bytes());
         buf[36..44].copy_from_slice(&self.created_at_ns.to_le_bytes());
@@ -379,7 +415,7 @@ impl NeedleHeader {
             flags: u16::from_le_bytes(buf[12..14].try_into().unwrap()),
             bucket_id: u16::from_le_bytes(buf[14..16].try_into().unwrap()),
             key_len: u16::from_le_bytes(buf[16..18].try_into().unwrap()),
-            reserved: u16::from_le_bytes(buf[18..20].try_into().unwrap()),
+            attrs_len: u16::from_le_bytes(buf[18..20].try_into().unwrap()),
             key_hash: u64::from_le_bytes(buf[20..28].try_into().unwrap()),
             payload_size: u64::from_le_bytes(buf[28..36].try_into().unwrap()),
             created_at_ns: u64::from_le_bytes(buf[36..44].try_into().unwrap()),
@@ -433,9 +469,19 @@ pub struct VolumeManager {
     mmap: RwLock<Option<Arc<Mmap>>>,
     remap_count: AtomicU64,
     is_sparse: bool,
+    /// The file's length as this process set it: a growing volume is extended in steps of
+    /// `growth_step` ahead of its writes, so the read mapping, which covers the whole file,
+    /// is redone once per step and not once per new read (#178). The written end is
+    /// `current_offset`; what lies between is zeros, which recovery stops at and the next
+    /// open truncates. A sparse volume is mapped once at its full span and never grows.
+    allocated: AtomicU64,
+    growth_step: AtomicU64,
+    grow_lock: parking_lot::Mutex<()>,
     max_span: AtomicU64,
     work: Arc<WorkCounters>,
     fail_next_write: std::sync::atomic::AtomicBool,
+    /// Tests: the next journal append fails, after the needle is on disk (#184).
+    fail_next_index: std::sync::atomic::AtomicBool,
     /// Writes that have reserved an offset here and not yet written their header (#167). A
     /// streamed PUT counts from `begin_needle` until its `NeedleWriter` is dropped.
     writers_in_flight: std::sync::atomic::AtomicUsize,
@@ -580,8 +626,7 @@ impl VolumeManager {
 
                 match NeedleHeader::decode(&header_bytes) {
                     Ok(hdr) => {
-                        let raw_len = 64 + hdr.key_len as usize + hdr.payload_size as usize;
-                        let total_len = (((raw_len + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE) as u64;
+                        let total_len = hdr.total_len();
                         if scan_offset + total_len > file_len {
                             // Incomplete needle written during crash
                             match next_indexed(&indexed, scan_offset) {
@@ -625,6 +670,7 @@ impl VolumeManager {
             None
         };
 
+        let allocated = if sparse { MAX_VOLUME_SPAN } else { aligned_file.metadata()?.len() };
         // Second opens, not `try_clone`: see `file_sync`.
         let idx_sync = OpenOptions::new().write(true).open(&idx_path)?;
         let file_sync = OpenOptions::new().write(true).open(&dat_path)?;
@@ -645,9 +691,13 @@ impl VolumeManager {
             mmap: RwLock::new(initial_mmap),
             remap_count: AtomicU64::new(0),
             is_sparse: sparse,
+            allocated: AtomicU64::new(allocated),
+            growth_step: AtomicU64::new(growth_step_from_env()),
+            grow_lock: parking_lot::Mutex::new(()),
             max_span: AtomicU64::new(MAX_VOLUME_SPAN),
             work: Arc::new(WorkCounters::default()),
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
+            fail_next_index: std::sync::atomic::AtomicBool::new(false),
             writers_in_flight: std::sync::atomic::AtomicUsize::new(0),
             sealed: std::sync::atomic::AtomicBool::new(false),
             gaps: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
@@ -663,13 +713,16 @@ impl VolumeManager {
 
     /// The first `n` payload bytes of the needle at `local`, from its first sector.
     pub fn payload_prefix(&self, local: u64, key_len: usize, n: usize) -> Result<Vec<u8>, VolumeError> {
-        let start = 64 + key_len;
-        if start + n > SECTOR_SIZE {
-            return Err(VolumeError::CorruptIndex);
-        }
         let mut buf = AlignedBuffer::new(SECTOR_SIZE);
         self.work.disk_read();
         self.file.read_aligned_at(local, &mut buf)?;
+        let mut hdr_bytes = [0u8; 64];
+        hdr_bytes.copy_from_slice(&buf[0..64]);
+        let header = NeedleHeader::decode(&hdr_bytes)?;
+        let start = header.payload_start();
+        if header.key_len as usize != key_len || start + n > SECTOR_SIZE {
+            return Err(VolumeError::CorruptIndex);
+        }
         Ok(buf[start..start + n].to_vec())
     }
 
@@ -677,6 +730,12 @@ impl VolumeManager {
     /// as a disk error would, leaving a gap in the volume.
     pub fn fail_next_write(&self) {
         self.fail_next_write.store(true, Ordering::SeqCst);
+    }
+
+    /// Tests: makes the next journal append fail after its needle was written, which leaves
+    /// a complete record in the volume that the write reports as failed (#184).
+    pub fn fail_next_index(&self) {
+        self.fail_next_index.store(true, Ordering::SeqCst);
     }
 
     /// Largest byte offset a needle may reach in this volume (default `MAX_VOLUME_SPAN`).
@@ -687,6 +746,43 @@ impl VolumeManager {
 
     pub fn max_span(&self) -> u64 {
         self.max_span.load(Ordering::SeqCst)
+    }
+
+    /// How far ahead of its writes a growing volume's file is extended (#178).
+    pub fn set_growth_step(&self, step: u64) {
+        self.growth_step.store(step.max(SECTOR_SIZE as u64) / SECTOR_SIZE as u64 * SECTOR_SIZE as u64, Ordering::SeqCst);
+    }
+
+    /// The file's length: the written end plus at most one growth step of zeros.
+    pub fn allocated_len(&self) -> u64 {
+        self.allocated.load(Ordering::SeqCst)
+    }
+
+    /// Makes the file at least `end` bytes long (#178). Up to a quarter of the growth step
+    /// (64 MiB by default) a volume grows by its writes, as before: remapping a small volume
+    /// is cheap, and a small deployment pays no disk for space it has not written. Past that
+    /// the file is extended ahead, by a quarter of its length, at least 1 MiB and at most the
+    /// step, so the mapping is redone once per extension. Not past the span, and never to
+    /// exactly `MAX_VOLUME_SPAN`, which is how a sparse volume is recognised. The extension
+    /// is a plain length change, not a sparse file, so a flush costs what it costs for a file
+    /// that grows by writing (decision 52).
+    fn ensure_allocated(&self, end: u64) -> Result<(), VolumeError> {
+        let step = self.growth_step.load(Ordering::SeqCst);
+        if self.is_sparse || end <= step / 4 || end <= self.allocated.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _g = self.grow_lock.lock();
+        // Below the threshold the file grew by its writes; it is at least that long now.
+        let current = self.allocated.load(Ordering::SeqCst).max(step / 4);
+        if end <= self.allocated.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let grow = (current / 4).clamp(step.min(1 << 20), step);
+        let limit = self.max_span().min(MAX_VOLUME_SPAN - SECTOR_SIZE as u64);
+        let target = end.max(current + grow).div_ceil(SECTOR_SIZE as u64).saturating_mul(SECTOR_SIZE as u64).min(limit).max(end);
+        self.file.set_len(target)?;
+        self.allocated.store(target, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn id(&self) -> u32 {
@@ -717,6 +813,9 @@ impl VolumeManager {
 
     /// Appends one record to the `.idx` journal.
     fn append_index(&self, key_hash: u64, offset: u64, total_len: u64, payload_size: u64, flags: u16, crc: u32) -> Result<(), VolumeError> {
+        if self.fail_next_index.swap(false, Ordering::SeqCst) {
+            return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected index failure")));
+        }
         let mut rec = [0u8; IDX_RECORD];
         rec[0..8].copy_from_slice(&key_hash.to_le_bytes());
         rec[8..12].copy_from_slice(&self.volume_id.to_le_bytes());
@@ -852,6 +951,44 @@ impl VolumeManager {
         self.write_needle_at(bucket_id, key, payload, flags, etag_hi, etag_lo, None)
     }
 
+    /// The flags of a needle with this block, or `VolumeFull` (move to a newer volume) when
+    /// this volume is older than format 3, which an older AwanFS would misread.
+    fn attrs_flags(&self, attrs: &[u8], flags: u16) -> Result<u16, VolumeError> {
+        if attrs.is_empty() {
+            return Ok(flags);
+        }
+        if attrs.len() > crate::attrs::MAX_BLOCK {
+            return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "attributes block over 65535 bytes")));
+        }
+        if self.format < 3 {
+            return Err(VolumeError::VolumeFull { offset: self.current_offset.load(Ordering::SeqCst), len: 0 });
+        }
+        Ok(flags | crate::meta_index::FLAG_ATTRS)
+    }
+
+    /// The attributes block of the needle at `offset` (empty for none), read from the
+    /// mapping and checked (`crate::attrs::Attrs::decode`). HEAD and GET read it only for
+    /// rows flagged `FLAG_ATTRS` (#150).
+    pub fn read_attrs(&self, offset: u64) -> Result<crate::attrs::Attrs, VolumeError> {
+        let mmap = self.get_or_remap(offset + SECTOR_SIZE as u64)?;
+        if offset as usize + 64 > mmap.len() {
+            return Err(VolumeError::TornNeedleAtOffset(offset));
+        }
+        let mut hdr_bytes = [0u8; 64];
+        hdr_bytes.copy_from_slice(&mmap[offset as usize..offset as usize + 64]);
+        let header = NeedleHeader::decode(&hdr_bytes)?;
+        if header.attrs_len == 0 {
+            return Ok(crate::attrs::Attrs::new());
+        }
+        let start = offset as usize + header.attrs_start();
+        let end = start + header.attrs_len as usize;
+        let mmap = if end > mmap.len() { self.get_or_remap(end as u64)? } else { mmap };
+        if end > mmap.len() {
+            return Err(VolumeError::TornNeedleAtOffset(offset));
+        }
+        crate::attrs::Attrs::decode(&mmap[start..end]).map_err(|_| VolumeError::CorruptIndex)
+    }
+
     /// `write_needle` with a given creation time: a version id, kept by compaction (#31).
     #[allow(clippy::too_many_arguments)]
     pub fn write_needle_at(
@@ -864,13 +1001,32 @@ impl VolumeManager {
         etag_lo: u64,
         created_at: Option<u64>,
     ) -> Result<NeedleLocation, VolumeError> {
+        self.write_needle_with_attrs(bucket_id, key, &[], payload, flags, etag_hi, etag_lo, created_at)
+    }
+
+    /// `write_needle_at` with an attributes block (`crate::attrs`, format 3, #150). A needle
+    /// with a block is flagged `FLAG_ATTRS` and goes only into a format 3 volume.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_needle_with_attrs(
+        &self,
+        bucket_id: u16,
+        key: &str,
+        attrs: &[u8],
+        payload: &[u8],
+        flags: u16,
+        etag_hi: u64,
+        etag_lo: u64,
+        created_at: Option<u64>,
+    ) -> Result<NeedleLocation, VolumeError> {
+        let flags = self.attrs_flags(attrs, flags)?;
         let key_bytes = key.as_bytes();
         let key_len = key_bytes.len() as u16;
         let payload_size = payload.len() as u64;
         let key_hash = xxh3_64(key_bytes);
         let payload_crc32c = crc32c::crc32c(payload);
 
-        let raw_len = 64 + key_bytes.len() + payload.len();
+        let p_start = 64 + key_bytes.len() + attrs.len();
+        let raw_len = p_start + payload.len();
         let total_len = (((raw_len + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE) as u64;
 
         let mut buf = AlignedBuffer::new(total_len as usize);
@@ -883,7 +1039,7 @@ impl VolumeManager {
             flags,
             bucket_id,
             key_len,
-            reserved: 0,
+            attrs_len: attrs.len() as u16,
             key_hash,
             payload_size,
             created_at_ns: now,
@@ -902,7 +1058,8 @@ impl VolumeManager {
 
         buf[0..64].copy_from_slice(&hdr_bytes);
         buf[64..64 + key_bytes.len()].copy_from_slice(key_bytes);
-        buf[64 + key_bytes.len()..raw_len].copy_from_slice(payload);
+        buf[64 + key_bytes.len()..p_start].copy_from_slice(attrs);
+        buf[p_start..raw_len].copy_from_slice(payload);
         self.work.payload_copy(payload.len() as u64);
         if total_len as usize > raw_len {
             buf[raw_len..total_len as usize].fill(0);
@@ -920,7 +1077,7 @@ impl VolumeManager {
             Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected write failure")))
         } else {
             // Lock-free concurrent positional write directly to disjoint disk offset
-            self.file.write_aligned_at(offset, &buf).map_err(VolumeError::from)
+            self.ensure_allocated(offset + total_len).and_then(|()| self.file.write_aligned_at(offset, &buf).map_err(VolumeError::from))
         };
         if let Err(e) = written {
             self.gaps.lock().insert(offset, total_len);
@@ -946,8 +1103,15 @@ impl VolumeManager {
     /// holds the header with the payload CRC, is written last by `NeedleWriter::finish`.
     /// A writer dropped before `finish` leaves a gap that recovery steps over (#38).
     pub fn begin_needle(self: &Arc<Self>, bucket_id: u16, key: &str, payload_size: u64, flags: u16) -> Result<NeedleWriter, VolumeError> {
+        self.begin_needle_with_attrs(bucket_id, key, &[], payload_size, flags)
+    }
+
+    /// `begin_needle` with an attributes block, written before the payload (#150).
+    pub fn begin_needle_with_attrs(self: &Arc<Self>, bucket_id: u16, key: &str, attrs: &[u8], payload_size: u64, flags: u16) -> Result<NeedleWriter, VolumeError> {
+        let flags = self.attrs_flags(attrs, flags)?;
         let key_len = key.len();
-        let total_len = (64 + key_len as u64 + payload_size).div_ceil(SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
+        let data_start = 64 + key_len as u64 + attrs.len() as u64;
+        let total_len = (data_start + payload_size).div_ceil(SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
         // Counted until the writer is dropped, after its header is written or it is abandoned
         // (#167). `forget` hands the count to the writer below.
         let in_flight = self.enter_write(total_len)?;
@@ -960,9 +1124,11 @@ impl VolumeManager {
         if self.fail_next_write.swap(false, Ordering::SeqCst) {
             return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected write failure")));
         }
+        // The whole needle at once: its chunks then never extend the file (#178).
+        self.ensure_allocated(offset + total_len)?;
         let mut first = AlignedBuffer::new(SECTOR_SIZE);
         first.fill(0);
-        let writer = NeedleWriter {
+        let mut writer = NeedleWriter {
             vm: Arc::clone(self),
             bucket_id,
             key: key.to_string(),
@@ -970,6 +1136,8 @@ impl VolumeManager {
             offset,
             total_len,
             payload_size,
+            attrs_len: attrs.len() as u16,
+            data_start,
             written: 0,
             crc: 0,
             first,
@@ -981,6 +1149,9 @@ impl VolumeManager {
         };
         // The writer now owns the count: its `Drop` gives it back.
         std::mem::forget(in_flight);
+        // The block goes where it belongs in the image: into sector 0 when it fits, the rest
+        // through the chunk buffer like payload bytes.
+        writer.place(64 + key_len as u64, attrs)?;
         Ok(writer)
     }
 
@@ -1056,6 +1227,52 @@ impl VolumeManager {
         Ok(())
     }
 
+    /// Calls `f` with the payload of the needle at `offset`, in pieces of at most
+    /// `STREAM_CHUNK`, read with aligned reads into one buffer: not through the mapping, so
+    /// copying a large needle does not fault it into the RSS (#185). The payload CRC is
+    /// computed as it is read; on a mismatch the error comes after the last piece, so the
+    /// caller must not commit what `f` built before this returns `Ok`.
+    pub fn copy_payload<F>(&self, offset: u64, expected_payload_crc: u32, mut f: F) -> Result<u64, VolumeError>
+    where
+        F: FnMut(&[u8]) -> Result<(), VolumeError>,
+    {
+        let mut buf = AlignedBuffer::new(STREAM_CHUNK);
+        self.work.disk_read();
+        self.file.read_aligned_at(offset, &mut buf[..SECTOR_SIZE])?;
+        let mut hdr_bytes = [0u8; 64];
+        hdr_bytes.copy_from_slice(&buf[0..64]);
+        let header = NeedleHeader::decode(&hdr_bytes)?;
+        // After the key and the attributes block (#150).
+        let p_start = header.payload_start() as u64;
+        let p_end = p_start + header.payload_size;
+        let total_len = header.total_len();
+        let mut crc = 0u32;
+        let mut pos = 0u64;
+        while pos < total_len {
+            let n = (STREAM_CHUNK as u64).min(total_len - pos) as usize;
+            if pos > 0 {
+                self.work.disk_read();
+                self.file.read_aligned_at(offset + pos, &mut buf[..n])?;
+            } else if n > SECTOR_SIZE {
+                self.work.disk_read();
+                self.file.read_aligned_at(offset, &mut buf[..n])?;
+            }
+            let lo = p_start.max(pos);
+            let hi = p_end.min(pos + n as u64);
+            if lo < hi {
+                let piece = &buf[(lo - pos) as usize..(hi - pos) as usize];
+                crc = crc32c::crc32c_append(crc, piece);
+                f(piece)?;
+            }
+            pos += n as u64;
+        }
+        self.work.payload_verify(header.payload_size);
+        if crc != expected_payload_crc {
+            return Err(VolumeError::CrcMismatch { expected: expected_payload_crc, actual: crc });
+        }
+        Ok(header.payload_size)
+    }
+
     /// A needle's payload as a slice of the mapping, with its header checked and its bytes
     /// not: nothing of the payload is read. For objects above 4 MiB, which are checksummed
     /// while they are sent, and for ranges of them, which are not checksummed (#155,
@@ -1069,9 +1286,7 @@ impl VolumeManager {
         let mut hdr_bytes = [0u8; 64];
         hdr_bytes.copy_from_slice(&mmap[offset as usize..offset as usize + 64]);
         let header = NeedleHeader::decode(&hdr_bytes)?;
-
-        let raw_len = 64 + header.key_len as usize + header.payload_size as usize;
-        let total_len = (((raw_len + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE) as u64;
+        let total_len = header.total_len();
 
         let mmap = if (offset + total_len) as usize > mmap.len() {
             self.get_or_remap(offset + total_len)?
@@ -1079,7 +1294,7 @@ impl VolumeManager {
             mmap
         };
 
-        let p_start = offset as usize + 64 + header.key_len as usize;
+        let p_start = offset as usize + header.payload_start();
         let p_end = p_start + header.payload_size as usize;
         if p_end > mmap.len() {
             return Err(VolumeError::TornNeedleAtOffset(offset));
@@ -1132,7 +1347,9 @@ impl VolumeManager {
     where
         F: FnMut(ScannedNeedle),
     {
-        let file_len = self.file.metadata()?.len();
+        // The written end, not the file's length: a growing volume holds up to one growth
+        // step of zeros past it (#178).
+        let file_len = self.file.metadata()?.len().min(self.current_offset.load(Ordering::SeqCst));
         let mut scan_offset = SECTOR_SIZE as u64;
         let mut read_buf = AlignedBuffer::new(SECTOR_SIZE);
 
@@ -1162,8 +1379,7 @@ impl VolumeManager {
                 }
             };
 
-            let raw_len = 64 + hdr.key_len as usize + hdr.payload_size as usize;
-            let total_len = (((raw_len + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE) as u64;
+            let total_len = hdr.total_len();
 
             if scan_offset + total_len > file_len {
                 match next_indexed(&self.indexed, scan_offset) {

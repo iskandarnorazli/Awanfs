@@ -170,7 +170,7 @@ async fn a_compressed_object_never_lands_in_a_format_1_volume() {
     }
     // Make volume 1 a volume written by format 1 AwanFS (the CRC covers bytes 0..16 only).
     let v1 = dir.join("volume_0001.dat");
-    assert_eq!(superblock_version(&v1), 2, "new volumes are format 2");
+    assert_eq!(superblock_version(&v1), s3_server::FORMAT_VERSION, "new volumes are the current format (2 or later; 3 since #150)");
     set_superblock_version(&v1, 1);
 
     let iam = ReloadingIam::open(&write_config(&temp_dir("v1_cfg"))).unwrap();
@@ -181,7 +181,7 @@ async fn a_compressed_object_never_lands_in_a_format_1_volume() {
         assert_eq!(superblock_version(&v1), 1, "the format 1 volume is not rewritten");
         let v2 = dir.join("volume_0002.dat");
         assert!(v2.exists(), "the compressed object went to a new volume");
-        assert_eq!(superblock_version(&v2), 2);
+        assert!(superblock_version(&v2) >= 2, "a compressed needle needs format 2 or later");
         check_reads(&c, &base, "logs/t", &t).await;
         handle.shutdown();
     }
