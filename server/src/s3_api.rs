@@ -1577,7 +1577,16 @@ impl S3ServiceState {
                     attempts += 1;
                     self.roll_volume(&vm)?;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // The write reserved an offset and may have left a complete record there
+                    // (header written, then the journal or the disk failed). Its offset is
+                    // later than every reservation made before it, so noting the largest
+                    // offset makes a streamed PUT of this key in flight relocate: a spurious
+                    // copy costs time, a missed one lets this failed write win after a
+                    // restart (#184).
+                    self.streams.note_append(b_id, key, u64::MAX);
+                    return Err(e);
+                }
             }
         }
     }
@@ -1597,11 +1606,10 @@ impl S3ServiceState {
         etag_hi: u64,
         etag_lo: u64,
     ) -> Result<(Arc<VolumeManager>, NeedleLocation, u64), VolumeError> {
-        let bytes = from_vm.read_needle_bytes(from_vm.id(), from.offset, from.payload_crc32c)?;
-        let mut writer = self.begin_needle_on_active(b_id, key, bytes.len() as u64, flags)?;
-        for piece in bytes.chunks(crate::volume::STREAM_CHUNK) {
-            writer.write(piece)?;
-        }
+        // Read in chunks, not through the mapping (#185); a CRC mismatch drops the writer
+        // before its header is written, so the copy leaves only a gap.
+        let mut writer = self.begin_needle_on_active(b_id, key, from.payload_size, flags)?;
+        from_vm.copy_payload(from.offset, from.payload_crc32c, |piece| writer.write(piece))?;
         let vm = Arc::clone(writer.volume());
         let g = global_offset(vm.id(), writer.offset());
         let loc = writer.finish(etag_hi, etag_lo)?;
@@ -3448,8 +3456,15 @@ async fn handle_s3_inner(
                         // last in the log: write it again at the end. Versions are ordered by
                         // their ids, taken above under the lock, so they stay where they are.
                         let (vm, loc, vol_offset) = if stamp.is_none() && ticket.appended_after(first_offset) {
-                            match state.relocate_needle(b_id, &key, &first_vm, &first_loc, flags, etag_hi, etag_lo) {
-                                Ok(moved) => moved,
+                            // Up to 5 GiB of reads and writes: on the blocking pool, not on an
+                            // executor thread (#185). The key lock is held across the await.
+                            let moved = {
+                                let (st, k, fvm) = (Arc::clone(&state), key.clone(), Arc::clone(&first_vm));
+                                tokio::task::spawn_blocking(move || st.relocate_needle(b_id, &k, &fvm, &first_loc, flags, etag_hi, etag_lo)).await
+                            };
+                            match moved {
+                                Ok(Ok(moved)) => moved,
+                                Ok(Err(e)) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                                 Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                             }
                         } else {
