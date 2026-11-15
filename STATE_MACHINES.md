@@ -26,7 +26,7 @@ or a test that is not in the file.
 | Bucket | absent, active, deleted; owner | implicit | manifest replay in `server/src/s3_api.rs` | restart tests | none needed: one serialized log | #149 (`bucket_step`) |
 | Bucket configuration of one kind | unset, set | implicit (new) | | | none needed | #149 |
 | Durability of a write | written, synced | implicit | `make_durable`, group commit in `server/src/volume.rs` | power-cut and durability tests | none | when touched |
-| Volume | active, sealed, compacting, retired; writes in flight | implicit (the seal and the in-flight count are in `server/src/volume.rs`: `seal`, `writers_in_flight`) | `compact_oldest_volume` in `server/src/s3_api.rs` | compaction tests, `server/tests/compaction_inflight_test.rs` | `ObjectVersions.tla` (CSeal, CScan, CCopy, CDrop; `fixed_compact.cfg`, `compact_no_wait.cfg`) | #167 modelled it; `volume_step` still to write |
+| Volume | active, sealed, compacting, retired; writes in flight; written end and allocated end (#178: the file is extended ahead of the written end, trimmed at open) | implicit (the seal and the in-flight count are in `server/src/volume.rs`: `seal`, `writers_in_flight`) | `compact_oldest_volume` in `server/src/s3_api.rs` | compaction tests, `server/tests/compaction_inflight_test.rs` | `ObjectVersions.tla` (CSeal, CScan, CCopy, CDrop; `fixed_compact.cfg`, `compact_no_wait.cfg`) | #167 modelled it; `volume_step` still to write |
 | Lifecycle of an object under a rule | live, expired, removed | implicit | `server/src/lifecycle.rs` | lifecycle tests | none | #118 |
 | Encrypted multipart upload | key and nonce state per part | not built | | | | #121 |
 | A scheduled background task | idle, running, stopping, stopped | not built | | | none | #158 |

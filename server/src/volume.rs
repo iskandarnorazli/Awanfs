@@ -97,6 +97,19 @@ pub struct NeedleLocation {
 /// Size of the pieces a streamed needle is written in.
 pub const STREAM_CHUNK: usize = 1 << 20;
 
+/// How far a growing volume's file is extended at a time (#178): `AWAN_VOLUME_GROWTH_STEP` in
+/// bytes, for measurements, or 256 MiB.
+pub const DEFAULT_GROWTH_STEP: u64 = 256 * 1024 * 1024;
+
+fn growth_step_from_env() -> u64 {
+    std::env::var("AWAN_VOLUME_GROWTH_STEP")
+        .ok()
+        .and_then(|v| crate::memory::parse_size(&v))
+        .filter(|&n| n >= SECTOR_SIZE as u64)
+        .map(|n| n / SECTOR_SIZE as u64 * SECTOR_SIZE as u64)
+        .unwrap_or(DEFAULT_GROWTH_STEP)
+}
+
 /// A needle being written as its payload arrives; see `VolumeManager::begin_needle`.
 pub struct NeedleWriter {
     vm: Arc<VolumeManager>,
@@ -456,6 +469,14 @@ pub struct VolumeManager {
     mmap: RwLock<Option<Arc<Mmap>>>,
     remap_count: AtomicU64,
     is_sparse: bool,
+    /// The file's length as this process set it: a growing volume is extended in steps of
+    /// `growth_step` ahead of its writes, so the read mapping, which covers the whole file,
+    /// is redone once per step and not once per new read (#178). The written end is
+    /// `current_offset`; what lies between is zeros, which recovery stops at and the next
+    /// open truncates. A sparse volume is mapped once at its full span and never grows.
+    allocated: AtomicU64,
+    growth_step: AtomicU64,
+    grow_lock: parking_lot::Mutex<()>,
     max_span: AtomicU64,
     work: Arc<WorkCounters>,
     fail_next_write: std::sync::atomic::AtomicBool,
@@ -647,6 +668,7 @@ impl VolumeManager {
             None
         };
 
+        let allocated = if sparse { MAX_VOLUME_SPAN } else { aligned_file.metadata()?.len() };
         // Second opens, not `try_clone`: see `file_sync`.
         let idx_sync = OpenOptions::new().write(true).open(&idx_path)?;
         let file_sync = OpenOptions::new().write(true).open(&dat_path)?;
@@ -665,6 +687,9 @@ impl VolumeManager {
             mmap: RwLock::new(initial_mmap),
             remap_count: AtomicU64::new(0),
             is_sparse: sparse,
+            allocated: AtomicU64::new(allocated),
+            growth_step: AtomicU64::new(growth_step_from_env()),
+            grow_lock: parking_lot::Mutex::new(()),
             max_span: AtomicU64::new(MAX_VOLUME_SPAN),
             work: Arc::new(WorkCounters::default()),
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
@@ -717,6 +742,43 @@ impl VolumeManager {
 
     pub fn max_span(&self) -> u64 {
         self.max_span.load(Ordering::SeqCst)
+    }
+
+    /// How far ahead of its writes a growing volume's file is extended (#178).
+    pub fn set_growth_step(&self, step: u64) {
+        self.growth_step.store(step.max(SECTOR_SIZE as u64) / SECTOR_SIZE as u64 * SECTOR_SIZE as u64, Ordering::SeqCst);
+    }
+
+    /// The file's length: the written end plus at most one growth step of zeros.
+    pub fn allocated_len(&self) -> u64 {
+        self.allocated.load(Ordering::SeqCst)
+    }
+
+    /// Makes the file at least `end` bytes long (#178). Up to a quarter of the growth step
+    /// (64 MiB by default) a volume grows by its writes, as before: remapping a small volume
+    /// is cheap, and a small deployment pays no disk for space it has not written. Past that
+    /// the file is extended ahead, by a quarter of its length, at least 1 MiB and at most the
+    /// step, so the mapping is redone once per extension. Not past the span, and never to
+    /// exactly `MAX_VOLUME_SPAN`, which is how a sparse volume is recognised. The extension
+    /// is a plain length change, not a sparse file, so a flush costs what it costs for a file
+    /// that grows by writing (decision 52).
+    fn ensure_allocated(&self, end: u64) -> Result<(), VolumeError> {
+        let step = self.growth_step.load(Ordering::SeqCst);
+        if self.is_sparse || end <= step / 4 || end <= self.allocated.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _g = self.grow_lock.lock();
+        // Below the threshold the file grew by its writes; it is at least that long now.
+        let current = self.allocated.load(Ordering::SeqCst).max(step / 4);
+        if end <= self.allocated.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let grow = (current / 4).clamp(step.min(1 << 20), step);
+        let limit = self.max_span().min(MAX_VOLUME_SPAN - SECTOR_SIZE as u64);
+        let target = end.max(current + grow).div_ceil(SECTOR_SIZE as u64).saturating_mul(SECTOR_SIZE as u64).min(limit).max(end);
+        self.file.set_len(target)?;
+        self.allocated.store(target, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn id(&self) -> u32 {
@@ -1011,7 +1073,7 @@ impl VolumeManager {
             Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected write failure")))
         } else {
             // Lock-free concurrent positional write directly to disjoint disk offset
-            self.file.write_aligned_at(offset, &buf).map_err(VolumeError::from)
+            self.ensure_allocated(offset + total_len).and_then(|()| self.file.write_aligned_at(offset, &buf).map_err(VolumeError::from))
         };
         if let Err(e) = written {
             self.gaps.lock().insert(offset, total_len);
@@ -1058,6 +1120,8 @@ impl VolumeManager {
         if self.fail_next_write.swap(false, Ordering::SeqCst) {
             return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected write failure")));
         }
+        // The whole needle at once: its chunks then never extend the file (#178).
+        self.ensure_allocated(offset + total_len)?;
         let mut first = AlignedBuffer::new(SECTOR_SIZE);
         first.fill(0);
         let mut writer = NeedleWriter {
@@ -1250,7 +1314,9 @@ impl VolumeManager {
     where
         F: FnMut(ScannedNeedle),
     {
-        let file_len = self.file.metadata()?.len();
+        // The written end, not the file's length: a growing volume holds up to one growth
+        // step of zeros past it (#178).
+        let file_len = self.file.metadata()?.len().min(self.current_offset.load(Ordering::SeqCst));
         let mut scan_offset = SECTOR_SIZE as u64;
         let mut read_buf = AlignedBuffer::new(SECTOR_SIZE);
 
