@@ -1,6 +1,6 @@
 # AwanFS on-disk format
 
-Format version **2** (`FORMAT_VERSION` in `server/src/volume.rs`). Owner decision 20: a newer
+Format version **3** (`FORMAT_VERSION` in `server/src/volume.rs`). Owner decision 20: a newer
 version is refused at startup with an error naming both versions; an older version is read as
 it is; nothing is rewritten in place. `server/tests/format_version_test.rs` builds a format 1
 volume from this document, byte by byte, and checks the server still serves it.
@@ -8,7 +8,8 @@ volume from this document, byte by byte, and checks the server still serves it.
 | Version | Adds |
 |---|---|
 | 1 | The layout below. |
-| 2 | Compressed needles (flag 0x20, #51) and versions (flags 0x40, 0x80, 0x100, #31). New volumes are written as format 2; a needle with any of these flags is never written to a format 1 volume (the server opens a new volume first), so an older AwanFS never misreads one. |
+| 2 | Compressed needles (flag 0x20, #51) and versions (flags 0x40, 0x80, 0x100, #31). A needle with any of these flags is never written to a format 1 volume (the server opens a new volume first), so an older AwanFS never misreads one. |
+| 3 | The attributes block (flag 0x400, header bytes 18..20, decision 43, #150). New volumes are written as format 3; a needle with a block is never written to an older volume. A needle without one is byte for byte a format 2 needle, and format 2 volumes are read as they are. An AwanFS that reads only format 2 refuses a format 3 volume at startup (decision 20). |
 
 All integers are little-endian. Sectors are 4096 bytes.
 
@@ -40,19 +41,42 @@ All integers are little-endian. Sectors are 4096 bytes.
 | 0..4 | magic `0x41574E33` ("AWN3") |
 | 4..8 | CRC32C of header bytes 8..64 |
 | 8..12 | CRC32C of the payload |
-| 12..14 | flags: 0x1 active, 0x2 tombstone, 0x4 multipart, 0x8 shared, 0x10 zero-byte, 0x20 compressed, 0x40 versioned, 0x80 null version, 0x100 version delete (`meta_index.rs`) |
+| 12..14 | flags: 0x1 active, 0x2 tombstone, 0x4 multipart, 0x8 shared, 0x10 zero-byte, 0x20 compressed, 0x40 versioned, 0x80 null version, 0x100 version delete, 0x200 attribute update (reserved, #150), 0x400 has an attributes block (`meta_index.rs`) |
 | 14..16 | bucket id |
 | 16..18 | key length |
-| 18..20 | reserved |
+| 18..20 | attributes block length (format 3); 0 for none |
 | 20..28 | xxh3-64 of the key |
 | 28..36 | payload length |
 | 36..44 | creation time, ns |
 | 44..60 | ETag (MD5) high and low halves |
 | 60..64 | reserved |
-| 64.. | key, then payload, then zero padding to the next sector |
+| 64.. | key, then the attributes block (if any), then payload, then zero padding to the next sector |
 
 The header sector of a needle written as it streams in (#36) is written last, so a crash
 leaves a needle that fails its header check, never one that passes with missing data.
+
+## Attributes block (flag 0x400, format 3)
+
+Between the key and the payload; its length is header bytes 18..20, at most 65,535 bytes
+(`server/src/attrs.rs`). The payload CRC covers the payload only, as before.
+
+| Bytes | Field |
+|---|---|
+| 0..4 | CRC32C of the rest of the block |
+| 4.. | entries: tag (2), value length (2), value; tags strictly ascending |
+
+A block whose CRC does not match is a read error: its attributes are never served. Readers
+skip tags they do not know, and compaction and the copy of a streamed PUT (decision 51) write
+the block again unchanged. An object's index row carries flag 0x400 too, so GET and HEAD read
+the block only for objects that have one.
+
+### Tag registry
+
+A tag number is never reused. 0x8000 and above are for tests.
+
+| Tag | Name | Group | Owner |
+|---|---|---|---|
+| 0x0001 | Content-Type, as sent | headers (write-time) | #150 |
 
 ## Journal record (`.idx`, 42 bytes)
 
