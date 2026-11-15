@@ -148,6 +148,20 @@ that overlap another write of the same key. Versioned keys are ordered by versio
 commit, and are never copied. Ordering recovery by a commit stamp instead was weighed and not
 chosen: it changes a recovery rule for every key and makes it depend on the clock. #154.
 
+**Decision 55 (2026-11-15): compaction seals a volume, and lists it only when no write is
+still landing in it.** A write reserves its offset before it writes its header, so a volume
+listed in between was missing that needle: not copied, then removed with the file, after the
+write had been acknowledged. A streamed PUT held that window open for as long as its client
+sent; the TLA+ model (`compact_no_wait.cfg`) shows a small PUT can hit it too. Each volume
+counts writes from before their reservation until their header is written; a sealed volume
+refuses new reservations, which then go to the active volume. A pass that finds writes in
+flight does nothing and says so (`busy`); the next pass finds the volume quiet. The listing
+steps over the gaps that abandoned or failed writes leave: each volume keeps the reservations
+made in this process that may never get a header, because the journal read at open knows
+nothing of them, and the listing used to stop at the first one. A delete marker is decided
+under its key lock like every other needle: its DELETE writes it before it records it. Both
+were found in review of #182. #167.
+
 **Decision 52 (2026-11-15): every new volume grows as it is written; none is created sparse.**
 The first volume of a data directory was a 32 GiB sparse file mapped once, and volumes made by
 rollover already grew. On Windows, flushing a sparse file takes 7.75 ms against 0.59 ms for one

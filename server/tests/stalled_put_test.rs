@@ -44,7 +44,7 @@ struct Stalled {
     rest: Vec<u8>,
 }
 
-async fn begin_stalled(url: &str, path: &str, body: &[u8], extra_headers: &str) -> Stalled {
+async fn begin_stalled(state: &S3ServiceState, url: &str, path: &str, body: &[u8], extra_headers: &str) -> Stalled {
     assert!(body.len() as u64 > STREAM_PUT_MIN, "the body must take the streamed path");
     let host = url.trim_start_matches("http://").to_string();
     let mut stream = TcpStream::connect(&host).await.unwrap();
@@ -53,8 +53,15 @@ async fn begin_stalled(url: &str, path: &str, body: &[u8], extra_headers: &str) 
     let half = body.len() / 2;
     stream.write_all(&body[..half]).await.unwrap();
     stream.flush().await.unwrap();
-    // Let the server take the request and start writing the body to the volume.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait until the server has reserved the needle, not for a fixed time: a slow runner that
+    // reserved after the next PUT would turn the relocation counts below upside down.
+    for _ in 0..400 {
+        if state.volume_writers_in_flight(1) == Some(1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(state.volume_writers_in_flight(1), Some(1), "the PUT reserved its needle");
     Stalled { stream, rest: body[half..].to_vec() }
 }
 
@@ -96,7 +103,7 @@ async fn a_stalled_put_does_not_block_other_writers_and_the_last_commit_wins_aft
     let key = format!("{}/stall-bkt/k", url);
     let (first, second, small) = (pattern(LEN, 1), pattern(LEN + 4096, 2), pattern(1000, 3));
 
-    let stalled = begin_stalled(&url, "/stall-bkt/k", &first, "").await;
+    let stalled = begin_stalled(&state, &url, "/stall-bkt/k", &first, "").await;
     // A streamed PUT and a buffered PUT of the same key both finish while the first waits.
     assert_eq!(put(&c, &key, second.clone()).await, StatusCode::OK);
     assert!(body_of(&c, &key).await.as_deref() == Some(&second[..]));
@@ -128,7 +135,7 @@ async fn a_delete_during_a_stalled_put_does_not_win_after_a_restart() {
     let key = format!("{}/stall-bkt/k", url);
     let first = pattern(LEN, 4);
 
-    let stalled = begin_stalled(&url, "/stall-bkt/k", &first, "").await;
+    let stalled = begin_stalled(&state, &url, "/stall-bkt/k", &first, "").await;
     assert_eq!(put(&c, &key, pattern(2000, 5)).await, StatusCode::OK);
     let res = tokio::time::timeout(WAIT, c.delete(&key).send()).await.expect("a DELETE waited for the stalled PUT").unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
@@ -153,7 +160,7 @@ async fn an_undisturbed_streamed_put_is_written_once() {
     let (state, url, _h) = start(&dir).await;
     make_bucket(&c, &url).await;
     // Other keys are written while it is in flight; only records of its own key matter.
-    let stalled = begin_stalled(&url, "/stall-bkt/alone", &pattern(LEN, 6), "").await;
+    let stalled = begin_stalled(&state, &url, "/stall-bkt/alone", &pattern(LEN, 6), "").await;
     for i in 0..20 {
         assert_eq!(put(&c, &format!("{}/stall-bkt/other-{}", url, i), pattern(3000, i)).await, StatusCode::OK);
     }
@@ -168,7 +175,7 @@ async fn an_abandoned_streamed_put_is_no_longer_tracked() {
     let c = reqwest::Client::new();
     let (state, url, _h) = start(&dir).await;
     make_bucket(&c, &url).await;
-    let stalled = begin_stalled(&url, "/stall-bkt/gone", &pattern(LEN, 7), "").await;
+    let stalled = begin_stalled(&state, &url, "/stall-bkt/gone", &pattern(LEN, 7), "").await;
     assert_eq!(state.streams.in_flight(), 1);
     drop(stalled);
     for _ in 0..100 {
@@ -191,7 +198,7 @@ async fn if_none_match_is_decided_at_commit() {
     let (first, second) = (pattern(LEN, 8), pattern(LEN + 1, 9));
 
     // Both start while the key does not exist; the one that commits first creates it.
-    let stalled = begin_stalled(&url, "/stall-bkt/once", &first, "If-None-Match: *\r\n").await;
+    let stalled = begin_stalled(&state, &url, "/stall-bkt/once", &first, "If-None-Match: *\r\n").await;
     let res = tokio::time::timeout(WAIT, c.put(&key).header("if-none-match", "*").body(second.clone()).send()).await.expect("waited").unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(stalled.finish().await, 412, "the key exists by the time the first PUT commits");
@@ -214,7 +221,7 @@ async fn in_a_versioned_bucket_the_last_commit_is_the_current_version_and_nothin
     let key = format!("{}/stall-bkt/v", url);
     let (first, second) = (pattern(LEN, 10), pattern(LEN + 7, 11));
 
-    let stalled = begin_stalled(&url, "/stall-bkt/v", &first, "").await;
+    let stalled = begin_stalled(&state, &url, "/stall-bkt/v", &first, "").await;
     assert_eq!(put(&c, &key, second.clone()).await, StatusCode::OK);
     assert_eq!(stalled.finish().await, 200);
     assert!(body_of(&c, &key).await.as_deref() == Some(&first[..]), "the last commit is the current version");

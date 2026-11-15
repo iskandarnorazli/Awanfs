@@ -35,11 +35,25 @@ Switches, so the same model checks the current code and the fixes:
   Relocate          the Relocate step exists. Without it the streamer's needle sits at an
                     early offset: it is the live object, and after a restart an older write at
                     a later offset wins.
+  Compactor         one compaction pass may run (s3_api.rs compact_oldest_volume, #167). The
+                    volume it compacts holds every offset below `cut`, the next offset when the
+                    pass starts; later writes land above it. The pass:
+                      CSeal     the volume takes no new reservations (VolumeManager::seal)
+                      CScan     the needles it holds are listed (scan_needles)
+                      CCopy     under the key lock, the needle the index points at, if listed,
+                                is written again at the end of the log
+                      CDrop     the volume file is removed: every record below `cut` is gone,
+                                and a write into it after that is lost
+  CompactWaitsForWriters
+                    CScan waits until no request has an offset below `cut` whose record is not
+                    yet written (VolumeManager::writers_in_flight is 0). Without it a streamed
+                    PUT still receiving its body is not listed, its needle is not copied, and
+                    the file it lands in is removed.
 *)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Writers, Deleters, UseKeyLock, WriteCanFail, RecoverSkipsGaps, DeleteLogsFirst,
-          Streamers, Relocate
+          Streamers, Relocate, Compactor, CompactWaitsForWriters
 
 ASSUME Streamers \subseteq Writers
 
@@ -53,9 +67,12 @@ Steps(p) == IF p \in Deleters /\ ~DeleteLogsFirst
             THEN <<"write", "relocate", "index">>
             ELSE <<"reserve", "write", "index">>
 
-VARIABLES pc, step, off, nextOff, log, engine, lock
+VARIABLES pc, step, off, nextOff, log, engine, lock, cpc, cut, snap
 
-vars == <<pc, step, off, nextOff, log, engine, lock>>
+vars == <<pc, step, off, nextOff, log, engine, lock, cpc, cut, snap>>
+procVars == <<pc, step, off, nextOff, log, engine, lock>>
+cVars == <<cpc, cut, snap>>
+Dropped == cpc = "done"
 
 \* Moves p to its next step, or to release after the last one.
 Advance(p) ==
@@ -72,7 +89,8 @@ Replay(o, limit, acc) ==
               Replay(o + 1, limit,
                      IF r.kind = "put" THEN [present |-> TRUE, val |-> r.val] ELSE Gone)
 
-Recovered == Replay(1, nextOff, Gone)
+\* A removed volume is not read: replay starts at the first offset that still exists.
+Recovered == Replay(IF Dropped THEN cut ELSE 1, nextOff, Gone)
 
 Init ==
     /\ pc = [p \in Procs |-> "start"]
@@ -82,6 +100,9 @@ Init ==
     /\ log = {}
     /\ engine = Gone
     /\ lock = "free"
+    /\ cpc = "idle"
+    /\ cut = 0
+    /\ snap = {}
 
 \* A streamer reserves before it has the lock: the body arrives next, for as long as the
 \* client takes. Nothing is in the log yet (the header sector is written last).
@@ -92,6 +113,7 @@ StreamReserve(p) ==
     /\ nextOff' = nextOff + 1
     /\ pc' = [pc EXCEPT ![p] = "body"]
     /\ UNCHANGED <<step, log, engine, lock>>
+    /\ UNCHANGED cVars
 
 Acquire(p) ==
     /\ pc[p] = IF p \in Streamers THEN "body" ELSE "start"
@@ -99,6 +121,7 @@ Acquire(p) ==
     /\ step' = [step EXCEPT ![p] = 1]
     /\ pc' = [pc EXCEPT ![p] = Steps(p)[1]]
     /\ UNCHANGED <<off, nextOff, log, engine>>
+    /\ UNCHANGED cVars
 
 Reserve(p) ==
     /\ pc[p] = "reserve"
@@ -106,18 +129,23 @@ Reserve(p) ==
     /\ nextOff' = nextOff + 1
     /\ Advance(p)
     /\ UNCHANGED <<log, engine, lock>>
+    /\ UNCHANGED cVars
 
 Write(p) ==
     /\ pc[p] = "write"
-    /\ log' = log \cup {[o |-> off[p], kind |-> IF p \in Writers THEN "put" ELSE "tomb", val |-> p]}
+    \* Into a removed volume file, the bytes go nowhere (the handle outlives the file).
+    /\ log' = IF Dropped /\ off[p] < cut THEN log
+              ELSE log \cup {[o |-> off[p], kind |-> IF p \in Writers THEN "put" ELSE "tomb", val |-> p]}
     /\ Advance(p)
     /\ UNCHANGED <<off, nextOff, engine, lock>>
+    /\ UNCHANGED cVars
 
 Fail(p) ==
     /\ WriteCanFail
     /\ pc[p] = "write"
     /\ pc' = [pc EXCEPT ![p] = "release"]
     /\ UNCHANGED <<step, off, nextOff, log, engine, lock>>
+    /\ UNCHANGED cVars
 
 \* Under the lock, after the streamer's own record is in the log: a record of this key at a
 \* later offset means offset order no longer says this write is the newest, so it is written
@@ -133,6 +161,7 @@ RelocateStep(p) ==
        ELSE UNCHANGED <<off, nextOff, log>>
     /\ Advance(p)
     /\ UNCHANGED <<engine, lock>>
+    /\ UNCHANGED cVars
 
 RelocateFail(p) ==
     /\ WriteCanFail
@@ -140,20 +169,54 @@ RelocateFail(p) ==
     /\ Relocate /\ LaterRecord(p)
     /\ pc' = [pc EXCEPT ![p] = "release"]
     /\ UNCHANGED <<step, off, nextOff, log, engine, lock>>
+    /\ UNCHANGED cVars
 
 Index(p) ==
     /\ pc[p] = "index"
     /\ engine' = IF p \in Writers THEN [present |-> TRUE, val |-> p] ELSE Gone
     /\ Advance(p)
     /\ UNCHANGED <<off, nextOff, log, lock>>
+    /\ UNCHANGED cVars
 
 Release(p) ==
     /\ pc[p] = "release"
     /\ IF UseKeyLock THEN lock' = "free" ELSE UNCHANGED lock
     /\ pc' = [pc EXCEPT ![p] = "done"]
     /\ UNCHANGED <<step, off, nextOff, log, engine>>
+    /\ UNCHANGED cVars
 
-AllDone == \A p \in Procs : pc[p] = "done"
+\* The compaction pass (#167).
+InFlightBelowCut == \E p \in Procs : off[p] > 0 /\ off[p] < cut /\ pc[p] \in {"body", "write"}
+\* The record the index points at: the newest record of the value the engine holds.
+Points(r) == engine.present /\ r.kind = "put" /\ r.val = engine.val
+             /\ ~\E r2 \in log : r2.val = r.val /\ r2.o > r.o
+CSeal ==
+    /\ Compactor /\ cpc = "idle"
+    /\ cut' = nextOff
+    /\ cpc' = "sealed"
+    /\ UNCHANGED snap /\ UNCHANGED procVars
+CScan ==
+    /\ cpc = "sealed"
+    /\ CompactWaitsForWriters => ~InFlightBelowCut
+    /\ snap' = {r \in log : r.o < cut}
+    /\ cpc' = "scanned"
+    /\ UNCHANGED cut /\ UNCHANGED procVars
+CCopy ==
+    /\ cpc = "scanned"
+    /\ UseKeyLock => lock = "free"
+    /\ IF \E r \in snap : Points(r)
+       THEN /\ log' = log \cup {[o |-> nextOff, kind |-> "put", val |-> engine.val]}
+            /\ nextOff' = nextOff + 1
+       ELSE UNCHANGED <<log, nextOff>>
+    /\ cpc' = "copied"
+    /\ UNCHANGED <<cut, snap, pc, step, off, engine, lock>>
+CDrop ==
+    /\ cpc = "copied"
+    /\ log' = {r \in log : r.o >= cut}
+    /\ cpc' = "done"
+    /\ UNCHANGED <<cut, snap, pc, step, off, nextOff, engine, lock>>
+
+AllDone == (\A p \in Procs : pc[p] = "done") /\ cpc \in {"idle", "done"}
 
 Finished == AllDone /\ UNCHANGED vars
 
@@ -167,6 +230,7 @@ Next ==
     \/ \E p \in Procs : Fail(p)
     \/ \E p \in Procs : Index(p)
     \/ \E p \in Procs : Release(p)
+    \/ CSeal \/ CScan \/ CCopy \/ CDrop
     \/ Finished
 
 Spec == Init /\ [][Next]_vars
@@ -176,5 +240,6 @@ AckedStateSurvivesRestart == AllDone => Recovered = engine
 TypeOK ==
     /\ pc \in [Procs -> {"start", "body", "reserve", "write", "relocate", "index", "release", "done"}]
     /\ step \in [Procs -> 0..4]
-    /\ nextOff \in 1..(Cardinality(Procs) + Cardinality(Streamers) + 1)
+    /\ nextOff \in 1..(Cardinality(Procs) + Cardinality(Streamers) + 2)
+    /\ cpc \in {"idle", "sealed", "scanned", "copied", "done"}
 ====

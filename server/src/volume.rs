@@ -218,6 +218,7 @@ impl NeedleWriter {
         self.vm.work.disk_write(SECTOR_SIZE as u64);
         self.vm.work.payload_copy(self.payload_size);
         self.vm.append_index(header.key_hash, self.offset, self.total_len, self.payload_size, self.flags, self.crc)?;
+        self.vm.gaps.lock().remove(&self.offset);
         let seq = self.vm.written_seq.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(NeedleLocation {
             volume_id: self.vm.volume_id,
@@ -382,6 +383,22 @@ fn next_indexed(indexed: &BTreeSet<u64>, after: u64) -> Option<u64> {
     indexed.range(after + 1..).next().copied()
 }
 
+/// One write counted in `VolumeManager::writers_in_flight` (#167).
+struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Drop for NeedleWriter {
+    /// The streamed write has ended: finished (its header is written) or abandoned.
+    fn drop(&mut self) {
+        self.vm.writers_in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub struct VolumeManager {
     dir: PathBuf,
     volume_id: u32,
@@ -394,6 +411,17 @@ pub struct VolumeManager {
     max_span: AtomicU64,
     work: Arc<WorkCounters>,
     fail_next_write: std::sync::atomic::AtomicBool,
+    /// Writes that have reserved an offset here and not yet written their header (#167). A
+    /// streamed PUT counts from `begin_needle` until its `NeedleWriter` is dropped.
+    writers_in_flight: std::sync::atomic::AtomicUsize,
+    /// Set by compaction before it lists the needles: no new reservation lands here after it.
+    sealed: std::sync::atomic::AtomicBool,
+    /// Reservations made in this process that may never get a header: a streamed needle from
+    /// `begin_needle` until `finish` indexes it, and a `write_needle_at` that failed after it
+    /// reserved. `scan_needles` steps over them; `indexed` covers only what the journal held
+    /// at open, so without this a scan stopped at such a gap and compaction did not list the
+    /// needles after it (#167). Offset to length; one entry per streamed PUT in flight.
+    gaps: parking_lot::Mutex<std::collections::BTreeMap<u64, u64>>,
     /// Needle offsets from the `.idx` journal at open time.
     indexed: BTreeSet<u64>,
     /// Format version in the superblock: what the needles of this volume may use (FORMAT.md).
@@ -591,6 +619,9 @@ impl VolumeManager {
             max_span: AtomicU64::new(MAX_VOLUME_SPAN),
             work: Arc::new(WorkCounters::default()),
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
+            writers_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            sealed: std::sync::atomic::AtomicBool::new(false),
+            gaps: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             indexed,
             format,
         })
@@ -848,18 +879,24 @@ impl VolumeManager {
             buf[raw_len..total_len as usize].fill(0);
         }
 
+        // Counted from before the reservation to the end of this function (#167).
+        let _in_flight = self.enter_write(total_len)?;
         // A WORM volume never reuses space: a needle that would end past the span is refused,
         // and the reserved range stays unused, so later writes are refused too.
         let offset = self.current_offset.fetch_add(total_len, Ordering::SeqCst);
         if offset + total_len > self.max_span() {
             return Err(VolumeError::VolumeFull { offset, len: total_len });
         }
-        if self.fail_next_write.swap(false, Ordering::SeqCst) {
-            return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected write failure")));
+        let written = if self.fail_next_write.swap(false, Ordering::SeqCst) {
+            Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected write failure")))
+        } else {
+            // Lock-free concurrent positional write directly to disjoint disk offset
+            self.file.write_aligned_at(offset, &buf).map_err(VolumeError::from)
+        };
+        if let Err(e) = written {
+            self.gaps.lock().insert(offset, total_len);
+            return Err(e);
         }
-
-        // Lock-free concurrent positional write directly to disjoint disk offset
-        self.file.write_aligned_at(offset, &buf)?;
         self.work.disk_write(total_len);
 
         self.append_index(key_hash, offset, total_len, payload_size, flags, payload_crc32c)?;
@@ -882,16 +919,21 @@ impl VolumeManager {
     pub fn begin_needle(self: &Arc<Self>, bucket_id: u16, key: &str, payload_size: u64, flags: u16) -> Result<NeedleWriter, VolumeError> {
         let key_len = key.len();
         let total_len = (64 + key_len as u64 + payload_size).div_ceil(SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
+        // Counted until the writer is dropped, after its header is written or it is abandoned
+        // (#167). `forget` hands the count to the writer below.
+        let in_flight = self.enter_write(total_len)?;
         let offset = self.current_offset.fetch_add(total_len, Ordering::SeqCst);
         if offset + total_len > self.max_span() {
             return Err(VolumeError::VolumeFull { offset, len: total_len });
         }
+        // A gap until `finish` indexes it, whatever happens to the writer.
+        self.gaps.lock().insert(offset, total_len);
         if self.fail_next_write.swap(false, Ordering::SeqCst) {
             return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected write failure")));
         }
         let mut first = AlignedBuffer::new(SECTOR_SIZE);
         first.fill(0);
-        Ok(NeedleWriter {
+        let writer = NeedleWriter {
             vm: Arc::clone(self),
             bucket_id,
             key: key.to_string(),
@@ -906,7 +948,34 @@ impl VolumeManager {
             chunk_start: SECTOR_SIZE as u64,
             chunk_fill: 0,
             created_at: None,
-        })
+        };
+        // The writer now owns the count: its `Drop` gives it back.
+        std::mem::forget(in_flight);
+        Ok(writer)
+    }
+
+    /// Counts a write that is about to reserve an offset, or refuses it with `VolumeFull`
+    /// when the volume is sealed, so the caller moves to the active volume. The count goes up
+    /// before `sealed` is read, and `seal` sets `sealed` before compaction reads the count
+    /// (both SeqCst): either the write sees the seal, or compaction sees the write.
+    fn enter_write(&self, len: u64) -> Result<InFlight<'_>, VolumeError> {
+        self.writers_in_flight.fetch_add(1, Ordering::SeqCst);
+        let guard = InFlight(&self.writers_in_flight);
+        if self.sealed.load(Ordering::SeqCst) {
+            return Err(VolumeError::VolumeFull { offset: self.current_offset.load(Ordering::SeqCst), len });
+        }
+        Ok(guard)
+    }
+
+    /// No reservation lands in this volume after this returns (#167). Compaction seals the
+    /// volume it is about to list; writers still holding it are sent to the active volume.
+    pub fn seal(&self) {
+        self.sealed.store(true, Ordering::SeqCst);
+    }
+
+    /// Writes that reserved an offset here and have not written their header yet.
+    pub fn writers_in_flight(&self) -> usize {
+        self.writers_in_flight.load(Ordering::SeqCst)
     }
 
     /// Reads a needle payload as a zero-copy Bytes slice directly from the memory map.
@@ -1019,13 +1088,19 @@ impl VolumeManager {
 
             let hdr = match NeedleHeader::decode(&header_bytes) {
                 Ok(h) => h,
-                Err(_) => match next_indexed(&self.indexed, scan_offset) {
-                    Some(next) => {
-                        scan_offset = next;
+                Err(_) => {
+                    if let Some(len) = self.gaps.lock().get(&scan_offset).copied() {
+                        scan_offset += len;
                         continue;
                     }
-                    None => break,
-                },
+                    match next_indexed(&self.indexed, scan_offset) {
+                        Some(next) => {
+                            scan_offset = next;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
             };
 
             let raw_len = 64 + hdr.key_len as usize + hdr.payload_size as usize;

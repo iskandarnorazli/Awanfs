@@ -1047,6 +1047,7 @@ impl S3ServiceState {
         if let Some((extra, ts)) = self.version_stamp(b_id, key) {
             let flags = AWAN_FLAG_TOMBSTONE | extra;
             let (vm, loc, g) = self.write_to_active_at(b_id, key, &[], flags, 0, 0, Some(ts)).map_err(|e| format!("could not record the delete: {:?}", e))?;
+            self.hook("delete_marker_written", key);
             self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
             self.make_durable(&vm, loc.seq).await.map_err(|e| format!("could not sync the delete: {:?}", e))?;
             self.needle_crc_map.write().insert((b_id, g), loc.payload_crc32c);
@@ -1262,6 +1263,7 @@ impl S3ServiceState {
                 tokio::time::sleep(every).await;
                 let Some(state) = weak.upgrade() else { return };
                 match state.auto_compact_once(threshold, min_bytes).await {
+                    Ok(Some(r)) if r.busy => eprintln!("auto-compaction: the oldest volume still has a write in flight; next pass"),
                     Ok(Some(r)) => eprintln!(
                         "auto-compaction: moved {} live needles, reclaimed {} dead ones",
                         r.live_needles_copied, r.dead_needles_reclaimed
@@ -1278,6 +1280,8 @@ impl S3ServiceState {
     /// - each live needle is copied under its key lock, and the index row moves only if it
     ///   still points at the old needle, so a concurrent PUT or DELETE wins and is never
     ///   followed in the log by an older copy;
+    /// - the volume is sealed and listed only once no write is still landing in it (#167), so
+    ///   every needle that will ever be in it is listed;
     /// - the copies are synced before the old files are removed;
     /// - only the oldest volume is compacted: a tombstone there can only hide needles in the
     ///   same volume, so dropping it cannot bring a deleted object back after a restart.
@@ -1290,6 +1294,14 @@ impl S3ServiceState {
             _ => return Ok(CompactionReport::default()),
         };
         let old_id = old.id();
+        // A write that reserved an offset in this volume and has not written its header would
+        // not be listed, so not copied, and would land in the file removed below (#167;
+        // verification/tla, compact_no_wait.cfg). Seal it first, so no new write lands in it,
+        // then list it only when no write is in flight. A busy volume is left for the next pass.
+        old.seal();
+        if old.writers_in_flight() > 0 {
+            return Ok(CompactionReport { busy: true, ..CompactionReport::default() });
+        }
         let mut needles = Vec::new();
         old.scan_needles(|n| needles.push((n.bucket_id as u32, n.key, n.offset, n.payload_size, n.etag_hi, n.etag_lo, n.flags, n.payload_crc32c, n.created_at_ns)))?;
 
@@ -1298,10 +1310,11 @@ impl S3ServiceState {
         let mut throttle = crate::throttle::Throttle::new(self.compaction_rate.load(Ordering::Relaxed));
         for (b_id, key, local, size, etag_hi, etag_lo, flags, crc, created_at) in needles {
             let g_old = global_offset(old_id, local);
-            // A delete marker still in a history is a version and is kept (#31); other
-            // tombstones only matter until the needles they cover are gone, and those are
-            // older, so already compacted.
-            if flags & AWAN_FLAG_TOMBSTONE != 0 && (flags & crate::meta_index::FLAG_VERSIONED == 0 || !self.versions.read().holds_offset(b_id, &key, g_old)) {
+            // An unversioned tombstone only matters until the needles it covers are gone, and
+            // those are older, so already compacted. A delete marker is a version (#31): whether
+            // a history holds it is decided under the key lock below, like any needle, because
+            // its DELETE writes it first and records it later, under that lock (#182 review).
+            if flags & AWAN_FLAG_TOMBSTONE != 0 && flags & crate::meta_index::FLAG_VERSIONED == 0 {
                 report.dead_needles_reclaimed += 1;
                 continue;
             }
@@ -1663,6 +1676,17 @@ impl S3ServiceState {
         }
         let vm = self.volumes.read().get(&id).cloned().ok_or(VolumeError::CorruptIndex)?;
         Ok((vm, local))
+    }
+
+    /// The ids of the volumes this server has open, oldest first.
+    pub fn volume_ids(&self) -> Vec<u32> {
+        self.volumes.read().keys().copied().collect()
+    }
+
+    /// Writes reserved in volume `id` whose header is not written yet (#167); `None` when the
+    /// volume does not exist. Tests wait on it instead of sleeping.
+    pub fn volume_writers_in_flight(&self, id: u32) -> Option<usize> {
+        self.volumes.read().get(&id).map(|v| v.writers_in_flight())
     }
 
     /// Sets the span of the active volume and of every volume opened after it. Tests use a
