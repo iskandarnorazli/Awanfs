@@ -155,7 +155,7 @@ impl NeedleWriter {
         self.written
     }
 
-    pub fn write(&mut self, mut data: &[u8]) -> Result<(), VolumeError> {
+    pub fn write(&mut self, data: &[u8]) -> Result<(), VolumeError> {
         self.state = match crate::fsm::needle_step(self.state, crate::fsm::NeedleEvent::Write(data.len() as u64)) {
             Ok(next) => next,
             Err(r) => {
