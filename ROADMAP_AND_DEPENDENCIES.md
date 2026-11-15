@@ -11,6 +11,11 @@ Plan of record since 2026-11-12. The GitHub milestones Phase 1-4 hold the issues
 | 3. Scale and efficiency | Grow past one disk's worth of metadata and data without losing speed | #50 format version, #26 tiered metadata and Bloom filter, #13 redb review, #51 compression, #28 compaction throttle, #104 copy-on-write cloning, #31 versioning |
 | 4. Multi-node (future) | High availability across machines | #52 clustering design, #27 multi-drive erasure coding, #15 erasure and heartbeat code |
 
+Since 2026-11-14 the conformance work has its own milestones, "Conformance 0: foundations" to
+"Conformance 4: beyond S3 (decide first)"; their order and reasons are in
+[`CONFORMANCE_DESIGN.md`](CONFORMANCE_DESIGN.md) section 10, and the tracker is #123. Who may
+take which issue is in [`AGENTS.md`](AGENTS.md).
+
 ## Status (2026-11-13)
 
 - **Phase 1:** done except #57 (multipart throughput on Linux CI).

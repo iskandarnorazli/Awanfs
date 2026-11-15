@@ -2,6 +2,8 @@
 
 Thanks for your interest. The plan of record is the issue milestones and `ROADMAP_AND_DEPENDENCIES.md`; decisions are in `ARCHITECTURE.md`. Open an issue before a large change.
 
+Agents (and anyone working from the issue queue) also follow [`AGENTS.md`](AGENTS.md).
+
 ## Rules every change follows
 
 - **A test that fails before the change.** Write the test first. Then turn the fix off and show the test fail again (the negative control), and say so in the commit message.

@@ -14,6 +14,9 @@ pub struct CompactionReport {
     pub new_locations: HashMap<String, NeedleLocation>,
     /// The compacted volume's data file was deleted.
     pub volume_removed: bool,
+    /// Nothing was done: a write was still landing in the oldest volume (#167). The volume is
+    /// sealed, so the next pass finds it quiet once that write ends.
+    pub busy: bool,
 }
 
 pub fn compact_volume(

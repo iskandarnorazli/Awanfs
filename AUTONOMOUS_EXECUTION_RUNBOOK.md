@@ -1,3 +1,5 @@
+> **Superseded (2026-11-15).** This runbook drove the PoC build in awan-lang (milestone 10, finished). It is a record, not instructions: its paths, issue numbers and its "decide without asking" table do not apply to this repository. Agents follow [`AGENTS.md`](AGENTS.md).
+
 # Awan Storage S3 Hybrid PoC — Autonomous Execution Runbook (Flash Edition)
 
 > **Self-Contained Execution Guide for Completing Milestone #10 ([#462](https://github.com/iskandarnorazli/awan-lang/issues/462)–[#471](https://github.com/iskandarnorazli/awan-lang/issues/471)) Start-to-Finish**  
