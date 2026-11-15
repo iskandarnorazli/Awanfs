@@ -16,6 +16,9 @@ on:
       direct_read_min:
         description: "AWAN_DIRECT_READ_MIN for the server: GETs this size and up read with direct I/O (empty: the server's default)"
         default: ""
+      server_env:
+        description: "More server settings, space separated AWAN_* assignments (AWAN_READ_CHUNK=4MiB AWAN_READ_AHEAD=4)"
+        default: ""
   pull_request:
     paths:
       - "benchmarks/large_object_check.py"
@@ -84,10 +87,14 @@ jobs:
           SIZES: ${{ inputs.sizes || '16MiB,64MiB,256MiB' }}
           RUNS: ${{ inputs.runs || '3' }}
           DIRECT_READ_MIN: ${{ inputs.direct_read_min }}
+          SERVER_ENV: ${{ inputs.server_env }}
         run: |
           set +e
           # The server inherits this environment; an empty value means its default.
           if [ -n "$DIRECT_READ_MIN" ]; then export AWAN_DIRECT_READ_MIN="$DIRECT_READ_MIN"; echo "AWAN_DIRECT_READ_MIN=$AWAN_DIRECT_READ_MIN" >> "$GITHUB_STEP_SUMMARY"; fi
+          for kv in $SERVER_ENV; do
+            case "$kv" in AWAN_*=*) export "$kv"; echo "$kv" >> "$GITHUB_STEP_SUMMARY" ;; *) echo "not an AWAN_ setting: $kv"; exit 2 ;; esac
+          done
           python -u benchmarks/large_object_check.py --server-bin server/target/release/s3-server \
             --minio-bin .tmp/minio/minio --mc-bin .tmp/minio/mc \
             --sizes "$SIZES" --runs "$RUNS" \

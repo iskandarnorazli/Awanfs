@@ -105,12 +105,12 @@ async fn no_payload_byte_is_read_before_the_body_is_polled() {
     while let Some(frame) = stream.frame().await {
         let frame = frame.unwrap();
         let data = frame.into_data().unwrap();
-        assert!(data.len() <= s3_server::stream_read::READ_CHUNK, "frames are at most one read");
+        assert!(data.len() <= s3_server::stream_read::read_chunk(), "frames are at most one read");
         got.extend_from_slice(&data);
     }
     assert!(got == body);
     let read = state.work.snapshot().since(&before);
-    assert!(read.disk_reads >= 1 + (LEN / s3_server::stream_read::READ_CHUNK) as u64, "{:?}", read);
+    assert!(read.disk_reads >= 1 + (LEN / s3_server::stream_read::read_chunk()) as u64, "{:?}", read);
 }
 
 /// Flips one byte of the stored payload, behind the server's back.

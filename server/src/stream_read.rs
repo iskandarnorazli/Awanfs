@@ -2,13 +2,15 @@
 //! mapping (#155, step two; decision 46).
 //!
 //! One reader per response runs on the blocking pool. It starts on the body's first poll, so no
-//! payload byte is read before the headers are sent. It reads at most `READ_CHUNK` at a time,
+//! payload byte is read before the headers are sent. It reads `read_chunk()` at a time,
 //! by size (owner decision 1C): from `direct_read_min` up with direct I/O, in aligned windows,
 //! so the bytes stay in no cache; below it through the page cache, so a hot object is read
 //! again from memory. Neither way puts the bytes in the RSS, as reading through the volume
 //! mapping did. It hands each
-//! chunk over a channel of one slot: the reader waits while the client is slow, and a
-//! response holds at most four chunks: one being read, one held back until the next is read (so the last is sent only once the CRC is known), one in the slot, one being sent.
+//! chunk over a channel of `read_ahead()` slots: the reader waits while the client is slow, and a
+//! response holds at most `read_ahead() + 3` chunks: one being read, one held back until the
+//! next is read (so the last is sent only once the CRC is known), the slots, one being sent.
+//! Read buffers come back to a small pool when sent, so a chunk is neither allocated nor zeroed.
 //! When the client goes away the receiver is dropped, the next send fails, and the reader
 //! stops and frees its buffer.
 //!
@@ -23,8 +25,48 @@ use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// The size of one read and one body frame.
-pub const READ_CHUNK: usize = 1 << 20;
+/// The largest frame: tests check frames are no bigger. The size used is `read_chunk()`.
+pub const READ_CHUNK: usize = 4 << 20;
+
+/// The size of one read and one body frame: `AWAN_READ_CHUNK` (a size, at most `READ_CHUNK`),
+/// or 1 MiB. Read once.
+pub fn read_chunk() -> usize {
+    static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        std::env::var("AWAN_READ_CHUNK")
+            .ok()
+            .and_then(|v| crate::memory::parse_size(&v))
+            .map(|n| (n as usize).clamp(SECTOR_SIZE, READ_CHUNK) / SECTOR_SIZE * SECTOR_SIZE)
+            .unwrap_or(1 << 20)
+    })
+}
+
+/// How many chunks the reader may have read ahead of the response: `AWAN_READ_AHEAD` (1 to 8),
+/// or 1. Read once.
+pub fn read_ahead() -> usize {
+    static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *AHEAD.get_or_init(|| std::env::var("AWAN_READ_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1usize).clamp(1, 8))
+}
+
+/// Buffers a frame gives back when the response has sent it, so a chunk costs neither an
+/// allocation nor zeroing. At most `POOL_IDLE` wait here; the rest are freed.
+const POOL_IDLE: usize = 16;
+
+fn pool() -> &'static parking_lot::Mutex<Vec<AlignedBuffer>> {
+    static POOL: std::sync::OnceLock<parking_lot::Mutex<Vec<AlignedBuffer>>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+fn take_buffer(len: usize) -> AlignedBuffer {
+    let mut free = pool().lock();
+    while let Some(b) = free.pop() {
+        if b.len() == len {
+            return b;
+        }
+    }
+    drop(free);
+    AlignedBuffer::new(len)
+}
 
 /// Until it is measured (#155), every large GET goes through the page cache unless
 /// `AWAN_DIRECT_READ_MIN` (a size such as `256MiB`) says from which size to read direct.
@@ -80,7 +122,7 @@ impl hyper::body::Body for PreadBody {
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
         let this = &mut *self;
         if let Some((range, payload_at)) = this.start.take() {
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let (tx, rx) = tokio::sync::mpsc::channel(read_ahead());
             READERS.fetch_add(1, Ordering::SeqCst);
             tokio::task::spawn_blocking(move || {
                 read_into(range, payload_at, tx);
@@ -114,12 +156,24 @@ impl hyper::body::Body for PreadBody {
     }
 }
 
-/// The buffer one read lands in, handed to the response as it is: no copy.
-struct Window(AlignedBuffer);
+/// The buffer one read lands in, handed to the response as it is: no copy. Back to the pool
+/// when the response has sent it.
+struct Window(Option<AlignedBuffer>);
 
 impl AsRef<[u8]> for Window {
     fn as_ref(&self) -> &[u8] {
-        &self.0
+        self.0.as_deref().unwrap_or(&[])
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        if let Some(b) = self.0.take() {
+            let mut free = pool().lock();
+            if free.len() < POOL_IDLE {
+                free.push(b);
+            }
+        }
     }
 }
 
@@ -134,17 +188,19 @@ fn read_into(range: PayloadRange, payload_at: u64, tx: tokio::sync::mpsc::Sender
     // The chunk read last, held back until the next one is read (or the CRC is known).
     let mut held: Option<Bytes> = None;
     let step = |state: StreamState, event: StreamEvent| stream_step(state, event).unwrap_or(state);
+    let chunk_len = read_chunk();
     while pos < end {
-        let n = (READ_CHUNK as u64).min(end - pos);
+        let n = (chunk_len as u64).min(end - pos);
+        // One buffer size for every chunk, so pooled buffers fit any read.
+        let mut window = take_buffer(chunk_len + 2 * SECTOR_SIZE);
         let read = if range.direct {
             let lo = pos / sector * sector;
             let hi = (pos + n).div_ceil(sector) * sector;
-            let mut window = AlignedBuffer::new((hi - lo) as usize);
-            range.vm.read_aligned(lo, &mut window).map(|()| Bytes::from_owner(Window(window)).slice((pos - lo) as usize..(pos - lo + n) as usize))
+            range.vm.read_aligned(lo, &mut window[..(hi - lo) as usize]).map(|()| (pos - lo) as usize)
         } else {
-            let mut piece = vec![0u8; n as usize];
-            range.vm.read_cached(pos, &mut piece).map(|()| Bytes::from(piece))
-        };
+            range.vm.read_cached(pos, &mut window[..n as usize]).map(|()| 0)
+        }
+        .map(|at| Bytes::from_owner(Window(Some(window))).slice(at..at + n as usize));
         let chunk = match read {
             Ok(c) => c,
             Err(e) => {
