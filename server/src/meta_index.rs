@@ -41,6 +41,11 @@ pub const FLAG_VERSIONED: u16 = 0x0040;
 pub const FLAG_NULL_ID: u16 = 0x0080;
 /// A tombstone removing one version; its 8-byte payload is the id (0 for null).
 pub const FLAG_VERSION_DELETE: u16 = 0x0100;
+/// Reserved for attribute-update needles (decision 43, #150 stage 2).
+pub const FLAG_ATTR_UPDATE: u16 = 0x0200;
+/// The needle carries an attributes block (format 3, `crate::attrs`, #150): HEAD and GET read
+/// it; rows without the flag read nothing more than they did before.
+pub const FLAG_ATTRS: u16 = 0x0400;
 
 pub const AWAN_FLAG_ACTIVE: u16 = FLAG_ACTIVE;
 pub const AWAN_FLAG_TOMBSTONE: u16 = FLAG_TOMBSTONE;

@@ -148,6 +148,26 @@ that overlap another write of the same key. Versioned keys are ordered by versio
 commit, and are never copied. Ordering recovery by a commit stamp instead was weighed and not
 chosen: it changes a recovery rule for every key and makes it depend on the clock. #154.
 
+**Decision 57 (owner, 2026-11-15): every new volume is format 3.** Not only volumes that
+hold a needle with attributes. One rule, and attributes will be on most PUTs once user
+metadata (#152) lands. The cost: once this version has run, an AwanFS that reads only format 2
+refuses the new volumes, so there is no downgrade (there never was a promise of one).
+Existing format 1 and 2 volumes are read as they are. The owner also approved the test change
+this needed: `compression_test` checks that a new volume is the current format, not "format
+2" (#200).
+
+**Decision 56 (2026-11-15): objects keep offset order; attribute updates are ordered by a
+per-key stamp.** #150 asked that replay order every record of a key by a commit stamp from
+#154, but #154 kept offset order and relocates a late streamed PUT instead (decision 51).
+The two rules compose. An object, a tombstone or a version delete is replayed in offset order
+(unversioned) or by version id (versioned), as now. An attribute update (flag 0x200, #150
+stage two) names the version it changes by that version's creation time, and is ordered among
+the updates of that version and group by its own creation time. That time is taken under the
+key lock as one more than the newest it replaces (`next_ts`), so it does not depend on the
+clock going forward. An update whose version is gone at replay is dropped and counted.
+Compaction keeps only the newest live update per group, so moving updates into newer volumes
+cannot reorder them. Stage one (format 3, the block, Content-Type) needs none of this.
+
 **Decision 55 (2026-11-15): compaction seals a volume, and lists it only when no write is
 still landing in it.** A write reserves its offset before it writes its header, so a volume
 listed in between was missing that needle: not copied, then removed with the file, after the
