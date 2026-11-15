@@ -112,8 +112,11 @@ checksums the whole object before the first byte (measured: 20.7 ms to headers a
 Per-block checksums, which would verify ranges, were not chosen now. #155.
 Step one (PR #169) checksums a full GET while it is sent and leaves ranges unchecked: time to
 headers is 0.4 ms and a 1 MiB range 1.6 ms at 16, 64 and 256 MiB
-(`measurements/2026-11-14-large-objects-after-155-step1.md`). The bounded reader outside the
-mapping and the scrub are still to build.
+(`measurements/2026-11-14-large-objects-after-155-step1.md`). Step two (PR #202) reads objects
+above 4 MiB with positioned reads outside the mapping (`server/src/stream_read.rs`): peak RSS
+354.5 MiB against 1464.7 MiB (runs 43734237547 and 43722345701), first GET level with MinIO,
+repeat GETs with 4 clients still 0.61-0.67x of MinIO's throughput while the reader is tuned.
+The scrub is still to build.
 
 **Decision 47 (2026-11-14): the conformance target is S3 behaviour only.** It is `test_s3.py`
 and `test_headers.py` of the ceph suite, without the RGW-only tests and storage classes
@@ -250,7 +253,7 @@ Awan Storage is built on six non-negotiable systems engineering invariants:
 2. **Columnar Metadata Layout (`@flat`):** All object metadata is lowered automatically into contiguous primitive arrays (Struct-of-Arrays) paired with an append-only Key String Arena and an Adaptive Radix Tree (ART) prefix index.
 3. **32 GiB Sparse Virtual Volume Pre-Allocation (`FSCTL_SET_SPARSE`), no longer the default (decision 52, 2026-11-15: new volumes grow as they are written; what follows describes volumes created before it, and `AWAN_SPARSE_VOLUME=1`):** Volumes are initialized as 32 GiB virtual sparse files (`FSCTL_SET_SPARSE` on Windows NTFS, sparse holes on Linux) without allocating physical disk clusters upfront. They are mapped once at startup via `memmap2::Mmap` (`open_sparse`), completely eliminating runtime `remap()` latency stalls, page table invalidation, and reader lock serialization.
 4. **Staged Parallel Part Files for Multipart Uploads:** Parts upload to independent file handles under `.staging/<upload-id>/part_<num>.dat`, eliminating Windows kernel `FO_SYNCHRONOUS_IO` lock serialization across parallel multipart workers.
-5. **Zero-Copy Kernel Handoff & Direct Extent Slicing:** Range GETs directly slice memory-mapped volume and part extents via `Bytes::from_owner(MmapOwner(mmap)).slice(...)`, bypassing heap allocations and disk read syscalls.
+5. **Zero-Copy Kernel Handoff & Direct Extent Slicing, for objects up to 4 MiB and multipart parts:** their GETs slice memory-mapped volume and part extents via `Bytes::from_owner(MmapOwner(mmap)).slice(...)`, bypassing heap allocations and disk read syscalls. Single-needle objects above 4 MiB are read with positioned reads instead (decisions 46 and 53, #155): pages read through the mapping stay resident and count in the RSS, outside `--memory-budget`.
 6. **Deterministic Shard Ownership & Lock-Free MVCC Reads:** The metadata index is partitioned into $S$ cache-line-aligned shards by keyed hash. Point reads execute lock-free via optimistic epoch/seqlock pins, ensuring in-flight `GET` streams never observe torn writes during concurrent `PUT` overwrites.
 
 ---
