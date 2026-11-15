@@ -15,7 +15,7 @@ Owner decisions after the 2026-11-12 audit. The milestones Phase 1-4 on GitHub c
 | 3 | **Performance gates:** no absolute MiB/s targets. Layer 1: exact work counts per request type in `server/tests/work_count_test.rs` (every PR, both platforms). Layer 2: nightly AwanFS/MinIO throughput ratio on the same runner (`benchmarks/ratio_check.py`, baseline `benchmarks/ratio_baseline.json`). | #33, #34 |
 | 4 | **Order:** correctness and security first (Phase 1), then production operations (Phase 2), then scale and efficiency (Phase 3), multi-node last (Phase 4). | milestones |
 | 5 | **Topology:** single node; operators use RAID or ZFS for disk failure. Multi-node clustering is a design issue for when a production deployment needs high availability; `libs/awan-cluster` from awan-lang is an input to the design, not code to port. | #52, #27, #15 |
-| 6 | **Metadata:** keep the redb spill index; review it with the tiered metadata and Bloom filter work after Phase 1 (which reads its segments with positioned reads: decision 58). | #13, #26 |
+| 6 | **Metadata:** keep the redb spill index; review it with the tiered metadata and Bloom filter work after Phase 1 (which reads its segments with positioned reads: decision 58). Superseded by decision 59. | #13, #26, #207 |
 | 7 | **Compression:** opt-in per bucket, in independent 64 KiB blocks so range GETs stay cheap; off by default. | #51 |
 | 8 | **Observability:** structured logs with request IDs, Prometheus `/metrics`, OpenTelemetry traces, health endpoints, a Grafana dashboard and alert rules, and an S3 access log. | #41-#46 |
 
@@ -44,7 +44,7 @@ Owner decisions after the 2026-11-12 unattended run (#64-#83), each the recommen
 | 20 | **On-disk format:** refuse a newer version; read older versions as they are; write new volumes in the new format. No in-place upgrade. | #50 |
 | 21 | **Versioning** after #50 and #53. | #31 |
 | 22 | **Compression:** zstd level 1, enabled per bucket in the TOML config. | #51 |
-| 23 | **Metadata scale:** close #13 if the redb spill meets its gate; #26 waits as `unmeasured` until a deployment needs over 100M objects. | #13, #26 |
+| 23 | **Metadata scale:** close #13 if the redb spill meets its gate; #26 waits as `unmeasured` until a deployment needs over 100M objects. Superseded by decision 59: #26 is built to replace the redb spill once #207 measures it. | #13, #26, #207 |
 | 24 | **Compaction I/O:** token-bucket limit (50 MB/s, configurable); copy-on-write cloning only after a measurement. | #28 |
 | 25 | **Multi-node:** #15 closed as a duplicate of #27; the #52 design note after Phase 2; no code yet. | #15, #27, #52 |
 | 26 | **Benchmark hardware:** the owner's machine as a self-hosted runner (`benchmarks/RUNNER.md`); paid runners only for published numbers. | #58 |
@@ -153,6 +153,24 @@ if so writes the object again at the end of the log. The cost is one extra copy,
 that overlap another write of the same key. Versioned keys are ordered by version id, taken at
 commit, and are never copied. Ordering recovery by a commit stamp instead was weighed and not
 chosen: it changes a recovery rule for every key and makes it depend on the clock. #154.
+
+**Decision 59 (owner, 2026-11-16): the metadata index past the in-memory hot set is AwanFS's
+own sorted segments, not redb, if a measurement at 10M keys confirms it.** AwanFS uses none of
+what redb is built for. The volumes are the record, every boot clears `metadata.db` and rebuilds
+it from them, and its commits skip fsync. What it uses is a sorted map on disk, with a 64 MiB
+page cache outside `--memory-budget` (#206) and one copy-on-write write transaction per PUT of a
+spilled key. The segments of #26 do that job:
+- sorted, immutable runs of the 64-byte rows and their keys, in separate columns per block;
+- fence keys and a bloom filter in heap, read with positioned reads (decision 58);
+- a manifest of live segments, so a restart opens a checkpoint instead of rebuilding from every
+  volume;
+- compaction that merges runs and drops dead rows.
+They borrow awan-lang's flat-memory designs: the 64-byte row as stored, columns within a block,
+and SIMD search over keys. awan-lang's own collections (`awan-db`, `awan-cache`, the OLC B+tree
+of its #216) are in memory and in Awan, so none of their code is reused. Order: #207 measures
+redb against a segment prototype (insert rate, reads per lookup, peak RSS, boot time). Go builds
+#26 and removes `redb`; no-go keeps redb with #206's fix. Until then nothing changes, and redb
+stays.
 
 **Decision 58 (owner, 2026-11-16): stored data is read with positioned reads, not through
 mappings, wherever the bytes could grow without bound.** Pages read through a mapping stay
