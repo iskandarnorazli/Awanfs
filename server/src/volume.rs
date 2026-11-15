@@ -382,6 +382,22 @@ fn next_indexed(indexed: &BTreeSet<u64>, after: u64) -> Option<u64> {
     indexed.range(after + 1..).next().copied()
 }
 
+/// One write counted in `VolumeManager::writers_in_flight` (#167).
+struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Drop for NeedleWriter {
+    /// The streamed write has ended: finished (its header is written) or abandoned.
+    fn drop(&mut self) {
+        self.vm.writers_in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub struct VolumeManager {
     dir: PathBuf,
     volume_id: u32,
@@ -394,6 +410,11 @@ pub struct VolumeManager {
     max_span: AtomicU64,
     work: Arc<WorkCounters>,
     fail_next_write: std::sync::atomic::AtomicBool,
+    /// Writes that have reserved an offset here and not yet written their header (#167). A
+    /// streamed PUT counts from `begin_needle` until its `NeedleWriter` is dropped.
+    writers_in_flight: std::sync::atomic::AtomicUsize,
+    /// Set by compaction before it lists the needles: no new reservation lands here after it.
+    sealed: std::sync::atomic::AtomicBool,
     /// Needle offsets from the `.idx` journal at open time.
     indexed: BTreeSet<u64>,
     /// Format version in the superblock: what the needles of this volume may use (FORMAT.md).
@@ -591,6 +612,8 @@ impl VolumeManager {
             max_span: AtomicU64::new(MAX_VOLUME_SPAN),
             work: Arc::new(WorkCounters::default()),
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
+            writers_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            sealed: std::sync::atomic::AtomicBool::new(false),
             indexed,
             format,
         })
@@ -848,6 +871,8 @@ impl VolumeManager {
             buf[raw_len..total_len as usize].fill(0);
         }
 
+        // Counted from before the reservation to the end of this function (#167).
+        let _in_flight = self.enter_write(total_len)?;
         // A WORM volume never reuses space: a needle that would end past the span is refused,
         // and the reserved range stays unused, so later writes are refused too.
         let offset = self.current_offset.fetch_add(total_len, Ordering::SeqCst);
@@ -882,6 +907,9 @@ impl VolumeManager {
     pub fn begin_needle(self: &Arc<Self>, bucket_id: u16, key: &str, payload_size: u64, flags: u16) -> Result<NeedleWriter, VolumeError> {
         let key_len = key.len();
         let total_len = (64 + key_len as u64 + payload_size).div_ceil(SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
+        // Counted until the writer is dropped, after its header is written or it is abandoned
+        // (#167). `forget` hands the count to the writer below.
+        let in_flight = self.enter_write(total_len)?;
         let offset = self.current_offset.fetch_add(total_len, Ordering::SeqCst);
         if offset + total_len > self.max_span() {
             return Err(VolumeError::VolumeFull { offset, len: total_len });
@@ -889,6 +917,7 @@ impl VolumeManager {
         if self.fail_next_write.swap(false, Ordering::SeqCst) {
             return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected write failure")));
         }
+        std::mem::forget(in_flight);
         let mut first = AlignedBuffer::new(SECTOR_SIZE);
         first.fill(0);
         Ok(NeedleWriter {
@@ -907,6 +936,30 @@ impl VolumeManager {
             chunk_fill: 0,
             created_at: None,
         })
+    }
+
+    /// Counts a write that is about to reserve an offset, or refuses it with `VolumeFull`
+    /// when the volume is sealed, so the caller moves to the active volume. The count goes up
+    /// before `sealed` is read, and `seal` sets `sealed` before compaction reads the count
+    /// (both SeqCst): either the write sees the seal, or compaction sees the write.
+    fn enter_write(&self, len: u64) -> Result<InFlight<'_>, VolumeError> {
+        self.writers_in_flight.fetch_add(1, Ordering::SeqCst);
+        let guard = InFlight(&self.writers_in_flight);
+        if self.sealed.load(Ordering::SeqCst) {
+            return Err(VolumeError::VolumeFull { offset: self.current_offset.load(Ordering::SeqCst), len });
+        }
+        Ok(guard)
+    }
+
+    /// No reservation lands in this volume after this returns (#167). Compaction seals the
+    /// volume it is about to list; writers still holding it are sent to the active volume.
+    pub fn seal(&self) {
+        self.sealed.store(true, Ordering::SeqCst);
+    }
+
+    /// Writes that reserved an offset here and have not written their header yet.
+    pub fn writers_in_flight(&self) -> usize {
+        self.writers_in_flight.load(Ordering::SeqCst)
     }
 
     /// Reads a needle payload as a zero-copy Bytes slice directly from the memory map.

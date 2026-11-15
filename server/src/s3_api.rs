@@ -1262,6 +1262,7 @@ impl S3ServiceState {
                 tokio::time::sleep(every).await;
                 let Some(state) = weak.upgrade() else { return };
                 match state.auto_compact_once(threshold, min_bytes).await {
+                    Ok(Some(r)) if r.busy => eprintln!("auto-compaction: the oldest volume still has a write in flight; next pass"),
                     Ok(Some(r)) => eprintln!(
                         "auto-compaction: moved {} live needles, reclaimed {} dead ones",
                         r.live_needles_copied, r.dead_needles_reclaimed
@@ -1278,6 +1279,8 @@ impl S3ServiceState {
     /// - each live needle is copied under its key lock, and the index row moves only if it
     ///   still points at the old needle, so a concurrent PUT or DELETE wins and is never
     ///   followed in the log by an older copy;
+    /// - the volume is sealed and listed only once no write is still landing in it (#167), so
+    ///   every needle that will ever be in it is listed;
     /// - the copies are synced before the old files are removed;
     /// - only the oldest volume is compacted: a tombstone there can only hide needles in the
     ///   same volume, so dropping it cannot bring a deleted object back after a restart.
@@ -1290,6 +1293,14 @@ impl S3ServiceState {
             _ => return Ok(CompactionReport::default()),
         };
         let old_id = old.id();
+        // A write that reserved an offset in this volume and has not written its header would
+        // not be listed, so not copied, and would land in the file removed below (#167;
+        // verification/tla, compact_no_wait.cfg). Seal it first, so no new write lands in it,
+        // then list it only when no write is in flight. A busy volume is left for the next pass.
+        old.seal();
+        if old.writers_in_flight() > 0 {
+            return Ok(CompactionReport { busy: true, ..CompactionReport::default() });
+        }
         let mut needles = Vec::new();
         old.scan_needles(|n| needles.push((n.bucket_id as u32, n.key, n.offset, n.payload_size, n.etag_hi, n.etag_lo, n.flags, n.payload_crc32c, n.created_at_ns)))?;
 
@@ -1663,6 +1674,11 @@ impl S3ServiceState {
         }
         let vm = self.volumes.read().get(&id).cloned().ok_or(VolumeError::CorruptIndex)?;
         Ok((vm, local))
+    }
+
+    /// The ids of the volumes this server has open, oldest first.
+    pub fn volume_ids(&self) -> Vec<u32> {
+        self.volumes.read().keys().copied().collect()
     }
 
     /// Sets the span of the active volume and of every volume opened after it. Tests use a
