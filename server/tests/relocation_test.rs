@@ -106,6 +106,9 @@ async fn a_write_that_failed_after_its_header_does_not_win_after_a_restart() {
     assert_eq!(status, StatusCode::OK);
     assert!(got == streamed, "live: the streamed PUT is the object");
     let relocations = state.stream_relocations.load(Ordering::SeqCst);
+    // Operators see it too: the counter is exported.
+    let metrics = c.get(format!("{}/_awanfs/metrics", url)).send().await.unwrap().text().await.unwrap();
+    assert!(metrics.lines().any(|l| l == format!("awanfs_stream_relocations_total {}", relocations)), "{}", metrics);
     handle.shutdown();
     drop(state);
 

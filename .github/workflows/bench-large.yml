@@ -22,6 +22,7 @@ on:
   pull_request:
     paths:
       - "benchmarks/large_object_check.py"
+      - "benchmarks/relocation_rss.py"
       - ".github/workflows/bench-large.yml"
 
 permissions:
@@ -79,7 +80,7 @@ jobs:
         run: .tmp/minio/minio --version && .tmp/minio/mc --version
 
       - name: Self-tests
-        run: python benchmarks/test_large_object_check.py
+        run: python benchmarks/test_large_object_check.py && python benchmarks/test_relocation_rss.py
 
       - name: Run the large-object check
         timeout-minutes: 40
@@ -103,9 +104,24 @@ jobs:
           [ -f large_report.md ] && cat large_report.md >> "$GITHUB_STEP_SUMMARY"
           exit $code
 
+      # #185: peak RSS while a 64 MiB streamed PUT is copied to the end of the log, under a 32 MiB
+      # budget. After the large-object check and with if: always(), so neither hides the other.
+      - name: Relocation under a memory budget
+        if: always()
+        timeout-minutes: 10
+        run: |
+          set +e
+          python -u benchmarks/relocation_rss.py --server-bin server/target/release/s3-server \
+            --size 64MiB --budget 32MiB --budget-mib 32 --overhead-mib 16 --report relocation_rss.md
+          code=$?
+          [ -f relocation_rss.md ] && cat relocation_rss.md >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: large-report
-          path: large_report.md
+          path: |
+            large_report.md
+            relocation_rss.md
           if-no-files-found: ignore

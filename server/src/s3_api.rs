@@ -2116,7 +2116,7 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
     let (hits, misses) = state.payload_cache.hit_counts();
     let w = state.work.snapshot();
     let budget = crate::memory::effective();
-    let gauges: [(&str, &str, &str, u64); 18] = [
+    let gauges: [(&str, &str, &str, u64); 20] = [
         ("awanfs_volume_used_bytes", "gauge", "Bytes written into all open volumes, including dead needles.", used),
         ("awanfs_volume_free_span_bytes", "gauge", "Span left in the active volume before it rolls over.", free),
         ("awanfs_volumes_open", "gauge", "Open volumes.", state.volumes.read().len() as u64),
@@ -2134,6 +2134,18 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
         ("awanfs_memory_budget_bytes", "gauge", "Memory the server may hold (--memory-budget).", budget.total),
         ("awanfs_memory_budget_cache_bytes", "gauge", "The budget's half for the payload cache.", budget.cache),
         ("awanfs_memory_budget_bodies_bytes", "gauge", "The budget's half for in-flight request bodies.", budget.bodies),
+        (
+            "awanfs_read_checksum_failures_total",
+            "counter",
+            "Full GETs cut because the bytes read failed their payload checksum (decision 46).",
+            state.read_checksum_failures.load(Ordering::Relaxed),
+        ),
+        (
+            "awanfs_stream_relocations_total",
+            "counter",
+            "Streamed PUTs copied to the end of the log because their key was written meanwhile (decision 51).",
+            state.stream_relocations.load(Ordering::Relaxed),
+        ),
         (
             "awanfs_log_lines_dropped_total",
             "counter",
