@@ -114,9 +114,12 @@ Step one (PR #169) checksums a full GET while it is sent and leaves ranges unche
 headers is 0.4 ms and a 1 MiB range 1.6 ms at 16, 64 and 256 MiB
 (`measurements/2026-11-14-large-objects-after-155-step1.md`). Step two (PR #202) reads objects
 above 4 MiB with positioned reads outside the mapping (`server/src/stream_read.rs`): peak RSS
-354.5 MiB against 1464.7 MiB (runs 43734237547 and 43722345701), first GET level with MinIO,
-repeat GETs with 4 clients still 0.61-0.67x of MinIO's throughput while the reader is tuned.
-The scrub is still to build.
+370.5 MiB against 1464.7 MiB, with every GET row above MinIO's: first GET 2.05-2.35x, repeat
+GETs with 4 clients 1.21-1.38x (runs 43736773027 and 43722345701,
+`measurements/2026-11-16-large-objects-155-step2.md`). The win was reusing read buffers. Reads
+go through the page cache by default: direct reads were slower at every size measured, up to
+256 MiB, so `AWAN_DIRECT_READ_MIN` is off until a larger size shows it helps (owner decision
+1C keeps the setting). The scrub is still to build.
 
 **Decision 47 (2026-11-14): the conformance target is S3 behaviour only.** It is `test_s3.py`
 and `test_headers.py` of the ceph suite, without the RGW-only tests and storage classes

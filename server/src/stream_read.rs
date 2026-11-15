@@ -68,8 +68,9 @@ fn take_buffer(len: usize) -> AlignedBuffer {
     AlignedBuffer::new(len)
 }
 
-/// Until it is measured (#155), every large GET goes through the page cache unless
-/// `AWAN_DIRECT_READ_MIN` (a size such as `256MiB`) says from which size to read direct.
+/// Every large GET goes through the page cache unless `AWAN_DIRECT_READ_MIN` (a size such as
+/// `1GiB`) says from which size to read direct. Measured up to 256 MiB, direct reads were slower
+/// at every size (`measurements/2026-11-16-large-objects-155-step2.md`).
 pub const DEFAULT_DIRECT_READ_MIN: u64 = u64::MAX;
 
 pub fn direct_read_min_from_env() -> u64 {
