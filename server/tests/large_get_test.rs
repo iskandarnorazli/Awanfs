@@ -129,6 +129,8 @@ async fn a_corrupted_large_object_cannot_be_received_whole() {
             Ok(b) => panic!("{}: a corrupted object was received as a complete body of {} bytes (equal to the original: {})", name, b.len(), b[..] == data[..]),
         }
         assert_eq!(state.read_checksum_failures.load(Ordering::SeqCst), 1, "{}: the failure is counted", name);
+        let metrics = c.get(format!("{}/_awanfs/metrics", url)).send().await.unwrap().text().await.unwrap();
+        assert!(metrics.lines().any(|l| l == "awanfs_read_checksum_failures_total 1"), "{}: exported to operators:\n{}", name, metrics);
 
         // Decision 46: a range is not verified. One that misses the bad byte is right...
         let clean = if at < 2 * MIB { (4 * MIB, 5 * MIB - 1) } else { (0, MIB - 1) };
