@@ -17,12 +17,14 @@ decisions are numbered in [`ARCHITECTURE.md`](ARCHITECTURE.md); stored bytes are
 - An issue blocked by another (GitHub's "blocked by" link, or a first line "Blocked by #N") waits until #N is closed.
 - Never start an issue labelled `outline` or `needs-decision`.
 - These need Claude or the owner, even when an issue seems to ask for them. Stop with `needs-decision` and say which:
-  - stored bytes: the needle header, the journal, the bucket manifest's record kinds, the volume format (`FORMAT.md`);
+  - stored bytes in volumes: the needle header, the journal, the volume format (`FORMAT.md`). A bucket manifest record is allowed when the issue gives its exact text and its gate has restart and replay tests;
   - recovery and replay, the key lock, the commit path, group commit, compaction;
   - authentication, authorization, SigV4, IAM, encryption;
   - the meaning of a TLA+ model in `verification/tla` (adding the configuration an issue names is fine);
   - the rules of an existing machine in `server/src/fsm.rs` (wiring a handler to it is fine);
   - any decision in `ARCHITECTURE.md`. A test never reverses one.
+
+  Moving code is not changing it: a refactor may move such code when the issue says so, if what it decides and stores is unchanged and the existing tests pass untouched.
 
 ## How an issue is worked
 
