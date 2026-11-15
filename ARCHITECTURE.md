@@ -148,6 +148,14 @@ that overlap another write of the same key. Versioned keys are ordered by versio
 commit, and are never copied. Ordering recovery by a commit stamp instead was weighed and not
 chosen: it changes a recovery rule for every key and makes it depend on the clock. #154.
 
+**Decision 57 (owner, 2026-11-15): every new volume is format 3.** Not only volumes that
+hold a needle with attributes. One rule, and attributes will be on most PUTs once user
+metadata (#152) lands. The cost: once this version has run, an AwanFS that reads only format 2
+refuses the new volumes, so there is no downgrade (there never was a promise of one).
+Existing format 1 and 2 volumes are read as they are. The owner also approved the test change
+this needed: `compression_test` checks that a new volume is the current format, not "format
+2" (#200).
+
 **Decision 56 (2026-11-15): objects keep offset order; attribute updates are ordered by a
 per-key stamp.** #150 asked that replay order every record of a key by a commit stamp from
 #154, but #154 kept offset order and relocates a late streamed PUT instead (decision 51).
