@@ -1,0 +1,76 @@
+name: Past the hot set (experiment)
+
+# #210: today's server as it passes its 100,000-object hot set and grows to 1M objects: PUT and
+# GET throughput and latency at 64 clients, peak RSS, and the time a restart takes. The "before"
+# numbers for #26 (decision 59). An experiment with no baseline: it fails only when an answer
+# was wrong or a phase did not run.
+
+on:
+  # A new workflow can be dispatched only once it is on the default branch; until then a push
+  # to the measurement branch runs it with the default inputs.
+  push:
+    branches: [ "measure/210-*" ]
+    paths:
+      - "server/examples/hot_set_bench.rs"
+      - "benchmarks/hot_set_scale.py"
+      - ".github/workflows/bench-hotset.yml"
+  workflow_dispatch:
+    inputs:
+      objects:
+        description: "Objects to PUT"
+        default: "1000000"
+      window:
+        description: "PUTs per window"
+        default: "50000"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: hot set (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      - name: Self-tests
+        run: python benchmarks/test_hot_set_scale.py
+
+      - name: Build the server and the client
+        run: cargo build --locked --release --bin s3-server --example hot_set_bench --manifest-path server/Cargo.toml
+
+      - name: Run it
+        shell: bash
+        env:
+          OBJECTS: ${{ inputs.objects || '1000000' }}
+          WINDOW: ${{ inputs.window || '50000' }}
+          # The runner's temp directory: on Windows it is on the fast disk (D:), see AGENTS.md.
+          DATA: ${{ runner.temp }}/hotset
+        run: |
+          set -uo pipefail
+          python -u benchmarks/hot_set_scale.py --server server/target/release/s3-server \
+            --client server/target/release/examples/hot_set_bench \
+            --objects "$OBJECTS" --window "$WINDOW" --data-dir "$DATA" \
+            --results hot_set.jsonl --report hot_set.md \
+            --title "Today's server past its hot set, $OBJECTS objects ($RUNNER_OS)"
+          code=$?
+          [ -f hot_set.md ] && cat hot_set.md >> "$GITHUB_STEP_SUMMARY"
+          [ -f "$DATA/server.log" ] && tail -n 20 "$DATA/server.log"
+          exit $code
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hot-set-${{ matrix.os }}
+          path: |
+            hot_set.jsonl
+            hot_set.md
+          if-no-files-found: ignore
