@@ -16,3 +16,32 @@ server/fuzz/target/
 server/fuzz/artifacts/
 server/fuzz/Cargo.lock
 server/fuzz/coverage/
+# Self-hosted GitHub Actions runner: binaries, job workspace, logs and its
+# registration credentials. Never commit it.
+actions-runner/
+
+# Local environment and secrets
+.env
+.env.*
+*.pem
+*.key
+!server/tests/fixtures/**/*.pem
+!server/tests/fixtures/**/*.key
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python tooling
+.venv/
+venv/
+.pytest_cache/
+*.pyc
+
+# Logs
+*.log
