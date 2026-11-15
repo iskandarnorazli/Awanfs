@@ -1,4 +1,7 @@
 target/
+# A self-hosted runner installed inside a checkout (the owner's laptop has one): its folder
+# holds the runner's credentials and private key, and a nested checkout in _work.
+actions-runner/
 **/target/
 __pycache__/
 *.exe

@@ -1,3 +1,5 @@
+> **Historical (2026-11-15).** The PoC this describes is built. Current design: [`ARCHITECTURE.md`](ARCHITECTURE.md), [`FORMAT.md`](FORMAT.md), [`CONFORMANCE_DESIGN.md`](CONFORMANCE_DESIGN.md). Agents follow [`AGENTS.md`](AGENTS.md).
+
 # Awan Storage: Hybrid S3 Substrate & MinIO Benchmark PoC Specification
 
 > **Specification for Phase 2 Fast-Track Drop-In S3 PoC**  
