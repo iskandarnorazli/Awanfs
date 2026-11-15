@@ -280,3 +280,36 @@ impl AlignedFile {
         self.file.sync_data()
     }
 }
+
+/// A positioned read through the page cache (no alignment), on a file opened without direct
+/// I/O. Lock-free across callers: no shared cursor. Pages read this way stay in the page
+/// cache but not in the process's RSS, unlike pages read through a mapping (#155).
+pub fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut total_read = 0;
+        while total_read < buf.len() {
+            let n = file.seek_read(&mut buf[total_read..], offset + total_read as u64)?;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected eof in seek_read"));
+            }
+            total_read += n;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file_clone = file.try_clone()?;
+        file_clone.seek(SeekFrom::Start(offset))?;
+        file_clone.read_exact(buf)
+    }
+}

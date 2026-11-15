@@ -659,6 +659,9 @@ pub struct S3ServiceState {
     pub key_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
     /// Large objects whose bytes failed their checksum while being sent (#155).
     pub read_checksum_failures: Arc<AtomicU64>,
+    /// GETs of at least this many bytes are read with direct I/O; smaller ones through the
+    /// page cache (owner decision 1C, 2026-11-15, #155). `AWAN_DIRECT_READ_MIN`.
+    pub direct_read_min: AtomicU64,
     /// Streamed PUTs in flight, and what was appended for their keys meanwhile (#154).
     pub streams: Arc<StreamsInFlight>,
     /// Streamed PUTs written a second time because their key was written or deleted while
@@ -724,6 +727,7 @@ impl S3ServiceState {
             test_hook: Arc::new(RwLock::new(None)),
             key_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
             read_checksum_failures: Arc::new(AtomicU64::new(0)),
+            direct_read_min: AtomicU64::new(crate::stream_read::direct_read_min_from_env()),
             streams: Arc::new(StreamsInFlight::default()),
             stream_relocations: Arc::new(AtomicU64::new(0)),
             auth: crate::auth::AuthConfig::open(),
@@ -964,6 +968,7 @@ impl S3ServiceState {
             test_hook: Arc::new(RwLock::new(None)),
             key_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
             read_checksum_failures: Arc::new(AtomicU64::new(0)),
+            direct_read_min: AtomicU64::new(crate::stream_read::direct_read_min_from_env()),
             streams: Arc::new(StreamsInFlight::default()),
             stream_relocations: Arc::new(AtomicU64::new(0)),
             auth: crate::auth::AuthConfig::open(),
@@ -1698,6 +1703,7 @@ impl S3ServiceState {
             local,
             start,
             len,
+            direct: len >= self.direct_read_min.load(Ordering::Relaxed),
             verify: verify.then_some(expected_crc),
             what,
             failures: Arc::clone(&self.read_checksum_failures),

@@ -59,25 +59,29 @@ async fn a_full_get_and_ranges_of_a_large_object_do_not_use_the_mapping() {
     let body = noise(LEN, 1);
     put_object(&c, &url, "big", &body).await;
     let before = remaps(&state);
+    // Both read modes (owner decision 1C): direct I/O, then the page cache.
+    for direct_read_min in [0, u64::MAX] {
+        state.direct_read_min.store(direct_read_min, Ordering::SeqCst);
 
-    let got = c.get(format!("{}/pbkt/big", url)).send().await.unwrap().bytes().await.unwrap();
-    assert!(got[..] == body[..], "the full GET is the object");
+        let got = c.get(format!("{}/pbkt/big", url)).send().await.unwrap().bytes().await.unwrap();
+        assert!(got[..] == body[..], "the full GET is the object (direct_read_min {})", direct_read_min);
 
-    // Ranges across the 1 MiB read boundaries and the sector boundaries, at both ends.
-    let mut x = 7u64;
-    let mut ranges = vec![(0u64, 0u64), (0, 4095), (4095, 4096), ((1 << 20) - 1, 1 << 20), (LEN as u64 - 1, LEN as u64 - 1), (0, LEN as u64 - 1)];
-    for _ in 0..24 {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let a = (x >> 11) % LEN as u64;
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let b = (a + (x >> 11) % (3 << 20)).min(LEN as u64 - 1);
-        ranges.push((a, b));
-    }
-    for (a, b) in ranges {
-        let res = c.get(format!("{}/pbkt/big", url)).header("range", format!("bytes={}-{}", a, b)).send().await.unwrap();
-        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
-        let got = res.bytes().await.unwrap();
-        assert!(got[..] == body[a as usize..=b as usize], "bytes {}-{}", a, b);
+        // Ranges across the 1 MiB read boundaries and the sector boundaries, at both ends.
+        let mut x = 7u64;
+        let mut ranges = vec![(0u64, 0u64), (0, 4095), (4095, 4096), ((1 << 20) - 1, 1 << 20), (LEN as u64 - 1, LEN as u64 - 1), (0, LEN as u64 - 1)];
+        for _ in 0..24 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let a = (x >> 11) % LEN as u64;
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let b = (a + (x >> 11) % (3 << 20)).min(LEN as u64 - 1);
+            ranges.push((a, b));
+        }
+        for (a, b) in ranges {
+            let res = c.get(format!("{}/pbkt/big", url)).header("range", format!("bytes={}-{}", a, b)).send().await.unwrap();
+            assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+            let got = res.bytes().await.unwrap();
+            assert!(got[..] == body[a as usize..=b as usize], "bytes {}-{} (direct_read_min {})", a, b, direct_read_min);
+        }
     }
     assert_eq!(remaps(&state), before, "no GET of the large object mapped the volume");
 }
@@ -139,7 +143,8 @@ async fn a_corrupted_byte_in_the_first_a_middle_or_the_last_chunk_cuts_a_full_ge
     let b_id = state.engine.read().lookup_bucket("pbkt").unwrap();
     let (_, local) = split_offset(state.engine.read().get_object(b_id, b"big").unwrap().vol_offset);
 
-    for at in [10u64, 3 * 1024 * 1024 + 17, LEN as u64 - 5] {
+    for (at, direct_read_min) in [10u64, 3 * 1024 * 1024 + 17, LEN as u64 - 5].into_iter().flat_map(|at| [(at, 0), (at, u64::MAX)]) {
+        state.direct_read_min.store(direct_read_min, Ordering::SeqCst);
         let failures = state.read_checksum_failures.load(Ordering::SeqCst);
         let old = corrupt(&dir, local, "big", at);
         let res = c.get(format!("{}/pbkt/big", url)).send().await.unwrap();

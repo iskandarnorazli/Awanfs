@@ -2,8 +2,11 @@
 //! mapping (#155, step two; decision 46).
 //!
 //! One reader per response runs on the blocking pool. It starts on the body's first poll, so no
-//! payload byte is read before the headers are sent. It reads aligned windows of at most
-//! `READ_CHUNK` with direct I/O, so the bytes do not stay in the page cache. It hands each
+//! payload byte is read before the headers are sent. It reads at most `READ_CHUNK` at a time,
+//! by size (owner decision 1C): from `direct_read_min` up with direct I/O, in aligned windows,
+//! so the bytes stay in no cache; below it through the page cache, so a hot object is read
+//! again from memory. Neither way puts the bytes in the RSS, as reading through the volume
+//! mapping did. It hands each
 //! chunk over a channel of one slot: the reader waits while the client is slow, and a
 //! response holds at most four chunks: one being read, one held back until the next is read (so the last is sent only once the CRC is known), one in the slot, one being sent.
 //! When the client goes away the receiver is dropped, the next send fails, and the reader
@@ -23,6 +26,14 @@ use std::sync::Arc;
 /// The size of one read and one body frame.
 pub const READ_CHUNK: usize = 1 << 20;
 
+/// Until it is measured (#155), every large GET goes through the page cache unless
+/// `AWAN_DIRECT_READ_MIN` (a size such as `256MiB`) says from which size to read direct.
+pub const DEFAULT_DIRECT_READ_MIN: u64 = u64::MAX;
+
+pub fn direct_read_min_from_env() -> u64 {
+    std::env::var("AWAN_DIRECT_READ_MIN").ok().and_then(|v| crate::memory::parse_size(&v)).unwrap_or(DEFAULT_DIRECT_READ_MIN)
+}
+
 static READERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Readers running now, in this process. Tests wait for it to fall to 0 after a client leaves.
@@ -36,6 +47,8 @@ pub struct PayloadRange {
     pub local: u64,
     pub start: u64,
     pub len: u64,
+    /// Read with direct I/O (aligned windows) rather than through the page cache.
+    pub direct: bool,
     /// The payload CRC to check, for a range that is the whole payload.
     pub verify: Option<u32>,
     /// For the log line on a checksum mismatch.
@@ -123,16 +136,24 @@ fn read_into(range: PayloadRange, payload_at: u64, tx: tokio::sync::mpsc::Sender
     let step = |state: StreamState, event: StreamEvent| stream_step(state, event).unwrap_or(state);
     while pos < end {
         let n = (READ_CHUNK as u64).min(end - pos);
-        let lo = pos / sector * sector;
-        let hi = (pos + n).div_ceil(sector) * sector;
-        let mut window = AlignedBuffer::new((hi - lo) as usize);
-        if let Err(e) = range.vm.read_aligned(lo, &mut window) {
-            state = step(state, StreamEvent::ReadError);
-            let _ = tx.blocking_send(Err(std::io::Error::other(format!("could not read the object: {:?}", e))));
-            debug_assert_eq!(state, StreamState::Aborted(StreamAbort::ReadError));
-            return;
-        }
-        let chunk = Bytes::from_owner(Window(window)).slice((pos - lo) as usize..(pos - lo + n) as usize);
+        let read = if range.direct {
+            let lo = pos / sector * sector;
+            let hi = (pos + n).div_ceil(sector) * sector;
+            let mut window = AlignedBuffer::new((hi - lo) as usize);
+            range.vm.read_aligned(lo, &mut window).map(|()| Bytes::from_owner(Window(window)).slice((pos - lo) as usize..(pos - lo + n) as usize))
+        } else {
+            let mut piece = vec![0u8; n as usize];
+            range.vm.read_cached(pos, &mut piece).map(|()| Bytes::from(piece))
+        };
+        let chunk = match read {
+            Ok(c) => c,
+            Err(e) => {
+                state = step(state, StreamEvent::ReadError);
+                let _ = tx.blocking_send(Err(std::io::Error::other(format!("could not read the object: {:?}", e))));
+                debug_assert_eq!(state, StreamState::Aborted(StreamAbort::ReadError));
+                return;
+            }
+        };
         if range.verify.is_some() {
             crc = crc32c::crc32c_append(crc, &chunk);
             work.payload_verify(n);

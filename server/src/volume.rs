@@ -459,6 +459,8 @@ pub struct VolumeManager {
     /// 2.5 ms a write against 0.02 ms (`measurements/2026-11-14-sync-probe.md`). A flush
     /// covers the file, whichever handle asks for it.
     file_sync: File,
+    /// A read-only handle without direct I/O, for GETs read through the page cache (#155).
+    file_cached: File,
     durability: std::sync::atomic::AtomicU8,
     /// Sequence number of the last write whose needle and journal record are written.
     written_seq: AtomicU64,
@@ -626,6 +628,7 @@ impl VolumeManager {
         // Second opens, not `try_clone`: see `file_sync`.
         let idx_sync = OpenOptions::new().write(true).open(&idx_path)?;
         let file_sync = OpenOptions::new().write(true).open(&dat_path)?;
+        let file_cached = OpenOptions::new().read(true).open(&dat_path)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             volume_id,
@@ -633,6 +636,7 @@ impl VolumeManager {
             idx_file: Mutex::new(idx_file),
             idx_sync,
             file_sync,
+            file_cached,
             durability: std::sync::atomic::AtomicU8::new(Durability::Group.code()),
             written_seq: AtomicU64::new(0),
             sync_state: std::sync::Mutex::new(SyncState::default()),
@@ -1032,6 +1036,15 @@ impl VolumeManager {
         hdr_bytes.copy_from_slice(&buf[0..64]);
         let header = NeedleHeader::decode(&hdr_bytes)?;
         Ok((local + header.payload_start() as u64, header.payload_size))
+    }
+
+    /// A positioned read of `buf.len()` bytes at `offset` through the page cache: any offset
+    /// and length. Repeat reads of a hot object come from memory, and the pages do not count
+    /// in the RSS as mapped pages do (#155).
+    pub fn read_cached(&self, offset: u64, buf: &mut [u8]) -> Result<(), VolumeError> {
+        self.work.disk_read();
+        crate::direct_io::read_exact_at(&self.file_cached, offset, buf)?;
+        Ok(())
     }
 
     /// A positioned read of `buf.len()` bytes at `offset`, both sector aligned, with direct
