@@ -431,6 +431,8 @@ pub struct VolumeManager {
     max_span: AtomicU64,
     work: Arc<WorkCounters>,
     fail_next_write: std::sync::atomic::AtomicBool,
+    /// Tests: the next journal append fails, after the needle is on disk (#184).
+    fail_next_index: std::sync::atomic::AtomicBool,
     /// Writes that have reserved an offset here and not yet written their header (#167). A
     /// streamed PUT counts from `begin_needle` until its `NeedleWriter` is dropped.
     writers_in_flight: std::sync::atomic::AtomicUsize,
@@ -639,6 +641,7 @@ impl VolumeManager {
             max_span: AtomicU64::new(MAX_VOLUME_SPAN),
             work: Arc::new(WorkCounters::default()),
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
+            fail_next_index: std::sync::atomic::AtomicBool::new(false),
             writers_in_flight: std::sync::atomic::AtomicUsize::new(0),
             sealed: std::sync::atomic::AtomicBool::new(false),
             gaps: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
@@ -668,6 +671,12 @@ impl VolumeManager {
     /// as a disk error would, leaving a gap in the volume.
     pub fn fail_next_write(&self) {
         self.fail_next_write.store(true, Ordering::SeqCst);
+    }
+
+    /// Tests: makes the next journal append fail after its needle was written, which leaves
+    /// a complete record in the volume that the write reports as failed (#184).
+    pub fn fail_next_index(&self) {
+        self.fail_next_index.store(true, Ordering::SeqCst);
     }
 
     /// Largest byte offset a needle may reach in this volume (default `MAX_VOLUME_SPAN`).
@@ -708,6 +717,9 @@ impl VolumeManager {
 
     /// Appends one record to the `.idx` journal.
     fn append_index(&self, key_hash: u64, offset: u64, total_len: u64, payload_size: u64, flags: u16, crc: u32) -> Result<(), VolumeError> {
+        if self.fail_next_index.swap(false, Ordering::SeqCst) {
+            return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected index failure")));
+        }
         let mut rec = [0u8; IDX_RECORD];
         rec[0..8].copy_from_slice(&key_hash.to_le_bytes());
         rec[8..12].copy_from_slice(&self.volume_id.to_le_bytes());
@@ -1016,6 +1028,51 @@ impl VolumeManager {
             });
         }
         Ok(payload)
+    }
+
+    /// Calls `f` with the payload of the needle at `offset`, in pieces of at most
+    /// `STREAM_CHUNK`, read with aligned reads into one buffer: not through the mapping, so
+    /// copying a large needle does not fault it into the RSS (#185). The payload CRC is
+    /// computed as it is read; on a mismatch the error comes after the last piece, so the
+    /// caller must not commit what `f` built before this returns `Ok`.
+    pub fn copy_payload<F>(&self, offset: u64, expected_payload_crc: u32, mut f: F) -> Result<u64, VolumeError>
+    where
+        F: FnMut(&[u8]) -> Result<(), VolumeError>,
+    {
+        let mut buf = AlignedBuffer::new(STREAM_CHUNK);
+        self.work.disk_read();
+        self.file.read_aligned_at(offset, &mut buf[..SECTOR_SIZE])?;
+        let mut hdr_bytes = [0u8; 64];
+        hdr_bytes.copy_from_slice(&buf[0..64]);
+        let header = NeedleHeader::decode(&hdr_bytes)?;
+        let p_start = 64 + header.key_len as u64;
+        let p_end = p_start + header.payload_size;
+        let total_len = p_end.div_ceil(SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
+        let mut crc = 0u32;
+        let mut pos = 0u64;
+        while pos < total_len {
+            let n = (STREAM_CHUNK as u64).min(total_len - pos) as usize;
+            if pos > 0 {
+                self.work.disk_read();
+                self.file.read_aligned_at(offset + pos, &mut buf[..n])?;
+            } else if n > SECTOR_SIZE {
+                self.work.disk_read();
+                self.file.read_aligned_at(offset, &mut buf[..n])?;
+            }
+            let lo = p_start.max(pos);
+            let hi = p_end.min(pos + n as u64);
+            if lo < hi {
+                let piece = &buf[(lo - pos) as usize..(hi - pos) as usize];
+                crc = crc32c::crc32c_append(crc, piece);
+                f(piece)?;
+            }
+            pos += n as u64;
+        }
+        self.work.payload_verify(header.payload_size);
+        if crc != expected_payload_crc {
+            return Err(VolumeError::CrcMismatch { expected: expected_payload_crc, actual: crc });
+        }
+        Ok(header.payload_size)
     }
 
     /// A needle's payload as a slice of the mapping, with its header checked and its bytes
