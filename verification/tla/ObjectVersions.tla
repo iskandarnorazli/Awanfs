@@ -44,6 +44,15 @@ Switches, so the same model checks the current code and the fixes:
                                 is written again at the end of the log
                       CDrop     the volume file is removed: every record below `cut` is gone,
                                 and a write into it after that is lost
+  FailLeavesRecord  a failure can come after the record reached the log: the journal append,
+                    the fsync or the index update fails once the needle is on disk (#184). The
+                    request answers 500, and the record is still there for recovery to replay.
+  IndexAfterLateFail
+                    the fix, owner decision 4B (2026-11-16): after such a failure the live
+                    index applies the record exactly as recovery will, so a GET before and
+                    after a restart agree. A 500 means the outcome is unknown (S3's rule).
+                    Without it the live index keeps the old object and a restart shows the
+                    write the client was told failed.
   CompactWaitsForWriters
                     CScan waits until no request has an offset below `cut` whose record is not
                     yet written (VolumeManager::writers_in_flight is 0). Without it a streamed
@@ -53,7 +62,8 @@ Switches, so the same model checks the current code and the fixes:
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Writers, Deleters, UseKeyLock, WriteCanFail, RecoverSkipsGaps, DeleteLogsFirst,
-          Streamers, Relocate, Compactor, CompactWaitsForWriters
+          Streamers, Relocate, Compactor, CompactWaitsForWriters,
+          FailLeavesRecord, IndexAfterLateFail
 
 ASSUME Streamers \subseteq Writers
 
@@ -171,6 +181,33 @@ RelocateFail(p) ==
     /\ UNCHANGED <<step, off, nextOff, log, engine, lock>>
     /\ UNCHANGED cVars
 
+\* What the live index shows after a write of p takes effect.
+Applied(p) == IF p \in Writers THEN [present |-> TRUE, val |-> p] ELSE Gone
+
+\* The record is in the log (Write or RelocateStep ran), then the fsync, the journal append or
+\* the index update fails, and the request answers 500 (#184).
+LateFail(p) ==
+    /\ WriteCanFail /\ FailLeavesRecord
+    /\ pc[p] = "index"
+    /\ \E r \in log : r.o = off[p]
+    /\ engine' = IF IndexAfterLateFail THEN Applied(p) ELSE engine
+    /\ pc' = [pc EXCEPT ![p] = "release"]
+    /\ UNCHANGED <<step, off, nextOff, log, lock>>
+    /\ UNCHANGED cVars
+
+\* A streamer's copy reaches the log, then the same failure: the copy is the newest record.
+RelocateLateFail(p) ==
+    /\ WriteCanFail /\ FailLeavesRecord
+    /\ pc[p] = "relocate"
+    /\ Relocate /\ LaterRecord(p)
+    /\ off' = [off EXCEPT ![p] = nextOff]
+    /\ nextOff' = nextOff + 1
+    /\ log' = log \cup {[o |-> nextOff, kind |-> "put", val |-> p]}
+    /\ engine' = IF IndexAfterLateFail THEN Applied(p) ELSE engine
+    /\ pc' = [pc EXCEPT ![p] = "release"]
+    /\ UNCHANGED <<step, lock>>
+    /\ UNCHANGED cVars
+
 Index(p) ==
     /\ pc[p] = "index"
     /\ engine' = IF p \in Writers THEN [present |-> TRUE, val |-> p] ELSE Gone
@@ -225,6 +262,8 @@ Next ==
     \/ \E p \in Procs : Acquire(p)
     \/ \E p \in Procs : RelocateStep(p)
     \/ \E p \in Procs : RelocateFail(p)
+    \/ \E p \in Procs : RelocateLateFail(p)
+    \/ \E p \in Procs : LateFail(p)
     \/ \E p \in Procs : Reserve(p)
     \/ \E p \in Procs : Write(p)
     \/ \E p \in Procs : Fail(p)
