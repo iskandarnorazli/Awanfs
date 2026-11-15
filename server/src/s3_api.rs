@@ -148,54 +148,6 @@ impl hyper::body::Body for ChunksBody {
 /// one is not checksummed (#155, decision 46). It is the largest payload the cache holds.
 pub const VERIFY_WHILE_SENDING_MIN: u64 = 4 * 1024 * 1024;
 
-/// A large object's payload, sent from the volume mapping in `STREAM_CHUNK` pieces and
-/// checksummed piece by piece. If the checksum of all of it is not the needle's, the last
-/// piece is not sent and the body fails: the client sees a cut transfer, never a complete
-/// response with wrong bytes. The headers have gone by then, so there is no status to send.
-struct VerifiedBody {
-    bytes: Bytes,
-    pos: usize,
-    crc: u32,
-    expected: u32,
-    what: String,
-    work: Arc<WorkCounters>,
-    failures: Arc<AtomicU64>,
-}
-
-impl hyper::body::Body for VerifiedBody {
-    type Data = Bytes;
-    type Error = std::io::Error;
-
-    fn poll_frame(
-        mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
-        let this = &mut *self;
-        if this.pos >= this.bytes.len() {
-            return std::task::Poll::Ready(None);
-        }
-        let end = (this.pos + crate::volume::STREAM_CHUNK).min(this.bytes.len());
-        let piece = this.bytes.slice(this.pos..end);
-        this.crc = crc32c::crc32c_append(this.crc, &piece);
-        this.work.payload_verify(piece.len() as u64);
-        this.pos = end;
-        if end == this.bytes.len() && this.crc != this.expected {
-            this.failures.fetch_add(1, Ordering::SeqCst);
-            tracing::error!(object = %this.what, expected = this.expected, actual = this.crc, "payload checksum mismatch while sending; the transfer is cut");
-            return std::task::Poll::Ready(Some(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "the object's bytes failed their checksum"))));
-        }
-        std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(piece))))
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.pos >= self.bytes.len()
-    }
-
-    fn size_hint(&self) -> hyper::body::SizeHint {
-        hyper::body::SizeHint::with_exact((self.bytes.len() - self.pos) as u64)
-    }
-}
-
 /// PUT bodies above this size are written to the volume as they arrive instead of being held
 /// in memory (#36). Smaller ones are collected, and cached after the write.
 pub const STREAM_PUT_MIN: u64 = 4 * 1024 * 1024;
@@ -1726,9 +1678,36 @@ impl S3ServiceState {
         Ok(bytes)
     }
 
+    /// A body that sends `len` bytes from payload offset `start` of a large object with
+    /// positioned reads (`stream_read`, #155), checking the payload CRC when `verify` (a full
+    /// GET). The header is read and checked against the index now, before any response
+    /// header, so a mismatch is still a 500; no payload byte is read until the body is polled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn large_payload_body(&self, b_id: u32, what: String, vol_offset: u64, size: u64, start: u64, len: u64, verify: bool) -> Result<crate::stream_read::PreadBody, VolumeError> {
+        if vol_offset == 0 || start + len > size {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let (vm, local) = self.volume_for(vol_offset)?;
+        let expected_crc = self.needle_crc_map.read().get(&(b_id, vol_offset)).copied().ok_or(VolumeError::CorruptIndex)?;
+        let (payload_at, stored) = vm.payload_extent(local)?;
+        if stored != size {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let range = crate::stream_read::PayloadRange {
+            vm,
+            local,
+            start,
+            len,
+            verify: verify.then_some(expected_crc),
+            what,
+            failures: Arc::clone(&self.read_checksum_failures),
+        };
+        Ok(crate::stream_read::PreadBody::new(range, payload_at))
+    }
+
     /// A large object's payload from the mapping, unread and unchecked, with the checksum it
-    /// must have. The caller checks it while sending (`VerifiedBody`) or, for a range, not
-    /// at all (#155, decision 46).
+    /// must have. GET no longer sends large objects this way (`large_payload_body`, #155);
+    /// the mapping is what faulted their pages into the RSS.
     pub fn load_payload_unverified(&self, b_id: u32, vol_offset: u64, expected_size: usize) -> Result<(Bytes, u32), VolumeError> {
         if vol_offset == 0 {
             return Err(VolumeError::CorruptIndex);
@@ -3642,6 +3621,25 @@ async fn handle_s3_inner(
                     if let Some(range_opt) = range_res {
                         match range_opt {
                             Ok(Some(range)) => {
+                                // A range of a large single-needle object is read with positioned
+                                // reads, only the range, as it is sent (#155).
+                                if !is_head && !is_multipart && !is_compressed && meta.size > VERIFY_WHILE_SENDING_MIN {
+                                    let len = range.end - range.start + 1;
+                                    let body = match state.large_payload_body(b_id, format!("{}/{}", bucket, key), meta.vol_offset, meta.size, range.start, len, false) {
+                                        Ok(b) => b,
+                                        Err(e) => return Ok(internal_error_response(&key, &format!("could not read the object: {:?}", e))),
+                                    };
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::PARTIAL_CONTENT)
+                                        .header(CONTENT_TYPE, "application/octet-stream")
+                                        .header(ETAG, etag_val)
+                                        .header(ACCEPT_RANGES, "bytes")
+                                        .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
+                                        .header(CONTENT_LENGTH, len.to_string())
+                                        .header(LAST_MODIFIED, "Tue, 10 Nov 2026 00:00:00 GMT")
+                                        .body(body.boxed())
+                                        .unwrap());
+                                }
                                 let sub_bytes = if is_head {
                                     Bytes::new()
                                 } else if is_multipart {
@@ -3789,18 +3787,9 @@ async fn handle_s3_inner(
 
                     // A large object goes out as it is checksummed; nothing of it is read first.
                     if !is_head && !is_compressed && meta.size > VERIFY_WHILE_SENDING_MIN {
-                        let (bytes, expected) = match state.load_payload_unverified(b_id, meta.vol_offset, meta.size as usize) {
-                            Ok(found) => found,
+                        let body = match state.large_payload_body(b_id, format!("{}/{}", bucket, key), meta.vol_offset, meta.size, 0, meta.size, true) {
+                            Ok(b) => b,
                             Err(e) => return Ok(internal_error_response(&key, &format!("could not read the object: {:?}", e))),
-                        };
-                        let body = VerifiedBody {
-                            bytes,
-                            pos: 0,
-                            crc: 0,
-                            expected,
-                            what: format!("{}/{}", bucket, key),
-                            work: Arc::clone(&state.work),
-                            failures: Arc::clone(&state.read_checksum_failures),
                         };
                         return Ok(Response::builder()
                             .status(StatusCode::OK)

@@ -333,6 +333,11 @@ pub struct NeedleHeader {
 }
 
 impl NeedleHeader {
+    /// Where the payload starts, from the needle's start.
+    pub fn payload_start(&self) -> usize {
+        64 + self.key_len as usize
+    }
+
     pub fn encode(&self, buf: &mut [u8; 64]) {
         buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
         buf[4..8].copy_from_slice(&self.header_crc32c.to_le_bytes());
@@ -1016,6 +1021,26 @@ impl VolumeManager {
             });
         }
         Ok(payload)
+    }
+
+    /// Where the payload of the needle at `local` starts in the file, and its length, from
+    /// one aligned read of its header sector: no mapping (#155).
+    pub fn payload_extent(&self, local: u64) -> Result<(u64, u64), VolumeError> {
+        let mut buf = AlignedBuffer::new(SECTOR_SIZE);
+        self.read_aligned(local, &mut buf)?;
+        let mut hdr_bytes = [0u8; 64];
+        hdr_bytes.copy_from_slice(&buf[0..64]);
+        let header = NeedleHeader::decode(&hdr_bytes)?;
+        Ok((local + header.payload_start() as u64, header.payload_size))
+    }
+
+    /// A positioned read of `buf.len()` bytes at `offset`, both sector aligned, with direct
+    /// I/O: the bytes do not stay in the page cache, so they do not add to the RSS (#155).
+    /// Concurrent reads do not share a file cursor.
+    pub fn read_aligned(&self, offset: u64, buf: &mut [u8]) -> Result<(), VolumeError> {
+        self.work.disk_read();
+        self.file.read_aligned_at(offset, buf)?;
+        Ok(())
     }
 
     /// A needle's payload as a slice of the mapping, with its header checked and its bytes

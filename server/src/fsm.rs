@@ -180,9 +180,91 @@ pub fn needle_step(state: NeedleState, event: NeedleEvent) -> Result<NeedleState
     }
 }
 
+pub const STREAM_ENDED: Refusal = refuse_because("InternalError", 500, "the response stream has ended");
+
+/// One GET response streamed from a volume with positioned reads (`stream_read`, #155).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamState {
+    /// The headers are sent; no payload byte has been read yet.
+    Opening,
+    /// At least one chunk has been sent.
+    Streaming,
+    /// Every byte was sent, and its checksum (when the whole payload was sent) matched.
+    Done,
+    /// Cut before the end. The client sees a transfer shorter than its Content-Length.
+    Aborted(StreamAbort),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamAbort {
+    /// A read from the volume failed.
+    ReadError,
+    /// The bytes read do not match the needle's payload CRC; the last chunk is not sent.
+    ChecksumMismatch,
+    /// The client went away; the reader stops and frees its buffers.
+    ClientGone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamEvent {
+    /// A chunk was read and handed to the response.
+    Chunk,
+    ReadError,
+    ClientGone,
+    /// The last byte was read. `checksum_ok` is false when the whole payload was read and
+    /// its CRC does not match; a range has no checksum and ends with `true`.
+    End { checksum_ok: bool },
+}
+
+/// A stream that has ended takes nothing more: no chunk after `Aborted` or `Done`.
+pub fn stream_step(state: StreamState, event: StreamEvent) -> Result<StreamState, Refusal> {
+    use StreamState::{Aborted, Done, Opening, Streaming};
+    match (state, event) {
+        (Opening | Streaming, StreamEvent::Chunk) => Ok(Streaming),
+        (Opening | Streaming, StreamEvent::ReadError) => Ok(Aborted(StreamAbort::ReadError)),
+        (Opening | Streaming, StreamEvent::ClientGone) => Ok(Aborted(StreamAbort::ClientGone)),
+        (Opening | Streaming, StreamEvent::End { checksum_ok: true }) => Ok(Done),
+        (Opening | Streaming, StreamEvent::End { checksum_ok: false }) => Ok(Aborted(StreamAbort::ChecksumMismatch)),
+        (Done | Aborted(_), _) => Err(STREAM_ENDED),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_every_pair_is_decided() {
+        use StreamAbort::{ChecksumMismatch, ClientGone, ReadError};
+        use StreamState::{Aborted, Done, Opening, Streaming};
+        let chunk = StreamEvent::Chunk;
+        let read_err = StreamEvent::ReadError;
+        let gone = StreamEvent::ClientGone;
+        let ok = StreamEvent::End { checksum_ok: true };
+        let bad = StreamEvent::End { checksum_ok: false };
+        let ended = [Done, Aborted(ReadError), Aborted(ChecksumMismatch), Aborted(ClientGone)];
+        let mut table = vec![
+            (Opening, chunk, Ok(Streaming)),
+            (Streaming, chunk, Ok(Streaming)),
+            (Opening, read_err, Ok(Aborted(ReadError))),
+            (Streaming, read_err, Ok(Aborted(ReadError))),
+            (Opening, gone, Ok(Aborted(ClientGone))),
+            (Streaming, gone, Ok(Aborted(ClientGone))),
+            (Opening, ok, Ok(Done)),
+            (Streaming, ok, Ok(Done)),
+            (Opening, bad, Ok(Aborted(ChecksumMismatch))),
+            (Streaming, bad, Ok(Aborted(ChecksumMismatch))),
+        ];
+        for s in ended {
+            for e in [chunk, read_err, gone, ok, bad] {
+                table.push((s, e, Err(STREAM_ENDED)));
+            }
+        }
+        for (state, event, want) in &table {
+            assert_eq!(stream_step(*state, *event), *want, "{:?} + {:?}", state, event);
+        }
+        assert_eq!(table.len(), 6 * 5, "every state against every event");
+    }
     use RetentionMode::{Compliance, Governance};
 
     const STATUSES: [Versioning; 3] = [Versioning::Unset, Versioning::Enabled, Versioning::Suspended];

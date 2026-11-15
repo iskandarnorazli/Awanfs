@@ -30,7 +30,7 @@ or a test that is not in the file.
 | Lifecycle of an object under a rule | live, expired, removed | implicit | `server/src/lifecycle.rs` | lifecycle tests | none | #118 |
 | Encrypted multipart upload | key and nonce state per part | not built | | | | #121 |
 | A scheduled background task | idle, running, stopping, stopped | not built | | | none | #158 |
-| A streamed response | opening, streaming, done, aborted | not built | | | none | #155 |
+| A streamed response | opening, streaming, done, aborted (read error, checksum mismatch, client gone) | wired | `server/src/fsm.rs::stream_step`, called by the reader in `server/src/stream_read.rs` | `stream_every_pair_is_decided`, `server/tests/stream_read_test.rs`, `server/tests/stream_read_disconnect_test.rs` | none: one reader per response | #155 step two |
 | Scrub of a needle | unchecked, good, bad | not built | | | none | #155 |
 | POST object form parser | preamble, part headers, part body, epilogue | not built | | | none | #119 |
 
