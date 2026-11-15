@@ -211,3 +211,43 @@ async fn a_format_2_volume_keeps_serving_and_attributes_go_to_a_format_3_volume(
     assert_object(&c, &format!("{}/abkt/plain", url), "application/octet-stream", &plain, "from the format 2 volume").await;
     assert_object(&c, &format!("{}/abkt/typed", url), "text/html", &typed, "from the format 3 volume").await;
 }
+
+/// #199 and #200 together: a streamed PUT with a Content-Type whose key was written meanwhile
+/// is copied to the end of the log (decision 51). The copy reads the payload in chunks
+/// (`copy_payload`) and must start after the attributes block, not after the key.
+#[tokio::test]
+async fn a_relocated_streamed_put_keeps_its_block_and_its_bytes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = temp_dir("reloc");
+    let c = reqwest::Client::new();
+    let (state, url, handle) = start(&dir).await;
+    assert_eq!(c.put(format!("{}/abkt", url)).send().await.unwrap().status(), StatusCode::OK);
+    let body = pattern(STREAM_PUT_MIN as usize + 2_000_000, 9);
+    let host = url.trim_start_matches("http://").to_string();
+    let mut s = tokio::net::TcpStream::connect(&host).await.unwrap();
+    let head = format!("PUT /abkt/k HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nContent-Type: image/webp\r\nConnection: close\r\n\r\n", host, body.len());
+    s.write_all(head.as_bytes()).await.unwrap();
+    let half = body.len() / 2;
+    s.write_all(&body[..half]).await.unwrap();
+    s.flush().await.unwrap();
+    for _ in 0..400 {
+        if state.volume_writers_in_flight(1) == Some(1) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(state.volume_writers_in_flight(1), Some(1), "the PUT reserved its needle");
+    // Written after the reservation: the streamed PUT must relocate when it commits.
+    assert_eq!(c.put(format!("{}/abkt/k", url)).body(pattern(500, 10)).send().await.unwrap().status(), StatusCode::OK);
+    s.write_all(&body[half..]).await.unwrap();
+    s.flush().await.unwrap();
+    let mut answer = Vec::new();
+    s.read_to_end(&mut answer).await.unwrap();
+    assert!(String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 200"), "{}", String::from_utf8_lossy(&answer));
+    assert_eq!(state.stream_relocations.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_object(&c, &format!("{}/abkt/k", url), "image/webp", &body, "after the relocation").await;
+    handle.shutdown();
+    drop(state);
+    let (_state, url, _h) = start(&dir).await;
+    assert_object(&c, &format!("{}/abkt/k", url), "image/webp", &body, "after a restart").await;
+}

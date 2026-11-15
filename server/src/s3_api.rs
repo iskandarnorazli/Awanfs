@@ -1607,7 +1607,16 @@ impl S3ServiceState {
                     attempts += 1;
                     self.roll_volume(&vm)?;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // The write reserved an offset and may have left a complete record there
+                    // (header written, then the journal or the disk failed). Its offset is
+                    // later than every reservation made before it, so noting the largest
+                    // offset makes a streamed PUT of this key in flight relocate: a spurious
+                    // copy costs time, a missed one lets this failed write win after a
+                    // restart (#184).
+                    self.streams.note_append(b_id, key, u64::MAX);
+                    return Err(e);
+                }
             }
         }
     }
@@ -1627,16 +1636,23 @@ impl S3ServiceState {
         etag_hi: u64,
         etag_lo: u64,
     ) -> Result<(Arc<VolumeManager>, NeedleLocation, u64), VolumeError> {
-        let bytes = from_vm.read_needle_bytes(from_vm.id(), from.offset, from.payload_crc32c)?;
-        // The copy carries the same attributes block, byte for byte (#150).
+        // Read in chunks, not through the mapping (#185); a CRC mismatch drops the writer
+        // before its header is written, so the copy leaves only a gap. The copy carries the
+        // same attributes block, byte for byte (#150).
         let attrs = from_vm.read_attrs(from.offset)?.encode().map_err(|_| VolumeError::CorruptIndex)?;
-        let mut writer = self.begin_needle_on_active(b_id, key, &attrs, bytes.len() as u64, flags)?;
-        for piece in bytes.chunks(crate::volume::STREAM_CHUNK) {
-            writer.write(piece)?;
-        }
+        let mut writer = self.begin_needle_on_active(b_id, key, &attrs, from.payload_size, flags)?;
+        from_vm.copy_payload(from.offset, from.payload_crc32c, |piece| writer.write(piece))?;
         let vm = Arc::clone(writer.volume());
         let g = global_offset(vm.id(), writer.offset());
-        let loc = writer.finish(etag_hi, etag_lo)?;
+        let loc = match writer.finish(etag_hi, etag_lo) {
+            Ok(loc) => loc,
+            Err(e) => {
+                // The header may be on disk (see `write_to_active_at`).
+                self.streams.note_append(b_id, key, u64::MAX);
+                return Err(e);
+            }
+        };
+        self.streams.note_append(b_id, key, g);
         self.total_volume_bytes.fetch_add(from.total_len, Ordering::Relaxed);
         self.tombstone_bytes.fetch_add(from.total_len, Ordering::Relaxed);
         self.stream_relocations.fetch_add(1, Ordering::SeqCst);
@@ -1653,10 +1669,10 @@ impl S3ServiceState {
                 continue;
             }
             match vm.begin_needle_with_attrs(b_id as u16, key, attrs, len, flags) {
-                Ok(w) => {
-                    self.streams.note_append(b_id, key, global_offset(vm.id(), w.offset()));
-                    return Ok(w);
-                }
+                // Not noted here: a reservation is not a record until its header is written.
+                // The streamed PUT and the relocation note at commit, under the key lock
+                // (#184, requirement 4).
+                Ok(w) => return Ok(w),
                 Err(VolumeError::VolumeFull { len, .. }) if len + crate::direct_io::SECTOR_SIZE as u64 > vm.max_span() => {
                     return Err(VolumeError::VolumeFull { offset: 0, len })
                 }
@@ -3549,15 +3565,29 @@ async fn handle_s3_inner(
                         let first_offset = global_offset(first_vm.id(), writer.offset());
                         let first_loc = match writer.finish(etag_hi, etag_lo) {
                             Ok(l) => l,
-                            Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
+                            Err(e) => {
+                                // The header may be on disk (see `write_to_active_at`).
+                                state.streams.note_append(b_id, &key, u64::MAX);
+                                return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e)));
+                            }
                         };
+                        // Its record is in the log now: a streamed PUT of this key that
+                        // reserved before it must not end up before it at replay.
+                        state.streams.note_append(b_id, &key, first_offset);
                         // An unversioned key is replayed in offset order. If a needle of this
                         // key was appended since this one was reserved, this one is not the
                         // last in the log: write it again at the end. Versions are ordered by
                         // their ids, taken above under the lock, so they stay where they are.
                         let (vm, loc, vol_offset) = if stamp.is_none() && ticket.appended_after(first_offset) {
-                            match state.relocate_needle(b_id, &key, &first_vm, &first_loc, flags, etag_hi, etag_lo) {
-                                Ok(moved) => moved,
+                            // Up to 5 GiB of reads and writes: on the blocking pool, not on an
+                            // executor thread (#185). The key lock is held across the await.
+                            let moved = {
+                                let (st, k, fvm) = (Arc::clone(&state), key.clone(), Arc::clone(&first_vm));
+                                tokio::task::spawn_blocking(move || st.relocate_needle(b_id, &k, &fvm, &first_loc, flags, etag_hi, etag_lo)).await
+                            };
+                            match moved {
+                                Ok(Ok(moved)) => moved,
+                                Ok(Err(e)) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                                 Err(e) => return Ok(internal_error_response(&key, &format!("could not store the object: {:?}", e))),
                             }
                         } else {
