@@ -15,7 +15,7 @@ Owner decisions after the 2026-11-12 audit. The milestones Phase 1-4 on GitHub c
 | 3 | **Performance gates:** no absolute MiB/s targets. Layer 1: exact work counts per request type in `server/tests/work_count_test.rs` (every PR, both platforms). Layer 2: nightly AwanFS/MinIO throughput ratio on the same runner (`benchmarks/ratio_check.py`, baseline `benchmarks/ratio_baseline.json`). | #33, #34 |
 | 4 | **Order:** correctness and security first (Phase 1), then production operations (Phase 2), then scale and efficiency (Phase 3), multi-node last (Phase 4). | milestones |
 | 5 | **Topology:** single node; operators use RAID or ZFS for disk failure. Multi-node clustering is a design issue for when a production deployment needs high availability; `libs/awan-cluster` from awan-lang is an input to the design, not code to port. | #52, #27, #15 |
-| 6 | **Metadata:** keep the redb spill index; review it with the tiered metadata and Bloom filter work after Phase 1. | #13, #26 |
+| 6 | **Metadata:** keep the redb spill index; review it with the tiered metadata and Bloom filter work after Phase 1 (which reads its segments with positioned reads: decision 58). | #13, #26 |
 | 7 | **Compression:** opt-in per bucket, in independent 64 KiB blocks so range GETs stay cheap; off by default. | #51 |
 | 8 | **Observability:** structured logs with request IDs, Prometheus `/metrics`, OpenTelemetry traces, health endpoints, a Grafana dashboard and alert rules, and an S3 access log. | #41-#46 |
 
@@ -150,6 +150,19 @@ if so writes the object again at the end of the log. The cost is one extra copy,
 that overlap another write of the same key. Versioned keys are ordered by version id, taken at
 commit, and are never copied. Ordering recovery by a commit stamp instead was weighed and not
 chosen: it changes a recovery rule for every key and makes it depend on the clock. #154.
+
+**Decision 58 (owner, 2026-11-16): stored data is read with positioned reads, not through
+mappings, wherever the bytes could grow without bound.** Pages read through a mapping stay
+resident and count in the RSS, outside `--memory-budget` (decision 53). The correction to 36
+measured the cost (117.0 to 2258.9 MiB peak RSS), and #155 step two measured the gain (1464.7 to
+354.5 MiB, PR #202). So:
+- objects above 4 MiB are read with positioned reads (#155);
+- the tiered metadata segments of #26 are too, with hot keys in the OS page cache or a heap
+  row cache inside the budget, and a heap bloom filter, so a key it rejects costs no read;
+- #126, a cache of mapping views, is closed as not planned.
+Objects up to 4 MiB and multipart parts still slice the mapping (invariant 5); their resident
+pages are within the 250 MiB ceiling the nightly run enforces. A gate on memory checks peak RSS,
+the outcome, not the mechanism.
 
 **Decision 57 (owner, 2026-11-15): every new volume is format 3.** Not only volumes that
 hold a needle with attributes. One rule, and attributes will be on most PUTs once user
