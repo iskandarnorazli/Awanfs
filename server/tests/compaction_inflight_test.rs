@@ -47,7 +47,7 @@ struct Stalled {
     rest: Vec<u8>,
 }
 
-async fn begin_stalled(url: &str, path: &str, body: &[u8]) -> Stalled {
+async fn begin_stalled(state: &S3ServiceState, url: &str, path: &str, body: &[u8]) -> Stalled {
     assert!(body.len() as u64 > STREAM_PUT_MIN, "the body must take the streamed path");
     let host = url.trim_start_matches("http://").to_string();
     let mut stream = TcpStream::connect(&host).await.unwrap();
@@ -56,7 +56,14 @@ async fn begin_stalled(url: &str, path: &str, body: &[u8]) -> Stalled {
     let half = body.len() / 2;
     stream.write_all(&body[..half]).await.unwrap();
     stream.flush().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for the reservation itself, not for a fixed time (a slow runner reserves late).
+    for _ in 0..400 {
+        if state.volume_writers_in_flight(1) == Some(1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(state.volume_writers_in_flight(1), Some(1), "the PUT reserved its needle in volume 1");
     Stalled { stream, rest: body[half..].to_vec() }
 }
 
@@ -87,7 +94,7 @@ async fn compaction_waits_for_a_streamed_put_still_writing_into_the_volume() {
     let key = format!("{}/cbkt/big", url);
 
     // The streamed PUT reserves its needle in volume 1 and waits.
-    let stalled = begin_stalled(&url, "/cbkt/big", &big).await;
+    let stalled = begin_stalled(&state, &url, "/cbkt/big", &big).await;
     // A 3 MiB PUT does not fit in what is left of volume 1: volume 2 becomes the active one,
     // and volume 1, still receiving the stalled body, is now the oldest that is not active.
     assert_eq!(c.put(format!("{}/cbkt/small", url)).body(pattern(3 * MIB, 2)).send().await.unwrap().status(), StatusCode::OK);
@@ -124,7 +131,7 @@ async fn an_abandoned_streamed_put_does_not_hold_compaction_back() {
     let c = reqwest::Client::new();
     let (state, url, _h) = start(&dir).await;
     assert_eq!(c.put(format!("{}/cbkt", url)).send().await.unwrap().status(), StatusCode::OK);
-    let stalled = begin_stalled(&url, "/cbkt/gone", &pattern(6 * MIB, 3)).await;
+    let stalled = begin_stalled(&state, &url, "/cbkt/gone", &pattern(6 * MIB, 3)).await;
     assert_eq!(c.put(format!("{}/cbkt/small", url)).body(pattern(3 * MIB, 4)).send().await.unwrap().status(), StatusCode::OK);
     assert!(state.compact_oldest_volume().await.unwrap().busy);
 
@@ -141,4 +148,114 @@ async fn an_abandoned_streamed_put_does_not_hold_compaction_back() {
     assert!(report.volume_removed, "{:?}", report);
     assert_eq!(body_of(&c, &format!("{}/cbkt/gone", url)).await.0, StatusCode::NOT_FOUND);
     assert_eq!(body_of(&c, &format!("{}/cbkt/small", url)).await.0, StatusCode::OK);
+}
+
+/// The reviewer's case (#182): an abandoned streamed PUT leaves a gap with no header, and a
+/// later PUT lands after it in the same volume. The scan used to stop at the gap (the journal
+/// read at open knows nothing of this process's writes), so compaction never listed the later
+/// object and removed the file it was in.
+#[tokio::test]
+async fn an_object_after_an_abandoned_put_in_the_same_volume_survives_compaction() {
+    let dir = temp_dir("after_gap");
+    let c = reqwest::Client::new();
+    let (state, url, handle) = start(&dir).await;
+    assert_eq!(c.put(format!("{}/cbkt", url)).send().await.unwrap().status(), StatusCode::OK);
+    let stalled = begin_stalled(&state, &url, "/cbkt/gone", &pattern(5 * MIB, 5)).await;
+    drop(stalled);
+    for _ in 0..400 {
+        if state.volume_writers_in_flight(1) == Some(0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(state.volume_writers_in_flight(1), Some(0), "the abandoned writer is gone");
+
+    // 1 MiB fits after the 5 MiB gap in volume 1; 3 MiB does not, and rolls to volume 2.
+    let after = pattern(MIB, 6);
+    assert_eq!(c.put(format!("{}/cbkt/after", url)).body(after.clone()).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(c.put(format!("{}/cbkt/roll", url)).body(pattern(3 * MIB, 7)).send().await.unwrap().status(), StatusCode::OK);
+    assert!(state.volume_ids().len() >= 2, "{:?}", state.volume_ids());
+
+    let report = state.compact_oldest_volume().await.unwrap();
+    assert!(!report.busy, "{:?}", report);
+    assert!(report.live_needles_copied >= 1, "the object after the gap was listed and copied: {:?}", report);
+    let (status, got) = body_of(&c, &format!("{}/cbkt/after", url)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(got == after);
+    handle.shutdown();
+    drop(state);
+
+    let (_state, url, _h) = start(&dir).await;
+    let (status, got) = body_of(&c, &format!("{}/cbkt/after", url)).await;
+    assert_eq!(status, StatusCode::OK, "and after a restart");
+    assert!(got == after);
+}
+
+/// The reviewer's second case (#182): a versioned DELETE writes its marker, then records it in
+/// the history, holding the key lock throughout. Compaction decided on delete markers before
+/// taking that lock, saw a marker no history held yet, and dropped it with the volume: after a
+/// restart the delete was gone. The DELETE is held between the two steps while compaction runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_marker_written_but_not_yet_recorded_survives_compaction() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    let dir = temp_dir("marker");
+    let c = reqwest::Client::new();
+    let (state, url, handle) = start(&dir).await;
+    assert_eq!(c.put(format!("{}/cbkt", url)).send().await.unwrap().status(), StatusCode::OK);
+    let enable = "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status></VersioningConfiguration>";
+    assert_eq!(c.put(format!("{}/cbkt?versioning", url)).body(enable).send().await.unwrap().status(), StatusCode::OK);
+
+    // 0: nothing yet; 1: the marker is written, the DELETE waits; 2: compaction is past it or
+    // waits on the key lock, so the DELETE may go on.
+    let step = Arc::new(AtomicU8::new(0));
+    {
+        let step = Arc::clone(&step);
+        let hook: s3_server::TestHook = Arc::new(move |point, key| {
+            if key != "m" {
+                return;
+            }
+            match point {
+                "delete_marker_written" => {
+                    step.store(1, Ordering::SeqCst);
+                    for _ in 0..500 {
+                        if step.load(Ordering::SeqCst) == 2 {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                "key_lock_contended" => step.store(2, Ordering::SeqCst),
+                _ => {}
+            }
+        });
+        *state.test_hook.write() = Some(hook);
+    }
+    let delete = tokio::spawn({
+        let c = c.clone();
+        let url = format!("{}/cbkt/m", url);
+        async move { c.delete(url).send().await.unwrap().status() }
+    });
+    for _ in 0..400 {
+        if step.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(step.load(Ordering::SeqCst), 1, "the DELETE wrote its marker");
+    // Rolls volume 1, which holds the marker, and compacts it.
+    let report = state.perform_online_compaction().await.unwrap();
+    step.store(2, Ordering::SeqCst);
+    assert_eq!(delete.await.unwrap(), StatusCode::NO_CONTENT);
+    *state.test_hook.write() = None;
+    assert!(report.volume_removed, "{:?}", report);
+
+    let markers = |xml: String| xml.matches("<DeleteMarker>").count();
+    let listing = c.get(format!("{}/cbkt?versions", url)).send().await.unwrap().text().await.unwrap();
+    assert_eq!(markers(listing), 1);
+    handle.shutdown();
+    drop(state);
+
+    let (_state, url, _h) = start(&dir).await;
+    let listing = c.get(format!("{}/cbkt?versions", url)).send().await.unwrap().text().await.unwrap();
+    assert_eq!(markers(listing.clone()), 1, "the delete marker is still there after a restart: {}", listing);
 }
