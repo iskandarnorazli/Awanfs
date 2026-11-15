@@ -45,6 +45,11 @@ struct Stalled {
 }
 
 async fn begin_stalled(state: &S3ServiceState, url: &str, path: &str, body: &[u8]) -> Stalled {
+    begin_stalled_nth(state, url, path, body, 1).await
+}
+
+/// `begin_stalled` for the `nth` write in flight in volume 1.
+async fn begin_stalled_nth(state: &S3ServiceState, url: &str, path: &str, body: &[u8], nth: usize) -> Stalled {
     assert!(body.len() as u64 > STREAM_PUT_MIN);
     let host = url.trim_start_matches("http://").to_string();
     let mut stream = TcpStream::connect(&host).await.unwrap();
@@ -54,12 +59,12 @@ async fn begin_stalled(state: &S3ServiceState, url: &str, path: &str, body: &[u8
     stream.write_all(&body[..half]).await.unwrap();
     stream.flush().await.unwrap();
     for _ in 0..400 {
-        if state.volume_writers_in_flight(1) == Some(1) {
+        if state.volume_writers_in_flight(1) == Some(nth) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert_eq!(state.volume_writers_in_flight(1), Some(1), "the PUT reserved its needle");
+    assert_eq!(state.volume_writers_in_flight(1), Some(nth), "the PUT reserved its needle");
     Stalled { stream, rest: body[half..].to_vec() }
 }
 
@@ -131,4 +136,33 @@ async fn a_relocation_reads_the_needle_in_chunks_not_through_the_mapping() {
     let (status, got) = body_of(&c, &key).await;
     assert_eq!(status, StatusCode::OK);
     assert!(got == streamed, "the copy is the object, byte for byte");
+}
+
+#[tokio::test]
+async fn a_streamed_put_abandoned_before_its_header_does_not_make_another_relocate() {
+    // #184, requirement 4: a reservation is not a record. Only a written header can sit after
+    // another streamed PUT's needle at replay.
+    let dir = temp_dir("abandoned");
+    let c = reqwest::Client::new();
+    let (state, url, handle) = start(&dir).await;
+    assert_eq!(c.put(format!("{}/rbkt", url)).send().await.unwrap().status(), StatusCode::OK);
+    let first = pattern(LEN, 5);
+    let a = begin_stalled_nth(&state, &url, "/rbkt/k", &first, 1).await;
+    let b = begin_stalled_nth(&state, &url, "/rbkt/k", &pattern(LEN, 6), 2).await;
+    drop(b);
+    for _ in 0..400 {
+        if state.volume_writers_in_flight(1) == Some(1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(state.volume_writers_in_flight(1), Some(1), "the second PUT's writer is gone");
+    assert_eq!(a.finish().await, 200);
+    assert_eq!(state.stream_relocations.load(Ordering::SeqCst), 0, "nothing of the key was logged after the first reservation");
+    handle.shutdown();
+    drop(state);
+    let (_state, url, _h) = start(&dir).await;
+    let (status, got) = body_of(&c, &format!("{}/rbkt/k", url)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(got == first, "after a restart: the one PUT that committed");
 }
