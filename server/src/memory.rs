@@ -18,6 +18,8 @@ pub const BUDGET_PERCENT: u64 = 25;
 pub const MIN_DEFAULT_BUDGET: u64 = 128 << 20;
 /// The default budget never goes above this, so the default cache stays at 1 GiB.
 pub const MAX_DEFAULT_BUDGET: u64 = 2 << 30;
+/// Maximum redb spill index page cache (64 MiB), carved out of the cache half.
+pub const MAX_SPILL_CACHE: u64 = 64 << 20;
 /// A cgroup limit at or above this means "no limit" (cgroup v1 writes i64::MAX rounded down).
 const NO_LIMIT: u64 = 1 << 60;
 
@@ -63,6 +65,13 @@ impl Budget {
         let cache = total / 2;
         Budget { total, cache, bodies: total - cache, source }
     }
+}
+
+/// Splits a budget's cache half into `(spill_cache, payload_cache)`.
+/// The spill cache gets `min(64 MiB, cache / 4)` and the payload cache gets `cache - spill`.
+pub fn split_cache(cache: u64) -> (u64, u64) {
+    let spill = (cache / 4).min(MAX_SPILL_CACHE);
+    (spill, cache - spill)
 }
 
 /// `"256MiB"`, `"2G"`, `"1073741824"`. Decimal suffixes are the powers of two they are usually
@@ -278,6 +287,23 @@ mod tests {
             let b = Budget::split(total, Source::Flag);
             assert_eq!(b.cache + b.bodies, total, "total {}", total);
             assert!(b.bodies >= b.cache, "the odd byte goes to bodies, total {}", total);
+        }
+    }
+
+    #[test]
+    fn spill_cache_comes_out_of_the_cache_half_and_is_capped_at_64mib() {
+        let cases = [
+            (32u64 << 20, 4u64 << 20),
+            (128u64 << 20, 16u64 << 20),
+            (1u64 << 30, 64u64 << 20),
+            (2u64 << 30, 64u64 << 20),
+        ];
+        for (total, expected_spill) in cases {
+            let b = Budget::split(total, Source::Flag);
+            let (spill, payload_cache) = split_cache(b.cache);
+            assert_eq!(spill, expected_spill, "total {}", total);
+            assert!(spill <= MAX_SPILL_CACHE, "total {}", total);
+            assert_eq!(spill + payload_cache, b.cache, "total {}", total);
         }
     }
 }

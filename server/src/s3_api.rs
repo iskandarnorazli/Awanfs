@@ -612,7 +612,7 @@ impl S3ServiceState {
             roll_lock: Arc::new(parking_lot::Mutex::new(())),
             volume_manager: Arc::new(RwLock::new(vol_mgr)),
             needle_crc_map: Arc::new(RwLock::new(HashMap::new())),
-            payload_cache: Arc::new(PayloadCache::default_auto_scaled()),
+            payload_cache: Arc::new(PayloadCache::new(crate::memory::split_cache(crate::memory::effective().cache).1.min(usize::MAX as u64) as usize)),
             next_vol_offset: Arc::new(RwLock::new(4096)),
             work,
             test_hook: Arc::new(RwLock::new(None)),
@@ -663,7 +663,8 @@ impl S3ServiceState {
         );
         let mut engine = AwanStorageEngine::new(100_000, 4_194_304, 65536);
         let db_path = dir.join("metadata.db");
-        if let Ok(spill) = crate::spill::SpillIndex::open(&db_path) {
+        let spill_cache_bytes = crate::memory::split_cache(crate::memory::effective().cache).0.min(usize::MAX as u64) as usize;
+        if let Ok(spill) = crate::spill::SpillIndex::open_with_cache_size(&db_path, spill_cache_bytes) {
             // Rebuilt from the volume replay below: its commits are not durable (#13).
             let _ = spill.clear();
             engine.attach_spill_index(spill);
@@ -853,7 +854,7 @@ impl S3ServiceState {
             roll_lock: Arc::new(parking_lot::Mutex::new(())),
             volume_manager: Arc::new(RwLock::new(vol_mgr)),
             needle_crc_map,
-            payload_cache: Arc::new(PayloadCache::default_auto_scaled()),
+            payload_cache: Arc::new(PayloadCache::new(crate::memory::split_cache(crate::memory::effective().cache).1.min(usize::MAX as u64) as usize)),
             next_vol_offset: Arc::new(RwLock::new(initial_vol_offset)),
             work,
             test_hook: Arc::new(RwLock::new(None)),
@@ -1814,7 +1815,7 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
     let (hits, misses) = state.payload_cache.hit_counts();
     let w = state.work.snapshot();
     let budget = crate::memory::effective();
-    let gauges: [(&str, &str, &str, u64); 20] = [
+    let gauges: [(&str, &str, &str, u64); 21] = [
         ("awanfs_volume_used_bytes", "gauge", "Bytes written into all open volumes, including dead needles.", used),
         ("awanfs_volume_free_span_bytes", "gauge", "Span left in the active volume before it rolls over.", free),
         ("awanfs_volumes_open", "gauge", "Open volumes.", state.volumes.read().len() as u64),
@@ -1831,6 +1832,7 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
         ("awanfs_ready", "gauge", "1 when /_awanfs/health/ready answers 200.", state.readiness().is_none() as u64),
         ("awanfs_memory_budget_bytes", "gauge", "Memory the server may hold (--memory-budget).", budget.total),
         ("awanfs_memory_budget_cache_bytes", "gauge", "The budget's half for the payload cache.", budget.cache),
+        ("awanfs_memory_budget_spill_bytes", "gauge", "The redb spill index page cache, carved out of the cache half.", crate::memory::split_cache(budget.cache).0),
         ("awanfs_memory_budget_bodies_bytes", "gauge", "The budget's half for in-flight request bodies.", budget.bodies),
         (
             "awanfs_read_checksum_failures_total",
