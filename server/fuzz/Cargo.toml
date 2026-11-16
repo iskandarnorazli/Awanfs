@@ -44,15 +44,19 @@ path = "fuzz_targets/attrs_block.rs"
 test = false
 doc = false
 
-<<<<<<< HEAD
 [[bin]]
 name = "form_upload"
 path = "fuzz_targets/form_upload.rs"
-=======
+test = false
+doc = false
 
 [[bin]]
 name = "cors_xml"
 path = "fuzz_targets/cors_xml.rs"
->>>>>>> 8281f60 (feat(cors): add CORS XML parser, serializer, and rule matching (#189))
+=======
+[[bin]]
+name = "object_lock_xml"
+path = "fuzz_targets/object_lock_xml.rs"
+>>>>>>> e0939e9 (object_lock: parse and serialise configuration, retention, legal hold, and headers (#191))
 test = false
 doc = false

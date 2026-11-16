@@ -12,7 +12,7 @@ on:
       - "server/src/sigv4.rs"
       - "server/src/aws_chunked.rs"
       - "server/src/lifecycle.rs"
-      - "server/src/cors.rs"
+        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, form_upload, cors_xml ]
       - "server/src/attrs.rs"
       - "server/src/form_upload.rs"
       - "server/src/s3_api.rs"
@@ -33,11 +33,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-<<<<<<< HEAD
-        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, form_upload ]
+        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, form_upload, cors_xml ]
 =======
-        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, cors_xml ]
->>>>>>> 8281f60 (feat(cors): add CORS XML parser, serializer, and rule matching (#189))
+        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, object_lock_xml ]
+>>>>>>> e0939e9 (object_lock: parse and serialise configuration, retention, legal hold, and headers (#191))
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

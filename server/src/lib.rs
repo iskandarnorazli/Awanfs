@@ -23,6 +23,7 @@ pub mod metrics;
 pub mod multipart;
 pub mod mvcc;
 pub mod names;
+pub mod object_lock;
 pub mod reactor;
 pub mod iam;
 pub mod request_log;
