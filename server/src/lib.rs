@@ -28,6 +28,7 @@ pub mod object_lock;
 pub mod reactor;
 pub mod iam;
 pub mod request_log;
+pub mod request_xml;
 pub mod tls;
 pub mod throttle;
 pub mod trace;

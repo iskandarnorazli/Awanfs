@@ -1,0 +1,1 @@
+<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"abc"</ETag><ChecksumSHA256>deadbeef</ChecksumSHA256></Part></CompleteMultipartUpload>

@@ -33,10 +33,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, form_upload, cors_xml ]
+        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, form_upload, cors_xml, object_lock_xml ]
 =======
-        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, object_lock_xml ]
->>>>>>> e0939e9 (object_lock: parse and serialise configuration, retention, legal hold, and headers (#191))
+        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, request_xml ]
+>>>>>>> 6ddf0f9 (request_xml: parse DeleteObjects, VersioningConfiguration, CompleteMultipartUpload (#194, #195))
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

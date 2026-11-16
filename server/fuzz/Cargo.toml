@@ -53,10 +53,12 @@ doc = false
 [[bin]]
 name = "cors_xml"
 path = "fuzz_targets/cors_xml.rs"
-=======
 [[bin]]
 name = "object_lock_xml"
 path = "fuzz_targets/object_lock_xml.rs"
->>>>>>> e0939e9 (object_lock: parse and serialise configuration, retention, legal hold, and headers (#191))
+=======
+name = "request_xml"
+path = "fuzz_targets/request_xml.rs"
+>>>>>>> 6ddf0f9 (request_xml: parse DeleteObjects, VersioningConfiguration, CompleteMultipartUpload (#194, #195))
 test = false
 doc = false
