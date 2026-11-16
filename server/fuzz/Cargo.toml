@@ -53,20 +53,29 @@ doc = false
 [[bin]]
 name = "cors_xml"
 path = "fuzz_targets/cors_xml.rs"
+test = false
+doc = false
+
 [[bin]]
 name = "object_lock_xml"
 path = "fuzz_targets/object_lock_xml.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "request_xml"
 path = "fuzz_targets/request_xml.rs"
+test = false
+doc = false
 
 [[bin]]
 name = "lifecycle_config_xml"
 path = "fuzz_targets/lifecycle_config_xml.rs"
-=======
+test = false
+doc = false
 
 [[bin]]
 name = "tagging_xml"
 path = "fuzz_targets/tagging_xml.rs"
->>>>>>> 40ba3f9 (tagging: add XML/header parser, validator, and XML serializer (#188))
 test = false
 doc = false
