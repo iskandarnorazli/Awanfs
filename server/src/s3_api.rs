@@ -631,7 +631,12 @@ pub struct S3ServiceState {
     pub scheduler: Arc<Scheduler>,
     /// Seconds per lifecycle day (default 86400; `--lifecycle-day-seconds`).
     pub lifecycle_day_seconds: Arc<AtomicU64>,
-}
+    /// Per-bucket configuration store backed by `buckets.manifest` (#149).
+    pub bucket_configs: Arc<parking_lot::Mutex<crate::bucket_config::BucketConfigStore>>,
+    /// Lock-free reader for `BucketConfig` snapshots (#149).
+    pub bucket_config_reader: crate::bucket_config::BucketConfigReader,
+    /// Metrics for bucket configuration writes and manifest health (#149).
+    pub bucket_config_metrics: Arc<crate::bucket_config::ConfigMetrics>,
 }
 
 impl S3ServiceState {
@@ -653,6 +658,11 @@ impl S3ServiceState {
             Arc::new(vm.with_clock(Arc::clone(&clock)))
         });
         let initial_bytes = if let Some(ref vm) = vol_mgr { vm.offset() } else { 0 };
+        let bucket_store = crate::bucket_config::BucketConfigStore::in_memory(
+            crate::bucket_config::ValidatorRegistry::with_default_validators(),
+        );
+        let bucket_config_reader = bucket_store.reader();
+        let bucket_config_metrics = bucket_store.metrics();
         Self {
             data_dir: None,
             total_volume_bytes: Arc::new(AtomicU64::new(initial_bytes)),
@@ -695,6 +705,9 @@ impl S3ServiceState {
             bucket_created_ns: Arc::new(RwLock::new(HashMap::new())),
             scheduler,
             lifecycle_day_seconds: Arc::new(AtomicU64::new(86_400)),
+            bucket_configs: Arc::new(parking_lot::Mutex::new(bucket_store)),
+            bucket_config_reader,
+            bucket_config_metrics,
         }
     }
 
@@ -751,38 +764,21 @@ impl S3ServiceState {
 
         // 1. Replay buckets manifest
         let manifest_path = dir.join("buckets.manifest");
+        let bucket_store = crate::bucket_config::BucketConfigStore::open(
+            Some(manifest_path),
+            crate::bucket_config::ValidatorRegistry::with_default_validators(),
+        )?;
+        let bucket_config_reader = bucket_store.reader();
+        let bucket_config_metrics = bucket_store.metrics();
         let mut versioning_map: HashMap<u32, crate::versions::Versioning> = HashMap::new();
         let mut bucket_created_ns: HashMap<u32, u64> = HashMap::new();
         let mut version_store = crate::versions::VersionStore::default();
-        if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-            for line in content.lines() {
-                let line = line.trim();
-                // `~<id>:<Enabled|Suspended>`: a bucket's versioning status (#31).
-                if let Some(rest) = line.strip_prefix('~') {
-                    if let Some((id_str, status)) = rest.split_once(':') {
-                        if let (Ok(id), Some(v)) = (id_str.parse::<u32>(), crate::versions::Versioning::parse(status)) {
-                            versioning_map.insert(id, v);
-                        }
-                    }
-                    continue;
-                }
-                if let Some(rest) = line.strip_prefix('+') {
-                    let mut parts = rest.splitn(3, ':');
-                    if let (Some(id_str), Some(name)) = (parts.next(), parts.next()) {
-                        if let Ok(id) = id_str.parse::<u32>() {
-                            engine.restore_bucket(id, name);
-                            let ts = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-                            bucket_created_ns.insert(id, ts);
-                        }
-                    }
-                } else if let Some(rest) = line.strip_prefix('-') {
-                    if let Some((id_str, _)) = rest.split_once(':') {
-                        if let Ok(id) = id_str.parse::<u32>() {
-                            let _ = engine.delete_bucket(id);
-                            versioning_map.remove(&id);
-                            bucket_created_ns.remove(&id);
-                        }
-                    }
+        for (&id, cfg) in bucket_store.snapshot().iter() {
+            engine.restore_bucket(id, &cfg.name);
+            if cfg.versioning != crate::versions::Versioning::Unset {
+                versioning_map.insert(id, cfg.versioning);
+                if cfg.created_ns != 0 {
+                    bucket_created_ns.insert(id, cfg.created_ns);
                 }
             }
         }
@@ -963,6 +959,9 @@ impl S3ServiceState {
             bucket_created_ns: Arc::new(RwLock::new(bucket_created_ns)),
             scheduler,
             lifecycle_day_seconds: Arc::new(AtomicU64::new(86_400)),
+            bucket_configs: Arc::new(parking_lot::Mutex::new(bucket_store)),
+            bucket_config_reader,
+            bucket_config_metrics,
         })
     }
 
@@ -1129,12 +1128,10 @@ impl S3ServiceState {
 
     /// Records a bucket's versioning status in the manifest and in memory (#31).
     pub fn set_versioning(&self, b_id: u32, status: crate::versions::Versioning) -> std::io::Result<()> {
-        if let Some(ref d) = self.data_dir {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(d.join("buckets.manifest"))?;
-            writeln!(f, "~{}:{}", b_id, status.as_str())?;
-            f.sync_all()?;
-        }
+        self.bucket_configs
+            .lock()
+            .apply_versioning(b_id, status)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         self.versioning.write().insert(b_id, status);
         Ok(())
     }
@@ -1915,6 +1912,7 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(8192);
     state.metrics.render(&mut out);
+    state.bucket_config_metrics.render(&mut out);
     let used: u64 = state.volumes.read().values().map(|v| v.offset()).sum();
     let (free, active_id) = match state.volume_manager.read().clone() {
         Some(vm) => (vm.max_span().saturating_sub(vm.offset()), vm.id()),

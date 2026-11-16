@@ -96,13 +96,7 @@ pub async fn create_bucket(
         Ok(id) => {
             let created_ns = state.clock.now_ns();
             state.bucket_created_ns.write().insert(id, created_ns);
-            if let Some(ref d) = state.data_dir {
-                let manifest = d.join("buckets.manifest");
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&manifest) {
-                    use std::io::Write;
-                    let _ = writeln!(f, "+{}:{}:{}", id, bucket, created_ns);
-                }
-            }
+            let _ = state.bucket_configs.lock().apply_bucket_create(id, bucket, created_ns, "", "");
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_LENGTH, "0")
@@ -154,13 +148,7 @@ pub async fn delete_bucket(
         Ok(()) => {
             state.versioning.write().remove(&b_id);
             state.bucket_created_ns.write().remove(&b_id);
-            if let Some(ref d) = state.data_dir {
-                let manifest = d.join("buckets.manifest");
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&manifest) {
-                    use std::io::Write;
-                    let _ = writeln!(f, "-{}:{}", b_id, bucket);
-                }
-            }
+            let _ = state.bucket_configs.lock().apply_bucket_delete(b_id, bucket, true);
             Ok(Response::builder()
                 .status(StatusCode::NO_CONTENT)
                 .header(CONTENT_LENGTH, "0")
