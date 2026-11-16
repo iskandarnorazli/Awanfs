@@ -22,6 +22,9 @@ on:
       window:
         description: "PUTs per window"
         default: "50000"
+      budget:
+        description: "--memory-budget for the server"
+        default: "2GiB"
 
 permissions:
   contents: read
@@ -52,15 +55,16 @@ jobs:
         env:
           OBJECTS: ${{ inputs.objects || '1000000' }}
           WINDOW: ${{ inputs.window || '50000' }}
+          BUDGET: ${{ inputs.budget || '2GiB' }}
           # The runner's temp directory: on Windows it is on the fast disk (D:), see AGENTS.md.
           DATA: ${{ runner.temp }}/hotset
         run: |
           set -uo pipefail
           python -u benchmarks/hot_set_scale.py --server server/target/release/s3-server \
             --client server/target/release/examples/hot_set_bench \
-            --objects "$OBJECTS" --window "$WINDOW" --data-dir "$DATA" \
+            --objects "$OBJECTS" --window "$WINDOW" --budget "$BUDGET" --data-dir "$DATA" \
             --results hot_set.jsonl --report hot_set.md \
-            --title "Today's server past its hot set, $OBJECTS objects ($RUNNER_OS)"
+            --title "Past the hot set: $OBJECTS objects, --memory-budget $BUDGET ($RUNNER_OS)"
           code=$?
           [ -f hot_set.md ] && cat hot_set.md >> "$GITHUB_STEP_SUMMARY"
           [ -f "$DATA/server.log" ] && tail -n 20 "$DATA/server.log"
