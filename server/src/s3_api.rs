@@ -121,6 +121,45 @@ pub(crate) async fn read_body(body: hyper::body::Incoming, limit: u64, resource:
     }
 }
 
+pub(crate) fn slow_down_response(resource: &str, msg: &str) -> Response<ResponseBody> {
+    let xml = s3_error_xml("SlowDown", msg, resource, "req-mem");
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(CONTENT_TYPE, "application/xml")
+        .header("connection", "close")
+        .body(full_body(Bytes::from(xml)))
+        .unwrap()
+}
+
+/// Acquires against `budget` before buffering `body`, returning the `AdmissionGuard` alongside
+/// the collected bytes so the caller holds the budget until the buffer is consumed or dropped.
+pub(crate) async fn read_body_admitted(
+    budget: &crate::memory::BodyBudget,
+    body: hyper::body::Incoming,
+    limit: u64,
+    estimated_bytes: Option<u64>,
+    resource: &str,
+) -> Result<Result<(Bytes, crate::memory::AdmissionGuard), Response<ResponseBody>>, hyper::Error> {
+    use hyper::body::Body as _;
+    let hint = estimated_bytes
+        .or_else(|| body.size_hint().exact())
+        .unwrap_or(limit)
+        .min(limit);
+    let guard = match budget.acquire_async(hint).await {
+        Ok(g) => g,
+        Err(_) => {
+            return Ok(Err(slow_down_response(
+                resource,
+                "Please reduce your request rate; in-flight body memory budget exhausted.",
+            )));
+        }
+    };
+    match read_body(body, limit, resource).await? {
+        Ok(bytes) => Ok(Ok((bytes, guard))),
+        Err(resp) => Ok(Err(resp)),
+    }
+}
+
 /// A response body sent as a list of chunks, one frame each: the parts of a multipart object
 /// go out from their mmaps without being copied into one buffer (#36).
 pub(crate) struct ChunksBody(pub(crate) std::collections::VecDeque<Bytes>);
@@ -539,6 +578,8 @@ pub struct S3ServiceState {
     roll_lock: Arc<parking_lot::Mutex<()>>,
     pub needle_crc_map: Arc<RwLock<HashMap<(u32, u64), u32>>>,
     pub payload_cache: Arc<PayloadCache>,
+    /// Byte-budget admission controller for buffered in-flight request bodies (#128).
+    pub body_budget: Arc<crate::memory::BodyBudget>,
     pub next_vol_offset: Arc<RwLock<u64>>,
     /// Disk writes, syncs, reads and payload copies, for the work-count tests.
     pub work: Arc<WorkCounters>,
@@ -613,6 +654,7 @@ impl S3ServiceState {
             volume_manager: Arc::new(RwLock::new(vol_mgr)),
             needle_crc_map: Arc::new(RwLock::new(HashMap::new())),
             payload_cache: Arc::new(PayloadCache::new(crate::memory::split_cache(crate::memory::effective().cache).1.min(usize::MAX as u64) as usize)),
+            body_budget: Arc::new(crate::memory::BodyBudget::new(crate::memory::effective().bodies)),
             next_vol_offset: Arc::new(RwLock::new(4096)),
             work,
             test_hook: Arc::new(RwLock::new(None)),
@@ -855,6 +897,7 @@ impl S3ServiceState {
             volume_manager: Arc::new(RwLock::new(vol_mgr)),
             needle_crc_map,
             payload_cache: Arc::new(PayloadCache::new(crate::memory::split_cache(crate::memory::effective().cache).1.min(usize::MAX as u64) as usize)),
+            body_budget: Arc::new(crate::memory::BodyBudget::new(crate::memory::effective().bodies)),
             next_vol_offset: Arc::new(RwLock::new(initial_vol_offset)),
             work,
             test_hook: Arc::new(RwLock::new(None)),
@@ -1815,7 +1858,7 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
     let (hits, misses) = state.payload_cache.hit_counts();
     let w = state.work.snapshot();
     let budget = crate::memory::effective();
-    let gauges: [(&str, &str, &str, u64); 21] = [
+    let gauges: [(&str, &str, &str, u64); 23] = [
         ("awanfs_volume_used_bytes", "gauge", "Bytes written into all open volumes, including dead needles.", used),
         ("awanfs_volume_free_span_bytes", "gauge", "Span left in the active volume before it rolls over.", free),
         ("awanfs_volumes_open", "gauge", "Open volumes.", state.volumes.read().len() as u64),
@@ -1834,6 +1877,8 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
         ("awanfs_memory_budget_cache_bytes", "gauge", "The budget's half for the payload cache.", budget.cache),
         ("awanfs_memory_budget_spill_bytes", "gauge", "The redb spill index page cache, carved out of the cache half.", crate::memory::split_cache(budget.cache).0),
         ("awanfs_memory_budget_bodies_bytes", "gauge", "The budget's half for in-flight request bodies.", budget.bodies),
+        ("awanfs_memory_bodies_in_use_bytes", "gauge", "Bytes currently held by admitted in-flight request bodies.", state.body_budget.in_use()),
+        ("awanfs_memory_bodies_rejected_total", "counter", "Requests rejected with 503 SlowDown because the body memory budget was exhausted.", state.body_budget.rejected()),
         (
             "awanfs_read_checksum_failures_total",
             "counter",

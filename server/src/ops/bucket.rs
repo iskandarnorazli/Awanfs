@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::ffi_bridge::{AWAN_ERR_BUCKET_NOT_EMPTY, AWAN_ERR_INVALID_ARG};
 use crate::iam::{Iam, Principal};
 use crate::s3_api::{
-    bad_request, empty_body, full_body, internal_error_response, md5_to_etag_hex, read_body,
+    bad_request, empty_body, full_body, internal_error_response, md5_to_etag_hex, read_body_admitted,
     s3_url_encode, ResponseBody, S3ServiceState, MAX_XML_BODY,
 };
 use crate::xml::{
@@ -220,7 +220,7 @@ pub async fn put_bucket_versioning(
     path: &str,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
-    let body_bytes = match read_body(body, MAX_XML_BODY, path).await? {
+    let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_XML_BODY, None, path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };
@@ -422,7 +422,7 @@ pub async fn delete_objects(
     iam: Option<&Iam>,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
-    let body_bytes = match read_body(body, MAX_XML_BODY, path).await? {
+    let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_XML_BODY, None, path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };

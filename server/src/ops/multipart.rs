@@ -14,7 +14,7 @@ use crate::multipart::{
 };
 use crate::s3_api::{
     bad_request, compute_md5, drain_body, empty_body, engine_error_response, full_body,
-    internal_error_response, read_body, ResponseBody, S3ServiceState, CHUNK_FRAMING_SLACK,
+    internal_error_response, read_body_admitted, ResponseBody, S3ServiceState, CHUNK_FRAMING_SLACK,
     MAX_OBJECT_BODY, MAX_XML_BODY, STREAM_PUT_MIN,
 };
 use crate::xml::s3_error_xml;
@@ -197,7 +197,7 @@ pub async fn upload_part(
             },
         );
     }
-    let raw_bytes = match read_body(body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, path).await? {
+    let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, declared_len, path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };
@@ -288,7 +288,7 @@ pub async fn complete_multipart_upload(
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let upload_id = &query_map["uploadId"];
-    let body_bytes = match read_body(body, MAX_XML_BODY, path).await? {
+    let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_XML_BODY, None, path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };

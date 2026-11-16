@@ -4,7 +4,7 @@ use hyper::{Response, StatusCode};
 use std::sync::Arc;
 
 use crate::lifecycle::{lifecycle_config_xml, parse_lifecycle_xml};
-use crate::s3_api::{empty_body, full_body, read_body, ResponseBody, S3ServiceState, MAX_XML_BODY};
+use crate::s3_api::{empty_body, full_body, read_body_admitted, ResponseBody, S3ServiceState, MAX_XML_BODY};
 use crate::xml::s3_error_xml;
 
 pub async fn put_bucket_lifecycle(
@@ -13,7 +13,7 @@ pub async fn put_bucket_lifecycle(
     path: &str,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
-    let body_bytes = match read_body(body, MAX_XML_BODY, path).await? {
+    let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_XML_BODY, None, path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };

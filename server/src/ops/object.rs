@@ -13,7 +13,7 @@ use crate::ffi_bridge::{
 use crate::iam::Iam;
 use crate::s3_api::{
     bad_request, drain_body, empty_body, engine_error_response, full_body,
-    internal_error_response, md5_to_etag_hex, parse_range_header, percent_decode_path, read_body,
+    internal_error_response, md5_to_etag_hex, parse_range_header, percent_decode_path, read_body_admitted,
     ChunksBody, ResponseBody, S3ServiceState, CHUNK_FRAMING_SLACK, FORMAT_2_FLAGS, MAX_OBJECT_BODY,
     STREAM_PUT_MIN, VERIFY_WHILE_SENDING_MIN,
 };
@@ -639,7 +639,7 @@ pub async fn put_object(
         }
         return Ok(finish_put(&state, b_id, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex));
     }
-    let raw_bytes = match read_body(body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, path).await? {
+    let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, expected_len.map(|n| n as u64), path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };
