@@ -1,0 +1,8 @@
+<CORSConfiguration>
+  <CORSRule>
+    <AllowedMethod>GET</AllowedMethod>
+    <AllowedMethod>PUT</AllowedMethod>
+    <AllowedOrigin>*.get</AllowedOrigin>
+    <AllowedOrigin>*.put</AllowedOrigin>
+  </CORSRule>
+</CORSConfiguration>

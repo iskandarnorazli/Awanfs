@@ -58,11 +58,17 @@ jobs:
             --junit /tmp/s3tests-results.xml --junit /tmp/s3tests-headers-results.xml \
             --suite-ref "ceph/s3-tests $(git -C /tmp/s3-tests rev-parse --short HEAD), run $GITHUB_RUN_ID" \
             --report /tmp/CONFORMANCE_MAP.md
+      - name: Triage report
+        if: always()
+        run: |
+          python3 tests/s3tests/test_triage.py
+          python3 tests/s3tests/triage.py /tmp/s3tests-results.xml /tmp/CONFORMANCE_MAP.md --out /tmp/TRIAGE.md
       - name: Summary
         if: always()
         run: |
           [ -f /tmp/s3tests-report.md ] && cat /tmp/s3tests-report.md >> "$GITHUB_STEP_SUMMARY"
           [ -f /tmp/CONFORMANCE_MAP.md ] && sed -n '1,/^## /p' /tmp/CONFORMANCE_MAP.md | sed '$d' | tee -a "$GITHUB_STEP_SUMMARY"
+          [ -f /tmp/TRIAGE.md ] && cat /tmp/TRIAGE.md >> "$GITHUB_STEP_SUMMARY"
           tail -20 /tmp/awanfs.log || true
       - uses: actions/upload-artifact@v4
         if: always()
@@ -73,3 +79,4 @@ jobs:
             /tmp/s3tests-headers-results.xml
             /tmp/s3tests-report.md
             /tmp/CONFORMANCE_MAP.md
+            /tmp/TRIAGE.md

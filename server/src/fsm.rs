@@ -39,6 +39,8 @@ pub const NO_SUCH_BUCKET: Refusal = refuse("NoSuchBucket", 404);
 pub const BUCKET_ALREADY_OWNED_BY_YOU: Refusal = refuse("BucketAlreadyOwnedByYou", 409);
 pub const BUCKET_ALREADY_EXISTS: Refusal = refuse("BucketAlreadyExists", 409);
 pub const BUCKET_NOT_EMPTY: Refusal = refuse("BucketNotEmpty", 409);
+pub const INVALID_BUCKET_NAME: Refusal = refuse("InvalidBucketName", 400);
+pub const KEY_TOO_LONG: Refusal = refuse("KeyTooLongError", 400);
 
 /// Bucket versioning (`PUT ?versioning`).
 ///

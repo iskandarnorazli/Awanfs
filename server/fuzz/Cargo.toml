@@ -44,6 +44,41 @@ path = "fuzz_targets/attrs_block.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "form_upload"
+path = "fuzz_targets/form_upload.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cors_xml"
+path = "fuzz_targets/cors_xml.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "object_lock_xml"
+path = "fuzz_targets/object_lock_xml.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "request_xml"
+path = "fuzz_targets/request_xml.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "lifecycle_config_xml"
+path = "fuzz_targets/lifecycle_config_xml.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "tagging_xml"
+path = "fuzz_targets/tagging_xml.rs"
+test = false
+doc = false
 
 [[bin]]
 name = "s3_target"
