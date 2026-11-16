@@ -784,13 +784,17 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         }
         Operation::CopyObject => object::copy_object(state, b_id.unwrap(), bucket, key, &c.parts.headers).await,
         Operation::GetObject => {
-            object::get_or_head_object(state, b_id.unwrap(), bucket, key, &c.query_map, &c.parts.headers, false).await
+            let auth_enabled = state.auth.credentials.is_some() || iam.as_deref().is_some_and(|i| !i.is_empty());
+            let is_anon_with_auth = auth_enabled && matches!(principal, Principal::Anonymous);
+            object::get_or_head_object(state, b_id.unwrap(), bucket, key, &c.query_map, &c.parts.headers, false, is_anon_with_auth).await
         }
         Operation::GetObjectAttributes => {
             object::get_object_attributes(state, b_id.unwrap(), bucket, key, &c.query_map, &c.parts.headers).await
         }
         Operation::HeadObject => {
-            object::get_or_head_object(state, b_id.unwrap(), bucket, key, &c.query_map, &c.parts.headers, true).await
+            let auth_enabled = state.auth.credentials.is_some() || iam.as_deref().is_some_and(|i| !i.is_empty());
+            let is_anon_with_auth = auth_enabled && matches!(principal, Principal::Anonymous);
+            object::get_or_head_object(state, b_id.unwrap(), bucket, key, &c.query_map, &c.parts.headers, true, is_anon_with_auth).await
         }
         Operation::DeleteObject => object::delete_object(state, b_id.unwrap(), key, &c.query_map).await,
         Operation::CreateMultipartUpload => {

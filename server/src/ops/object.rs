@@ -1,6 +1,10 @@
 use bytes::Bytes;
 use http_body_util::BodyExt;
-use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED};
+use hyper::header::{
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH,
+    CONTENT_RANGE, CONTENT_TYPE, ETAG, EXPIRES, LAST_MODIFIED,
+};
+use std::collections::BTreeMap;
 use hyper::{HeaderMap, Response, StatusCode};
 use sha2::Digest;
 use std::collections::HashMap;
@@ -74,6 +78,25 @@ fn put_ok_response(etag_hex: &str, version_id: Option<&str>, checksum: Option<(c
     b.body(empty_body()).unwrap()
 }
 
+const MAX_USER_METADATA_BYTES: usize = 2048;
+
+fn valid_header_str<'a>(val: &'a hyper::header::HeaderValue, key: &str) -> Result<&'a str, Response<ResponseBody>> {
+    let bytes = val.as_bytes();
+    if bytes.iter().any(|&b| b == b'\r' || b == b'\n') {
+        return Err(bad_request("InvalidArgument", "Metadata header value must not contain CR or LF.", key));
+    }
+    val.to_str()
+        .map_err(|_| bad_request("InvalidArgument", "Metadata header value must be valid UTF-8.", key))
+}
+
+fn strip_aws_chunked(raw: &str) -> String {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("aws-chunked"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn request_attrs_with_checksum(
     headers: &HeaderMap,
     key: &str,
@@ -81,7 +104,7 @@ fn request_attrs_with_checksum(
 ) -> Result<Vec<u8>, Response<ResponseBody>> {
     let mut attrs = crate::attrs::Attrs::new();
     if let Some(ct) = headers.get(CONTENT_TYPE) {
-        attrs.set(crate::attrs::TAG_CONTENT_TYPE, ct.as_bytes());
+        attrs.set(crate::attrs::TAG_CONTENT_TYPE, valid_header_str(ct, key)?.as_bytes());
     }
     if let Some(tagging) = headers.get("x-amz-tagging") {
         let raw = tagging
@@ -96,6 +119,51 @@ fn request_attrs_with_checksum(
     if let Some((alg, cksum_type, val)) = checksum {
         attrs.set_checksum(alg, cksum_type, val);
     }
+    if let Some(ce) = headers.get(CONTENT_ENCODING) {
+        let stripped = strip_aws_chunked(valid_header_str(ce, key)?);
+        if !stripped.is_empty() {
+            attrs.set(crate::attrs::TAG_CONTENT_ENCODING, stripped.as_bytes());
+        }
+    }
+    for (hdr, tag) in [
+        (CONTENT_DISPOSITION.as_str(), crate::attrs::TAG_CONTENT_DISPOSITION),
+        (CONTENT_LANGUAGE.as_str(), crate::attrs::TAG_CONTENT_LANGUAGE),
+        (CACHE_CONTROL.as_str(), crate::attrs::TAG_CACHE_CONTROL),
+        (EXPIRES.as_str(), crate::attrs::TAG_EXPIRES),
+        ("x-amz-website-redirect-location", crate::attrs::TAG_WEBSITE_REDIRECT),
+    ] {
+        if let Some(v) = headers.get(hdr) {
+            attrs.set(tag, valid_header_str(v, key)?.as_bytes());
+        }
+    }
+
+    let mut user_meta: BTreeMap<String, String> = BTreeMap::new();
+    for (name, value) in headers.iter() {
+        if let Some(suffix) = name.as_str().strip_prefix("x-amz-meta-") {
+            if suffix.is_empty() {
+                continue;
+            }
+            let val = valid_header_str(value, key)?;
+            let lower = suffix.to_ascii_lowercase();
+            user_meta
+                .entry(lower)
+                .and_modify(|existing| {
+                    existing.push_str(", ");
+                    existing.push_str(val);
+                })
+                .or_insert_with(|| val.to_string());
+        }
+    }
+    let total_user_meta: usize = user_meta.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if total_user_meta > MAX_USER_METADATA_BYTES {
+        return Err(bad_request(
+            "MetadataTooLarge",
+            "Your metadata headers exceed the maximum allowed metadata size.",
+            key,
+        ));
+    }
+    attrs.set_user_meta(user_meta.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+
     attrs
         .encode()
         .map_err(|_| bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key))
@@ -131,6 +199,94 @@ pub(crate) fn with_checksum_headers(
         }
     }
     builder
+}
+
+#[derive(Default)]
+struct ResponseOverrides<'a> {
+    content_type: Option<&'a str>,
+    content_language: Option<&'a str>,
+    expires: Option<&'a str>,
+    cache_control: Option<&'a str>,
+    content_disposition: Option<&'a str>,
+    content_encoding: Option<&'a str>,
+}
+
+impl<'a> ResponseOverrides<'a> {
+    fn from_query(
+        query_map: &'a HashMap<String, String>,
+        key: &str,
+        is_anon_with_auth: bool,
+    ) -> Result<Self, Response<ResponseBody>> {
+        let ov = Self {
+            content_type: query_map.get("response-content-type").map(String::as_str),
+            content_language: query_map.get("response-content-language").map(String::as_str),
+            expires: query_map.get("response-expires").map(String::as_str),
+            cache_control: query_map.get("response-cache-control").map(String::as_str),
+            content_disposition: query_map.get("response-content-disposition").map(String::as_str),
+            content_encoding: query_map.get("response-content-encoding").map(String::as_str),
+        };
+        let any = ov.content_type.is_some()
+            || ov.content_language.is_some()
+            || ov.expires.is_some()
+            || ov.cache_control.is_some()
+            || ov.content_disposition.is_some()
+            || ov.content_encoding.is_some();
+        if any && is_anon_with_auth {
+            return Err(bad_request(
+                "InvalidRequest",
+                "Request specific response headers cannot be used for anonymous GET requests.",
+                key,
+            ));
+        }
+        for val in [
+            ov.content_type,
+            ov.content_language,
+            ov.expires,
+            ov.cache_control,
+            ov.content_disposition,
+            ov.content_encoding,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if val.bytes().any(|b| b == b'\r' || b == b'\n') {
+                return Err(bad_request("InvalidArgument", "Response override value must not contain CR or LF.", key));
+            }
+        }
+        Ok(ov)
+    }
+}
+
+trait MetadataHeadersExt {
+    fn with_object_metadata(self, view: &crate::s3_api::ObjectView, ov: &ResponseOverrides<'_>) -> Self;
+}
+
+impl MetadataHeadersExt for hyper::http::response::Builder {
+    fn with_object_metadata(mut self, view: &crate::s3_api::ObjectView, ov: &ResponseOverrides<'_>) -> Self {
+        self = self.header(CONTENT_TYPE, ov.content_type.unwrap_or_else(|| view.content_type()));
+        if let Some(v) = ov.content_encoding.or_else(|| view.attrs.content_encoding()) {
+            self = self.header(CONTENT_ENCODING, v);
+        }
+        if let Some(v) = ov.content_disposition.or_else(|| view.attrs.content_disposition()) {
+            self = self.header(CONTENT_DISPOSITION, v);
+        }
+        if let Some(v) = ov.content_language.or_else(|| view.attrs.content_language()) {
+            self = self.header(CONTENT_LANGUAGE, v);
+        }
+        if let Some(v) = ov.cache_control.or_else(|| view.attrs.cache_control()) {
+            self = self.header(CACHE_CONTROL, v);
+        }
+        if let Some(v) = ov.expires.or_else(|| view.attrs.expires()) {
+            self = self.header(EXPIRES, v);
+        }
+        if let Some(v) = view.attrs.website_redirect() {
+            self = self.header("x-amz-website-redirect-location", v);
+        }
+        for (k, v) in view.attrs.user_meta() {
+            self = self.header(format!("x-amz-meta-{}", k), v);
+        }
+        self
+    }
 }
 
 pub(crate) fn null_version_of(m: &crate::meta_index::ObjectMeta) -> crate::versions::Version {
@@ -279,6 +435,7 @@ fn version_get_response(
     head: bool,
     range: Option<&str>,
     headers: &HeaderMap,
+    overrides: &ResponseOverrides<'_>,
 ) -> Response<ResponseBody> {
     let id = match vid {
         Some(s) => match crate::versions::parse_id(s) {
@@ -356,12 +513,12 @@ fn version_get_response(
     let cksum_mode = checksum_mode_enabled(headers);
     let builder = with_tagging_count(
         with_checksum_headers(
-        Response::builder()
-            .header(CONTENT_TYPE, view.content_type())
-            .header(ETAG, etag_val)
-            .header(ACCEPT_RANGES, "bytes")
-            .header("x-amz-version-id", v.id_string())
-            .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts)),
+            Response::builder()
+        .with_object_metadata(&view, &overrides)
+        .header(ETAG, etag_val)
+        .header(ACCEPT_RANGES, "bytes")
+        .header("x-amz-version-id", v.id_string())
+        .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts)),
             &view.attrs,
             cksum_mode,
         ),
@@ -516,9 +673,19 @@ pub async fn copy_object(
         Ok(r) => r,
         Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
     };
-    let replace = headers
-        .get("x-amz-metadata-directive")
-        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"REPLACE"));
+    let replace = match headers.get("x-amz-metadata-directive").and_then(|v| v.to_str().ok()) {
+        None => false,
+        Some(v) if v.eq_ignore_ascii_case("COPY") => false,
+        Some(v) if v.eq_ignore_ascii_case("REPLACE") => true,
+        Some(_) => return Ok(bad_request("InvalidArgument", "Unknown metadata directive.", key)),
+    };
+    if src_bucket == bucket && src_key == key && src_vid.is_none() && !replace {
+        return Ok(bad_request(
+            "InvalidRequest",
+            "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.",
+            key,
+        ));
+    }
     let copy_attrs = if replace {
         match request_attrs(headers, key) {
             Ok(a) => a,
@@ -1012,11 +1179,16 @@ pub async fn get_or_head_object(
     query_map: &HashMap<String, String>,
     headers: &HeaderMap,
     is_head: bool,
+    is_anon_with_auth: bool,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
+    let overrides = match ResponseOverrides::from_query(query_map, key, is_anon_with_auth) {
+        Ok(ov) => ov,
+        Err(resp) => return Ok(resp),
+    };
     let vid = query_map.get("versionId").map(|s| s.as_str());
     if vid.is_some() || state.versions.read().has(b_id, key) {
         let range = headers.get("Range").and_then(|v| v.to_str().ok());
-        return Ok(version_get_response(&state, b_id, key, vid, is_head, range, headers));
+        return Ok(version_get_response(&state, b_id, key, vid, is_head, range, headers, &overrides));
     }
     let (meta, is_multipart) = {
         let engine = state.engine.read();
@@ -1083,20 +1255,16 @@ pub async fn get_or_head_object(
                         Ok(b) => b,
                         Err(e) => return Ok(internal_error_response(key, &format!("could not read the object: {:?}", e))),
                     };
-                    return Ok(with_tagging_count(with_checksum_headers(
-                        Response::builder()
-                            .status(StatusCode::PARTIAL_CONTENT)
-                            .header(CONTENT_TYPE, view.content_type())
-                            .header(ETAG, etag_val)
-                            .header(ACCEPT_RANGES, "bytes")
-                            .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
-                            .header(CONTENT_LENGTH, len.to_string())
-                            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)),
-                        &view.attrs,
-                        cksum_mode,
-                    ), tag_count)
-                    .body(body.boxed())
-                    .unwrap());
+                    return Ok(with_tagging_count(with_checksum_headers(Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .with_object_metadata(&view, &overrides)
+                        .header(ETAG, etag_val)
+                        .header(ACCEPT_RANGES, "bytes")
+                        .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
+                        .header(CONTENT_LENGTH, len.to_string())
+                        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count)
+                        .body(body.boxed())
+                        .unwrap());
                 }
                 let sub_bytes = if is_head {
                     Bytes::new()
@@ -1147,7 +1315,7 @@ pub async fn get_or_head_object(
                             }
                             return Ok(with_tagging_count(Response::builder()
                                 .status(StatusCode::PARTIAL_CONTENT)
-                                .header(CONTENT_TYPE, view.content_type())
+                                .with_object_metadata(&view, &overrides)
                                 .header(ETAG, etag_val)
                                 .header(ACCEPT_RANGES, "bytes")
                                 .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
@@ -1185,20 +1353,16 @@ pub async fn get_or_head_object(
                 let content_range = format!("bytes {}-{}/{}", range.start, range.end, meta.size);
                 let body = if is_head { empty_body() } else { full_body(sub_bytes) };
 
-                return Ok(with_tagging_count(with_checksum_headers(
-                    Response::builder()
-                        .status(StatusCode::PARTIAL_CONTENT)
-                        .header(CONTENT_TYPE, view.content_type())
-                        .header(ETAG, etag_val)
-                        .header(ACCEPT_RANGES, "bytes")
-                        .header(CONTENT_RANGE, content_range)
-                        .header(CONTENT_LENGTH, (range.end - range.start + 1).to_string())
-                        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)),
-                    &view.attrs,
-                    cksum_mode,
-                ), tag_count)
-                .body(body)
-                .unwrap());
+                return Ok(with_tagging_count(with_checksum_headers(Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .with_object_metadata(&view, &overrides)
+                    .header(ETAG, etag_val)
+                    .header(ACCEPT_RANGES, "bytes")
+                    .header(CONTENT_RANGE, content_range)
+                    .header(CONTENT_LENGTH, (range.end - range.start + 1).to_string())
+                    .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count)
+                    .body(body)
+                    .unwrap());
             }
             Err(()) => {
                 let xml = s3_error_xml("InvalidRange", "The requested range cannot be satisfied.", key, "req-range-err");
@@ -1231,19 +1395,15 @@ pub async fn get_or_head_object(
         if chunks.iter().map(|c| c.len() as u64).sum::<u64>() != meta.size {
             return Ok(internal_error_response(key, "a part of the object is missing"));
         }
-        return Ok(with_tagging_count(with_checksum_headers(
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, view.content_type())
-                .header(ETAG, etag_val)
-                .header(ACCEPT_RANGES, "bytes")
-                .header(CONTENT_LENGTH, meta.size.to_string())
-                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)),
-            &view.attrs,
-            cksum_mode,
-        ), tag_count)
-        .body(ChunksBody(chunks).boxed())
-        .unwrap());
+        return Ok(with_tagging_count(with_checksum_headers(Response::builder()
+            .status(StatusCode::OK)
+            .with_object_metadata(&view, &overrides)
+            .header(ETAG, etag_val)
+            .header(ACCEPT_RANGES, "bytes")
+            .header(CONTENT_LENGTH, meta.size.to_string())
+            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count)
+            .body(ChunksBody(chunks).boxed())
+            .unwrap());
     }
 
     if !is_head && !is_compressed && meta.size > VERIFY_WHILE_SENDING_MIN {
@@ -1259,19 +1419,15 @@ pub async fn get_or_head_object(
             Ok(b) => b,
             Err(e) => return Ok(internal_error_response(key, &format!("could not read the object: {:?}", e))),
         };
-        return Ok(with_tagging_count(with_checksum_headers(
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, view.content_type())
-                .header(ETAG, etag_val)
-                .header(ACCEPT_RANGES, "bytes")
-                .header(CONTENT_LENGTH, meta.size.to_string())
-                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)),
-            &view.attrs,
-            cksum_mode,
-        ), tag_count)
-        .body(body.boxed())
-        .unwrap());
+        return Ok(with_tagging_count(with_checksum_headers(Response::builder()
+            .status(StatusCode::OK)
+            .with_object_metadata(&view, &overrides)
+            .header(ETAG, etag_val)
+            .header(ACCEPT_RANGES, "bytes")
+            .header(CONTENT_LENGTH, meta.size.to_string())
+            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count)
+            .body(body.boxed())
+            .unwrap());
     }
 
     let payload = if is_head {
@@ -1295,19 +1451,15 @@ pub async fn get_or_head_object(
         return Ok(internal_error_response(key, "the object's bytes could not be read or failed verification"));
     }
     let body = if is_head { empty_body() } else { full_body(payload) };
-    Ok(with_tagging_count(with_checksum_headers(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, view.content_type())
-            .header(ETAG, etag_val)
-            .header(ACCEPT_RANGES, "bytes")
-            .header(CONTENT_LENGTH, meta.size.to_string())
-            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)),
-        &view.attrs,
-        cksum_mode,
-    ), tag_count)
-    .body(body)
-    .unwrap())
+    Ok(with_tagging_count(with_checksum_headers(Response::builder()
+        .status(StatusCode::OK)
+        .with_object_metadata(&view, &overrides)
+        .header(ETAG, etag_val)
+        .header(ACCEPT_RANGES, "bytes")
+        .header(CONTENT_LENGTH, meta.size.to_string())
+        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count)
+        .body(body)
+        .unwrap())
 }
 
 pub async fn delete_object(

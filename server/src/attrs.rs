@@ -12,6 +12,20 @@ pub const MAX_BLOCK: usize = u16::MAX as usize;
 
 /// `Content-Type` as sent with the object (#150). Write-time.
 pub const TAG_CONTENT_TYPE: u16 = 0x0001;
+/// `Content-Encoding` with `aws-chunked` stripped (#152). Write-time.
+pub const TAG_CONTENT_ENCODING: u16 = 0x0002;
+/// `Content-Disposition` (#152). Write-time.
+pub const TAG_CONTENT_DISPOSITION: u16 = 0x0003;
+/// `Content-Language` (#152). Write-time.
+pub const TAG_CONTENT_LANGUAGE: u16 = 0x0004;
+/// `Cache-Control` (#152). Write-time.
+pub const TAG_CACHE_CONTROL: u16 = 0x0005;
+/// `Expires` (#152). Write-time.
+pub const TAG_EXPIRES: u16 = 0x0006;
+/// `x-amz-website-redirect-location` (#152). Write-time.
+pub const TAG_WEBSITE_REDIRECT: u16 = 0x0007;
+/// User metadata (`x-amz-meta-*`) packed as `name_len (u16 LE) | name | val_len (u16 LE) | val` (#152).
+pub const TAG_USER_META: u16 = 0x0008;
 
 /// Object tags (`TagSet`, #115). Mutable: rewriting the needle updates this tag.
 pub const TAG_TAGGING: u16 = 0x0010;
@@ -117,6 +131,84 @@ impl Attrs {
                 .collect(),
         )
     }
+    fn get_str(&self, tag: u16) -> Option<&str> {
+        self.get(tag).and_then(|v| std::str::from_utf8(v).ok())
+    }
+
+    pub fn content_encoding(&self) -> Option<&str> {
+        self.get_str(TAG_CONTENT_ENCODING)
+    }
+
+    pub fn content_disposition(&self) -> Option<&str> {
+        self.get_str(TAG_CONTENT_DISPOSITION)
+    }
+
+    pub fn content_language(&self) -> Option<&str> {
+        self.get_str(TAG_CONTENT_LANGUAGE)
+    }
+
+    pub fn cache_control(&self) -> Option<&str> {
+        self.get_str(TAG_CACHE_CONTROL)
+    }
+
+    pub fn expires(&self) -> Option<&str> {
+        self.get_str(TAG_EXPIRES)
+    }
+
+    pub fn website_redirect(&self) -> Option<&str> {
+        self.get_str(TAG_WEBSITE_REDIRECT)
+    }
+
+    /// Encodes `x-amz-meta-*` entries (already lower-cased names) into `TAG_USER_META`.
+    /// Does nothing when `entries` is empty so needles without metadata stay format 2.
+    pub fn set_user_meta<'a, I>(&mut self, entries: I)
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        let mut buf = Vec::new();
+        for (name, val) in entries {
+            let nb = name.as_bytes();
+            let vb = val.as_bytes();
+            buf.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+            buf.extend_from_slice(nb);
+            buf.extend_from_slice(&(vb.len() as u16).to_le_bytes());
+            buf.extend_from_slice(vb);
+        }
+        if !buf.is_empty() {
+            self.set(TAG_USER_META, &buf);
+        }
+    }
+
+    /// Decodes `x-amz-meta-*` entries from `TAG_USER_META`.
+    pub fn user_meta(&self) -> Vec<(&str, &str)> {
+        let Some(mut rest) = self.get(TAG_USER_META) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while rest.len() >= 2 {
+            let nlen = u16::from_le_bytes([rest[0], rest[1]]) as usize;
+            rest = &rest[2..];
+            if rest.len() < nlen + 2 {
+                break;
+            }
+            let Ok(name) = std::str::from_utf8(&rest[..nlen]) else {
+                break;
+            };
+            rest = &rest[nlen..];
+            let vlen = u16::from_le_bytes([rest[0], rest[1]]) as usize;
+            rest = &rest[2..];
+            if rest.len() < vlen {
+                break;
+            }
+            let Ok(val) = std::str::from_utf8(&rest[..vlen]) else {
+                break;
+            };
+            rest = &rest[vlen..];
+            out.push((name, val));
+        }
+        out
+    }
+
     /// The tags, ascending.
     pub fn tags(&self) -> impl Iterator<Item = u16> + '_ {
         self.entries.iter().map(|e| e.0)
