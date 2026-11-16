@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use crate::clock::{Clock, SystemClock};
 use memmap2::Mmap;
 use crate::xml::xml_escape;
 
@@ -66,6 +66,7 @@ pub struct MultipartManager {
     pub staging_dir: PathBuf,
     pub staged_mmaps: RwLock<HashMap<PathBuf, Arc<Mmap>>>,
     pub work: Arc<crate::work::WorkCounters>,
+    pub clock: Arc<dyn Clock>,
 }
 
 impl MultipartManager {
@@ -94,6 +95,7 @@ impl MultipartManager {
             staging_dir,
             staged_mmaps: RwLock::new(HashMap::new()),
             work: Arc::new(crate::work::WorkCounters::default()),
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -101,6 +103,41 @@ impl MultipartManager {
     pub fn with_work_counters(mut self, work: Arc<crate::work::WorkCounters>) -> Self {
         self.work = work;
         self
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Removes up to `budget` incomplete uploads older than `max_age_ms`, returning
+    /// `(removed_count, more_waiting)`.
+    pub fn cleanup_expired(&self, now_ms: u64, max_age_ms: u64, budget: usize) -> (usize, bool) {
+        if budget == 0 {
+            return (0, false);
+        }
+        let mut expired = Vec::new();
+        let mut more = false;
+        {
+            let uploads = self.uploads.read();
+            for (id, u) in uploads.iter() {
+                if now_ms.saturating_sub(u.initiated_at) >= max_age_ms {
+                    if expired.len() < budget {
+                        expired.push(id.clone());
+                    } else {
+                        more = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let mut removed = 0;
+        for id in expired {
+            if self.abort_upload(&id).is_ok() {
+                removed += 1;
+            }
+        }
+        (removed, more)
     }
 
     pub fn get_or_mmap_part(&self, path: &Path) -> std::io::Result<Arc<Mmap>> {
@@ -135,10 +172,7 @@ impl MultipartManager {
         };
         drop(id_gen);
 
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_ms = self.clock.now_ns() / 1_000_000;
 
         let upload_dir = self.staging_dir.join(&upload_id);
         let _ = std::fs::create_dir_all(&upload_dir);
@@ -174,7 +208,7 @@ impl MultipartManager {
         let upload_dir = self.staging_dir.join(upload_id);
         std::fs::create_dir_all(&upload_dir)?;
         let path = upload_dir.join(format!("part_{:05}.dat", part_number));
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let nanos = self.clock.now_ns();
         let tmp = upload_dir.join(format!("part_{:05}.dat.partial-{}", part_number, nanos));
         let file = std::fs::File::create(&tmp)?;
         Ok(PartWriter { file, tmp, path, buf: Vec::new(), written: 0, work: Arc::clone(&self.work), done: false })
@@ -203,10 +237,7 @@ impl MultipartManager {
         let mut uploads = self.uploads.write();
         let upload = uploads.get_mut(upload_id).ok_or("NoSuchUpload")?;
 
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_ms = self.clock.now_ns() / 1_000_000;
 
         let part = StagedPart {
             part_number,
@@ -477,7 +508,7 @@ pub fn list_parts_result_xml(
     for p in parts {
         out.push_str("  <Part>\n");
         out.push_str(&format!("    <PartNumber>{}</PartNumber>\n", p.part_number));
-        out.push_str("    <LastModified>2026-11-10T00:00:00.000Z</LastModified>\n");
+        out.push_str(&format!("    <LastModified>{}</LastModified>\n", crate::versions::iso8601(p.uploaded_at.saturating_mul(1_000_000))));
         out.push_str(&format!("    <ETag>\"{}\"</ETag>\n", p.etag_hex));
         out.push_str(&format!("    <Size>{}</Size>\n", p.size));
         out.push_str("  </Part>\n");
@@ -511,7 +542,7 @@ pub fn list_multipart_uploads_result_xml(
         out.push_str("    <Initiator><ID>root</ID><DisplayName>root</DisplayName></Initiator>\n");
         out.push_str("    <Owner><ID>root</ID><DisplayName>root</DisplayName></Owner>\n");
         out.push_str("    <StorageClass>STANDARD</StorageClass>\n");
-        out.push_str("    <Initiated>2026-11-10T00:00:00.000Z</Initiated>\n");
+        out.push_str(&format!("    <Initiated>{}</Initiated>\n", crate::versions::iso8601(u.initiated_at.saturating_mul(1_000_000))));
         out.push_str("  </Upload>\n");
     }
 

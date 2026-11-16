@@ -182,6 +182,7 @@ pub fn run_lifecycle_sweep(state: &S3ServiceState, lifecycle: &LifecycleManager,
     let configs_guard = lifecycle.configs.read();
     let disable_prefix = FAULT_DISABLE_PREFIX_CHECK.load(Ordering::Relaxed);
 
+    let day_ms = state.lifecycle_day_seconds.load(Ordering::Relaxed).max(1) * 1000;
     for (bucket_name, rules) in configs_guard.iter() {
         for rule in rules {
             if !rule.status {
@@ -190,7 +191,7 @@ pub fn run_lifecycle_sweep(state: &S3ServiceState, lifecycle: &LifecycleManager,
 
             // 1. Object Expiration Sweep
             if let Some(exp_days) = rule.expiration_days {
-                let ttl_ms = (exp_days as u64) * 86_400_000;
+                let ttl_ms = (exp_days as u64) * day_ms;
                 let b_id = match state.engine.read().lookup_bucket(bucket_name) {
                     Ok(id) => id,
                     Err(_) => continue,
@@ -224,7 +225,7 @@ pub fn run_lifecycle_sweep(state: &S3ServiceState, lifecycle: &LifecycleManager,
 
             // 2. Abort Incomplete Multipart Sweep
             if let Some(abort_days) = rule.abort_multipart_days {
-                let ttl_ms = (abort_days as u64) * 86_400_000;
+                let ttl_ms = (abort_days as u64) * day_ms;
                 let mut uploads_to_abort = Vec::new();
                 {
                     let uploads_guard = state.multipart.uploads.read();

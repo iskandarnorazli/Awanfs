@@ -344,7 +344,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixture_dir(name: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = crate::clock::SystemClock.now_ns();
         let d = std::env::temp_dir().join(format!("awanfs_budget_{}_{}_{}", name, std::process::id(), nanos));
         std::fs::create_dir_all(&d).unwrap();
         d

@@ -54,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut auto_compaction = std::env::var("AWANFS_AUTO_COMPACTION").ok().as_deref() != Some("off");
     let mut durability = std::env::var("AWANFS_DURABILITY").unwrap_or_else(|_| "group".to_string());
     let mut memory_budget: Option<String> = None;
+    let mut lifecycle_day_seconds: u64 = 86_400;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -88,6 +89,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else if arg == "--config" {
             config_path = args.next().map(PathBuf::from);
         } else if arg == "--memory-budget" {
+            memory_budget = args.next();
+        } else if arg == "--lifecycle-day-seconds" {
+            if let Some(v) = args.next().and_then(|s| s.parse::<u64>().ok()).filter(|&n| n > 0) {
+                lifecycle_day_seconds = v;
+            }
             memory_budget = args.next();
         } else if arg == "--allow-anonymous" {
             allow_anonymous = true;
@@ -181,6 +187,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.set_durability(durability);
     // Compaction copies at most this many MB/s (#28, decision 24); 0 = no limit.
     state.compaction_rate.store(compaction_mb.unwrap_or(50) * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+    state.lifecycle_day_seconds.store(lifecycle_day_seconds, std::sync::atomic::Ordering::Relaxed);
+    if lifecycle_day_seconds != 86_400 {
+        eprintln!("WARNING: --lifecycle-day-seconds {} is set (default 86400); for test use only", lifecycle_day_seconds);
+    }
     // Traces (#43): off unless an OTLP endpoint is given.
     if let Some(ref endpoint) = otlp {
         if let Err(e) = s3_server::trace::init(endpoint, "awanfs") {
@@ -227,6 +237,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if auto_compaction {
         state.start_auto_compaction(std::time::Duration::from_secs(600), 0.20, 1 << 30);
     }
+    state.start_multipart_cleanup(std::time::Duration::from_secs(600), 7 * lifecycle_day_seconds * 1000);
+        state.start_auto_compaction(std::time::Duration::from_secs(600), 0.20, 1 << 30);
+    }
 
     // TLS (#30, owner decision 18): with --cert and --key the port serves HTTPS only; plain
     // HTTP needs --http-port.
@@ -264,6 +277,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     let finished = handle.shutdown_gracefully(std::time::Duration::from_secs(30)).await;
     if !finished {
+        eprintln!("some connections were still open after 30 s");
+    }
+    if !state_for_stop.scheduler.shutdown(std::time::Duration::from_secs(10)).await {
+        eprintln!("some background tasks did not finish within 10 s");
+    }
         eprintln!("some connections were still open after 30 s");
     }
     if let Err(e) = state_for_stop.sync_all_volumes() {

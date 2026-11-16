@@ -9,7 +9,7 @@ use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST};
 use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+
 
 use crate::iam::{Iam, Principal};
 use crate::s3_api::{
@@ -529,7 +529,7 @@ pub fn classify_request(req: Request<hyper::body::Incoming>) -> Result<Classifie
 }
 
 pub fn authenticate(state: &S3ServiceState, c: Classified) -> Result<Authenticated, Response<ResponseBody>> {
-    let now_sec = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let now_sec = state.clock.now_ns() / 1_000_000_000;
     let iam = state.iam.read().as_ref().map(|r| r.current());
     let path = c.parts.uri.path();
     let principal = match crate::auth::authenticate_with(

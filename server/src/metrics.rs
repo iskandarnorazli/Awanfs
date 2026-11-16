@@ -1,7 +1,10 @@
 //! Request metrics for `/_awanfs/metrics` in Prometheus text format (#42).
 
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use parking_lot::RwLock;
 
 /// S3 operations, as the metrics label them.
 pub const OPERATIONS: &[&str] = &[
@@ -40,15 +43,28 @@ struct OpStats {
     sum_us: AtomicU64,
 }
 
+#[derive(Default)]
+struct TaskStats {
+    ticks: AtomicU64,
+    buckets: [AtomicU64; 13],
+    sum_us: AtomicU64,
+}
+
 pub struct Metrics {
     ops: Vec<OpStats>,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    tasks: RwLock<BTreeMap<String, Arc<TaskStats>>>,
 }
 
 impl Default for Metrics {
     fn default() -> Self {
-        Metrics { ops: OPERATIONS.iter().map(|_| OpStats::default()).collect(), bytes_in: AtomicU64::new(0), bytes_out: AtomicU64::new(0) }
+        Metrics {
+            ops: OPERATIONS.iter().map(|_| OpStats::default()).collect(),
+            bytes_in: AtomicU64::new(0),
+            bytes_out: AtomicU64::new(0),
+            tasks: RwLock::new(BTreeMap::new()),
+        }
     }
 }
 
@@ -71,6 +87,21 @@ impl Metrics {
         s.sum_us.fetch_add((seconds * 1e6) as u64, Ordering::Relaxed);
         self.bytes_in.fetch_add(bytes_in, Ordering::Relaxed);
         self.bytes_out.fetch_add(bytes_out, Ordering::Relaxed);
+    }
+
+    pub fn record_background_tick(&self, task: &str, seconds: f64) {
+        let stats = {
+            let guard = self.tasks.read();
+            guard.get(task).cloned()
+        }
+        .unwrap_or_else(|| {
+            let mut guard = self.tasks.write();
+            guard.entry(task.to_string()).or_insert_with(|| Arc::new(TaskStats::default())).clone()
+        });
+        stats.ticks.fetch_add(1, Ordering::Relaxed);
+        let slot = LATENCY_BUCKETS.iter().position(|&b| seconds <= b).unwrap_or(LATENCY_BUCKETS.len());
+        stats.buckets[slot].fetch_add(1, Ordering::Relaxed);
+        stats.sum_us.fetch_add((seconds * 1e6) as u64, Ordering::Relaxed);
     }
 
     /// Requests of `op` answered so far, all status classes.
@@ -107,5 +138,28 @@ impl Metrics {
         }
         let _ = writeln!(out, "# HELP awanfs_request_bytes_total Request body bytes declared by Content-Length.\n# TYPE awanfs_request_bytes_total counter\nawanfs_request_bytes_total {}", self.bytes_in.load(Ordering::Relaxed));
         let _ = writeln!(out, "# HELP awanfs_response_bytes_total Response body bytes declared by Content-Length.\n# TYPE awanfs_response_bytes_total counter\nawanfs_response_bytes_total {}", self.bytes_out.load(Ordering::Relaxed));
+        out.push_str("# HELP awanfs_background_ticks_total Completed background scheduler ticks, by task.\n# TYPE awanfs_background_ticks_total counter\n");
+        let tasks = self.tasks.read();
+        for (name, s) in tasks.iter() {
+            let n = s.ticks.load(Ordering::Relaxed);
+            if n > 0 {
+                let _ = writeln!(out, "awanfs_background_ticks_total{{task=\"{}\"}} {}", name, n);
+            }
+        }
+        out.push_str("# HELP awanfs_background_tick_seconds Duration of background scheduler ticks.\n# TYPE awanfs_background_tick_seconds histogram\n");
+        for (name, s) in tasks.iter() {
+            let total: u64 = s.buckets.iter().map(|b| b.load(Ordering::Relaxed)).sum();
+            if total == 0 {
+                continue;
+            }
+            let mut cum = 0;
+            for (b, bound) in LATENCY_BUCKETS.iter().enumerate() {
+                cum += s.buckets[b].load(Ordering::Relaxed);
+                let _ = writeln!(out, "awanfs_background_tick_seconds_bucket{{task=\"{}\",le=\"{}\"}} {}", name, bound, cum);
+            }
+            let _ = writeln!(out, "awanfs_background_tick_seconds_bucket{{task=\"{}\",le=\"+Inf\"}} {}", name, total);
+            let _ = writeln!(out, "awanfs_background_tick_seconds_sum{{task=\"{}\"}} {}", name, s.sum_us.load(Ordering::Relaxed) as f64 / 1e6);
+            let _ = writeln!(out, "awanfs_background_tick_seconds_count{{task=\"{}\"}} {}", name, total);
+        }
     }
 }

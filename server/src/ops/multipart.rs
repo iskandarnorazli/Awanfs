@@ -335,9 +335,10 @@ pub async fn complete_multipart_upload(
             }
             let manifest = Bytes::from(encode_extents_manifest(&state.multipart.staging_dir, total_size, &extents));
             let stamp = state.version_stamp(b_id, key);
+            let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
             let mp_flags = AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART | stamp.map_or(0, |s| s.0);
             let manifest_offset = match state
-                .store_payload_at(b_id, key, &manifest, mp_flags, hi, lo, stamp.map(|s| s.1))
+                .store_payload_at(b_id, key, &manifest, mp_flags, hi, lo, Some(created_ns))
                 .await
             {
                 Ok(off) => off,
@@ -360,7 +361,7 @@ pub async fn complete_multipart_upload(
                 }
             } else {
                 let mut engine = state.engine.write();
-                if let Err(code) = engine.put_object(
+                if let Err(code) = engine.put_object_at(
                     b_id,
                     key.as_bytes(),
                     manifest_offset,
@@ -369,6 +370,7 @@ pub async fn complete_multipart_upload(
                     lo,
                     extents.len() as u16,
                     AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART,
+                    created_ns / 1_000_000,
                 ) {
                     return Ok(engine_error_response(code, key));
                 }

@@ -7,7 +7,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use crate::clock::{Clock, SystemClock};
 use bytes::Bytes;
 use memmap2::Mmap;
 use parking_lot::{Mutex, RwLock};
@@ -235,7 +235,7 @@ impl NeedleWriter {
             }
         })?;
         self.flush_chunk()?;
-        let now = self.created_at.unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64);
+        let now = self.created_at.unwrap_or_else(|| self.vm.clock.now_ns());
         let key_bytes = self.key.as_bytes();
         let mut header = NeedleHeader {
             magic: NEEDLE_MAGIC,
@@ -479,6 +479,7 @@ pub struct VolumeManager {
     grow_lock: parking_lot::Mutex<()>,
     max_span: AtomicU64,
     work: Arc<WorkCounters>,
+    clock: Arc<dyn Clock>,
     fail_next_write: std::sync::atomic::AtomicBool,
     /// Tests: the next journal append fails, after the needle is on disk (#184).
     fail_next_index: std::sync::atomic::AtomicBool,
@@ -524,7 +525,11 @@ impl VolumeManager {
         Self::open_mode(dir, volume_id, true)
     }
 
-    pub fn open_mode(dir: &Path, volume_id: u32, mut sparse: bool) -> Result<Self, VolumeError> {
+    pub fn open_mode(dir: &Path, volume_id: u32, sparse: bool) -> Result<Self, VolumeError> {
+        Self::open_mode_with_clock(dir, volume_id, sparse, Arc::new(SystemClock))
+    }
+
+    pub fn open_mode_with_clock(dir: &Path, volume_id: u32, mut sparse: bool, clock: Arc<dyn Clock>) -> Result<Self, VolumeError> {
         let dat_path = dir.join(format!("volume_{:04}.dat", volume_id));
         let idx_path = dir.join(format!("volume_{:04}.idx", volume_id));
 
@@ -556,7 +561,7 @@ impl VolumeManager {
             let mut super_buf = AlignedBuffer::new(SECTOR_SIZE);
             super_buf[0..4].copy_from_slice(&SUPERBLOCK_MAGIC.to_le_bytes());
             super_buf[4..8].copy_from_slice(&volume_id.to_le_bytes());
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+            let now = clock.now_ns();
             super_buf[8..16].copy_from_slice(&now.to_le_bytes());
             let crc = crc32c::crc32c(&super_buf[0..16]);
             super_buf[16..20].copy_from_slice(&crc.to_le_bytes());
@@ -703,7 +708,13 @@ impl VolumeManager {
             gaps: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             indexed,
             format,
+            clock,
         })
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// The volume's format version (1 or 2). Compressed needles (#51) need 2.
@@ -1031,7 +1042,7 @@ impl VolumeManager {
 
         let mut buf = AlignedBuffer::new(total_len as usize);
 
-        let now = created_at.unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64);
+        let now = created_at.unwrap_or_else(|| self.clock.now_ns());
         let mut header = NeedleHeader {
             magic: NEEDLE_MAGIC,
             header_crc32c: 0,

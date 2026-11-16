@@ -3,6 +3,8 @@
 
 pub mod aws_chunked;
 pub mod cache;
+pub mod clock;
+pub mod cluster;
 pub mod cluster;
 pub mod coalesce;
 pub mod compaction;
@@ -29,6 +31,7 @@ pub mod tls;
 pub mod throttle;
 pub mod trace;
 pub mod s3_api;
+pub mod scheduler;
 pub mod sigv4;
 pub mod spill;
 pub mod auth;

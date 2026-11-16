@@ -97,9 +97,6 @@ pub fn parse_id(s: &str) -> Option<u64> {
 /// `2026-11-13T01:02:03.000Z` from ns since the Unix epoch; ns 0 (before versioning) gives
 /// the fixed time the listings used before #31.
 pub fn iso8601(ns: u64) -> String {
-    if ns == 0 {
-        return "2026-11-10T00:00:00.000Z".to_string();
-    }
     let secs = ns / 1_000_000_000;
     let ms = (ns / 1_000_000) % 1000;
     let days = (secs / 86_400) as i64;

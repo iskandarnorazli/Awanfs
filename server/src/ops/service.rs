@@ -8,11 +8,14 @@ use crate::xml::list_buckets_xml;
 
 pub async fn list_buckets(state: Arc<S3ServiceState>) -> Result<Response<ResponseBody>, hyper::Error> {
     let engine = state.engine.read();
-    let mut b_list = Vec::new();
-    for (name, _) in &engine.bucket_names {
-        b_list.push((name.as_str(), "2026-11-10T00:00:00.000Z"));
+    let created_map = state.bucket_created_ns.read();
+    let mut entries: Vec<(&str, String)> = Vec::new();
+    for (name, &b_id) in &engine.bucket_names {
+        let ts = created_map.get(&b_id).copied().filter(|&t| t != 0).unwrap_or(state.started_at_ns);
+        entries.push((name.as_str(), crate::versions::iso8601(ts)));
     }
-    b_list.sort_by_key(|&(n, _)| n);
+    entries.sort_by_key(|(n, _)| *n);
+    let b_list: Vec<(&str, &str)> = entries.iter().map(|(n, d)| (*n, d.as_str())).collect();
     let xml = list_buckets_xml(&b_list, "req-list-buckets");
     Ok(Response::builder()
         .status(StatusCode::OK)

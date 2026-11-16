@@ -12,7 +12,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use crate::clock::{Clock, SystemClock};
+use crate::scheduler::Scheduler;
 
 use crate::cache::PayloadCache;
 use crate::coalesce::SingleFlight;
@@ -617,11 +618,28 @@ pub struct S3ServiceState {
     pub versioning: Arc<RwLock<HashMap<u32, crate::versions::Versioning>>>,
     /// Version histories of the keys of versioned buckets (#31). Lock order: never take the
     /// engine lock while holding this one.
+    /// Version histories of the keys of versioned buckets (#31). Lock order: never take the
+    /// engine lock while holding this one.
     pub versions: Arc<RwLock<crate::versions::VersionStore>>,
+    /// Single clock for the server (#158).
+    pub clock: Arc<dyn Clock>,
+    /// Time the server started (used as fallback CreationDate for legacy buckets).
+    pub started_at_ns: u64,
+    /// Bucket creation timestamps (ns since Unix epoch) from `buckets.manifest`.
+    pub bucket_created_ns: Arc<RwLock<HashMap<u32, u64>>>,
+    /// Background task scheduler (#158).
+    pub scheduler: Arc<Scheduler>,
+    /// Seconds per lifecycle day (default 86400; `--lifecycle-day-seconds`).
+    pub lifecycle_day_seconds: Arc<AtomicU64>,
+}
 }
 
 impl S3ServiceState {
     pub fn new() -> Self {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let started_at_ns = clock.now_ns();
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&metrics)));
         let id = INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let default_dir = std::env::temp_dir().join(format!(
             "s3_vol_{}_{}",
@@ -632,7 +650,7 @@ impl S3ServiceState {
         let work = Arc::new(WorkCounters::default());
         let vol_mgr = VolumeManager::open(&default_dir, 1).ok().map(|mut vm| {
             vm.attach_work_counters(Arc::clone(&work));
-            Arc::new(vm)
+            Arc::new(vm.with_clock(Arc::clone(&clock)))
         });
         let initial_bytes = if let Some(ref vm) = vol_mgr { vm.offset() } else { 0 };
         Self {
@@ -643,7 +661,7 @@ impl S3ServiceState {
             active_volume_id: Arc::new(AtomicU32::new(1)),
             engine: Arc::new(RwLock::new(AwanStorageEngine::new(100_000, 4_194_304, 65536))),
             multipart: Arc::new(
-                MultipartManager::with_staging_dir(default_dir.join(".staging")).with_work_counters(Arc::clone(&work)),
+                MultipartManager::with_staging_dir(default_dir.join(".staging")).with_work_counters(Arc::clone(&work)).with_clock(Arc::clone(&clock)),
             ),
             sigv4_cache: Arc::new(SigV4KeyCache::new()),
             lifecycle: Arc::new(LifecycleManager::new()),
@@ -665,24 +683,40 @@ impl S3ServiceState {
             stream_relocations: Arc::new(AtomicU64::new(0)),
             auth: crate::auth::AuthConfig::open(),
             not_ready: Arc::new(RwLock::new(None)),
-            metrics: Arc::new(crate::metrics::Metrics::default()),
+            metrics,
             access_log: Arc::new(RwLock::new(None)),
             log_lines_dropped: Arc::new(AtomicU64::new(0)),
             audit_log: Arc::new(RwLock::new(None)),
             iam: Arc::new(RwLock::new(None)),
             versioning: Arc::new(RwLock::new(HashMap::new())),
             versions: Arc::new(RwLock::new(crate::versions::VersionStore::default())),
+            clock,
+            started_at_ns,
+            bucket_created_ns: Arc::new(RwLock::new(HashMap::new())),
+            scheduler,
+            lifecycle_day_seconds: Arc::new(AtomicU64::new(86_400)),
         }
     }
 
     /// Opens a data directory, panicking when it cannot be served; see `try_with_data_dir`.
     pub fn with_data_dir(dir: &Path) -> Self {
-        Self::try_with_data_dir(dir).unwrap_or_else(|e| panic!("cannot open {}: {}", dir.display(), e))
+        Self::with_data_dir_and_clock(dir, Arc::new(SystemClock))
+    }
+
+    pub fn with_data_dir_and_clock(dir: &Path, clock: Arc<dyn Clock>) -> Self {
+        Self::try_with_data_dir_and_clock(dir, clock).unwrap_or_else(|e| panic!("cannot open {}: {}", dir.display(), e))
     }
 
     /// Opens a data directory and replays it. Fails, instead of serving a subset, when a volume
     /// cannot be opened or was written in a newer on-disk format (#50).
     pub fn try_with_data_dir(dir: &Path) -> Result<Self, String> {
+        Self::try_with_data_dir_and_clock(dir, Arc::new(SystemClock))
+    }
+
+    pub fn try_with_data_dir_and_clock(dir: &Path, clock: Arc<dyn Clock>) -> Result<Self, String> {
+        let started_at_ns = clock.now_ns();
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&metrics)));
         let _ = std::fs::create_dir_all(dir);
         let work = Arc::new(WorkCounters::default());
         // Every volume in id order; writes go to the last one (#37).
@@ -695,13 +729,14 @@ impl S3ServiceState {
             // Every new volume grows as it is written (decision 52). A volume that is already a
             // 32 GiB sparse file, from before that decision, is recognised by its length and
             // stays sparse. `AWAN_SPARSE_VOLUME=1` still makes new ones sparse, for comparison.
-            let mut vm = VolumeManager::open(dir, id).map_err(|e| format!("volume {}: {}", id, e))?;
+            let sparse = std::env::var("AWAN_SPARSE_VOLUME").ok().as_deref() == Some("1");
+            let mut vm = VolumeManager::open_mode_with_clock(dir, id, sparse, Arc::clone(&clock)).map_err(|e| format!("volume {}: {}", id, e))?;
             vm.attach_work_counters(Arc::clone(&work));
             volumes.insert(id, Arc::new(vm));
         }
         let vol_mgr = volumes.values().next_back().cloned();
         let multipart = Arc::new(
-            MultipartManager::with_staging_dir(dir.join(".staging")).with_work_counters(Arc::clone(&work)),
+            MultipartManager::with_staging_dir(dir.join(".staging")).with_work_counters(Arc::clone(&work)).with_clock(Arc::clone(&clock)),
         );
         let mut engine = AwanStorageEngine::new(100_000, 4_194_304, 65536);
         let db_path = dir.join("metadata.db");
@@ -717,6 +752,7 @@ impl S3ServiceState {
         // 1. Replay buckets manifest
         let manifest_path = dir.join("buckets.manifest");
         let mut versioning_map: HashMap<u32, crate::versions::Versioning> = HashMap::new();
+        let mut bucket_created_ns: HashMap<u32, u64> = HashMap::new();
         let mut version_store = crate::versions::VersionStore::default();
         if let Ok(content) = std::fs::read_to_string(&manifest_path) {
             for line in content.lines() {
@@ -731,9 +767,12 @@ impl S3ServiceState {
                     continue;
                 }
                 if let Some(rest) = line.strip_prefix('+') {
-                    if let Some((id_str, name)) = rest.split_once(':') {
+                    let mut parts = rest.splitn(3, ':');
+                    if let (Some(id_str), Some(name)) = (parts.next(), parts.next()) {
                         if let Ok(id) = id_str.parse::<u32>() {
                             engine.restore_bucket(id, name);
+                            let ts = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                            bucket_created_ns.insert(id, ts);
                         }
                     }
                 } else if let Some(rest) = line.strip_prefix('-') {
@@ -741,6 +780,7 @@ impl S3ServiceState {
                         if let Ok(id) = id_str.parse::<u32>() {
                             let _ = engine.delete_bucket(id);
                             versioning_map.remove(&id);
+                            bucket_created_ns.remove(&id);
                         }
                     }
                 }
@@ -758,6 +798,7 @@ impl S3ServiceState {
             let mut events = Vec::new();
             let _ = vm.scan_needles(|n| events.push(n));
             for n in events {
+                let created_at_ms = n.created_at_ns / 1_000_000;
                 let (b_id, key, local, size, etag_hi, etag_lo, flags, crc32c) = (n.bucket_id, n.key, n.offset, n.payload_size, n.etag_hi, n.etag_lo, n.flags, n.payload_crc32c);
                 let offset = global_offset(vm.id(), local);
                 crcs.insert((b_id as u32, offset), crc32c);
@@ -810,7 +851,7 @@ impl S3ServiceState {
                     version_store.apply(b, &key, ev);
                     match version_store.current(b, &key) {
                         Some(v) if !v.marker => {
-                            let _ = engine.put_object(b, key.as_bytes(), v.vol_offset, v.size, v.etag_hi, v.etag_lo, v.part_count, v.flags);
+                            let _ = engine.put_object_at(b, key.as_bytes(), v.vol_offset, v.size, v.etag_hi, v.etag_lo, v.part_count, v.flags, v.ts / 1_000_000);
                             if v.flags & AWAN_FLAG_MULTIPART != 0 {
                                 if let Some(ext) = mp_extents.get(&(b, v.vol_offset)) {
                                     multipart.restore_completed(b, &key, ext.clone());
@@ -841,7 +882,7 @@ impl S3ServiceState {
                         Err(_) => None,
                     };
                     if let Some((total, extents)) = manifest {
-                        let _ = engine.put_object(
+                        let _ = engine.put_object_at(
                             b_id as u32,
                             key.as_bytes(),
                             offset,
@@ -850,6 +891,7 @@ impl S3ServiceState {
                             etag_lo,
                             extents.len() as u16,
                             flags,
+                            created_at_ms,
                         );
                         multipart.restore_completed(b_id as u32, &key, extents);
                     }
@@ -863,7 +905,7 @@ impl S3ServiceState {
                     } else {
                         size
                     };
-                    let _ = engine.put_object(
+                    let _ = engine.put_object_at(
                         b_id as u32,
                         key.as_bytes(),
                         offset,
@@ -872,6 +914,7 @@ impl S3ServiceState {
                         etag_lo,
                         0,
                         flags,
+                        created_at_ms,
                     );
                 }
             }
@@ -908,13 +951,18 @@ impl S3ServiceState {
             stream_relocations: Arc::new(AtomicU64::new(0)),
             auth: crate::auth::AuthConfig::open(),
             not_ready: Arc::new(RwLock::new(None)),
-            metrics: Arc::new(crate::metrics::Metrics::default()),
+            metrics,
             access_log: Arc::new(RwLock::new(None)),
             log_lines_dropped: Arc::new(AtomicU64::new(0)),
             audit_log: Arc::new(RwLock::new(None)),
             iam: Arc::new(RwLock::new(None)),
             versioning: Arc::new(RwLock::new(versioning_map)),
             versions: Arc::new(RwLock::new(version_store)),
+            clock,
+            started_at_ns,
+            bucket_created_ns: Arc::new(RwLock::new(bucket_created_ns)),
+            scheduler,
+            lifecycle_day_seconds: Arc::new(AtomicU64::new(86_400)),
         })
     }
 
@@ -1015,7 +1063,7 @@ impl S3ServiceState {
             crate::versions::Versioning::Enabled => crate::meta_index::FLAG_VERSIONED,
             crate::versions::Versioning::Suspended => crate::meta_index::FLAG_VERSIONED | crate::meta_index::FLAG_NULL_ID,
         };
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        let now = self.clock.now_ns();
         Some((extra, self.versions.read().next_ts(b_id, key, now)))
     }
 
@@ -1041,7 +1089,7 @@ impl S3ServiceState {
         }
         match current {
             Some(v) if !v.marker => {
-                self.engine.write().put_object(b_id, key.as_bytes(), v.vol_offset, v.size, v.etag_hi, v.etag_lo, v.part_count, v.flags)?;
+                self.engine.write().put_object_at(b_id, key.as_bytes(), v.vol_offset, v.size, v.etag_hi, v.etag_lo, v.part_count, v.flags, v.ts / 1_000_000)?;
                 if v.flags & AWAN_FLAG_MULTIPART != 0 {
                     if let Some(ext) = self.manifest_extents(b_id, v.vol_offset) {
                         self.multipart.restore_completed(b_id, key, ext);
@@ -1148,22 +1196,39 @@ impl S3ServiceState {
 
     /// Runs `auto_compact_once` every `every` while the state is alive. The binary starts this
     /// unless `--auto-compaction off`; the library never starts it by itself.
+    /// Runs `auto_compact_once` every `every` on the background scheduler. The binary starts
+    /// this unless `--auto-compaction off`; the library never starts it by itself.
     pub fn start_auto_compaction(self: &Arc<Self>, every: std::time::Duration, threshold: f64, min_bytes: u64) {
         let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(every).await;
-                let Some(state) = weak.upgrade() else { return };
-                match state.auto_compact_once(threshold, min_bytes).await {
-                    Ok(Some(r)) if r.busy => eprintln!("auto-compaction: the oldest volume still has a write in flight; next pass"),
-                    Ok(Some(r)) => eprintln!(
+        let rt = tokio::runtime::Handle::current();
+        self.scheduler.register("auto_compaction", every, move |_budget| {
+            let Some(state) = weak.upgrade() else { return Ok(false) };
+            match rt.block_on(state.auto_compact_once(threshold, min_bytes)) {
+                Ok(Some(r)) if r.busy => {
+                    eprintln!("auto-compaction: the oldest volume still has a write in flight; next pass");
+                    Ok(true)
+                }
+                Ok(Some(r)) => {
+                    eprintln!(
                         "auto-compaction: moved {} live needles, reclaimed {} dead ones",
                         r.live_needles_copied, r.dead_needles_reclaimed
-                    ),
-                    Ok(None) => {}
-                    Err(e) => eprintln!("auto-compaction failed: {:?}", e),
+                    );
+                    Ok(false)
                 }
+                Ok(None) => Ok(false),
+                Err(e) => Err(format!("{:?}", e)),
             }
+        });
+    }
+
+    /// Runs incomplete-multipart cleanup on the background scheduler.
+    pub fn start_multipart_cleanup(self: &Arc<Self>, every: std::time::Duration, max_age_ms: u64) {
+        let weak = Arc::downgrade(self);
+        self.scheduler.register("multipart_cleanup", every, move |budget| {
+            let Some(state) = weak.upgrade() else { return Ok(false) };
+            let now_ms = state.clock.now_ns() / 1_000_000;
+            let (_removed, more) = state.multipart.cleanup_expired(now_ms, max_age_ms, budget);
+            Ok(more)
         });
     }
 

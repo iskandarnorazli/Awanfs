@@ -34,6 +34,7 @@ fn finish_put(
     etag_lo: u64,
     flags: u16,
     etag_hex: &str,
+    created_at_ms: u64,
 ) -> Response<ResponseBody> {
     if let Some((prev_off, prev_sz)) = old_info {
         if prev_off > 0 && prev_off != vol_offset {
@@ -44,7 +45,7 @@ fn finish_put(
             state.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
         }
     }
-    if let Err(code) = state.engine.write().put_object(b_id, key.as_bytes(), vol_offset, payload_len, etag_hi, etag_lo, 0, flags) {
+    if let Err(code) = state.engine.write().put_object_at(b_id, key.as_bytes(), vol_offset, payload_len, etag_hi, etag_lo, 0, flags, created_at_ms) {
         return engine_error_response(code, key);
     }
     Response::builder()
@@ -289,7 +290,7 @@ fn version_get_response(
         .header(ETAG, etag_val)
         .header(ACCEPT_RANGES, "bytes")
         .header("x-amz-version-id", v.id_string())
-        .header(LAST_MODIFIED, format_http_date(lm_secs));
+        .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts));
     if let Some(h) = range {
         match parse_range_header(h, v.size) {
             Ok(Some(r)) => {
@@ -465,8 +466,9 @@ pub async fn copy_object(
     let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset);
     let stamp = state.version_stamp(b_id, key);
     let flags = flags | stamp.map_or(0, |s| s.0);
+    let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
     let (vol_offset, flags) = match state
-        .store_object(b_id, bucket, key, &copy_attrs, &bytes, flags, src_etag_hi, src_etag_lo, stamp.map(|s| s.1))
+        .store_object(b_id, bucket, key, &copy_attrs, &bytes, flags, src_etag_hi, src_etag_lo, Some(created_ns))
         .await
     {
         Ok(written) => written,
@@ -488,7 +490,7 @@ pub async fn copy_object(
             None => resp,
         };
         return Ok(resp
-            .body(full_body(Bytes::from(copy_object_result_xml(&etag_hex, "2026-11-10T00:00:00.000Z"))))
+            .body(full_body(Bytes::from(copy_object_result_xml(&etag_hex, &crate::versions::iso8601(ts)))))
             .unwrap());
     }
     if let Some(prev_off) = old_info {
@@ -497,7 +499,7 @@ pub async fn copy_object(
             state.needle_crc_map.write().remove(&(b_id, prev_off));
         }
     }
-    if let Err(code) = state.engine.write().put_object(
+    if let Err(code) = state.engine.write().put_object_at(
         b_id,
         key.as_bytes(),
         vol_offset,
@@ -506,12 +508,13 @@ pub async fn copy_object(
         src_etag_lo,
         0,
         flags,
+        created_ns / 1_000_000,
     ) {
         return Ok(engine_error_response(code, key));
     }
 
     let etag_hex = md5_to_etag_hex(src_etag_hi, src_etag_lo);
-    let xml = copy_object_result_xml(&etag_hex, "2026-11-10T00:00:00.000Z");
+    let xml = copy_object_result_xml(&etag_hex, &crate::versions::iso8601(created_ns));
     let resp = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/xml")
@@ -694,9 +697,8 @@ pub async fn put_object(
             ));
         }
         writer.set_flags(flags);
-        if let Some((_, ts)) = stamp {
-            writer.set_created_at(ts);
-        }
+        let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
+        writer.set_created_at(created_ns);
         let first_vm = Arc::clone(writer.volume());
         let first_offset = global_offset(first_vm.id(), writer.offset());
         let first_loc = match writer.finish(etag_hi, etag_lo) {
@@ -733,7 +735,7 @@ pub async fn put_object(
                 Err(r) => r,
             });
         }
-        return Ok(finish_put(&state, b_id, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex));
+        return Ok(finish_put(&state, b_id, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns / 1_000_000));
     }
     let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, expected_len.map(|n| n as u64), path).await? {
         Ok(b) => b,
@@ -841,8 +843,9 @@ pub async fn put_object(
 
     let stamp = state.version_stamp(b_id, key);
     let flags = flags | stamp.map_or(0, |s| s.0);
+    let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
     let (vol_offset, flags) = match state
-        .store_object(b_id, bucket, key, &put_attrs, &decoded_bytes, flags, etag_hi, etag_lo, stamp.map(|s| s.1))
+        .store_object(b_id, bucket, key, &put_attrs, &decoded_bytes, flags, etag_hi, etag_lo, Some(created_ns))
         .await
     {
         Ok(written) => written,
@@ -855,7 +858,7 @@ pub async fn put_object(
             Err(r) => r,
         });
     }
-    Ok(finish_put(&state, b_id, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex))
+    Ok(finish_put(&state, b_id, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns / 1_000_000))
 }
 
 pub async fn get_or_head_object(
@@ -936,7 +939,7 @@ pub async fn get_or_head_object(
                         .header(ACCEPT_RANGES, "bytes")
                         .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
                         .header(CONTENT_LENGTH, len.to_string())
-                        .header(LAST_MODIFIED, lm_str.as_str())
+                        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
                         .body(body.boxed())
                         .unwrap());
                 }
@@ -994,7 +997,7 @@ pub async fn get_or_head_object(
                                 .header(ACCEPT_RANGES, "bytes")
                                 .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
                                 .header(CONTENT_LENGTH, (range.end - range.start + 1).to_string())
-                                .header(LAST_MODIFIED, lm_str.as_str())
+                                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
                                 .body(ChunksBody(chunks).boxed())
                                 .unwrap());
                         }
@@ -1034,7 +1037,7 @@ pub async fn get_or_head_object(
                     .header(ACCEPT_RANGES, "bytes")
                     .header(CONTENT_RANGE, content_range)
                     .header(CONTENT_LENGTH, (range.end - range.start + 1).to_string())
-                    .header(LAST_MODIFIED, lm_str.as_str())
+                    .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
                     .body(body)
                     .unwrap());
             }
@@ -1075,7 +1078,7 @@ pub async fn get_or_head_object(
             .header(ETAG, etag_val)
             .header(ACCEPT_RANGES, "bytes")
             .header(CONTENT_LENGTH, meta.size.to_string())
-            .header(LAST_MODIFIED, lm_str.as_str())
+            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
             .body(ChunksBody(chunks).boxed())
             .unwrap());
     }
@@ -1099,7 +1102,7 @@ pub async fn get_or_head_object(
             .header(ETAG, etag_val)
             .header(ACCEPT_RANGES, "bytes")
             .header(CONTENT_LENGTH, meta.size.to_string())
-            .header(LAST_MODIFIED, lm_str.as_str())
+            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
             .body(body.boxed())
             .unwrap());
     }
@@ -1131,7 +1134,7 @@ pub async fn get_or_head_object(
         .header(ETAG, etag_val)
         .header(ACCEPT_RANGES, "bytes")
         .header(CONTENT_LENGTH, meta.size.to_string())
-        .header(LAST_MODIFIED, lm_str.as_str())
+        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
         .body(body)
         .unwrap())
 }

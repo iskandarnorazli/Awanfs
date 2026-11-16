@@ -94,11 +94,13 @@ pub async fn create_bucket(
     let mut engine = state.engine.write();
     match engine.create_bucket(bucket) {
         Ok(id) => {
+            let created_ns = state.clock.now_ns();
+            state.bucket_created_ns.write().insert(id, created_ns);
             if let Some(ref d) = state.data_dir {
                 let manifest = d.join("buckets.manifest");
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&manifest) {
                     use std::io::Write;
-                    let _ = writeln!(f, "+{}:{}", id, bucket);
+                    let _ = writeln!(f, "+{}:{}:{}", id, bucket, created_ns);
                 }
             }
             Ok(Response::builder()
@@ -151,6 +153,7 @@ pub async fn delete_bucket(
     match engine.delete_bucket(b_id) {
         Ok(()) => {
             state.versioning.write().remove(&b_id);
+            state.bucket_created_ns.write().remove(&b_id);
             if let Some(ref d) = state.data_dir {
                 let manifest = d.join("buckets.manifest");
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&manifest) {
@@ -281,13 +284,14 @@ pub async fn list_objects(
     let key_strings: Vec<String> = page.objects.iter().map(|(k, _)| enc(&String::from_utf8_lossy(k))).collect();
     let etag_strings: Vec<String> = page.objects.iter().map(|(_, m)| md5_to_etag_hex(m.etag_hi, m.etag_lo)).collect();
     let prefix_strings: Vec<String> = page.prefixes.iter().map(|p| enc(&String::from_utf8_lossy(p))).collect();
+    let lm_strings: Vec<String> = page.objects.iter().map(|(_, m)| crate::versions::iso8601(m.created_at.saturating_mul(1_000_000))).collect();
     let contents: Vec<S3ObjectEntry> = page
         .objects
         .iter()
         .enumerate()
         .map(|(i, (_, m))| S3ObjectEntry {
             key: &key_strings[i],
-            last_modified: "2026-11-10T00:00:00.000Z",
+            last_modified: &lm_strings[i],
             etag: &etag_strings[i],
             size: m.size,
         })

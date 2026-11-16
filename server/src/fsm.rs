@@ -229,6 +229,77 @@ pub fn stream_step(state: StreamState, event: StreamEvent) -> Result<StreamState
     }
 }
 
+pub const TASK_ALREADY_RUNNING: Refusal = refuse_because("TaskBusy", 409, "a tick is already running");
+pub const TASK_NOT_RUNNING: Refusal = refuse_because("TaskIdle", 409, "no tick is running");
+pub const TASK_STOPPING: Refusal = refuse_because("TaskStopping", 409, "task is stopping");
+pub const TASK_STOPPED: Refusal = refuse_because("TaskStopped", 409, "task has stopped");
+
+/// State of one scheduled background task (`scheduler.rs`, #158).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskState {
+    Idle,
+    Running,
+    Stopping,
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskEvent {
+    Tick,
+    Done,
+    Stop,
+}
+
+/// Transition function for a scheduled background task (#158).
+///
+/// `Idle -> Running -> Idle`, `Idle -> Stopped`, `Running -> Stopping -> Stopped`.
+/// A second `Tick` while `Running` is refused rather than starting a second thread.
+pub fn task_step(state: TaskState, event: TaskEvent) -> Result<TaskState, Refusal> {
+    use TaskEvent::{Done, Stop, Tick};
+    use TaskState::{Idle, Running, Stopped, Stopping};
+    match (state, event) {
+        (Idle, Tick) => Ok(Running),
+        (Idle, Done) => Err(TASK_NOT_RUNNING),
+        (Idle, Stop) => Ok(Stopped),
+        (Running, Tick) => Err(TASK_ALREADY_RUNNING),
+        (Running, Done) => Ok(Idle),
+        (Running, Stop) => Ok(Stopping),
+        (Stopping, Tick) => Err(TASK_STOPPING),
+        (Stopping, Done) => Ok(Stopped),
+        (Stopping, Stop) => Err(TASK_STOPPING),
+        (Stopped, _) => Err(TASK_STOPPED),
+    }
+}
+
+#[cfg(test)]
+mod task_tests {
+    use super::*;
+
+    #[test]
+    fn task_every_pair_is_decided() {
+        use TaskEvent::{Done, Stop, Tick};
+        use TaskState::{Idle, Running, Stopped, Stopping};
+        let table = [
+            (Idle, Tick, Ok(Running)),
+            (Idle, Done, Err(TASK_NOT_RUNNING)),
+            (Idle, Stop, Ok(Stopped)),
+            (Running, Tick, Err(TASK_ALREADY_RUNNING)),
+            (Running, Done, Ok(Idle)),
+            (Running, Stop, Ok(Stopping)),
+            (Stopping, Tick, Err(TASK_STOPPING)),
+            (Stopping, Done, Ok(Stopped)),
+            (Stopping, Stop, Err(TASK_STOPPING)),
+            (Stopped, Tick, Err(TASK_STOPPED)),
+            (Stopped, Done, Err(TASK_STOPPED)),
+            (Stopped, Stop, Err(TASK_STOPPED)),
+        ];
+        for (state, event, want) in table {
+            assert_eq!(task_step(state, event), want, "{:?} + {:?}", state, event);
+        }
+        assert_eq!(table.len(), 4 * 3, "every state against every event");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
