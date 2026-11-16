@@ -27,6 +27,12 @@ def test_multipart_upload_small(x):
 def test_bucket_list_empty():
     pass
 
+def test_lifecycle_transition():
+    pass
+
+def test_bucket_logging_flush_j():
+    pass
+
 def helper():
     pass
 '''
@@ -37,6 +43,8 @@ JUNIT = '''<testsuite>
 <testcase name="test_multipart_upload_small[2]"><error message="boom"/></testcase>
 <testcase name="test_bucket_list_empty"><skipped message="no reason"/></testcase>
 <testcase name="test_object_lock_put_obj_retention"/>
+<testcase name="test_lifecycle_transition"><skipped message="needs storage classes"/></testcase>
+<testcase name="test_bucket_logging_flush_j"><skipped type="pytest.skip" message="skipped">test_s3.py:10: need ceph extension</skipped></testcase>
 </testsuite>'''
 
 
@@ -58,7 +66,7 @@ class Map(unittest.TestCase):
 
     def test_only_test_functions_are_read_with_their_markers(self):
         t = cm.suite_tests(self.suite)
-        self.assertEqual(list(t), ["test_put_obj_enc_conflict", "test_object_lock_put_obj_retention", "test_multipart_upload_small", "test_bucket_list_empty"])
+        self.assertEqual(list(t), ["test_put_obj_enc_conflict", "test_object_lock_put_obj_retention", "test_multipart_upload_small", "test_bucket_list_empty", "test_lifecycle_transition", "test_bucket_logging_flush_j"])
         self.assertEqual(t["test_put_obj_enc_conflict"], ["encryption"])
 
     def test_each_test_gets_one_area_and_its_owner(self):
@@ -82,6 +90,8 @@ class Map(unittest.TestCase):
         self.assertEqual(got["test_multipart_upload_small"], ("fail", "boom"))  # one case failed
         self.assertEqual(got["test_bucket_list_empty"], ("pass", ""))  # passing.txt wins
         self.assertEqual(got["test_object_lock_put_obj_retention"], ("pass", "passes; add it to passing.txt"))
+        self.assertEqual(got["test_lifecycle_transition"], ("skip", "needs storage classes"))
+        self.assertEqual(got["test_bucket_logging_flush_j"], ("skip", "test_s3.py:10: need ceph extension"))
 
     def test_without_junit_the_rest_is_unknown(self):
         rows, _ = self.rows(junit=False)
@@ -99,6 +109,8 @@ class Map(unittest.TestCase):
         text = cm.render(rows, unassigned, "suite x")
         self.assertIn("| encryption | #121 | 8.2 | 0 | 1 | 0 |", text)
         self.assertIn("- `test_put_obj_enc_conflict` (fail): assert 400 == 200", text)
+        self.assertIn("- `test_lifecycle_transition` (skip): needs storage classes", text)
+        self.assertIn("- `test_bucket_logging_flush_j` (skip): test_s3.py:10: need ceph extension", text)
 
 
 if __name__ == "__main__":

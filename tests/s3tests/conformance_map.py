@@ -95,7 +95,10 @@ def junit_status(path: str) -> Dict[str, Tuple[str, str]]:
                 why = (child.get("message") or child.text or "").strip().splitlines()[0][:160] if (child.get("message") or child.text) else ""
             elif child.tag == "skipped" and status != "fail":
                 status = "skip"
-                why = (child.get("message") or "").strip()[:160]
+                msg = (child.get("message") or "").strip()
+                txt = (child.text or "").strip()
+                raw = txt if (not msg or msg.lower() == "skipped") and txt else (msg or txt)
+                why = raw.splitlines()[0][:160] if raw else ""
         if name not in out or rank[status] > rank[out[name][0]]:
             out[name] = (status, why)
     return out
