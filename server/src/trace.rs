@@ -61,10 +61,21 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
+fn is_lower_hex(s: &str) -> bool {
+    s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// `00-<trace id>-<parent span id>-<flags>` (W3C Trace Context).
 pub fn parse_traceparent(v: &str) -> Option<([u8; 16], [u8; 8])> {
     let parts: Vec<&str> = v.trim().split('-').collect();
-    if parts.len() != 4 || parts[1].len() != 32 || parts[2].len() != 16 {
+    if parts.len() != 4
+        || parts[0].len() != 2
+        || parts[1].len() != 32
+        || parts[2].len() != 16
+        || parts[3].len() != 2
+        || parts[0] == "ff"
+        || !parts.iter().all(|p| is_lower_hex(p))
+    {
         return None;
     }
     let mut t = [0u8; 16];

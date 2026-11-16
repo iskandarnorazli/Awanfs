@@ -14,6 +14,9 @@ on:
       - "server/src/lifecycle.rs"
       - "server/src/attrs.rs"
       - "server/src/s3_api.rs"
+      - "server/src/trace.rs"
+      - "server/src/versions.rs"
+      - "server/src/memory.rs"
       - "server/fuzz/**"
       - ".github/workflows/fuzz.yml"
   schedule:
@@ -31,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block ]
+        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, s3_target, iso8601, traceparent, version_id, parse_size ]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

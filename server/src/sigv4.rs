@@ -82,7 +82,11 @@ impl Default for SigV4KeyCache {
 
 pub fn parse_iso8601_epoch(dt: &str) -> Option<u64> {
     // Basic format: "20261110T120000Z"
-    if dt.len() < 16 || !dt.is_ascii() || !dt.ends_with('Z') {
+    let b = dt.as_bytes();
+    if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
+        return None;
+    }
+    if !b[0..8].iter().all(u8::is_ascii_digit) || !b[9..15].iter().all(u8::is_ascii_digit) {
         return None;
     }
     let year: i32 = dt[0..4].parse().ok()?;
@@ -91,11 +95,10 @@ pub fn parse_iso8601_epoch(dt: &str) -> Option<u64> {
     let hour: u32 = dt[9..11].parse().ok()?;
     let min: u32 = dt[11..13].parse().ok()?;
     let sec: u32 = dt[13..15].parse().ok()?;
-    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || hour > 23 || min > 59 || sec > 59 {
         return None;
     }
 
-    // Approximate days from epoch (valid for 2020..2030)
     let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
     let days_in_months = [
         31,
@@ -111,6 +114,9 @@ pub fn parse_iso8601_epoch(dt: &str) -> Option<u64> {
         30,
         31,
     ];
+    if day == 0 || (day as u64) > days_in_months[(month - 1) as usize] {
+        return None;
+    }
 
     let mut total_days = 0u64;
     for y in 1970..year {
