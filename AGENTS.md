@@ -28,12 +28,13 @@ decisions are numbered in [`ARCHITECTURE.md`](ARCHITECTURE.md); stored bytes are
 
 ## How an issue is worked
 
-1. Add `wip:antigravity` (or `wip:claude`). Branch from `main`: `issue/<n>-<slug>`.
+1. Add `wip:antigravity` (or `wip:claude`). Branch from `main`: `issue/<n>-<slug>`. **One issue, one branch, one PR**, even when several issues are worked in parallel (owner, 2026-11-17). Never combine issues into a batch PR: in #216 ten issues in one PR hid a regression, skipped each issue's checks and could not be reverted one at a time.
 2. Read the Goal, the Gate and the Stop list. Write the tests first and show them failing.
 3. Commit as `Iskandar Norazli <111472977+iskandarnorazli@users.noreply.github.com>`, with no AI or Co-Authored-By lines. The message states the tests added, the commands run with their results, and the negative control: the fix turned off, the new test failing.
 4. Push the branch and open a **draft** PR. Never push `main`, never force-push, never merge.
-5. Comment on the issue: each gate line, its command and its result. Remove `wip:`, add `needs-review`. Never close an issue; the owner or a reviewer who did not build it does.
-6. Stop and leave a comment when the work needs a file the issue does not list, a design decision, or a change to an existing test's expectation.
+5. **Wait for the PR's checks and read them:** `gh pr checks <pr>`. Every check passes, including `s3tests`; it runs the ceph suite when the PR changes server code and passes in seconds otherwise. A failing or pending check means the work is not done: fix it, or stop and say why. `main` requires these checks, so a red PR cannot merge.
+6. Comment on the issue: each gate line, its command and its result, and the `gh pr checks <pr>` output pasted as it printed. A suite-wide line ("cargo test passed") does not answer a line that names something else (a journey, a test list, a run id). Remove `wip:`, add `needs-review`. Never close an issue; the owner or a reviewer who did not build it does.
+7. Stop and leave a comment when the work needs a file the issue does not list, a design decision, or a change to an existing test's expectation. Removing a test from `tests/s3tests/passing.txt` is a change to a test's expectation.
 
 ## Gate commands
 
@@ -45,7 +46,8 @@ decisions are numbered in [`ARCHITECTURE.md`](ARCHITECTURE.md); stored bytes are
 | Driven end to end | `bash scripts/verify_drive.sh` (CI's `Drive the server (aws CLI)` job) |
 | Conformance map | `python3 tests/s3tests/test_conformance_map.py` |
 | Benchmark tooling | `python3 benchmarks/test_run_warp_benchmark.py` and the other `benchmarks/test_*.py` |
-| Speed and memory | `gh workflow run bench-ratio.yml --ref <branch>`: six rows in tolerance, budget gate under its ceiling |
+| Conformance on the PR | the PR's `s3tests` check: its Ratchet line reads `0 of them no longer pass`, and every test the issue lists as its own is in its "Passing but not listed" list or in `passing.txt` (add them in the same PR) |
+| Speed and memory | `gh workflow run bench-ratio.yml --ref <branch>` when the issue asks for it per PR; otherwise the reviewer runs it once on `main` after a batch of PRs merges (one self-hosted runner: ten runs would queue for hours) |
 
 A change to PUT, DELETE, CopyObject, multipart completion, `write_needle` or recovery also
 runs the `verify-object-versions` skill (`.claude/skills/verify-object-versions`). A

@@ -7,15 +7,11 @@ on:
   schedule:
     - cron: "37 20 * * *"
   workflow_dispatch:
+  # Every pull request, so the job always reports and can be a required check (owner,
+  # 2026-11-17). Batch #216 changed handlers with no s3-tests run before merge, and the nightly
+  # run after it found four listed tests answering 417 (run 43845822284). The first step decides
+  # whether the suite needs to run; when it does not, the job passes and says so.
   pull_request:
-    # Server code too: batch #216 changed handlers with no s3-tests run before merge, and the
-    # nightly run after it found four listed tests answering 417 (run 43845822284).
-    paths:
-      - "server/src/**"
-      - "server/Cargo.toml"
-      - "server/Cargo.lock"
-      - "tests/s3tests/**"
-      - ".github/workflows/s3-tests.yml"
 
 permissions:
   contents: read
@@ -26,15 +22,38 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Does this change need the suite?
+        id: changes
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # A pull request is checked out as its merge commit: HEAD^1 is the base.
+          files=$(git diff --name-only HEAD^1 HEAD)
+          printf '%s\n' "$files"
+          if printf '%s\n' "$files" | grep -q -E '^(server/src/|server/Cargo\.(toml|lock)$|tests/s3tests/|\.github/workflows/s3-tests\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "s3-tests skipped: this pull request changes no server code, s3-tests file or this workflow." >> "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.changes.outputs.run == 'true'
       - uses: Swatinem/rust-cache@v2
+        if: steps.changes.outputs.run == 'true'
         with:
           workspaces: server
       - name: Build
+        if: steps.changes.outputs.run == 'true'
         run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
       - name: Start AwanFS
+        if: steps.changes.outputs.run == 'true'
         run: bash tests/s3tests/start_server.sh
       - name: Get s3-tests
+        if: steps.changes.outputs.run == 'true'
         run: |
           # Pinned: the ratchet (tests/s3tests/passing.txt) names tests of this commit. Bump it on
           # purpose, in its own PR, and re-record the list from that run.
@@ -44,6 +63,7 @@ jobs:
           python3 -m venv /tmp/venv
           /tmp/venv/bin/pip install -q -r /tmp/s3-tests/requirements.txt pytest-timeout
       - name: Run
+        if: steps.changes.outputs.run == 'true'
         run: |
           cd /tmp/s3-tests
           S3TEST_CONF=$GITHUB_WORKSPACE/tests/s3tests/s3tests.conf /tmp/venv/bin/pytest s3tests/functional/test_s3.py \
@@ -53,9 +73,10 @@ jobs:
             -p no:cacheprovider -q --timeout=60 --junitxml=/tmp/s3tests-headers-results.xml -o junit_family=xunit1 || true
           test -s /tmp/s3tests-headers-results.xml
       - name: Ratchet
+        if: steps.changes.outputs.run == 'true'
         run: python3 tests/s3tests/ratchet.py /tmp/s3tests-results.xml /tmp/s3tests-headers-results.xml tests/s3tests/passing.txt --report /tmp/s3tests-report.md
       - name: Conformance map (every test has an owner; CONFORMANCE_DESIGN.md)
-        if: always()
+        if: always() && steps.changes.outputs.run == 'true'
         run: |
           python3 tests/s3tests/test_conformance_map.py
           python3 tests/s3tests/test_ratchet.py
@@ -64,19 +85,19 @@ jobs:
             --suite-ref "ceph/s3-tests $(git -C /tmp/s3-tests rev-parse --short HEAD), run $GITHUB_RUN_ID" \
             --report /tmp/CONFORMANCE_MAP.md
       - name: Triage report
-        if: always()
+        if: always() && steps.changes.outputs.run == 'true'
         run: |
           python3 tests/s3tests/test_triage.py
           python3 tests/s3tests/triage.py /tmp/s3tests-results.xml /tmp/CONFORMANCE_MAP.md --out /tmp/TRIAGE.md
       - name: Summary
-        if: always()
+        if: always() && steps.changes.outputs.run == 'true'
         run: |
           [ -f /tmp/s3tests-report.md ] && cat /tmp/s3tests-report.md >> "$GITHUB_STEP_SUMMARY"
           [ -f /tmp/CONFORMANCE_MAP.md ] && sed -n '1,/^## /p' /tmp/CONFORMANCE_MAP.md | sed '$d' | tee -a "$GITHUB_STEP_SUMMARY"
           [ -f /tmp/TRIAGE.md ] && cat /tmp/TRIAGE.md >> "$GITHUB_STEP_SUMMARY"
           tail -20 /tmp/awanfs.log || true
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.changes.outputs.run == 'true'
         with:
           name: s3tests-results
           path: |

@@ -18,8 +18,9 @@ sections 6 to 8 is a consumer of them.
 
 Constraints that hold for every change:
 
-- **Speed and memory.** The nightly ratio check stays in tolerance and the memory budget gate
-  stays under its ceiling. A request for an object that uses none of the new features does
+- **Speed and memory.** The ratio check stays in tolerance and the memory budget gate stays
+  under its ceiling: run on the PR when its issue asks, otherwise by the reviewer on `main`
+  after a batch of PRs merges, and every night. A request for an object that uses none of the new features does
   the same work as today: HEAD stays index-only, GET stays zero-copy.
 - **Durability and recovery.** Anything a 200 acknowledges survives a restart. New record
   kinds are replayed by recovery and kept by compaction, with a test for each.
@@ -268,8 +269,11 @@ Each area is one issue. Section 10 gives the order. Section 6.1 is the contract 
 
 ### 6.1 How an area is worked
 
-- **Gate:** every test the map lists under the area is in `tests/s3tests/passing.txt`, the
-  nightly ratchet line shows them, and no listed test stopped passing.
+- **Gate, checked on the PR (owner, 2026-11-17):** the issue names the tests it must make
+  pass, and the tests of its area it does not own, each with the issue that does. On the PR's
+  `s3tests` check the Ratchet line reads `0 of them no longer pass`, every named test passes
+  and is added to `tests/s3tests/passing.txt` in the same PR. A named test that cannot pass is
+  a stop, not a removal. One area, one PR; the nightly run is a second look, never the gate.
 - **No indirect state machines** (owner, 2026-11-14). Anything with states and rules for
   moving between them is a pure function in `server/src/fsm.rs` with a test over every
   (state, event) pair and a row in [`STATE_MACHINES.md`](STATE_MACHINES.md), checked in CI.
