@@ -61,23 +61,26 @@ def run(a) -> list:
 
     def keep(proc, rec):
         rec["server_peak_rss_mib"] = round(get_process_peak_rss_mb(proc.pid), 1)
+        note(rec)
+
+    def note(rec):
         out.append(rec)
         print(json.dumps(rec), flush=True)
 
     proc, port, boot = start(a.server, a.data_dir, a.budget, 60)
-    out.append({"phase": "first_boot", "objects": 0, "boot_secs": round(boot, 2)})
+    note({"phase": "first_boot", "objects": 0, "boot_secs": round(boot, 2)})
     try:
         code = client(a.client, "load", port, a.objects, extra, lambda r: keep(proc, r))
         if code != 0:
-            out.append({"phase": "load_failed", "exit": code})
+            note({"phase": "load_failed", "exit": code})
             return out
     finally:
         proc.kill()
         proc.wait(timeout=60)
     proc, port, boot = start(a.server, a.data_dir, a.budget, a.boot_timeout)
     try:
-        out.append({"phase": "restart", "objects": a.objects, "boot_secs": round(boot, 2),
-                    "server_peak_rss_mib": round(get_process_peak_rss_mb(proc.pid), 1)})
+        note({"phase": "restart", "objects": a.objects, "boot_secs": round(boot, 2),
+              "server_peak_rss_mib": round(get_process_peak_rss_mb(proc.pid), 1)})
         client(a.client, "verify", port, a.objects, ["--threads", str(a.threads)], lambda r: keep(proc, r))
     finally:
         proc.kill()
