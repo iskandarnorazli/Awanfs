@@ -48,8 +48,8 @@ j_objects() { local et; head -c 70000 /dev/urandom >"$EVID/obj.bin" &&
   et=$(S3 put-object --bucket verify-bkt --key a/obj --body "$EVID/obj.bin" --query ETag --output text) && [ "$et" = "$(md5q "$EVID/obj.bin")" ] &&
   S3 get-object --bucket verify-bkt --key a/obj "$EVID/obj.out" >/dev/null && same "$EVID/obj.bin" "$EVID/obj.out" &&
   S3 head-object --bucket verify-bkt --key a/obj | grep -q '"ContentLength": 70000' &&
-  ! S3 get-object --bucket verify-bkt --key a/obj --if-none-match "$et" "$EVID/o304.out" 2>"$EVID/o304.err" && grep -q 304 "$EVID/o304.err" &&
-  ! S3 get-object --bucket verify-bkt --key a/obj --if-match '"x"' "$EVID/o412.out" 2>"$EVID/o412.err" && grep -q 412 "$EVID/o412.err" &&
+  ! S3 get-object --bucket verify-bkt --key a/obj --if-none-match "$et" "$EVID/o304.out" 2>"$EVID/o304.err" && grep -qE '304|Not ?Modified' "$EVID/o304.err" &&
+  ! S3 get-object --bucket verify-bkt --key a/obj --if-match '"x"' "$EVID/o412.out" 2>"$EVID/o412.err" && grep -qE '412|PreconditionFailed' "$EVID/o412.err" &&
   : >"$EVID/z.bin" && S3 put-object --bucket verify-bkt --key z --body "$EVID/z.bin" --query ETag --output text | grep -qx '"d41d8cd98f00b204e9800998ecf8427e"' &&
   S3 get-object --bucket verify-bkt --key z "$EVID/z.out" >/dev/null && [ ! -s "$EVID/z.out" ] &&
   S3 delete-object --bucket verify-bkt --key a/obj && ! S3 head-object --bucket verify-bkt --key a/obj 2>/dev/null &&
