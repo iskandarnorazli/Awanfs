@@ -21,6 +21,7 @@ use crate::ffi_bridge::*;
 use crate::lifecycle::*;
 use crate::multipart::*;
 use crate::mvcc::MvccStore;
+use crate::ops::object::null_version_of;
 use crate::sigv4::*;
 use crate::volume::{global_offset, split_offset, Durability, NeedleLocation, VolumeError, VolumeManager};
 use crate::work::WorkCounters;
@@ -1697,7 +1698,7 @@ impl Default for S3ServiceState {
 }
 
 /// Needle flags that only format 2 volumes may hold (FORMAT.md).
-const FORMAT_2_FLAGS: u16 = crate::meta_index::FLAG_COMPRESSED | crate::meta_index::FLAG_VERSIONED | crate::meta_index::FLAG_NULL_ID | crate::meta_index::FLAG_VERSION_DELETE;
+pub(crate) const FORMAT_2_FLAGS: u16 = crate::meta_index::FLAG_COMPRESSED | crate::meta_index::FLAG_VERSIONED | crate::meta_index::FLAG_NULL_ID | crate::meta_index::FLAG_VERSION_DELETE;
 
 /// The oldest volume format that can hold a needle with these flags and attributes.
 fn needed_format(flags: u16, attrs: &[u8]) -> u32 {

@@ -8,16 +8,16 @@ use std::sync::Arc;
 
 use crate::ffi_bridge::{AWAN_FLAG_ACTIVE, AWAN_FLAG_MULTIPART};
 use crate::iam::Iam;
-use crate::multipart::encode_extents_manifest;
+use crate::multipart::{
+    complete_multipart_upload_result_xml, encode_extents_manifest,
+    initiate_multipart_upload_result_xml, list_multipart_uploads_result_xml, list_parts_result_xml,
+};
 use crate::s3_api::{
     bad_request, compute_md5, drain_body, empty_body, engine_error_response, full_body,
     internal_error_response, read_body, ResponseBody, S3ServiceState, CHUNK_FRAMING_SLACK,
     MAX_OBJECT_BODY, MAX_XML_BODY, STREAM_PUT_MIN,
 };
-use crate::xml::{
-    complete_multipart_upload_result_xml, initiate_multipart_upload_result_xml,
-    list_multipart_uploads_result_xml, list_parts_result_xml, s3_error_xml,
-};
+use crate::xml::s3_error_xml;
 
 use super::object::finish_version_put;
 

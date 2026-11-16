@@ -2,19 +2,19 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED};
 use hyper::{HeaderMap, Response, StatusCode};
+use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::ffi_bridge::{
     unpack_flags, unpack_part_count, AWAN_FLAG_ACTIVE, AWAN_FLAG_MULTIPART, AWAN_FLAG_ZERO_BYTE,
-    FORMAT_2_FLAGS,
 };
 use crate::iam::Iam;
 use crate::s3_api::{
     bad_request, drain_body, empty_body, engine_error_response, full_body,
     internal_error_response, md5_to_etag_hex, parse_range_header, percent_decode_path, read_body,
-    ChunksBody, ResponseBody, S3ServiceState, CHUNK_FRAMING_SLACK, MAX_OBJECT_BODY,
+    ChunksBody, ResponseBody, S3ServiceState, CHUNK_FRAMING_SLACK, FORMAT_2_FLAGS, MAX_OBJECT_BODY,
     STREAM_PUT_MIN, VERIFY_WHILE_SENDING_MIN,
 };
 use crate::volume::{global_offset, VolumeError};
