@@ -199,6 +199,12 @@ pub struct StorageEngine {
 
 pub type AwanStorageEngine = StorageEngine;
 
+/// Milliseconds since the epoch, for the callers of `put_object` that pass no time (the FFI
+/// path). Before #158 every insert read it here; the server's own paths pass their clock's.
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
 impl StorageEngine {
     pub fn new(max_objects: usize, key_arena_bytes: usize, slab_bytes: usize) -> Self {
         Self {
@@ -308,7 +314,7 @@ impl StorageEngine {
         flags: u16,
     ) -> Result<(), i32> {
         let key_hash = xxh3_64_with_seed(key, bucket_id as u64);
-        self.put_object_with_hash_at(bucket_id, key, key_hash, vol_offset, size, etag_hi, etag_lo, part_count, flags, 0)
+        self.put_object_with_hash_at(bucket_id, key, key_hash, vol_offset, size, etag_hi, etag_lo, part_count, flags, wall_clock_ms())
     }
 
     pub fn put_object_at(
@@ -339,7 +345,7 @@ impl StorageEngine {
         part_count: u16,
         flags: u16,
     ) -> Result<(), i32> {
-        self.put_object_with_hash_at(bucket_id, key, key_hash, vol_offset, size, etag_hi, etag_lo, part_count, flags, 0)
+        self.put_object_with_hash_at(bucket_id, key, key_hash, vol_offset, size, etag_hi, etag_lo, part_count, flags, wall_clock_ms())
     }
 
     pub fn put_object_with_hash_at(
