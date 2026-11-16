@@ -8,7 +8,12 @@ on:
     - cron: "37 20 * * *"
   workflow_dispatch:
   pull_request:
+    # Server code too: batch #216 changed handlers with no s3-tests run before merge, and the
+    # nightly run after it found four listed tests answering 417 (run 43845822284).
     paths:
+      - "server/src/**"
+      - "server/Cargo.toml"
+      - "server/Cargo.lock"
       - "tests/s3tests/**"
       - ".github/workflows/s3-tests.yml"
 

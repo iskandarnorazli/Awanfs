@@ -22,8 +22,13 @@ struct CacheState {
 impl PayloadCache {
     /// Creates a new PayloadCache bounded by maximum byte capacity.
     pub fn new(max_bytes: usize) -> Self {
-        // Allow up to 1,000,000 items in index, eviction is driven by max_bytes
-        let cap = NonZeroUsize::new(1_000_000).unwrap();
+        Self::with_entry_cap(max_bytes, 1_000_000)
+    }
+
+    /// A cache that also holds at most `entry_cap` entries. Bytes bound its memory; the entry
+    /// cap bounds the index. Either cap evicts the least recently used entry.
+    pub fn with_entry_cap(max_bytes: usize, entry_cap: usize) -> Self {
+        let cap = NonZeroUsize::new(entry_cap.max(1)).unwrap();
         Self {
             max_bytes,
             inner: Mutex::new(CacheState {
@@ -83,7 +88,14 @@ impl PayloadCache {
         }
 
         guard.current_bytes += size;
-        guard.lru.put((b_id, offset), (payload, size));
+        // `push` hands back the entry the entry cap evicted, so its bytes leave the count (#211).
+        if let Some((_, (_, evicted_sz))) = guard.lru.push((b_id, offset), (payload, size)) {
+            guard.current_bytes = guard.current_bytes.saturating_sub(evicted_sz);
+        }
+    }
+
+    pub fn entry_cap(&self) -> usize {
+        self.inner.lock().lru.cap().get()
     }
 
     pub fn remove(&self, b_id: u32, offset: u64) {

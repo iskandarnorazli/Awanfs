@@ -745,17 +745,6 @@ pub fn validate(a: Authorized) -> Result<Validated, Response<ResponseBody>> {
     if declared.is_some_and(|n| n > body_limit) {
         return Err(entity_too_large(c.parts.uri.path(), body_limit));
     }
-    if let Some(expect) = c.parts.headers.get(hyper::header::EXPECT).and_then(|v| v.to_str().ok()) {
-        if !expect.trim().eq_ignore_ascii_case("100-continue") {
-            let xml = s3_error_xml("ExpectationFailed", "Expectation Failed", c.parts.uri.path(), "req-expect");
-            return Err(Response::builder()
-                .status(StatusCode::EXPECTATION_FAILED)
-                .header(CONTENT_TYPE, "application/xml")
-                .body(full_body(Bytes::from(xml)))
-                .unwrap());
-        }
-    }
-
     Ok(Validated { authorized: a })
 }
 

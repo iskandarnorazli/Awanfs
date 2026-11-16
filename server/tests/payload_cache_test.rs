@@ -123,3 +123,29 @@ fn payload_cache_does_not_pin_oversized_bytes_slices() {
         upper_bound
     );
 }
+
+/// #211 requirement 2: when the entry cap, not the byte cap, evicts the least recently used
+/// entry, its size leaves `current_bytes` too. Before, `put` dropped it silently and the count
+/// only grew, so a full cache evicted by bytes that were no longer held.
+#[test]
+fn eviction_by_entry_count_takes_the_entry_out_of_the_byte_count() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let cap = 4usize;
+    let cache = PayloadCache::with_entry_cap(1 << 20, cap);
+    for i in 0..(cap as u64 + 3) {
+        cache.insert(1, i, Bytes::from(vec![i as u8; 100]));
+    }
+    assert_eq!(cache.len(), cap);
+    assert_eq!(cache.current_bytes(), cap * 100, "the evicted entries' bytes were not subtracted");
+    for i in 3..(cap as u64 + 3) {
+        assert_eq!(cache.get(1, i).as_deref(), Some(&vec![i as u8; 100][..]), "entry {} is held", i);
+    }
+    assert!(cache.get(1, 0).is_none(), "the oldest entry was evicted");
+}
+
+#[test]
+fn new_keeps_a_million_entry_cap() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = PayloadCache::new(1 << 20);
+    assert_eq!(cache.entry_cap(), 1_000_000);
+}
