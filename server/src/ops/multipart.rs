@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use http_body_util::BodyExt;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG};
 use hyper::{HeaderMap, Response, StatusCode};
 use md5::{Digest, Md5};
@@ -14,7 +13,7 @@ use crate::multipart::{
 };
 use crate::s3_api::{
     bad_request, compute_md5, drain_body, empty_body, engine_error_response, full_body,
-    internal_error_response, read_body_admitted, ResponseBody, S3ServiceState, CHUNK_FRAMING_SLACK,
+    internal_error_response, read_body_admitted, request_timeout_response, ResponseBody, S3ServiceState, CHUNK_FRAMING_SLACK,
     MAX_OBJECT_BODY, MAX_XML_BODY, STREAM_PUT_MIN,
 };
 use crate::xml::s3_error_xml;
@@ -109,7 +108,16 @@ pub async fn upload_part(
                 verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))
             })
         });
-        while let Some(frame) = body.frame().await {
+        let idle_timeout = state.body_idle_timeout();
+        loop {
+            let frame = match crate::body_timeout::next_frame_with_idle(&mut body, idle_timeout).await {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(crate::body_timeout::BodyIdleTimeout) => {
+                    drop(writer);
+                    return Ok(request_timeout_response(key));
+                }
+            };
             if let Ok(data) = frame?.into_data() {
                 if let Some(h) = sha.as_mut() {
                     h.update(&data);
@@ -197,7 +205,7 @@ pub async fn upload_part(
             },
         );
     }
-    let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, declared_len, path).await? {
+    let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, declared_len, state.body_idle_timeout(), path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };
@@ -288,7 +296,7 @@ pub async fn complete_multipart_upload(
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let upload_id = &query_map["uploadId"];
-    let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_XML_BODY, None, path).await? {
+    let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_XML_BODY, None, state.body_idle_timeout(), path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };

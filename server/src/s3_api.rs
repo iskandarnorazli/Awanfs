@@ -98,28 +98,55 @@ pub(crate) fn entity_too_large(resource: &str, limit: u64) -> Response<ResponseB
         .unwrap()
 }
 
-/// Reads a request body of at most `limit` bytes. `Ok(Err(response))` is the answer to send
-/// when the body is too large or cut short.
-pub(crate) async fn read_body(body: hyper::body::Incoming, limit: u64, resource: &str) -> Result<Result<Bytes, Response<ResponseBody>>, hyper::Error> {
-    match http_body_util::Limited::new(body, limit as usize).collect().await {
-        Ok(c) => Ok(Ok(c.to_bytes())),
-        Err(e) => {
-            if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
-                return Ok(Err(entity_too_large(resource, limit)));
+/// Reads a request body of at most `limit` bytes, timing out if no frame arrives within
+/// `idle_timeout`. `Ok(Err(response))` is the answer to send when the body is too large,
+/// times out, or is cut short.
+pub(crate) async fn read_body(
+    mut body: hyper::body::Incoming,
+    limit: u64,
+    idle_timeout: std::time::Duration,
+    resource: &str,
+) -> Result<Result<Bytes, Response<ResponseBody>>, hyper::Error> {
+    use hyper::body::Body as _;
+    if body.size_hint().lower() > limit {
+        return Ok(Err(entity_too_large(resource, limit)));
+    }
+    let mut buf = bytes::BytesMut::new();
+    loop {
+        match crate::body_timeout::next_frame_with_idle(&mut body, idle_timeout).await {
+            Err(crate::body_timeout::BodyIdleTimeout) => {
+                return Ok(Err(request_timeout_response(resource)));
             }
-            match e.downcast::<hyper::Error>() {
-                Ok(h) => Err(*h),
-                Err(other) => {
-                    let xml = s3_error_xml("IncompleteBody", &other.to_string(), resource, "req-body");
-                    Ok(Err(Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .header(CONTENT_TYPE, "application/xml")
-                        .body(full_body(Bytes::from(xml)))
-                        .unwrap()))
+            Ok(None) => return Ok(Ok(buf.freeze())),
+            Ok(Some(Err(e))) => return Err(e),
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    if (buf.len() as u64).saturating_add(data.len() as u64) > limit {
+                        return Ok(Err(entity_too_large(resource, limit)));
+                    }
+                    if buf.is_empty() && body.is_end_stream() {
+                        return Ok(Ok(data));
+                    }
+                    buf.extend_from_slice(&data);
                 }
             }
         }
     }
+}
+
+pub(crate) fn request_timeout_response(resource: &str) -> Response<ResponseBody> {
+    let xml = s3_error_xml(
+        "RequestTimeout",
+        "Your socket connection to the server was not read from or written to within the timeout period. Idle connections will be closed.",
+        resource,
+        "req-timeout",
+    );
+    Response::builder()
+        .status(StatusCode::REQUEST_TIMEOUT)
+        .header(CONTENT_TYPE, "application/xml")
+        .header("connection", "close")
+        .body(full_body(Bytes::from(xml)))
+        .unwrap()
 }
 
 pub(crate) fn slow_down_response(resource: &str, msg: &str) -> Response<ResponseBody> {
@@ -139,6 +166,7 @@ pub(crate) async fn read_body_admitted(
     body: hyper::body::Incoming,
     limit: u64,
     estimated_bytes: Option<u64>,
+    idle_timeout: std::time::Duration,
     resource: &str,
 ) -> Result<Result<(Bytes, crate::memory::AdmissionGuard), Response<ResponseBody>>, hyper::Error> {
     use hyper::body::Body as _;
@@ -155,7 +183,7 @@ pub(crate) async fn read_body_admitted(
             )));
         }
     };
-    match read_body(body, limit, resource).await? {
+    match read_body(body, limit, idle_timeout, resource).await? {
         Ok(bytes) => Ok(Ok((bytes, guard))),
         Err(resp) => Ok(Err(resp)),
     }
@@ -197,8 +225,8 @@ pub const STREAM_PUT_MIN: u64 = 4 * 1024 * 1024;
 pub(crate) async fn drain_body(body: &mut hyper::body::Incoming, limit: u64) {
     let mut seen = 0u64;
     while seen < limit {
-        match body.frame().await {
-            Some(Ok(f)) => seen += f.data_ref().map_or(0, |d| d.len() as u64),
+        match crate::body_timeout::next_frame_with_idle(body, crate::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT).await {
+            Ok(Some(Ok(f))) => seen += f.data_ref().map_or(0, |d| d.len() as u64),
             _ => break,
         }
     }
@@ -637,6 +665,10 @@ pub struct S3ServiceState {
     pub bucket_config_reader: crate::bucket_config::BucketConfigReader,
     /// Metrics for bucket configuration writes and manifest health (#149).
     pub bucket_config_metrics: Arc<crate::bucket_config::ConfigMetrics>,
+    /// Idle timeout while waiting for request headers (#187).
+    pub header_idle_timeout_ms: Arc<AtomicU64>,
+    /// Idle timeout between consecutive request body frames (#187).
+    pub body_idle_timeout_ms: Arc<AtomicU64>,
 }
 
 impl S3ServiceState {
@@ -708,6 +740,12 @@ impl S3ServiceState {
             bucket_configs: Arc::new(parking_lot::Mutex::new(bucket_store)),
             bucket_config_reader,
             bucket_config_metrics,
+            header_idle_timeout_ms: Arc::new(AtomicU64::new(
+                crate::body_timeout::DEFAULT_HEADER_IDLE_TIMEOUT.as_millis() as u64,
+            )),
+            body_idle_timeout_ms: Arc::new(AtomicU64::new(
+                crate::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT.as_millis() as u64,
+            )),
         }
     }
 
@@ -964,7 +1002,31 @@ impl S3ServiceState {
             bucket_configs: Arc::new(parking_lot::Mutex::new(bucket_store)),
             bucket_config_reader,
             bucket_config_metrics,
+            header_idle_timeout_ms: Arc::new(AtomicU64::new(
+                crate::body_timeout::DEFAULT_HEADER_IDLE_TIMEOUT.as_millis() as u64,
+            )),
+            body_idle_timeout_ms: Arc::new(AtomicU64::new(
+                crate::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT.as_millis() as u64,
+            )),
         })
+    }
+
+    pub fn header_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.header_idle_timeout_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn set_header_idle_timeout(&self, d: std::time::Duration) {
+        self.header_idle_timeout_ms
+            .store(d.as_millis().max(1) as u64, Ordering::Relaxed);
+    }
+
+    pub fn body_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.body_idle_timeout_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn set_body_idle_timeout(&self, d: std::time::Duration) {
+        self.body_idle_timeout_ms
+            .store(d.as_millis().max(1) as u64, Ordering::Relaxed);
     }
 
     pub fn fragmentation_ratio(&self) -> f64 {

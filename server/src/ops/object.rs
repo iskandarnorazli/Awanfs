@@ -17,6 +17,7 @@ use crate::precondition::{
 use crate::s3_api::{
     bad_request, drain_body, empty_body, engine_error_response, full_body,
     internal_error_response, md5_to_etag_hex, parse_range_header, percent_decode_path, read_body_admitted,
+    request_timeout_response,
     ChunksBody, ResponseBody, S3ServiceState, CHUNK_FRAMING_SLACK, FORMAT_2_FLAGS, MAX_OBJECT_BODY,
     STREAM_PUT_MIN, VERIFY_WHILE_SENDING_MIN,
 };
@@ -607,7 +608,17 @@ pub async fn put_object(
                 verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))
             })
         });
-        while let Some(frame) = body.frame().await {
+        let idle_timeout = state.body_idle_timeout();
+        loop {
+            let frame = match crate::body_timeout::next_frame_with_idle(&mut body, idle_timeout).await {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(crate::body_timeout::BodyIdleTimeout) => {
+                    drop(writer);
+                    drop(ticket);
+                    return Ok(request_timeout_response(key));
+                }
+            };
             if let Ok(data) = frame?.into_data() {
                 if let Some(h) = sha.as_mut() {
                     h.update(&data);
@@ -737,7 +748,7 @@ pub async fn put_object(
         }
         return Ok(finish_put(&state, b_id, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns / 1_000_000));
     }
-    let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, expected_len.map(|n| n as u64), path).await? {
+    let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, expected_len.map(|n| n as u64), state.body_idle_timeout(), path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };

@@ -55,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut durability = std::env::var("AWANFS_DURABILITY").unwrap_or_else(|_| "group".to_string());
     let mut memory_budget: Option<String> = None;
     let mut lifecycle_day_seconds: u64 = 86_400;
+    let mut body_idle_timeout = s3_server::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -95,6 +96,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 lifecycle_day_seconds = v;
             }
             memory_budget = args.next();
+        } else if arg == "--body-idle-timeout" {
+            let Some(v) = args.next() else {
+                eprintln!("--body-idle-timeout requires a value such as 20s");
+                std::process::exit(2);
+            };
+            match s3_server::body_timeout::parse_timeout_duration(&v) {
+                Ok(d) => body_idle_timeout = d,
+                Err(e) => {
+                    eprintln!("--body-idle-timeout: {}", e);
+                    std::process::exit(2);
+                }
+            }
         } else if arg == "--allow-anonymous" {
             allow_anonymous = true;
         } else if arg == "--data-dir" || arg == "-d" {
@@ -185,6 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         *state.iam.write() = Some(r);
     }
     state.set_durability(durability);
+    state.set_body_idle_timeout(body_idle_timeout);
     // Compaction copies at most this many MB/s (#28, decision 24); 0 = no limit.
     state.compaction_rate.store(compaction_mb.unwrap_or(50) * 1_000_000, std::sync::atomic::Ordering::Relaxed);
     state.lifecycle_day_seconds.store(lifecycle_day_seconds, std::sync::atomic::Ordering::Relaxed);
