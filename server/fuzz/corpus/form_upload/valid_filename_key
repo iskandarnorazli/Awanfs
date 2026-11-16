@@ -1,0 +1,13 @@
+--fuzzboundary
+Content-Disposition: form-data; name="key"
+
+${filename}
+--fuzzboundary
+Content-Disposition: form-data; name="acl"
+
+public-read
+--fuzzboundary
+Content-Disposition: form-data; name="file"; filename="foo.txt"
+
+bar
+--fuzzboundary--

@@ -12,7 +12,13 @@ on:
       - "server/src/sigv4.rs"
       - "server/src/aws_chunked.rs"
       - "server/src/lifecycle.rs"
+      - "server/src/lifecycle_config.rs"
+      - "server/src/cors.rs"
+      - "server/src/object_lock.rs"
+      - "server/src/request_xml.rs"
+      - "server/src/tagging.rs"
       - "server/src/attrs.rs"
+      - "server/src/form_upload.rs"
       - "server/src/s3_api.rs"
       - "server/fuzz/**"
       - ".github/workflows/fuzz.yml"
@@ -31,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block ]
+        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, form_upload, cors_xml, object_lock_xml, request_xml, lifecycle_config_xml, tagging_xml ]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

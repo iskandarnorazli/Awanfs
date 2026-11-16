@@ -1,0 +1,11 @@
+<CORSConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <CORSRule>
+    <ID>rule-1</ID>
+    <AllowedOrigin>https://*.example.com</AllowedOrigin>
+    <AllowedMethod>GET</AllowedMethod>
+    <AllowedMethod>HEAD</AllowedMethod>
+    <AllowedHeader>x-amz-*</AllowedHeader>
+    <MaxAgeSeconds>3600</MaxAgeSeconds>
+    <ExposeHeader>ETag</ExposeHeader>
+  </CORSRule>
+</CORSConfiguration>

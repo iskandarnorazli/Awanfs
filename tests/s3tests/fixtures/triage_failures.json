@@ -1,0 +1,67 @@
+[
+  {
+    "name": "http_status_preserved",
+    "raw": "assert 200 == 204",
+    "expected": "assert 200 == 204"
+  },
+  {
+    "name": "http_status_403_400_preserved",
+    "raw": "assert 403 == 400",
+    "expected": "assert 403 == 400"
+  },
+  {
+    "name": "invalid_response_status_preserved",
+    "raw": "AssertionError: Invalid response 501",
+    "expected": "AssertionError: Invalid response 501"
+  },
+  {
+    "name": "non_status_numbers_stripped",
+    "raw": "assert 10 == 6",
+    "expected": "assert <N> == <N>"
+  },
+  {
+    "name": "timeout_float_stripped",
+    "raw": "Failed: Timeout (>60.0s) from pytest-timeout.",
+    "expected": "Failed: Timeout (><N>s) from pytest-timeout."
+  },
+  {
+    "name": "request_id_and_http_status",
+    "raw": "AssertionError: assert not 'VersionId' in {'ResponseMetadata': {'RequestId': '6AF7B29D00000000000029E2', 'HostId': '', 'HTTPStatusCode': 200}}",
+    "expected": "AssertionError: assert not 'VersionId' in {'ResponseMetadata': {'RequestId': '<REQ_ID>', 'HostId': '', 'HTTPStatusCode': 200}}"
+  },
+  {
+    "name": "etag_hex_and_datetime_and_key",
+    "raw": "assert 'Owner' in {'Key': 'foo/bar', 'LastModified': datetime.datetime(2026, 11, 10, 0, 0, tzinfo=tzlocal()), 'ETag': '\"82d0f0fa8551de8b7eb5ecb65eae0261\"'}",
+    "expected": "assert 'Owner' in {'Key': '<KEY>', 'LastModified': <DATETIME>, 'ETag': '\"<HEX>\"'}"
+  },
+  {
+    "name": "botocore_s3_error_code_and_operation_preserved",
+    "raw": "botocore.errorfactory.NoSuchBucket: An error occurred (NoSuchBucket) when calling the ListObjects operation: The specified bucket does not exist",
+    "expected": "botocore.errorfactory.NoSuchBucket: An error occurred (NoSuchBucket) when calling the ListObjects operation: The specified bucket does not exist"
+  },
+  {
+    "name": "botocore_500_and_retries_stripped",
+    "raw": "botocore.exceptions.ClientError: An error occurred (500) when calling the GetObjectAcl operation (reached max retries: 2): Internal Server Error",
+    "expected": "botocore.exceptions.ClientError: An error occurred (500) when calling the GetObjectAcl operation (reached max retries: <N>): Internal Server Error"
+  },
+  {
+    "name": "bucket_and_key_in_kwargs_stripped",
+    "raw": "botocore.errorfactory.NoSuchBucket: An error occurred (NoSuchBucket) when calling the PutObject operation: Bucket='test-bucket-abc123', Key='dir/obj-99.txt'",
+    "expected": "botocore.errorfactory.NoSuchBucket: An error occurred (NoSuchBucket) when calling the PutObject operation: Bucket='<BUCKET>', Key='<KEY>'"
+  },
+  {
+    "name": "s3_uri_stripped",
+    "raw": "AssertionError: missing s3://my-test-bucket-42/some/object/key",
+    "expected": "AssertionError: missing s3://<BUCKET>/<KEY>"
+  },
+  {
+    "name": "hex_pointer_stripped",
+    "raw": "AssertionError: unexpected object at 0x7f9a1c2b3d40",
+    "expected": "AssertionError: unexpected object at <HEX>"
+  },
+  {
+    "name": "key_error_preserved",
+    "raw": "KeyError: 'ChecksumSHA256'",
+    "expected": "KeyError: 'ChecksumSHA256'"
+  }
+]

@@ -1,0 +1,10 @@
+--fuzzboundary
+Content-Disposition: form-data; name="key"
+
+foo.txt
+--fuzzboundary
+Content-Disposition: form-data; name="file"; filename="bar.txt"
+Content-Type: text/plain
+
+hello world
+--fuzzboundary--
