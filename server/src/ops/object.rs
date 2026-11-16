@@ -11,6 +11,9 @@ use crate::ffi_bridge::{
     unpack_flags, unpack_part_count, AWAN_FLAG_ACTIVE, AWAN_FLAG_MULTIPART, AWAN_FLAG_ZERO_BYTE,
 };
 use crate::iam::Iam;
+use crate::precondition::{
+    format_http_date, precondition, ObjectFacts, PreconditionOutcome, DEFAULT_LAST_MODIFIED_SECS,
+};
 use crate::s3_api::{
     bad_request, drain_body, empty_body, engine_error_response, full_body,
     internal_error_response, md5_to_etag_hex, parse_range_header, percent_decode_path, read_body_admitted,
@@ -146,6 +149,66 @@ fn find_version(state: &S3ServiceState, b_id: u32, key: &str, id: Option<u64>) -
     }
 }
 
+fn last_modified_secs_from_ms(ms: u64) -> u64 {
+    if ms == 0 {
+        DEFAULT_LAST_MODIFIED_SECS
+    } else {
+        ms / 1000
+    }
+}
+
+fn last_modified_secs_from_ns(ns: u64) -> u64 {
+    if ns == 0 {
+        DEFAULT_LAST_MODIFIED_SECS
+    } else {
+        ns / 1_000_000_000
+    }
+}
+
+fn format_object_etag(etag_hi: u64, etag_lo: u64, is_multipart: bool, part_count: u16) -> String {
+    let hex = md5_to_etag_hex(etag_hi, etag_lo);
+    if is_multipart {
+        format!("\"{}-{}\"", hex, part_count)
+    } else {
+        format!("\"{}\"", hex)
+    }
+}
+
+fn precondition_failure_response(
+    outcome: PreconditionOutcome,
+    facts: Option<&ObjectFacts>,
+    key: &str,
+    is_head: bool,
+) -> Response<ResponseBody> {
+    match outcome {
+        PreconditionOutcome::Proceed => unreachable!("precondition_failure_response called with Proceed"),
+        PreconditionOutcome::NotModified => {
+            let mut b = Response::builder().status(StatusCode::NOT_MODIFIED).header(CONTENT_LENGTH, "0");
+            if let Some(f) = facts {
+                b = b.header(ETAG, &f.etag).header(LAST_MODIFIED, format_http_date(f.last_modified_secs));
+            }
+            b.body(empty_body()).unwrap()
+        }
+        PreconditionOutcome::PreconditionFailed => {
+            let mut b = Response::builder().status(StatusCode::PRECONDITION_FAILED);
+            if let Some(f) = facts {
+                b = b.header(ETAG, &f.etag).header(LAST_MODIFIED, format_http_date(f.last_modified_secs));
+            }
+            if is_head {
+                b.header(CONTENT_LENGTH, "0").body(empty_body()).unwrap()
+            } else {
+                let xml = s3_error_xml(
+                    "PreconditionFailed",
+                    "At least one of the pre-conditions you specified did not hold",
+                    key,
+                    "req-precond",
+                );
+                b.header(CONTENT_TYPE, "application/xml").body(full_body(Bytes::from(xml))).unwrap()
+            }
+        }
+    }
+}
+
 fn version_get_response(
     state: &S3ServiceState,
     b_id: u32,
@@ -153,6 +216,7 @@ fn version_get_response(
     vid: Option<&str>,
     head: bool,
     range: Option<&str>,
+    headers: &HeaderMap,
 ) -> Response<ResponseBody> {
     let id = match vid {
         Some(s) => match crate::versions::parse_id(s) {
@@ -163,6 +227,9 @@ fn version_get_response(
     };
     let v = find_version(state, b_id, key, id);
     let Some(v) = v else {
+        if precondition(headers, None, false) == PreconditionOutcome::PreconditionFailed {
+            return precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, head);
+        }
         if id.is_some() {
             return no_such_version(key);
         }
@@ -174,6 +241,9 @@ fn version_get_response(
             .unwrap();
     };
     if v.marker {
+        if precondition(headers, None, false) == PreconditionOutcome::PreconditionFailed {
+            return precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, head);
+        }
         let (status, code, msg) = if id.is_some() {
             (StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against a delete marker.")
         } else {
@@ -192,6 +262,16 @@ fn version_get_response(
             .body(body)
             .unwrap();
     }
+    let etag_val = version_etag(&v);
+    let lm_secs = last_modified_secs_from_ns(v.ts);
+    let facts = ObjectFacts {
+        etag: etag_val.clone(),
+        last_modified_secs: lm_secs,
+    };
+    match precondition(headers, Some(&facts), false) {
+        PreconditionOutcome::Proceed => {}
+        outcome => return precondition_failure_response(outcome, Some(&facts), key, head),
+    }
     let bytes = if head {
         Bytes::new()
     } else {
@@ -206,10 +286,10 @@ fn version_get_response(
     };
     let builder = Response::builder()
         .header(CONTENT_TYPE, view.content_type())
-        .header(ETAG, version_etag(&v))
+        .header(ETAG, etag_val)
         .header(ACCEPT_RANGES, "bytes")
         .header("x-amz-version-id", v.id_string())
-        .header(LAST_MODIFIED, "Tue, 10 Nov 2026 00:00:00 GMT");
+        .header(LAST_MODIFIED, format_http_date(lm_secs));
     if let Some(h) = range {
         match parse_range_header(h, v.size) {
             Ok(Some(r)) => {
@@ -326,15 +406,31 @@ pub async fn copy_object(
                     .body(full_body(Bytes::from(xml)))
                     .unwrap());
             }
+            let src_facts = ObjectFacts {
+                etag: version_etag(&v),
+                last_modified_secs: last_modified_secs_from_ns(v.ts),
+            };
+            if precondition(headers, Some(&src_facts), true) != PreconditionOutcome::Proceed {
+                return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
+            }
             src_view = state.object_attrs(v.vol_offset, v.flags);
             state
                 .read_version_bytes(src_b_id, src_key, &v)
                 .map(|b| (b, v.size, v.etag_hi, v.etag_lo, Some(v.id_string())))
         }
         (None, Some(m)) => {
-            src_view = state.object_attrs(m.vol_offset, unpack_flags(m.bucket_flags));
+            let flags = unpack_flags(m.bucket_flags);
+            let is_mp = flags & AWAN_FLAG_MULTIPART != 0;
+            let src_facts = ObjectFacts {
+                etag: format_object_etag(m.etag_hi, m.etag_lo, is_mp, unpack_part_count(m.bucket_flags)),
+                last_modified_secs: last_modified_secs_from_ms(m.created_at),
+            };
+            if precondition(headers, Some(&src_facts), true) != PreconditionOutcome::Proceed {
+                return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
+            }
+            src_view = state.object_attrs(m.vol_offset, flags);
             state
-                .read_object_bytes(src_b_id, src_key, m.vol_offset, m.size, unpack_flags(m.bucket_flags))
+                .read_object_bytes(src_b_id, src_key, m.vol_offset, m.size, flags)
                 .map(|b| (b, m.size, m.etag_hi, m.etag_lo, None))
         }
         (None, None) => unreachable!("src_meta is read whenever no version is named"),
@@ -774,13 +870,16 @@ pub async fn get_or_head_object(
     let vid = query_map.get("versionId").map(|s| s.as_str());
     if vid.is_some() || state.versions.read().has(b_id, key) {
         let range = headers.get("Range").and_then(|v| v.to_str().ok());
-        return Ok(version_get_response(&state, b_id, key, vid, is_head, range));
+        return Ok(version_get_response(&state, b_id, key, vid, is_head, range, headers));
     }
     let (meta, is_multipart) = {
         let engine = state.engine.read();
         let m = match engine.get_object(b_id, key.as_bytes()) {
             Ok(m) => m,
             Err(_) => {
+                if precondition(headers, None, false) == PreconditionOutcome::PreconditionFailed {
+                    return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, is_head));
+                }
                 let xml = s3_error_xml("NoSuchKey", "The specified key does not exist.", key, "req-get-obj");
                 return Ok(Response::builder()
                     .status(StatusCode::NOT_FOUND)
@@ -798,35 +897,16 @@ pub async fn get_or_head_object(
     };
     let is_compressed = unpack_flags(meta.bucket_flags) & crate::meta_index::FLAG_COMPRESSED != 0;
 
-    let etag_val = if is_multipart {
-        let part_count = unpack_part_count(meta.bucket_flags);
-        let hex = md5_to_etag_hex(meta.etag_hi, meta.etag_lo);
-        format!("\"{}-{}\"", hex, part_count)
-    } else {
-        format!("\"{}\"", md5_to_etag_hex(meta.etag_hi, meta.etag_lo))
+    let etag_val = format_object_etag(meta.etag_hi, meta.etag_lo, is_multipart, unpack_part_count(meta.bucket_flags));
+    let lm_secs = last_modified_secs_from_ms(meta.created_at);
+    let lm_str = format_http_date(lm_secs);
+    let facts = ObjectFacts {
+        etag: etag_val.clone(),
+        last_modified_secs: lm_secs,
     };
-
-    if let Some(if_match) = headers.get("If-Match").and_then(|v| v.to_str().ok()) {
-        let if_match = if_match.trim();
-        if if_match != "*" && if_match != etag_val && if_match != etag_val.trim_matches('"') {
-            return Ok(Response::builder()
-                .status(StatusCode::PRECONDITION_FAILED)
-                .header(CONTENT_LENGTH, "0")
-                .body(empty_body())
-                .unwrap());
-        }
-    }
-
-    if let Some(if_none_match) = headers.get("If-None-Match").and_then(|v| v.to_str().ok()) {
-        let if_none_match = if_none_match.trim();
-        if if_none_match == "*" || if_none_match == etag_val || if_none_match == etag_val.trim_matches('"') {
-            return Ok(Response::builder()
-                .status(StatusCode::NOT_MODIFIED)
-                .header(ETAG, etag_val)
-                .header(CONTENT_LENGTH, "0")
-                .body(empty_body())
-                .unwrap());
-        }
+    match precondition(headers, Some(&facts), false) {
+        PreconditionOutcome::Proceed => {}
+        outcome => return Ok(precondition_failure_response(outcome, Some(&facts), key, is_head)),
     }
 
     let range_hdr = headers.get("Range").and_then(|v| v.to_str().ok());
@@ -856,7 +936,7 @@ pub async fn get_or_head_object(
                         .header(ACCEPT_RANGES, "bytes")
                         .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
                         .header(CONTENT_LENGTH, len.to_string())
-                        .header(LAST_MODIFIED, "Tue, 10 Nov 2026 00:00:00 GMT")
+                        .header(LAST_MODIFIED, lm_str.as_str())
                         .body(body.boxed())
                         .unwrap());
                 }
@@ -914,7 +994,7 @@ pub async fn get_or_head_object(
                                 .header(ACCEPT_RANGES, "bytes")
                                 .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
                                 .header(CONTENT_LENGTH, (range.end - range.start + 1).to_string())
-                                .header(LAST_MODIFIED, "Tue, 10 Nov 2026 00:00:00 GMT")
+                                .header(LAST_MODIFIED, lm_str.as_str())
                                 .body(ChunksBody(chunks).boxed())
                                 .unwrap());
                         }
@@ -954,7 +1034,7 @@ pub async fn get_or_head_object(
                     .header(ACCEPT_RANGES, "bytes")
                     .header(CONTENT_RANGE, content_range)
                     .header(CONTENT_LENGTH, (range.end - range.start + 1).to_string())
-                    .header(LAST_MODIFIED, "Tue, 10 Nov 2026 00:00:00 GMT")
+                    .header(LAST_MODIFIED, lm_str.as_str())
                     .body(body)
                     .unwrap());
             }
@@ -995,7 +1075,7 @@ pub async fn get_or_head_object(
             .header(ETAG, etag_val)
             .header(ACCEPT_RANGES, "bytes")
             .header(CONTENT_LENGTH, meta.size.to_string())
-            .header(LAST_MODIFIED, "Tue, 10 Nov 2026 00:00:00 GMT")
+            .header(LAST_MODIFIED, lm_str.as_str())
             .body(ChunksBody(chunks).boxed())
             .unwrap());
     }
@@ -1019,7 +1099,7 @@ pub async fn get_or_head_object(
             .header(ETAG, etag_val)
             .header(ACCEPT_RANGES, "bytes")
             .header(CONTENT_LENGTH, meta.size.to_string())
-            .header(LAST_MODIFIED, "Tue, 10 Nov 2026 00:00:00 GMT")
+            .header(LAST_MODIFIED, lm_str.as_str())
             .body(body.boxed())
             .unwrap());
     }
@@ -1051,7 +1131,7 @@ pub async fn get_or_head_object(
         .header(ETAG, etag_val)
         .header(ACCEPT_RANGES, "bytes")
         .header(CONTENT_LENGTH, meta.size.to_string())
-        .header(LAST_MODIFIED, "Tue, 10 Nov 2026 00:00:00 GMT")
+        .header(LAST_MODIFIED, lm_str.as_str())
         .body(body)
         .unwrap())
 }

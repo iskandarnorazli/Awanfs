@@ -21,6 +21,7 @@ pub mod metrics;
 pub mod multipart;
 pub mod mvcc;
 pub mod ops;
+pub mod precondition;
 pub mod reactor;
 pub mod iam;
 pub mod request_log;
