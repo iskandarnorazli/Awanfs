@@ -500,6 +500,20 @@ def join_all(threads: List[threading.Thread], label: str, timeout_sec: float = P
     return stuck
 
 
+def object_key(
+    worker_id: int,
+    req_count: int,
+    pool_keys_per_worker: int,
+    unique_keys: bool = False,
+) -> str:
+    """Object key for a worker request: unique per (worker_id, req_count) when unique_keys is set,
+    otherwise cycling through the warm-up pool."""
+    if unique_keys:
+        return f"worker_{worker_id}_uniq_{req_count}.dat"
+    key_idx = req_count % pool_keys_per_worker
+    return f"worker_{worker_id}_obj_{key_idx}.dat"
+
+
 def run_workload_phase(
     host: str,
     port: int,
@@ -510,7 +524,9 @@ def run_workload_phase(
     mode: str,  # "put", "get", or "range_get_4k"
     server_pid: Optional[int] = None,
     warmup_timeout_sec: float = WARMUP_TIMEOUT_SEC,
+    unique_keys: bool = False,
 ) -> BenchmarkMetrics:
+    use_unique = unique_keys and mode == "put"
     payload = os.urandom(payload_size)
     phase_label = f"{mode} {payload_size}B c={concurrency}"
     stop_event = threading.Event()
@@ -576,9 +592,9 @@ def run_workload_phase(
         range_headers = {"Connection": "keep-alive", "Range": "bytes=0-4095"}
 
         while not stop_event.is_set():
-            key_idx = req_count % pool_keys_per_worker
+            key = object_key(worker_id, req_count, pool_keys_per_worker, use_unique)
             req_count += 1
-            path = f"/{bucket}/worker_{worker_id}_obj_{key_idx}.dat"
+            path = f"/{bucket}/{key}"
             t0 = time.perf_counter()
 
             try:
