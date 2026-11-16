@@ -16,6 +16,7 @@ decisions are numbered in [`ARCHITECTURE.md`](ARCHITECTURE.md); stored bytes are
 - Work only on issues labelled `ready:antigravity` with no `wip:` label. An empty queue means stop and say so.
 - An issue blocked by another (GitHub's "blocked by" link, or a first line "Blocked by #N") waits until #N is closed.
 - Never start an issue labelled `outline` or `needs-decision`.
+- **A gate line is checked on the PR** (owner, 2026-11-17). Whoever writes an issue writes each gate line as something the PR's checks or a command run on its branch can show, before merge: never "the nightly run shows". A conformance gate names its tests (must pass, and owned elsewhere with the owning issue), as `CONFORMANCE_DESIGN.md` 6.1 says. A gate line the builder cannot check on the PR is a reason to stop and ask, not to skip it.
 - These need Claude or the owner, even when an issue seems to ask for them. Stop with `needs-decision` and say which:
   - stored bytes in volumes: the needle header, the journal, the volume format (`FORMAT.md`). A bucket manifest record is allowed when the issue gives its exact text and its gate has restart and replay tests;
   - recovery and replay, the key lock, the commit path, group commit, compaction;
