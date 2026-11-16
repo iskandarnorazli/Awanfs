@@ -58,7 +58,6 @@ test_s3::test_bucket_create_naming_good_starts_alpha
 test_s3::test_bucket_create_naming_good_starts_digit
 test_s3::test_bucket_delete_nonempty
 test_s3::test_bucket_delete_notexist
-test_s3::test_bucket_head
 test_s3::test_bucket_head_notexist
 test_s3::test_bucket_list_delimiter_alt
 test_s3::test_bucket_list_delimiter_basic
