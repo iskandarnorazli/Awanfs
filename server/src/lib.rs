@@ -20,6 +20,7 @@ pub mod meta_index;
 pub mod metrics;
 pub mod multipart;
 pub mod mvcc;
+pub mod ops;
 pub mod reactor;
 pub mod iam;
 pub mod request_log;
