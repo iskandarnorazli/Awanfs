@@ -371,8 +371,9 @@ impl ChunkVerifier {
 /// `Content-Encoding: aws-chunked`.
 pub fn is_aws_chunked(headers: &HeaderMap) -> bool {
     headers.get("x-amz-content-sha256").and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("STREAMING-"))
-        || headers
-            .get("content-encoding")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.split(',').any(|e| e.trim().eq_ignore_ascii_case("aws-chunked")))
+        || (headers.contains_key("x-amz-decoded-content-length")
+            && headers
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.split(',').any(|e| e.trim().eq_ignore_ascii_case("aws-chunked"))))
 }

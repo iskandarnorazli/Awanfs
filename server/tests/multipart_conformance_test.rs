@@ -427,3 +427,63 @@ async fn list_parts_and_list_multipart_uploads_pagination() {
     handle.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+#[tokio::test]
+async fn complete_multipart_is_idempotent_and_abort_after_complete_is_no_such_upload() {
+    let dir = temp_dir("idemp");
+    let (handle, base, _dir2) = start_server("idemp").await;
+    let c = reqwest::Client::new();
+    assert_eq!(c.put(format!("{}/bkt", base)).send().await.unwrap().status(), StatusCode::OK);
+
+    let init = c.post(format!("{}/bkt/obj?uploads", base)).send().await.unwrap().text().await.unwrap();
+    let uid = between(&init, "<UploadId>", "</UploadId>").unwrap().to_string();
+
+    let p1 = c
+        .put(format!("{}/bkt/obj?partNumber=1&uploadId={}", base, uid))
+        .body("hello-idempotent")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(p1.status(), StatusCode::OK);
+    let e1 = p1.headers().get("etag").unwrap().to_str().unwrap().to_string();
+
+    let xml_body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        e1
+    );
+    let cmp1 = c
+        .post(format!("{}/bkt/obj?uploadId={}", base, uid))
+        .body(xml_body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cmp1.status(), StatusCode::OK);
+    let etag1 = cmp1.headers().get("etag").unwrap().to_str().unwrap().to_string();
+    let body1 = cmp1.text().await.unwrap();
+
+    // Second CompleteMultipartUpload on the same uploadId answers the completed result (200 OK).
+    let cmp2 = c
+        .post(format!("{}/bkt/obj?uploadId={}", base, uid))
+        .body(xml_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cmp2.status(), StatusCode::OK);
+    assert_eq!(cmp2.headers().get("etag").unwrap().to_str().unwrap(), etag1);
+    let body2 = cmp2.text().await.unwrap();
+    assert_eq!(between(&body2, "<ETag>", "</ETag>"), between(&body1, "<ETag>", "</ETag>"));
+
+    // Abort after Complete answers 404 NoSuchUpload.
+    let abort = c
+        .delete(format!("{}/bkt/obj?uploadId={}", base, uid))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(abort.status(), StatusCode::NOT_FOUND);
+    let abort_xml = abort.text().await.unwrap();
+    assert_eq!(between(&abort_xml, "<Code>", "</Code>"), Some("NoSuchUpload"));
+
+    handle.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

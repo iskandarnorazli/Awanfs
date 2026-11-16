@@ -396,3 +396,82 @@ async fn metadata_survives_compaction_and_restart() {
         assert_eq!(res.bytes().await.unwrap().as_ref(), &body[..]);
     }
 }
+
+
+#[tokio::test]
+async fn prop_no_crlf_injection_and_exact_roundtrip_plus_aws_chunked_literal_encoding() {
+    let dir = temp_dir("prop_meta");
+    let c = reqwest::Client::new();
+    let (_st, url, handle) = start(&dir).await;
+    assert_eq!(c.put(format!("{}/pbkt", url)).send().await.unwrap().status(), StatusCode::OK);
+
+    // 1. Property test over 64 deterministic pseudo-random byte sequences:
+    //    - Valid header values (printable ASCII, no CR/LF, no NUL) round-trip byte-for-byte.
+    //    - Any value containing CR or LF is refused (either by HTTP layer or 400 InvalidArgument) and never stored.
+    let mut seed: u64 = 0x5EED_CAFE_1234_5678;
+    for i in 0..64usize {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let len = ((seed >> 16) % 24) as usize + 1;
+        let mut val_bytes = Vec::with_capacity(len);
+        for j in 0..len {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            // Printable ASCII 0x21..=0x7E
+            val_bytes.push((0x21 + ((seed >> 24) % 94)) as u8);
+            if i % 4 == 0 && j == len / 2 {
+                // Inject CR or LF on every 4th iteration
+                val_bytes.push(if i % 8 == 0 { b'\r' } else { b'\n' });
+            }
+        }
+        let has_crlf = val_bytes.iter().any(|&b| b == b'\r' || b == b'\n');
+        let key = format!("k{}", i);
+        if has_crlf {
+            // reqwest rejects CR/LF in HeaderValue; test raw TCP to ensure server itself rejects CR/LF if sent.
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let addr: std::net::SocketAddr = url.strip_prefix("http://").unwrap().parse().unwrap();
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut req = Vec::new();
+            req.extend_from_slice(format!("PUT /pbkt/{} HTTP/1.1\r\nHost: {}\r\nContent-Length: 2\r\nx-amz-meta-test: ", key, addr).as_bytes());
+            req.extend_from_slice(&val_bytes);
+            req.extend_from_slice(b"\r\nConnection: close\r\n\r\nok");
+            stream.write_all(&req).await.unwrap();
+            let mut resp = Vec::new();
+            let _ = stream.read_to_end(&mut resp).await;
+            let resp_str = String::from_utf8_lossy(&resp);
+            assert!(
+                resp_str.contains("HTTP/1.1 400"),
+                "expected 400 for CR/LF injection on iter {}, got: {}",
+                i,
+                resp_str
+            );
+        } else {
+            let val_str = std::str::from_utf8(&val_bytes).unwrap();
+            let put = c
+                .put(format!("{}/pbkt/{}", url, key))
+                .header("x-amz-meta-test", val_str)
+                .body("ok")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(put.status(), StatusCode::OK, "iter {}", i);
+            let get = c.get(format!("{}/pbkt/{}", url, key)).send().await.unwrap();
+            assert_eq!(get.status(), StatusCode::OK);
+            assert_eq!(get.headers().get("x-amz-meta-test").unwrap().as_bytes(), val_bytes.as_slice());
+        }
+    }
+
+    // 2. Non-streaming PutObject with Content-Encoding: aws-chunked must NOT fail with IncompleteBody.
+    let ce_put = c
+        .put(format!("{}/pbkt/ce-literal", url))
+        .header("content-encoding", "aws-chunked")
+        .body("plain-body-not-chunked")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ce_put.status(), StatusCode::OK);
+    let ce_get = c.get(format!("{}/pbkt/ce-literal", url)).send().await.unwrap();
+    assert_eq!(ce_get.status(), StatusCode::OK);
+    assert_eq!(ce_get.headers().get("content-encoding").unwrap().to_str().unwrap(), "aws-chunked");
+    assert_eq!(ce_get.bytes().await.unwrap().as_ref(), b"plain-body-not-chunked");
+
+    handle.shutdown();
+}
