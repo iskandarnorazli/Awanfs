@@ -72,7 +72,7 @@ Owner decisions after the 2026-11-12 unattended run (#64-#83), each the recommen
 
 | # | Decision | Issues |
 |---|---|---|
-| 36 | **Memory plan first:** one `--memory-budget`; a cap on request bytes held in memory; the nightly ratio run enforces an RSS ceiling. Conformance quick wins (#111-#114) come after. | #57, #111-#114 |
+| 36 | **Memory plan first:** one `--memory-budget`; a cap on request bytes held in memory (enforced since #128: bodies are admitted against their half of the budget, 503 `SlowDown` after a 100 ms wait); the nightly ratio run enforces an RSS ceiling. Conformance quick wins (#111-#114) come after. | #57, #111-#114 |
 | 37 | **Object lock: governance and compliance modes, plus legal hold**, as S3 defines them, on top of versioning (#31). | #120 |
 | 38 | **Encryption: SSE-S3 with a local master key that wraps per-object keys, and SSE-C;** SSE-KMS first from a local key file of named keys (decision 49, 2026-11-14, replacing "through an external service later"); an external KMS can replace the file without a format change. | #121 |
 | 39 | **Access: bucket policies (on the #53 evaluator), canned ACLs, per-grantee ACL grants and the public access block.** Per-grantee grants were ruled out here at first and allowed by decision 48 (2026-11-14); new buckets have ACLs off. | #122 |
