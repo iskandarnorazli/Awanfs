@@ -302,6 +302,8 @@ mod task_tests {
             assert_eq!(task_step(state, event), want, "{:?} + {:?}", state, event);
         }
         assert_eq!(table.len(), 4 * 3, "every state against every event");
+    }
+}
 
 /// Lifecycle of a bucket (#149).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
