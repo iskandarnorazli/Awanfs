@@ -58,11 +58,15 @@ name = "object_lock_xml"
 path = "fuzz_targets/object_lock_xml.rs"
 name = "request_xml"
 path = "fuzz_targets/request_xml.rs"
-=======
 
 [[bin]]
 name = "lifecycle_config_xml"
 path = "fuzz_targets/lifecycle_config_xml.rs"
->>>>>>> 74d8153 (lifecycle_config: parse, validate, serialize, and match full S3 lifecycle rules (#192))
+=======
+
+[[bin]]
+name = "tagging_xml"
+path = "fuzz_targets/tagging_xml.rs"
+>>>>>>> 40ba3f9 (tagging: add XML/header parser, validator, and XML serializer (#188))
 test = false
 doc = false

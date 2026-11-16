@@ -33,10 +33,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, form_upload, cors_xml, object_lock_xml, request_xml ]
+        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, form_upload, cors_xml, object_lock_xml, request_xml, lifecycle_config_xml ]
 =======
-        target: [ range, aws_chunked, sigv4, lifecycle_xml, lifecycle_config_xml, attrs_block ]
->>>>>>> 74d8153 (lifecycle_config: parse, validate, serialize, and match full S3 lifecycle rules (#192))
+        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, tagging_xml ]
+>>>>>>> 40ba3f9 (tagging: add XML/header parser, validator, and XML serializer (#188))
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
