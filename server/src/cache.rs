@@ -62,6 +62,10 @@ impl PayloadCache {
             return;
         }
 
+        // Copy into an exact-sized Bytes so the cache never pins a larger
+        // request buffer (e.g. a BytesMut slab) in memory (#211).
+        let payload = Bytes::copy_from_slice(&payload);
+
         let mut guard = self.inner.lock();
 
         // If key already exists, deduct previous size

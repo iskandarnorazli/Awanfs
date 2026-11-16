@@ -1,7 +1,9 @@
 """Which ceph s3-tests belong to which area of work, and where each area stands.
 
     python3 tests/s3tests/conformance_map.py /tmp/s3-tests/s3tests/functional/test_s3.py \
-        tests/s3tests/passing.txt --junit /tmp/s3tests-results.xml --report CONFORMANCE_MAP.md
+        [/tmp/s3-tests/s3tests/functional/test_headers.py] tests/s3tests/passing.txt \
+        --junit /tmp/s3tests-results.xml [--junit /tmp/s3tests-headers-results.xml] \
+        --report CONFORMANCE_MAP.md
 
 Every test function in the pinned suite is assigned to exactly one area by the first rule
 that matches its pytest markers or its name (AREAS, in order). An area names the issue that
@@ -15,6 +17,7 @@ line, which the report lists so the owner of an area starts from the symptom.
 """
 import argparse
 import ast
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -24,6 +27,7 @@ from typing import Dict, List, Optional, Tuple
 # (area, issue, design section, name regex or None, markers). First match wins, so the order
 # is part of the map: narrow areas come before the broad ones that would also match.
 AREAS: List[Tuple[str, str, str, Optional[str], frozenset]] = [
+    ("request-headers", "#160", "3", r"^test_headers::", frozenset()),
     ("rgw-only", "out of scope", "9", r"^test_(head_bucket_usage|account_usage|bucket_head_extended|get_object_torrent)$|_unordered$|_tenant$", frozenset()),
     ("bucket-logging", "#153", "8.4", r"logging", frozenset({"bucket_logging", "bucket_logging_cleanup", "fails_without_logging_rollover"})),
     ("storage-classes", "out of scope", "9", r"transition|cloud|restore|storage_class", frozenset({"lifecycle_transition", "cloud_transition", "cloud_restore"})),
@@ -49,9 +53,10 @@ AREAS: List[Tuple[str, str, str, Optional[str], frozenset]] = [
 ]
 
 
-def suite_tests(path: str) -> "OrderedDict[str, List[str]]":
+def suite_tests(path: str, prefix: str = "") -> "OrderedDict[str, List[str]]":
     """{test function: its pytest marker names}, in file order."""
-    tree = ast.parse(open(path, encoding="utf-8").read())
+    with open(path, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
     out: "OrderedDict[str, List[str]]" = OrderedDict()
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
@@ -60,7 +65,7 @@ def suite_tests(path: str) -> "OrderedDict[str, List[str]]":
                 m = re.match(r"pytest\.mark\.(\w+)", ast.unparse(d))
                 if m:
                     marks.append(m.group(1))
-            out[node.name] = marks
+            out[f"{prefix}{node.name}"] = marks
     return out
 
 
@@ -74,30 +79,42 @@ def area_of(name: str, markers) -> Optional[Tuple[str, str, str]]:
 
 def passing_names(path: str) -> set:
     out = set()
-    for line in open(path, encoding="utf-8"):
-        line = line.strip()
-        if line and not line.startswith("#"):
-            out.add(line.split("::")[-1].split("[")[0])
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                if line.startswith("test_s3::"):
+                    line = line[len("test_s3::"):]
+                out.add(line.split("[")[0])
     return out
 
 
-def junit_status(path: str) -> Dict[str, Tuple[str, str]]:
+def junit_status(paths) -> Dict[str, Tuple[str, str]]:
     """{test function: (status, first line of the failure)}. A parametrized function is
     "fail" when any case failed, else "skip" when any was skipped, else "pass"."""
+    if isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
     rank = {"pass": 0, "skip": 1, "fail": 2}
     out: Dict[str, Tuple[str, str]] = {}
-    for case in ET.parse(path).getroot().iter("testcase"):
-        name = case.get("name", "").split("[")[0]
-        status, why = "pass", ""
-        for child in case:
-            if child.tag in ("failure", "error"):
-                status = "fail"
-                why = (child.get("message") or child.text or "").strip().splitlines()[0][:160] if (child.get("message") or child.text) else ""
-            elif child.tag == "skipped" and status != "fail":
-                status = "skip"
-                why = (child.get("message") or "").strip()[:160]
-        if name not in out or rank[status] > rank[out[name][0]]:
-            out[name] = (status, why)
+    for path in paths:
+        for case in ET.parse(path).getroot().iter("testcase"):
+            cls = case.get("classname", "")
+            mod = cls.split(".")[-1] if cls else ""
+            base = case.get("name", "").split("[")[0]
+            name = f"{mod}::{base}" if mod and mod != "test_s3" else base
+            status, why = "pass", ""
+            for child in case:
+                if child.tag in ("failure", "error"):
+                    status = "fail"
+                    why = (child.get("message") or child.text or "").strip().splitlines()[0][:160] if (child.get("message") or child.text) else ""
+                elif child.tag == "skipped" and status != "fail":
+                    status = "skip"
+                    msg = (child.get("message") or "").strip()
+                    txt = (child.text or "").strip()
+                    raw = txt if (not msg or msg.lower() == "skipped") and txt else (msg or txt)
+                    why = raw.splitlines()[0][:160] if raw else ""
+            if name not in out or rank[status] > rank[out[name][0]]:
+                out[name] = (status, why)
     return out
 
 
@@ -160,13 +177,18 @@ def render(rows, unassigned, suite_ref: str) -> str:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("suite", help="s3tests/functional/test_s3.py of the pinned suite")
+    ap.add_argument("suite", nargs="+", help="s3tests/functional/test_s3.py (and optionally test_headers.py) of the pinned suite")
     ap.add_argument("passing")
-    ap.add_argument("--junit", default="")
+    ap.add_argument("--junit", action="append", default=[])
     ap.add_argument("--suite-ref", default="the pinned suite")
     ap.add_argument("--report", default="")
     a = ap.parse_args(argv)
-    rows, unassigned = build(suite_tests(a.suite), passing_names(a.passing), junit_status(a.junit) if a.junit else None)
+    tests: "OrderedDict[str, List[str]]" = OrderedDict()
+    for path in a.suite:
+        prefix = "test_headers::" if os.path.basename(path) == "test_headers.py" else ""
+        tests.update(suite_tests(path, prefix=prefix))
+    junits = [j for j in a.junit if j]
+    rows, unassigned = build(tests, passing_names(a.passing), junit_status(junits) if junits else None)
     text = render(rows, unassigned, a.suite_ref)
     if a.report:
         with open(a.report, "w", encoding="utf-8") as fh:

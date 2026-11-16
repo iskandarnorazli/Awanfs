@@ -134,3 +134,39 @@ is its null version.
 Text. Line 1: `AWNMPU<version>` (`AWNMPU1`). Line 2: total size. Then one line per part:
 `part size \t cumulative end \t volume offset \t md5 hex \t staged path relative to .staging`.
 A manifest of a newer version stops startup.
+
+## Bucket manifest (`buckets.manifest`)
+
+Text log, one record per line (`\n`-terminated). Writes append and `sync_all` before acknowledging.
+
+| Prefix | Format | Meaning |
+|---|---|---|
+| `+` | `+<id>:<name>[:<created_ns>[:<owner>[:<namespace>]]]` | Bucket created; trailing fields after `<name>` are optional when reading older manifests. |
+| `-` | `-<id>:<name>` | Bucket deleted; drops all configurations for `<id>`. |
+| `~` | `~<id>:<Enabled\|Suspended>` | Bucket versioning status (#31); also populates kind `versioning`. |
+| `=` | `=<id>:<kind>:<base64>` | Sets configuration `<kind>` for bucket `<id>` to the decoded document bytes. |
+| `=` | `=<id>:<kind>:-` | Deletes (unsets) configuration `<kind>` for bucket `<id>`. An empty payload `=<id>:<kind>:` is also read as delete. |
+
+### Configuration kinds, limits, and GET rendering
+
+| Kind | Max bytes | GET rendering |
+|---|---|---|
+| `owner` | 64 KiB | Internal metadata (no dedicated GET subresource) |
+| `policy` | 20 KiB | Exact stored JSON bytes |
+| `acl` | 64 KiB | Canonical XML of the parsed form |
+| `ownership` | 64 KiB | Canonical XML of the parsed form |
+| `public-access-block` | 64 KiB | Canonical XML of the parsed form |
+| `cors` | 64 KiB | Canonical XML of the parsed form |
+| `lifecycle` | 64 KiB | Canonical XML of the parsed form |
+| `logging` | 64 KiB | Canonical XML of the parsed form |
+| `encryption` | 64 KiB | Canonical XML of the parsed form |
+| `object-lock` | 64 KiB | Canonical XML of the parsed form |
+| `tagging` | 64 KiB | Canonical XML of the parsed form |
+| `versioning` | 64 KiB | Canonical XML of the parsed form |
+
+### Replay and compaction
+
+- An unknown `<kind>` in an `=` record stops startup with an error naming the kind.
+- A torn last line (not terminated by `\n` and failing syntax or base64 checks) is ignored with a warning.
+- A corrupt line in the middle stops startup with the 1-based line number.
+- At startup, when dead records strictly outnumber live records, `buckets.manifest` is rewritten to `buckets.manifest.tmp`, synced, and renamed into place.

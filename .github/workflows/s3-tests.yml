@@ -1,6 +1,6 @@
 name: ceph s3-tests
 
-# Conformance (#47): the ceph s3-tests suite against a fresh AwanFS. Fails only when a test in
+# Conformance (#47, #160): the ceph s3-tests suite against a fresh AwanFS. Fails only when a test in
 # tests/s3tests/passing.txt stops passing; the report lists new passes to add.
 
 on:
@@ -28,12 +28,7 @@ jobs:
       - name: Build
         run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
       - name: Start AwanFS
-        run: |
-          mkdir -p /tmp/awanfs-data
-          install -m 600 tests/s3tests/users.toml /tmp/awanfs-users.toml
-          AWANFS_ACCESS_KEY=AWANFSMAINKEY0000000 AWANFS_SECRET_KEY=awanfs-main-secret-for-s3-tests-0000000000 AWANFS_LOG=off \
-            nohup server/target/release/s3-server --port 9000 --data-dir /tmp/awanfs-data --auto-compaction off --config /tmp/awanfs-users.toml > /tmp/awanfs.log 2>&1 &
-          for i in $(seq 1 50); do curl -sf http://127.0.0.1:9000/_awanfs/health/ready && break; sleep 0.2; done
+        run: bash tests/s3tests/start_server.sh
       - name: Get s3-tests
         run: |
           # Pinned: the ratchet (tests/s3tests/passing.txt) names tests of this commit. Bump it on
@@ -49,14 +44,19 @@ jobs:
           S3TEST_CONF=$GITHUB_WORKSPACE/tests/s3tests/s3tests.conf /tmp/venv/bin/pytest s3tests/functional/test_s3.py \
             -p no:cacheprovider -q --timeout=60 --junitxml=/tmp/s3tests-results.xml -o junit_family=xunit1 || true
           test -s /tmp/s3tests-results.xml
+          S3TEST_CONF=$GITHUB_WORKSPACE/tests/s3tests/s3tests.conf /tmp/venv/bin/pytest s3tests/functional/test_headers.py \
+            -p no:cacheprovider -q --timeout=60 --junitxml=/tmp/s3tests-headers-results.xml -o junit_family=xunit1 || true
+          test -s /tmp/s3tests-headers-results.xml
       - name: Ratchet
-        run: python3 tests/s3tests/ratchet.py /tmp/s3tests-results.xml tests/s3tests/passing.txt --report /tmp/s3tests-report.md
+        run: python3 tests/s3tests/ratchet.py /tmp/s3tests-results.xml /tmp/s3tests-headers-results.xml tests/s3tests/passing.txt --report /tmp/s3tests-report.md
       - name: Conformance map (every test has an owner; CONFORMANCE_DESIGN.md)
         if: always()
         run: |
           python3 tests/s3tests/test_conformance_map.py
-          python3 tests/s3tests/conformance_map.py /tmp/s3-tests/s3tests/functional/test_s3.py tests/s3tests/passing.txt \
-            --junit /tmp/s3tests-results.xml --suite-ref "ceph/s3-tests $(git -C /tmp/s3-tests rev-parse --short HEAD), run $GITHUB_RUN_ID" \
+          python3 tests/s3tests/test_ratchet.py
+          python3 tests/s3tests/conformance_map.py /tmp/s3-tests/s3tests/functional/test_s3.py /tmp/s3-tests/s3tests/functional/test_headers.py tests/s3tests/passing.txt \
+            --junit /tmp/s3tests-results.xml --junit /tmp/s3tests-headers-results.xml \
+            --suite-ref "ceph/s3-tests $(git -C /tmp/s3-tests rev-parse --short HEAD), run $GITHUB_RUN_ID" \
             --report /tmp/CONFORMANCE_MAP.md
       - name: Triage report
         if: always()
@@ -76,6 +76,7 @@ jobs:
           name: s3tests-results
           path: |
             /tmp/s3tests-results.xml
+            /tmp/s3tests-headers-results.xml
             /tmp/s3tests-report.md
             /tmp/CONFORMANCE_MAP.md
             /tmp/TRIAGE.md

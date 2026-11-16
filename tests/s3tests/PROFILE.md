@@ -1,0 +1,40 @@
+# Conformance profile
+
+This document states the exact `s3-server` and client configuration that `tests/s3tests/start_server.sh` uses when running `ceph/s3-tests`. Every "passes N tests" count is under this profile.
+
+`scripts/check_profile.py` enforces that every flag and `AWANFS_*` setting in `start_server.sh` has a row here (and vice versa), that `.github/workflows/s3-tests.yml` does not invoke `s3-server` outside `start_server.sh`, and that skip reasons in `CONFORMANCE_MAP.md` are listed here.
+
+## Settings
+
+| Setting | Value in profile | Default | Tests that need it | Safe in production? |
+|---|---|---|---|---|
+| `--port` | `9000` | `9000` | All (`s3tests.conf` targets `127.0.0.1:9000`) | Yes |
+| `--data-dir` | `/tmp/awanfs-data` (`$AWANFS_DATA_DIR`) | `S3_DATA_DIR` / temp | All (fresh storage directory per suite run) | Yes (use persistent storage) |
+| `--auto-compaction` | `off` | `on` | All (avoids background compaction during short suite runs) | No (keep `on` in production to reclaim dead space) |
+| `--config` | `/tmp/awanfs-users.toml` (copied from `tests/s3tests/users.toml` with mode `0600`) | none | Multi-user and policy tests (`alt`, `tenant`) | Yes (with real keys and scoped policies) |
+| `AWANFS_ACCESS_KEY` | `AWANFSMAINKEY0000000` | none | All (`[s3 main]` in `s3tests.conf`) | No (public test credential) |
+| `AWANFS_SECRET_KEY` | `awanfs-main-secret-for-s3-tests-0000000000` | none | All (`[s3 main]` in `s3tests.conf`) | No (public test credential) |
+| `AWANFS_LOG` | `off` | `on` (JSON line per request on stderr) | All (keeps `/tmp/awanfs.log` bounded) | Optional (keep `on` for request audit logs) |
+| `tests/s3tests/users.toml` | `alt` and `tenant` users with `Allow s3:*` policy | none | Multi-user tests (`*_alt`, `*_tenant`) | No (wildcard `s3:*` and public test credentials) |
+| `tests/s3tests/s3tests.conf` | `[DEFAULT]`, `[fixtures]`, `[s3 main]`, `[s3 alt]`, `[s3 tenant]`, `[iam*]` | none | All (`S3TEST_CONF`) | N/A (client test config) |
+
+## Skips
+
+Skipped tests in `tests/s3tests/CONFORMANCE_MAP.md` are skipped by `pytest` because the profile or client environment lacks a required capability.
+
+| Skip reason | Area | What would un-skip it |
+|---|---|---|
+| ceph client extension (`bucket_logging`, `fails_without_logging_rollover`, `bucket_logging_cleanup`) | `bucket-logging` (#153) | Installing ceph's custom botocore service model extension and implementing RGW logging journal/rollover endpoints |
+| `kms_keyid` | `encryption` (#121) | Setting `kms_keyid` in `s3tests.conf` and passing a key file via `--sse-master-key-file` |
+| storage classes (`lifecycle_transition`, `cloud_transition`, `cloud_restore`, `[s3 cloud]`) | `storage-classes` (out of scope, #162) | Configuring multiple storage classes and an `[s3 cloud]` tiering target in `s3tests.conf` |
+| `deny_self_denied_policy` | `policy` (#122) | Upstream conditional skip in `s3-tests` for self-denied bucket policy tests |
+
+## Planned settings
+
+Area issues that add new profile settings update `start_server.sh` and the **Settings** table above in the same PR:
+
+- `#118`: shortened lifecycle day (`--lifecycle-day-seconds 10`, test-only flag with startup warning)
+- `#122`: default object ownership (`D5`, ACLs enabled on new buckets for the suite)
+- `#121`: `--sse-master-key-file` and `kms_keyid` in `s3tests.conf`
+- `#140`: `--region` matching `api_name`
+- `#151`: users with `user_id`, `display_name`, and `email`

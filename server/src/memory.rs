@@ -11,6 +11,9 @@
 //! which it was.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// A quarter of the machine or the container.
 pub const BUDGET_PERCENT: u64 = 25;
@@ -18,6 +21,8 @@ pub const BUDGET_PERCENT: u64 = 25;
 pub const MIN_DEFAULT_BUDGET: u64 = 128 << 20;
 /// The default budget never goes above this, so the default cache stays at 1 GiB.
 pub const MAX_DEFAULT_BUDGET: u64 = 2 << 30;
+/// Maximum redb spill index page cache (64 MiB), carved out of the cache half.
+pub const MAX_SPILL_CACHE: u64 = 64 << 20;
 /// A cgroup limit at or above this means "no limit" (cgroup v1 writes i64::MAX rounded down).
 const NO_LIMIT: u64 = 1 << 60;
 
@@ -63,6 +68,13 @@ impl Budget {
         let cache = total / 2;
         Budget { total, cache, bodies: total - cache, source }
     }
+}
+
+/// Splits a budget's cache half into `(spill_cache, payload_cache)`.
+/// The spill cache gets `min(64 MiB, cache / 4)` and the payload cache gets `cache - spill`.
+pub fn split_cache(cache: u64) -> (u64, u64) {
+    let spill = (cache / 4).min(MAX_SPILL_CACHE);
+    (spill, cache - spill)
 }
 
 /// `"256MiB"`, `"2G"`, `"1073741824"`. Decimal suffixes are the powers of two they are usually
@@ -173,13 +185,167 @@ pub fn effective() -> Budget {
     })
 }
 
+/// Default bounded wait before rejecting an over-budget request with `503 SlowDown`.
+pub const DEFAULT_BODY_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Error returned when `BodyBudget::acquire_async` times out with the budget exhausted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyBudgetExhausted;
+
+impl std::fmt::Display for BodyBudgetExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("in-flight body memory budget exhausted")
+    }
+}
+
+impl std::error::Error for BodyBudgetExhausted {}
+
+#[derive(Debug)]
+struct BodyBudgetInner {
+    limit: u64,
+    in_use: AtomicU64,
+    rejected: AtomicU64,
+    wait_timeout: Duration,
+    notify: tokio::sync::Notify,
+}
+
+/// Byte-budget admission controller for in-flight request bodies (#128, decision 36).
+///
+/// Drawn from `Budget::bodies` (the bodies half of `--memory-budget`). A request larger than
+/// `limit` is clamped to `limit` so it can run alone without deadlocking.
+#[derive(Clone, Debug)]
+pub struct BodyBudget {
+    inner: Arc<BodyBudgetInner>,
+}
+
+/// Permit holding `bytes` of the `BodyBudget`. Dropping the guard releases the bytes
+/// automatically, even on error or client disconnect, and wakes waiting requests.
+#[derive(Debug)]
+pub struct AdmissionGuard {
+    inner: Arc<BodyBudgetInner>,
+    bytes: u64,
+}
+
+impl AdmissionGuard {
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.inner.in_use.fetch_sub(self.bytes, Ordering::AcqRel);
+            self.inner.notify.notify_waiters();
+        }
+    }
+}
+
+impl BodyBudget {
+    pub fn new(limit: u64) -> Self {
+        Self::with_wait_timeout(limit, DEFAULT_BODY_WAIT_TIMEOUT)
+    }
+
+    pub fn with_wait_timeout(limit: u64, wait_timeout: Duration) -> Self {
+        Self {
+            inner: Arc::new(BodyBudgetInner {
+                limit,
+                in_use: AtomicU64::new(0),
+                rejected: AtomicU64::new(0),
+                wait_timeout,
+                notify: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.inner.limit
+    }
+
+    pub fn in_use(&self) -> u64 {
+        self.inner.in_use.load(Ordering::Acquire)
+    }
+
+    pub fn rejected(&self) -> u64 {
+        self.inner.rejected.load(Ordering::Relaxed)
+    }
+
+    /// Tries to admit `bytes` immediately without waiting.
+    pub fn try_acquire(&self, bytes: u64) -> Option<AdmissionGuard> {
+        let charge = bytes.min(self.inner.limit);
+        if charge == 0 {
+            return Some(AdmissionGuard {
+                inner: Arc::clone(&self.inner),
+                bytes: 0,
+            });
+        }
+        let mut cur = self.inner.in_use.load(Ordering::Acquire);
+        loop {
+            if cur.saturating_add(charge) > self.inner.limit {
+                return None;
+            }
+            match self.inner.in_use.compare_exchange_weak(
+                cur,
+                cur + charge,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(AdmissionGuard {
+                        inner: Arc::clone(&self.inner),
+                        bytes: charge,
+                    });
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Waits up to `self.wait_timeout` for `bytes` to fit, or increments `rejected` and returns
+    /// `Err(BodyBudgetExhausted)`.
+    pub async fn acquire_async(&self, bytes: u64) -> Result<AdmissionGuard, BodyBudgetExhausted> {
+        self.acquire_with_timeout(bytes, self.inner.wait_timeout).await
+    }
+
+    /// Waits up to `timeout` for `bytes` to fit, or increments `rejected` and returns
+    /// `Err(BodyBudgetExhausted)`.
+    pub async fn acquire_with_timeout(
+        &self,
+        bytes: u64,
+        timeout: Duration,
+    ) -> Result<AdmissionGuard, BodyBudgetExhausted> {
+        if let Some(guard) = self.try_acquire(bytes) {
+            return Ok(guard);
+        }
+        if timeout.is_zero() {
+            self.inner.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(BodyBudgetExhausted);
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.inner.notify.notified();
+            if let Some(guard) = self.try_acquire(bytes) {
+                return Ok(guard);
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                if let Some(guard) = self.try_acquire(bytes) {
+                    return Ok(guard);
+                }
+                self.inner.rejected.fetch_add(1, Ordering::Relaxed);
+                return Err(BodyBudgetExhausted);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
 
     fn fixture_dir(name: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        use crate::clock::Clock;
+        let nanos = crate::clock::SystemClock.now_ns();
         let d = std::env::temp_dir().join(format!("awanfs_budget_{}_{}_{}", name, std::process::id(), nanos));
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -278,6 +444,23 @@ mod tests {
             let b = Budget::split(total, Source::Flag);
             assert_eq!(b.cache + b.bodies, total, "total {}", total);
             assert!(b.bodies >= b.cache, "the odd byte goes to bodies, total {}", total);
+        }
+    }
+
+    #[test]
+    fn spill_cache_comes_out_of_the_cache_half_and_is_capped_at_64mib() {
+        let cases = [
+            (32u64 << 20, 4u64 << 20),
+            (128u64 << 20, 16u64 << 20),
+            (1u64 << 30, 64u64 << 20),
+            (2u64 << 30, 64u64 << 20),
+        ];
+        for (total, expected_spill) in cases {
+            let b = Budget::split(total, Source::Flag);
+            let (spill, payload_cache) = split_cache(b.cache);
+            assert_eq!(spill, expected_spill, "total {}", total);
+            assert!(spill <= MAX_SPILL_CACHE, "total {}", total);
+            assert_eq!(spill + payload_cache, b.cache, "total {}", total);
         }
     }
 }

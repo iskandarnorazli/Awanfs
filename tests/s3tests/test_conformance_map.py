@@ -27,6 +27,12 @@ def test_multipart_upload_small(x):
 def test_bucket_list_empty():
     pass
 
+def test_lifecycle_transition():
+    pass
+
+def test_bucket_logging_flush_j():
+    pass
+
 def helper():
     pass
 '''
@@ -37,6 +43,8 @@ JUNIT = '''<testsuite>
 <testcase name="test_multipart_upload_small[2]"><error message="boom"/></testcase>
 <testcase name="test_bucket_list_empty"><skipped message="no reason"/></testcase>
 <testcase name="test_object_lock_put_obj_retention"/>
+<testcase name="test_lifecycle_transition"><skipped message="needs storage classes"/></testcase>
+<testcase name="test_bucket_logging_flush_j"><skipped type="pytest.skip" message="skipped">test_s3.py:10: need ceph extension</skipped></testcase>
 </testsuite>'''
 
 
@@ -58,7 +66,7 @@ class Map(unittest.TestCase):
 
     def test_only_test_functions_are_read_with_their_markers(self):
         t = cm.suite_tests(self.suite)
-        self.assertEqual(list(t), ["test_put_obj_enc_conflict", "test_object_lock_put_obj_retention", "test_multipart_upload_small", "test_bucket_list_empty"])
+        self.assertEqual(list(t), ["test_put_obj_enc_conflict", "test_object_lock_put_obj_retention", "test_multipart_upload_small", "test_bucket_list_empty", "test_lifecycle_transition", "test_bucket_logging_flush_j"])
         self.assertEqual(t["test_put_obj_enc_conflict"], ["encryption"])
 
     def test_each_test_gets_one_area_and_its_owner(self):
@@ -82,6 +90,8 @@ class Map(unittest.TestCase):
         self.assertEqual(got["test_multipart_upload_small"], ("fail", "boom"))  # one case failed
         self.assertEqual(got["test_bucket_list_empty"], ("pass", ""))  # passing.txt wins
         self.assertEqual(got["test_object_lock_put_obj_retention"], ("pass", "passes; add it to passing.txt"))
+        self.assertEqual(got["test_lifecycle_transition"], ("skip", "needs storage classes"))
+        self.assertEqual(got["test_bucket_logging_flush_j"], ("skip", "test_s3.py:10: need ceph extension"))
 
     def test_without_junit_the_rest_is_unknown(self):
         rows, _ = self.rows(junit=False)
@@ -99,6 +109,59 @@ class Map(unittest.TestCase):
         text = cm.render(rows, unassigned, "suite x")
         self.assertIn("| encryption | #121 | 8.2 | 0 | 1 | 0 |", text)
         self.assertIn("- `test_put_obj_enc_conflict` (fail): assert 400 == 200", text)
+        self.assertIn("- `test_lifecycle_transition` (skip): needs storage classes", text)
+        self.assertIn("- `test_bucket_logging_flush_j` (skip): test_s3.py:10: need ceph extension", text)
+
+
+    def test_headers_suite_assigned_to_request_headers(self):
+        headers_suite = '''
+def test_put_obj_bad_content_length():
+    pass
+
+def test_headers_missing_host():
+    pass
+'''
+        headers_junit = '''<testsuite>
+<testcase classname="s3tests.functional.test_headers" name="test_put_obj_bad_content_length"/>
+<testcase classname="s3tests.functional.test_headers" name="test_headers_missing_host"><failure message="400 != 403"/></testcase>
+</testsuite>'''
+        s3_junit = '''<testsuite>
+<testcase classname="s3tests.functional.test_s3" name="test_put_obj_enc_conflict"><failure message="assert 400 == 200"/></testcase>
+<testcase classname="s3tests.functional.test_s3" name="test_multipart_upload_small[1]"/>
+<testcase classname="s3tests.functional.test_s3" name="test_multipart_upload_small[2]"><error message="boom"/></testcase>
+<testcase classname="s3tests.functional.test_s3" name="test_bucket_list_empty"><skipped message="no reason"/></testcase>
+<testcase classname="s3tests.functional.test_s3" name="test_object_lock_put_obj_retention"/>
+<testcase classname="s3tests.functional.test_s3" name="test_lifecycle_transition"><skipped message="needs storage classes"/></testcase>
+<testcase classname="s3tests.functional.test_s3" name="test_bucket_logging_flush_j"><skipped type="pytest.skip" message="skipped">test_s3.py:10: need ceph extension</skipped></testcase>
+</testsuite>'''
+        with tempfile.TemporaryDirectory() as d:
+            s3_path = os.path.join(d, "test_s3.py")
+            headers_path = os.path.join(d, "test_headers.py")
+            s3_xml = os.path.join(d, "s3.xml")
+            headers_xml = os.path.join(d, "headers.xml")
+            passing_path = os.path.join(d, "passing.txt")
+            out = os.path.join(d, "map.md")
+            for path, content in (
+                (s3_path, SUITE),
+                (headers_path, headers_suite),
+                (s3_xml, s3_junit),
+                (headers_xml, headers_junit),
+                (passing_path, "test_s3::test_bucket_list_empty\ntest_headers::test_put_obj_bad_content_length\n"),
+            ):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(content)
+            rc = cm.main([
+                s3_path, headers_path, passing_path,
+                "--junit", s3_xml, "--junit", headers_xml,
+                "--report", out,
+            ])
+            self.assertEqual(rc, 0)
+            with open(out, encoding="utf-8") as fh:
+                text = fh.read()
+            self.assertIn("| request-headers | #160 | 3 | 1 | 1 | 0 |", text)
+            self.assertIn("## request-headers: 1 not passing", text)
+            self.assertIn("- `test_headers::test_headers_missing_host` (fail): 400 != 403", text)
+            self.assertNotIn("test_headers::test_put_obj_bad_content_length", text)
 
 
 if __name__ == "__main__":

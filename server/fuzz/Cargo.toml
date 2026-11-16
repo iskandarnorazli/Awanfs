@@ -79,3 +79,33 @@ name = "tagging_xml"
 path = "fuzz_targets/tagging_xml.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "s3_target"
+path = "fuzz_targets/s3_target.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "iso8601"
+path = "fuzz_targets/iso8601.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "traceparent"
+path = "fuzz_targets/traceparent.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "version_id"
+path = "fuzz_targets/version_id.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_size"
+path = "fuzz_targets/parse_size.rs"
+test = false
+doc = false

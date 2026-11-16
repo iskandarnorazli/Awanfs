@@ -10,6 +10,7 @@
 //! (state, event) pair, and a row in `STATE_MACHINES.md`. `scripts/check_state_machines.py`
 //! fails CI when a row names a function or test that is not there.
 
+use crate::bucket_config::ConfigKind;
 use crate::versions::Versioning;
 
 /// Why a transition was refused: the S3 error code and HTTP status the caller answers with.
@@ -34,6 +35,10 @@ pub const INVALID_BUCKET_STATE: Refusal = refuse("InvalidBucketState", 409);
 pub const MALFORMED_XML: Refusal = refuse("MalformedXML", 400);
 pub const ACCESS_DENIED: Refusal = refuse("AccessDenied", 403);
 pub const INVALID_ARGUMENT: Refusal = refuse("InvalidArgument", 400);
+pub const NO_SUCH_BUCKET: Refusal = refuse("NoSuchBucket", 404);
+pub const BUCKET_ALREADY_OWNED_BY_YOU: Refusal = refuse("BucketAlreadyOwnedByYou", 409);
+pub const BUCKET_ALREADY_EXISTS: Refusal = refuse("BucketAlreadyExists", 409);
+pub const BUCKET_NOT_EMPTY: Refusal = refuse("BucketNotEmpty", 409);
 pub const INVALID_BUCKET_NAME: Refusal = refuse("InvalidBucketName", 400);
 pub const KEY_TOO_LONG: Refusal = refuse("KeyTooLongError", 400);
 
@@ -228,6 +233,170 @@ pub fn stream_step(state: StreamState, event: StreamEvent) -> Result<StreamState
         (Opening | Streaming, StreamEvent::End { checksum_ok: true }) => Ok(Done),
         (Opening | Streaming, StreamEvent::End { checksum_ok: false }) => Ok(Aborted(StreamAbort::ChecksumMismatch)),
         (Done | Aborted(_), _) => Err(STREAM_ENDED),
+    }
+}
+
+pub const TASK_ALREADY_RUNNING: Refusal = refuse_because("TaskBusy", 409, "a tick is already running");
+pub const TASK_NOT_RUNNING: Refusal = refuse_because("TaskIdle", 409, "no tick is running");
+pub const TASK_STOPPING: Refusal = refuse_because("TaskStopping", 409, "task is stopping");
+pub const TASK_STOPPED: Refusal = refuse_because("TaskStopped", 409, "task has stopped");
+
+/// State of one scheduled background task (`scheduler.rs`, #158).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskState {
+    Idle,
+    Running,
+    Stopping,
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskEvent {
+    Tick,
+    Done,
+    Stop,
+}
+
+/// Transition function for a scheduled background task (#158).
+///
+/// `Idle -> Running -> Idle`, `Idle -> Stopped`, `Running -> Stopping -> Stopped`.
+/// A second `Tick` while `Running` is refused rather than starting a second thread.
+pub fn task_step(state: TaskState, event: TaskEvent) -> Result<TaskState, Refusal> {
+    use TaskEvent::{Done, Stop, Tick};
+    use TaskState::{Idle, Running, Stopped, Stopping};
+    match (state, event) {
+        (Idle, Tick) => Ok(Running),
+        (Idle, Done) => Err(TASK_NOT_RUNNING),
+        (Idle, Stop) => Ok(Stopped),
+        (Running, Tick) => Err(TASK_ALREADY_RUNNING),
+        (Running, Done) => Ok(Idle),
+        (Running, Stop) => Ok(Stopping),
+        (Stopping, Tick) => Err(TASK_STOPPING),
+        (Stopping, Done) => Ok(Stopped),
+        (Stopping, Stop) => Err(TASK_STOPPING),
+        (Stopped, _) => Err(TASK_STOPPED),
+    }
+}
+
+#[cfg(test)]
+mod task_tests {
+    use super::*;
+
+    #[test]
+    fn task_every_pair_is_decided() {
+        use TaskEvent::{Done, Stop, Tick};
+        use TaskState::{Idle, Running, Stopped, Stopping};
+        let table = [
+            (Idle, Tick, Ok(Running)),
+            (Idle, Done, Err(TASK_NOT_RUNNING)),
+            (Idle, Stop, Ok(Stopped)),
+            (Running, Tick, Err(TASK_ALREADY_RUNNING)),
+            (Running, Done, Ok(Idle)),
+            (Running, Stop, Ok(Stopping)),
+            (Stopping, Tick, Err(TASK_STOPPING)),
+            (Stopping, Done, Ok(Stopped)),
+            (Stopping, Stop, Err(TASK_STOPPING)),
+            (Stopped, Tick, Err(TASK_STOPPED)),
+            (Stopped, Done, Err(TASK_STOPPED)),
+            (Stopped, Stop, Err(TASK_STOPPED)),
+        ];
+        for (state, event, want) in table {
+            assert_eq!(task_step(state, event), want, "{:?} + {:?}", state, event);
+        }
+        assert_eq!(table.len(), 4 * 3, "every state against every event");
+    }
+}
+
+/// Lifecycle of a bucket (#149).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BucketStatus {
+    Absent,
+    Active,
+    Deleted,
+}
+
+/// Presence of one configuration kind on a bucket (#149).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigStatus {
+    Unset,
+    Set,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BucketState {
+    pub status: BucketStatus,
+    pub owner_id: u32,
+    pub configs: u16,
+}
+
+impl BucketState {
+    pub const fn absent() -> Self {
+        Self {
+            status: BucketStatus::Absent,
+            owner_id: 0,
+            configs: 0,
+        }
+    }
+
+    pub const fn config_status(&self, kind: ConfigKind) -> ConfigStatus {
+        if self.configs & kind.bit() != 0 {
+            ConfigStatus::Set
+        } else {
+            ConfigStatus::Unset
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BucketEvent {
+    Create { caller_id: u32, is_us_east_1: bool },
+    Delete { empty: bool },
+    PutConfig(ConfigKind),
+    DeleteConfig(ConfigKind),
+}
+
+/// Bucket and per-kind configuration transitions (#149).
+///
+/// - `Absent -> Active` on `Create`, `Active -> Deleted` on `Delete { empty: true }`.
+/// - `Create` on `Active` by owner in `us-east-1` is idempotent (`Ok`), else 409
+///   `BucketAlreadyOwnedByYou`; by another account is 409 `BucketAlreadyExists`.
+/// - `Delete` on non-empty `Active` is 409 `BucketNotEmpty`; on empty `Active` drops all configs.
+/// - `PutConfig(kind)` sets `kind` (`Unset -> Set`); `DeleteConfig(kind)` clears `kind` (`Set -> Unset`).
+/// - Any `Delete` or config event on `Absent` or `Deleted` is 404 `NoSuchBucket`.
+pub fn bucket_step(state: BucketState, event: BucketEvent) -> Result<BucketState, Refusal> {
+    match (state.status, event) {
+        (BucketStatus::Absent, BucketEvent::Create { caller_id, .. }) => Ok(BucketState {
+            status: BucketStatus::Active,
+            owner_id: caller_id,
+            configs: 0,
+        }),
+        (BucketStatus::Active, BucketEvent::Create { caller_id, is_us_east_1 }) => {
+            if caller_id == state.owner_id {
+                if is_us_east_1 {
+                    Ok(state)
+                } else {
+                    Err(BUCKET_ALREADY_OWNED_BY_YOU)
+                }
+            } else {
+                Err(BUCKET_ALREADY_EXISTS)
+            }
+        }
+        (BucketStatus::Deleted, BucketEvent::Create { .. }) => Err(INVALID_BUCKET_STATE),
+        (BucketStatus::Absent | BucketStatus::Deleted, _) => Err(NO_SUCH_BUCKET),
+        (BucketStatus::Active, BucketEvent::Delete { empty: false }) => Err(BUCKET_NOT_EMPTY),
+        (BucketStatus::Active, BucketEvent::Delete { empty: true }) => Ok(BucketState {
+            status: BucketStatus::Deleted,
+            owner_id: state.owner_id,
+            configs: 0,
+        }),
+        (BucketStatus::Active, BucketEvent::PutConfig(kind)) => Ok(BucketState {
+            configs: state.configs | kind.bit(),
+            ..state
+        }),
+        (BucketStatus::Active, BucketEvent::DeleteConfig(kind)) => Ok(BucketState {
+            configs: state.configs & !kind.bit(),
+            ..state
+        }),
     }
 }
 
@@ -540,6 +709,88 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn bucket_every_pair_is_decided() {
+        let kind = ConfigKind::Policy;
+        let states = [
+            BucketState { status: BucketStatus::Absent, owner_id: 1, configs: 0 },
+            BucketState { status: BucketStatus::Active, owner_id: 1, configs: 0 },
+            BucketState { status: BucketStatus::Active, owner_id: 1, configs: kind.bit() },
+            BucketState { status: BucketStatus::Deleted, owner_id: 1, configs: 0 },
+        ];
+        let events = [
+            BucketEvent::Create { caller_id: 1, is_us_east_1: true },
+            BucketEvent::Create { caller_id: 1, is_us_east_1: false },
+            BucketEvent::Create { caller_id: 2, is_us_east_1: true },
+            BucketEvent::Delete { empty: false },
+            BucketEvent::Delete { empty: true },
+            BucketEvent::PutConfig(kind),
+            BucketEvent::DeleteConfig(kind),
+        ];
+        let mut count = 0usize;
+        for s in states {
+            for e in events {
+                let res = bucket_step(s, e);
+                match (s.status, e) {
+                    (BucketStatus::Absent, BucketEvent::Create { caller_id, .. }) => {
+                        assert_eq!(res, Ok(BucketState { status: BucketStatus::Active, owner_id: caller_id, configs: 0 }));
+                    }
+                    (BucketStatus::Active, BucketEvent::Create { caller_id: 1, is_us_east_1: true }) => {
+                        assert_eq!(res, Ok(s));
+                    }
+                    (BucketStatus::Active, BucketEvent::Create { caller_id: 1, is_us_east_1: false }) => {
+                        assert_eq!(res, Err(BUCKET_ALREADY_OWNED_BY_YOU));
+                    }
+                    (BucketStatus::Active, BucketEvent::Create { .. }) => {
+                        assert_eq!(res, Err(BUCKET_ALREADY_EXISTS));
+                    }
+                    (BucketStatus::Deleted, BucketEvent::Create { .. }) => {
+                        assert_eq!(res, Err(INVALID_BUCKET_STATE));
+                    }
+                    (BucketStatus::Absent | BucketStatus::Deleted, _) => {
+                        assert_eq!(res, Err(NO_SUCH_BUCKET));
+                    }
+                    (BucketStatus::Active, BucketEvent::Delete { empty: false }) => {
+                        assert_eq!(res, Err(BUCKET_NOT_EMPTY));
+                    }
+                    (BucketStatus::Active, BucketEvent::Delete { empty: true }) => {
+                        assert_eq!(res, Ok(BucketState { status: BucketStatus::Deleted, owner_id: 1, configs: 0 }));
+                    }
+                    (BucketStatus::Active, BucketEvent::PutConfig(k)) => {
+                        let next = res.unwrap();
+                        assert_eq!(next.status, BucketStatus::Active);
+                        assert_eq!(next.config_status(k), ConfigStatus::Set);
+                    }
+                    (BucketStatus::Active, BucketEvent::DeleteConfig(k)) => {
+                        let next = res.unwrap();
+                        assert_eq!(next.status, BucketStatus::Active);
+                        assert_eq!(next.config_status(k), ConfigStatus::Unset);
+                    }
+                }
+                count += 1;
+            }
+        }
+        assert_eq!(count, states.len() * events.len());
+    }
+
+    #[test]
+    fn bucket_deleted_drops_configs_and_stays_deleted() {
+        let mut st = BucketState::absent();
+        st = bucket_step(st, BucketEvent::Create { caller_id: 7, is_us_east_1: true }).unwrap();
+        for &k in ConfigKind::ALL {
+            st = bucket_step(st, BucketEvent::PutConfig(k)).unwrap();
+            assert_eq!(st.config_status(k), ConfigStatus::Set);
+        }
+        st = bucket_step(st, BucketEvent::Delete { empty: true }).unwrap();
+        assert_eq!(st.status, BucketStatus::Deleted);
+        assert_eq!(st.configs, 0);
+        for &k in ConfigKind::ALL {
+            assert_eq!(st.config_status(k), ConfigStatus::Unset);
+            assert_eq!(bucket_step(st, BucketEvent::PutConfig(k)), Err(NO_SUCH_BUCKET));
+            assert_eq!(bucket_step(st, BucketEvent::DeleteConfig(k)), Err(NO_SUCH_BUCKET));
         }
     }
 }

@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::catch_unwind;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 use crate::spill::SpillIndex;
 
@@ -308,7 +308,23 @@ impl StorageEngine {
         flags: u16,
     ) -> Result<(), i32> {
         let key_hash = xxh3_64_with_seed(key, bucket_id as u64);
-        self.put_object_with_hash(bucket_id, key, key_hash, vol_offset, size, etag_hi, etag_lo, part_count, flags)
+        self.put_object_with_hash_at(bucket_id, key, key_hash, vol_offset, size, etag_hi, etag_lo, part_count, flags, 0)
+    }
+
+    pub fn put_object_at(
+        &mut self,
+        bucket_id: u32,
+        key: &[u8],
+        vol_offset: u64,
+        size: u64,
+        etag_hi: u64,
+        etag_lo: u64,
+        part_count: u16,
+        flags: u16,
+        created_at_ms: u64,
+    ) -> Result<(), i32> {
+        let key_hash = xxh3_64_with_seed(key, bucket_id as u64);
+        self.put_object_with_hash_at(bucket_id, key, key_hash, vol_offset, size, etag_hi, etag_lo, part_count, flags, created_at_ms)
     }
 
     pub fn put_object_with_hash(
@@ -323,15 +339,27 @@ impl StorageEngine {
         part_count: u16,
         flags: u16,
     ) -> Result<(), i32> {
+        self.put_object_with_hash_at(bucket_id, key, key_hash, vol_offset, size, etag_hi, etag_lo, part_count, flags, 0)
+    }
+
+    pub fn put_object_with_hash_at(
+        &mut self,
+        bucket_id: u32,
+        key: &[u8],
+        key_hash: u64,
+        vol_offset: u64,
+        size: u64,
+        etag_hi: u64,
+        etag_lo: u64,
+        part_count: u16,
+        flags: u16,
+        now_ms: u64,
+    ) -> Result<(), i32> {
         if key.is_empty() || key.len() > 1024 {
             return Err(ERR_INVALID_ARG);
         }
         let bucket = self.buckets.get_mut(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
 
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
 
         let active_flags = flags | FLAG_ACTIVE;
         let bucket_flags = pack_bucket_flags(bucket_id, part_count, active_flags);

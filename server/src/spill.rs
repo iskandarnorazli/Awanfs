@@ -59,9 +59,13 @@ fn decode_meta(buf: &[u8]) -> Option<ObjectMeta> {
 
 impl SpillIndex {
     pub fn open(path: &Path) -> Result<Self, redb::Error> {
+        Self::open_with_cache_size(path, SPILL_CACHE_BYTES)
+    }
+
+    pub fn open_with_cache_size(path: &Path, cache_bytes: usize) -> Result<Self, redb::Error> {
         // A bounded page cache: the spill exists to keep memory bounded (#13). redb's default
         // is about 1 GiB.
-        let db = Database::builder().set_cache_size(SPILL_CACHE_BYTES).create(path)?;
+        let db = Database::builder().set_cache_size(cache_bytes).create(path)?;
 
         // Initialize table if needed
         let write_txn = db.begin_write()?;

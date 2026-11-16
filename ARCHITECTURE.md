@@ -154,6 +154,9 @@ that overlap another write of the same key. Versioned keys are ordered by versio
 commit, and are never copied. Ordering recovery by a commit stamp instead was weighed and not
 chosen: it changes a recovery rule for every key and makes it depend on the clock. #154.
 
+**Decision 60 (2026-11-16): bucket configuration lives in `buckets.manifest` as `=` records, read lock-free via a swapped pointer (`#149`).**
+Each bucket holds one immutable `BucketConfig` inside a double-buffered `Arc` snapshot swapped after the manifest append is synced. Writes validate against registered per-kind validators (20 KiB limit for `policy`, 64 KiB otherwise) and step through `fsm::bucket_step`. Dead records are compacted at startup when they outnumber live records.
+
 **Decision 59 (owner, 2026-11-16): the metadata index past the in-memory hot set is AwanFS's
 own sorted segments, not redb. A measurement at 10M keys confirmed it (#207, go below).** AwanFS uses none of
 what redb is built for. The volumes are the record, every boot clears `metadata.db` and rebuilds

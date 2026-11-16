@@ -204,3 +204,79 @@ fn lifecycle_xml_round_trips_through_its_serialiser() {
         assert_eq!(back, rules, "round trip of {}", xml);
     }
 }
+
+
+#[test]
+fn s3_target_handles_non_ascii_host_and_requires_dot_separator() {
+    use s3_server::ParsedTarget;
+    assert_eq!(parse_s3_target("/", Some("élocalhost")), ParsedTarget::Service);
+    assert_eq!(
+        parse_s3_target("/mybucket/key", Some("xxlocalhost")),
+        ParsedTarget::Object { bucket: "mybucket".into(), key: "key".into() }
+    );
+    assert_eq!(
+        parse_s3_target("/key", Some("mybucket.localhost:9000")),
+        ParsedTarget::Object { bucket: "mybucket".into(), key: "key".into() }
+    );
+}
+
+#[test]
+fn iso8601_rejects_malformed_and_invalid_calendar_dates() {
+    for bad in [
+        "20261110X120000Z",
+        "20261110T120000EXTRAZ",
+        "+2021110T120000Z",
+        "20260231T000000Z",
+        "20260431T000000Z",
+        "20250229T000000Z",
+        "20261110T120060Z",
+    ] {
+        assert_eq!(parse_iso8601_epoch(bad), None, "{:?}", bad);
+    }
+    assert!(parse_iso8601_epoch("20240229T235959Z").is_some());
+}
+
+#[test]
+fn traceparent_enforces_w3c_grammar_without_panicking() {
+    assert_eq!(
+        s3_server::trace::parse_traceparent("00-€aaaaaaaaaaaaaaaaaaaaaaaaaaaaa-00f067aa0ba902b7-01"),
+        None
+    );
+    for bad in [
+        "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+        "00-+1f92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-zz",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1",
+    ] {
+        assert_eq!(s3_server::trace::parse_traceparent(bad), None, "{:?}", bad);
+    }
+}
+
+#[test]
+fn parse_s3_target_leading_slash_key_fuzz_regression() {
+    use s3_server::ParsedTarget;
+    assert_eq!(
+        parse_s3_target("/a991//%EF%BF%BD1/%7Fm%00%26%EF%BF%BD", None),
+        ParsedTarget::Object {
+            bucket: "a991".into(),
+            key: "/\u{fffd}1/\x7fm\0&\u{fffd}".into(),
+        }
+    );
+    assert_eq!(
+        parse_s3_target("//%EF%BF%BD1/%7Fm%00%26%EF%BF%BD", Some("a991.s3.amazonaws.com")),
+        ParsedTarget::Object {
+            bucket: "a991".into(),
+            key: "\u{fffd}1/\x7fm\0&\u{fffd}".into(),
+        }
+    );
+}
+
+#[test]
+fn parse_s3_target_vhost_slash_in_host_does_not_yield_slash_bucket() {
+    use s3_server::ParsedTarget;
+    let parsed = parse_s3_target("ue3", Some("skc/.localhost"));
+    if let ParsedTarget::Bucket { bucket } | ParsedTarget::Object { bucket, .. } = parsed {
+        assert!(!bucket.contains('/'), "bucket must not contain '/': {:?}", bucket);
+    }
+}
