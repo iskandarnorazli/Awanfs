@@ -104,12 +104,11 @@ impl Attrs {
         let s = self.get(TAG_CHECKSUM).and_then(|v| std::str::from_utf8(v).ok())?;
         let (alg_str, rest) = s.split_once(':')?;
         let alg = crate::checksum::ChecksumAlgorithm::from_header_name(alg_str)?;
-        if let Some((cksum_type, val)) = rest.split_once(':') {
-            Some((alg, cksum_type, val))
-        } else {
-            let cksum_type = if rest.contains('-') { "COMPOSITE" } else { "FULL_OBJECT" };
-            Some((alg, cksum_type, rest))
+        let (cksum_type, val) = rest.split_once(':')?;
+        if cksum_type.is_empty() || val.is_empty() {
+            return None;
         }
+        Some((alg, cksum_type, val))
     }
 
     pub fn set_part_sizes(&mut self, sizes: &[u64]) {
@@ -292,6 +291,9 @@ pub fn decode_tags(bytes: &[u8]) -> Result<crate::tagging::TagSet, AttrsError> {
     }
     let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
     let mut rest = &bytes[2..];
+    if count * 4 > rest.len() {
+        return Err(AttrsError::Corrupt("tag block length"));
+    }
     let mut tags = Vec::with_capacity(count);
     for _ in 0..count {
         if rest.len() < 2 {
@@ -402,5 +404,157 @@ mod tests {
         let mut block = crc32c::crc32c(&body).to_le_bytes().to_vec();
         block.extend_from_slice(&body);
         assert_eq!(Attrs::decode(&block), Err(AttrsError::Corrupt("tags out of order")));
+    }
+
+    #[test]
+    fn decode_tags_rejects_huge_count_without_over_allocating() {
+        assert_eq!(decode_tags(&[0xFF, 0xFF]), Err(AttrsError::Corrupt("tag block length")));
+    }
+
+    #[test]
+    fn truncated_tag_set_returns_error() {
+        let set = crate::tagging::TagSet::new(vec![
+            crate::tagging::Tag::new("env", "prod"),
+            crate::tagging::Tag::new("team", "core"),
+        ]);
+        let encoded = encode_tags(&set);
+        for n in 0..encoded.len() {
+            assert!(
+                decode_tags(&encoded[..n]).is_err(),
+                "tag set truncated to {} bytes should fail",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_part_sizes_returns_none_or_empty() {
+        let mut a = Attrs::new();
+        a.set_part_sizes(&[5 * 1024 * 1024]);
+        let encoded = a.get(TAG_PART_SIZES).unwrap().to_vec();
+        for n in 0..encoded.len() {
+            let mut trunc = Attrs::new();
+            trunc.set(TAG_PART_SIZES, &encoded[..n]);
+            let got = trunc.part_sizes();
+            if n == 0 {
+                assert_eq!(got, Some(Vec::new()));
+            } else {
+                assert_eq!(got, None, "part_sizes truncated to {} bytes should be None", n);
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_user_meta_returns_empty() {
+        let mut a = Attrs::new();
+        a.set_user_meta([("owner", "alice")]);
+        let encoded = a.get(TAG_USER_META).unwrap().to_vec();
+        for n in 0..encoded.len() {
+            let mut trunc = Attrs::new();
+            trunc.set(TAG_USER_META, &encoded[..n]);
+            assert!(
+                trunc.user_meta().is_empty(),
+                "user_meta truncated to {} bytes should be empty",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_checksum_returns_none() {
+        let mut a = Attrs::new();
+        a.set_checksum(crate::checksum::ChecksumAlgorithm::Crc32, "FULL_OBJECT", "A");
+        let encoded = a.get(TAG_CHECKSUM).unwrap().to_vec();
+        for n in 0..encoded.len() {
+            let mut trunc = Attrs::new();
+            trunc.set(TAG_CHECKSUM, &encoded[..n]);
+            assert_eq!(
+                trunc.checksum(),
+                None,
+                "checksum truncated to {} bytes ({:?}) should be None",
+                n,
+                std::str::from_utf8(&encoded[..n])
+            );
+        }
+    }
+
+    use proptest::prelude::*;
+
+    fn checksum_alg_strategy() -> impl Strategy<Value = crate::checksum::ChecksumAlgorithm> {
+        prop_oneof![
+            Just(crate::checksum::ChecksumAlgorithm::Crc32),
+            Just(crate::checksum::ChecksumAlgorithm::Crc32c),
+            Just(crate::checksum::ChecksumAlgorithm::Crc64Nvme),
+            Just(crate::checksum::ChecksumAlgorithm::Sha1),
+            Just(crate::checksum::ChecksumAlgorithm::Sha256),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn prop_string_tags_round_trip(
+            ct in "\\PC{0,64}",
+            ce in "\\PC{0,64}",
+            cd in "\\PC{0,64}",
+            cl in "\\PC{0,64}",
+            cc in "\\PC{0,64}",
+            ex in "\\PC{0,64}",
+            wr in "\\PC{0,64}",
+        ) {
+            let mut a = Attrs::new();
+            a.set(TAG_CONTENT_TYPE, ct.as_bytes());
+            a.set(TAG_CONTENT_ENCODING, ce.as_bytes());
+            a.set(TAG_CONTENT_DISPOSITION, cd.as_bytes());
+            a.set(TAG_CONTENT_LANGUAGE, cl.as_bytes());
+            a.set(TAG_CACHE_CONTROL, cc.as_bytes());
+            a.set(TAG_EXPIRES, ex.as_bytes());
+            a.set(TAG_WEBSITE_REDIRECT, wr.as_bytes());
+            prop_assert_eq!(a.content_type(), Some(ct.as_str()));
+            prop_assert_eq!(a.content_encoding(), Some(ce.as_str()));
+            prop_assert_eq!(a.content_disposition(), Some(cd.as_str()));
+            prop_assert_eq!(a.content_language(), Some(cl.as_str()));
+            prop_assert_eq!(a.cache_control(), Some(cc.as_str()));
+            prop_assert_eq!(a.expires(), Some(ex.as_str()));
+            prop_assert_eq!(a.website_redirect(), Some(wr.as_str()));
+        }
+
+        #[test]
+        fn prop_tags_round_trip(
+            pairs in proptest::collection::vec(("\\PC{1,64}", "\\PC{0,64}"), 0..=20)
+        ) {
+            let set = crate::tagging::TagSet::new(
+                pairs.into_iter().map(|(k, v)| crate::tagging::Tag::new(k, v)).collect(),
+            );
+            let encoded = encode_tags(&set);
+            prop_assert_eq!(decode_tags(&encoded), Ok(set));
+        }
+
+        #[test]
+        fn prop_part_sizes_round_trip(sizes in proptest::collection::vec(any::<u64>(), 0..=64)) {
+            let mut a = Attrs::new();
+            a.set_part_sizes(&sizes);
+            prop_assert_eq!(a.part_sizes(), Some(sizes));
+        }
+
+        #[test]
+        fn prop_user_meta_round_trip(
+            entries in proptest::collection::vec(("\\PC{1,64}", "\\PC{0,64}"), 0..=20)
+        ) {
+            let mut a = Attrs::new();
+            a.set_user_meta(entries.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+            let expected: Vec<(&str, &str)> = entries.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            prop_assert_eq!(a.user_meta(), expected);
+        }
+
+        #[test]
+        fn prop_checksum_round_trip(
+            alg in checksum_alg_strategy(),
+            cksum_type in "[A-Z0-9_]{1,16}",
+            val in "[A-Za-z0-9+/=-]{1,64}",
+        ) {
+            let mut a = Attrs::new();
+            a.set_checksum(alg, &cksum_type, &val);
+            prop_assert_eq!(a.checksum(), Some((alg, cksum_type.as_str(), val.as_str())));
+        }
     }
 }

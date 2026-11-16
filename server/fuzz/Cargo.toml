@@ -45,6 +45,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "attrs_values"
+path = "fuzz_targets/attrs_values.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "form_upload"
 path = "fuzz_targets/form_upload.rs"
 test = false
