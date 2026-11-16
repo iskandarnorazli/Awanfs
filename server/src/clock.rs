@@ -58,7 +58,7 @@ const MONTHS: [&str; 12] = [
 ];
 
 /// Formats `ns` since the Unix epoch as an RFC 7231 IMF-fixdate HTTP-date
-/// (`"Tue, 10 Nov 2026 00:00:00 GMT"`).
+/// (`"Thu, 01 Jan 1970 00:00:00 GMT"`).
 pub fn format_http_date(ns: u64) -> String {
     let secs = ns / 1_000_000_000;
     let days = (secs / 86_400) as i64;

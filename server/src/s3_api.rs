@@ -777,10 +777,10 @@ impl S3ServiceState {
             engine.restore_bucket(id, &cfg.name);
             if cfg.versioning != crate::versions::Versioning::Unset {
                 versioning_map.insert(id, cfg.versioning);
-                if let Some(ts) = cfg.created_ns {
-                    if ts != 0 {
-                        bucket_created_ns.insert(id, ts);
-                    }
+            }
+            if let Some(ts) = cfg.created_ns {
+                if ts != 0 {
+                    bucket_created_ns.insert(id, ts);
                 }
             }
         }

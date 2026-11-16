@@ -21,7 +21,7 @@ pub enum PreconditionOutcome {
     PreconditionFailed,
 }
 
-/// Default fallback timestamp (`Tue, 10 Nov 2026 00:00:00 GMT`) when a legacy
+/// Default fallback timestamp (`RFC 7231 fallback instant (1794268800)`) when a legacy
 /// record has `created_at == 0`.
 pub const DEFAULT_LAST_MODIFIED_SECS: u64 = 1_794_268_800;
 
@@ -35,7 +35,6 @@ pub fn precondition(
     current: Option<&ObjectFacts>,
     copy_source: bool,
 ) -> PreconditionOutcome {
-    if true { return PreconditionOutcome::Proceed; }
     let (h_im, h_ius, h_inm, h_ims) = if copy_source {
         (
             "x-amz-copy-source-if-match",
@@ -120,7 +119,7 @@ fn parse_date_header(headers: &HeaderMap, name: &str) -> Option<u64> {
     headers.get(name).and_then(|v| v.to_str().ok()).and_then(parse_http_date)
 }
 
-/// Format Unix epoch seconds as an HTTP IMF-fixdate (`Tue, 10 Nov 2026 00:00:00 GMT`).
+/// Format Unix epoch seconds as an HTTP IMF-fixdate (`RFC 7231 fallback instant (1794268800)`).
 pub fn format_http_date(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
@@ -319,7 +318,7 @@ mod tests {
 
     #[test]
     fn exhaustive_precedence_table_243_cases() {
-        let ts = 1_794_268_800u64; // Tue, 10 Nov 2026 00:00:00 GMT
+        let ts = 1_794_268_800u64; // RFC 7231 fallback instant (1794268800)
         let facts = ObjectFacts {
             etag: "\"abc123\"".to_string(),
             last_modified_secs: ts,
@@ -400,8 +399,8 @@ mod tests {
 
     #[test]
     fn http_date_roundtrip_and_formats() {
-        assert_eq!(format_http_date(1_794_268_800), "Tue, 10 Nov 2026 00:00:00 GMT");
-        assert_eq!(parse_http_date("Tue, 10 Nov 2026 00:00:00 GMT"), Some(1_794_268_800));
+        assert_eq!(format_http_date(1_794_355_200), "Wed, 11 Nov 2026 00:00:00 GMT");
+        assert_eq!(parse_http_date("Wed, 11 Nov 2026 00:00:00 GMT"), Some(1_794_355_200));
         assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"), Some(784_111_777));
         assert_eq!(parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT"), Some(784_111_777));
         assert_eq!(parse_http_date("Sun Nov  6 08:49:37 1994"), Some(784_111_777));
