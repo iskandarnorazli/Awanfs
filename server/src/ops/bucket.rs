@@ -34,6 +34,9 @@ struct ListPage {
 /// and the scan jumps past them (prefix + 0xFF, a byte no UTF-8 key contains).
 fn list_page(state: &S3ServiceState, b_id: u32, prefix: &[u8], delimiter: &[u8], start: &[u8], max: usize) -> ListPage {
     let mut page = ListPage { objects: Vec::new(), prefixes: Vec::new(), truncated: false, next: None, last_name: None };
+    if max == 0 {
+        return page;
+    }
     let mut cursor = start.to_vec();
     'outer: loop {
         let batch = state.engine.read().list_keys(b_id, prefix, &cursor, 1000);
@@ -61,7 +64,9 @@ fn list_page(state: &S3ServiceState, b_id: u32, prefix: &[u8], delimiter: &[u8],
                         continue 'outer;
                     }
                     page.last_name = Some(cp.clone());
-                    page.prefixes.push(cp);
+                    if page.prefixes.last() != Some(&cp) {
+                        page.prefixes.push(cp);
+                    }
                     cursor = past;
                     continue 'outer;
                 }
@@ -247,8 +252,37 @@ pub async fn list_objects(
     let q = |k: &str| query_map.get(k).map(|s| s.as_str()).unwrap_or("");
     let prefix = q("prefix");
     let delimiter = q("delimiter");
+    if let Some(et) = query_map.get("encoding-type") {
+        if !et.is_empty() && et != "url" {
+            let xml = s3_error_xml("InvalidArgument", "Invalid Encoding Method specified in Request", bucket, "req-list-obj");
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(full_body(Bytes::from(xml)))
+                .unwrap());
+        }
+    }
     let url_encode = q("encoding-type") == "url";
-    let max_keys = query_map.get("max-keys").and_then(|s| s.parse::<usize>().ok()).unwrap_or(1000).min(1000);
+    let fetch_owner = v2 && q("fetch-owner").eq_ignore_ascii_case("true");
+    let max_keys = match query_map.get("max-keys") {
+        Some(s) => match s.parse::<i32>() {
+            Ok(n) if n >= 0 => (n as usize).min(1000),
+            _ => {
+                let xml = s3_error_xml(
+                    "InvalidArgument",
+                    "Argument max-keys must be an integer between 0 and 2147483647",
+                    bucket,
+                    "req-list-obj",
+                );
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(full_body(Bytes::from(xml)))
+                    .unwrap());
+            }
+        },
+        None => 1000,
+    };
     let start: Vec<u8> = if v2 {
         match query_map.get("continuation-token") {
             Some(t) => match decode_hex_token(t) {
@@ -297,6 +331,7 @@ pub async fn list_objects(
             truncated: page.truncated,
             next_token: next.as_deref(),
             encoding_url: url_encode,
+            fetch_owner,
             contents: &contents,
             prefixes: &cps,
         })

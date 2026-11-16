@@ -191,17 +191,21 @@ pub struct ListV2<'a> {
     pub truncated: bool,
     pub next_token: Option<&'a str>,
     pub encoding_url: bool,
+    pub fetch_owner: bool,
     pub contents: &'a [S3ObjectEntry<'a>],
     pub prefixes: &'a [&'a str],
 }
 
-fn contents_and_prefixes(out: &mut String, contents: &[S3ObjectEntry], prefixes: &[&str]) {
+fn contents_and_prefixes(out: &mut String, contents: &[S3ObjectEntry], prefixes: &[&str], include_owner: bool) {
     for obj in contents {
         out.push_str("  <Contents>\n");
         out.push_str(&format!("    <Key>{}</Key>\n", xml_escape(obj.key)));
         out.push_str(&format!("    <LastModified>{}</LastModified>\n", obj.last_modified));
         out.push_str(&format!("    <ETag>\"{}\"</ETag>\n", obj.etag));
         out.push_str(&format!("    <Size>{}</Size>\n", obj.size));
+        if include_owner {
+            out.push_str("    <Owner><ID>awanfs</ID><DisplayName>awanfs</DisplayName></Owner>\n");
+        }
         out.push_str("    <StorageClass>STANDARD</StorageClass>\n");
         out.push_str("  </Contents>\n");
     }
@@ -237,7 +241,7 @@ pub fn list_objects_v2_xml_full(l: &ListV2) -> String {
     if let Some(t) = l.next_token {
         out.push_str(&format!("  <NextContinuationToken>{}</NextContinuationToken>\n", xml_escape(t)));
     }
-    contents_and_prefixes(&mut out, l.contents, l.prefixes);
+    contents_and_prefixes(&mut out, l.contents, l.prefixes, l.fetch_owner);
     out.push_str("</ListBucketResult>");
     out
 }
@@ -273,7 +277,7 @@ pub fn list_objects_v1_xml(
     if let Some(m) = next_marker {
         out.push_str(&format!("  <NextMarker>{}</NextMarker>\n", xml_escape(m)));
     }
-    contents_and_prefixes(&mut out, contents, prefixes);
+    contents_and_prefixes(&mut out, contents, prefixes, true);
     out.push_str("</ListBucketResult>");
     out
 }
