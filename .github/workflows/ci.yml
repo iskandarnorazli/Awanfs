@@ -54,6 +54,13 @@ jobs:
         run: python3 scripts/test_check_state_machines.py && python3 scripts/check_state_machines.py
       - name: Conformance profile matches start_server.sh and workflow
         run: python3 scripts/test_check_profile.py && python3 scripts/check_profile.py
+      - name: s3-tests ratchet log self-tests
+        run: python3 scripts/test_check_ratchet_log.py
+      - name: Every test removed from passing.txt has a RATCHET_LOG.md row
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+          python3 scripts/check_ratchet_log.py "origin/${{ github.base_ref }}"
       - name: promtool check rules
         run: |
           v=3.5.0
