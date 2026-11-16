@@ -566,16 +566,12 @@ fn version_get_response(
     let tag_count = view.attrs.tag_count();
     let cksum_mode = checksum_mode_enabled(headers);
     let builder = with_tagging_count(
-        with_checksum_headers(
-            Response::builder()
-                .with_object_metadata(&view, &overrides)
-        .header(ETAG, etag_val)
-        .header(ACCEPT_RANGES, "bytes")
-        .header("x-amz-version-id", v.id_string())
-        .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts)),
-            &view.attrs,
-            cksum_mode,
-        ),
+        Response::builder()
+            .with_object_metadata(&view, &overrides)
+            .header(ETAG, etag_val)
+            .header(ACCEPT_RANGES, "bytes")
+            .header("x-amz-version-id", v.id_string())
+            .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts)),
         tag_count,
     );
     if let Some(h) = range {
@@ -610,7 +606,11 @@ fn version_get_response(
         }
     }
     let body = if head { empty_body() } else { full_body(bytes) };
-    builder.status(StatusCode::OK).header(CONTENT_LENGTH, v.size.to_string()).body(body).unwrap()
+    with_checksum_headers(builder, &view.attrs, cksum_mode)
+        .status(StatusCode::OK)
+        .header(CONTENT_LENGTH, v.size.to_string())
+        .body(body)
+        .unwrap()
 }
 
 pub async fn copy_object(
@@ -1392,14 +1392,14 @@ pub async fn get_or_head_object(
                         Ok(b) => b,
                         Err(e) => return Ok(internal_error_response(key, &format!("could not read the object: {:?}", e))),
                     };
-                    return Ok(with_tagging_count(with_checksum_headers(Response::builder()
+                    return Ok(with_tagging_count(Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
                         .with_object_metadata(&view, &overrides)
                         .header(ETAG, etag_val)
                         .header(ACCEPT_RANGES, "bytes")
                         .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
                         .header(CONTENT_LENGTH, len.to_string())
-                        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count)
+                        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count)
                         .body(body.boxed())
                         .unwrap());
                 }
@@ -1490,14 +1490,14 @@ pub async fn get_or_head_object(
                 let content_range = format!("bytes {}-{}/{}", range.start, range.end, meta.size);
                 let body = if is_head { empty_body() } else { full_body(sub_bytes) };
 
-                return Ok(with_tagging_count(with_checksum_headers(Response::builder()
+                return Ok(with_tagging_count(Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
                     .with_object_metadata(&view, &overrides)
                     .header(ETAG, etag_val)
                     .header(ACCEPT_RANGES, "bytes")
                     .header(CONTENT_RANGE, content_range)
                     .header(CONTENT_LENGTH, (range.end - range.start + 1).to_string())
-                    .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count)
+                    .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count)
                     .body(body)
                     .unwrap());
             }

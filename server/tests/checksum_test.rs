@@ -420,3 +420,79 @@ async fn multipart_checksum_and_get_object_attributes_parts() {
 
     handle2.shutdown();
 }
+
+
+#[tokio::test]
+async fn range_get_omits_checksum_headers_while_whole_get_includes_them() {
+    let dir = temp_dir("range_cksum");
+    let c = reqwest::Client::new();
+    let (_state, url, handle) = start(&dir).await;
+    assert_eq!(c.put(format!("{}/rbkt", url)).send().await.unwrap().status(), StatusCode::OK);
+
+    let data = vec![b'R'; 20_000];
+    let crc = compute_b64(ChecksumAlgorithm::Crc32, &data);
+    assert_eq!(
+        c.put(format!("{}/rbkt/obj", url))
+            .header("x-amz-checksum-crc32", &crc)
+            .body(data.clone())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    // Whole-object GET with checksum-mode=ENABLED includes the full-object checksum
+    let full = c
+        .get(format!("{}/rbkt/obj", url))
+        .header("x-amz-checksum-mode", "ENABLED")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(full.status(), StatusCode::OK);
+    assert_eq!(full.headers().get("x-amz-checksum-crc32").unwrap(), crc.as_str());
+
+    // Range GET (206 Partial Content) must NOT return the full-object checksum header
+    let partial = c
+        .get(format!("{}/rbkt/obj", url))
+        .header("Range", "bytes=100-4195")
+        .header("x-amz-checksum-mode", "ENABLED")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+    assert!(partial.headers().get("x-amz-checksum-crc32").is_none());
+    assert!(partial.headers().get("x-amz-checksum-type").is_none());
+
+    // Also verify on a versioned bucket
+    assert_eq!(
+        c.put(format!("{}/rbkt?versioning", url))
+            .body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let put_v = c
+        .put(format!("{}/rbkt/vobj", url))
+        .header("x-amz-checksum-crc32", &crc)
+        .body(data)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put_v.status(), StatusCode::OK);
+    let vid = put_v.headers().get("x-amz-version-id").unwrap().to_str().unwrap().to_string();
+
+    let v_partial = c
+        .get(format!("{}/rbkt/vobj?versionId={}", url, vid))
+        .header("Range", "bytes=0-99")
+        .header("x-amz-checksum-mode", "ENABLED")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(v_partial.status(), StatusCode::PARTIAL_CONTENT);
+    assert!(v_partial.headers().get("x-amz-checksum-crc32").is_none());
+
+    handle.shutdown();
+}
