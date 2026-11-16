@@ -1,6 +1,6 @@
 name: ceph s3-tests
 
-# Conformance (#47): the ceph s3-tests suite against a fresh AwanFS. Fails only when a test in
+# Conformance (#47, #160): the ceph s3-tests suite against a fresh AwanFS. Fails only when a test in
 # tests/s3tests/passing.txt stops passing; the report lists new passes to add.
 
 on:
@@ -44,14 +44,19 @@ jobs:
           S3TEST_CONF=$GITHUB_WORKSPACE/tests/s3tests/s3tests.conf /tmp/venv/bin/pytest s3tests/functional/test_s3.py \
             -p no:cacheprovider -q --timeout=60 --junitxml=/tmp/s3tests-results.xml -o junit_family=xunit1 || true
           test -s /tmp/s3tests-results.xml
+          S3TEST_CONF=$GITHUB_WORKSPACE/tests/s3tests/s3tests.conf /tmp/venv/bin/pytest s3tests/functional/test_headers.py \
+            -p no:cacheprovider -q --timeout=60 --junitxml=/tmp/s3tests-headers-results.xml -o junit_family=xunit1 || true
+          test -s /tmp/s3tests-headers-results.xml
       - name: Ratchet
-        run: python3 tests/s3tests/ratchet.py /tmp/s3tests-results.xml tests/s3tests/passing.txt --report /tmp/s3tests-report.md
+        run: python3 tests/s3tests/ratchet.py /tmp/s3tests-results.xml /tmp/s3tests-headers-results.xml tests/s3tests/passing.txt --report /tmp/s3tests-report.md
       - name: Conformance map (every test has an owner; CONFORMANCE_DESIGN.md)
         if: always()
         run: |
           python3 tests/s3tests/test_conformance_map.py
-          python3 tests/s3tests/conformance_map.py /tmp/s3-tests/s3tests/functional/test_s3.py tests/s3tests/passing.txt \
-            --junit /tmp/s3tests-results.xml --suite-ref "ceph/s3-tests $(git -C /tmp/s3-tests rev-parse --short HEAD), run $GITHUB_RUN_ID" \
+          python3 tests/s3tests/test_ratchet.py
+          python3 tests/s3tests/conformance_map.py /tmp/s3-tests/s3tests/functional/test_s3.py /tmp/s3-tests/s3tests/functional/test_headers.py tests/s3tests/passing.txt \
+            --junit /tmp/s3tests-results.xml --junit /tmp/s3tests-headers-results.xml \
+            --suite-ref "ceph/s3-tests $(git -C /tmp/s3-tests rev-parse --short HEAD), run $GITHUB_RUN_ID" \
             --report /tmp/CONFORMANCE_MAP.md
       - name: Summary
         if: always()
@@ -65,5 +70,6 @@ jobs:
           name: s3tests-results
           path: |
             /tmp/s3tests-results.xml
+            /tmp/s3tests-headers-results.xml
             /tmp/s3tests-report.md
             /tmp/CONFORMANCE_MAP.md

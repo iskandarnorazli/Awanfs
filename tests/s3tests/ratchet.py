@@ -1,8 +1,8 @@
-"""Ratchet for the ceph s3-tests run (#47).
+"""Ratchet for the ceph s3-tests run (#47, #160).
 
-    python tests/s3tests/ratchet.py results.xml tests/s3tests/passing.txt [--report report.md]
+    python tests/s3tests/ratchet.py results.xml [headers-results.xml ...] tests/s3tests/passing.txt [--report report.md]
 
-Reads the JUnit XML pytest wrote. Exit 1 when a test listed in passing.txt did not pass;
+Reads the JUnit XML file(s) pytest wrote. Exit 1 when a test listed in passing.txt did not pass;
 otherwise 0. Prints the tests that pass now but are not listed (add them to passing.txt to
 raise the ratchet) and writes a markdown report with the counts.
 """
@@ -28,13 +28,16 @@ def outcomes(path):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("results")
+    ap.add_argument("results", nargs="+")
     ap.add_argument("passing")
     ap.add_argument("--report")
     a = ap.parse_args(argv)
-    res = outcomes(a.results)
+    res = {}
+    for path in a.results:
+        res.update(outcomes(path))
     try:
-        listed = [l.strip() for l in open(a.passing, encoding="utf-8") if l.strip() and not l.startswith("#")]
+        with open(a.passing, encoding="utf-8") as fh:
+            listed = [l.strip() for l in fh if l.strip() and not l.startswith("#")]
     except FileNotFoundError:
         listed = []
     regressions = [t for t in listed if res.get(t) != "passed"]
@@ -54,7 +57,8 @@ def main(argv=None):
     text = "\n".join(lines)
     print(text)
     if a.report:
-        open(a.report, "w", encoding="utf-8").write(text)
+        with open(a.report, "w", encoding="utf-8") as fh:
+            fh.write(text)
     return 1 if regressions else 0
 
 
