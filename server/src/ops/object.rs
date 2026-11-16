@@ -367,7 +367,7 @@ pub(crate) fn find_version(state: &S3ServiceState, b_id: u32, key: &str, id: Opt
     }
 }
 
-fn last_modified_secs_from_ms(ms: u64) -> u64 {
+pub(super) fn last_modified_secs_from_ms(ms: u64) -> u64 {
     if ms == 0 {
         DEFAULT_LAST_MODIFIED_SECS
     } else {
@@ -375,7 +375,7 @@ fn last_modified_secs_from_ms(ms: u64) -> u64 {
     }
 }
 
-fn last_modified_secs_from_ns(ns: u64) -> u64 {
+pub(super) fn last_modified_secs_from_ns(ns: u64) -> u64 {
     if ns == 0 {
         DEFAULT_LAST_MODIFIED_SECS
     } else {
@@ -383,7 +383,7 @@ fn last_modified_secs_from_ns(ns: u64) -> u64 {
     }
 }
 
-fn format_object_etag(etag_hi: u64, etag_lo: u64, is_multipart: bool, part_count: u16) -> String {
+pub(super) fn format_object_etag(etag_hi: u64, etag_lo: u64, is_multipart: bool, part_count: u16) -> String {
     let hex = md5_to_etag_hex(etag_hi, etag_lo);
     if is_multipart {
         format!("\"{}-{}\"", hex, part_count)
@@ -392,7 +392,7 @@ fn format_object_etag(etag_hi: u64, etag_lo: u64, is_multipart: bool, part_count
     }
 }
 
-fn precondition_failure_response(
+pub(super) fn precondition_failure_response(
     outcome: PreconditionOutcome,
     facts: Option<&ObjectFacts>,
     key: &str,
@@ -434,6 +434,7 @@ fn version_get_response(
     vid: Option<&str>,
     head: bool,
     range: Option<&str>,
+    part_num: Option<u32>,
     headers: &HeaderMap,
     overrides: &ResponseOverrides<'_>,
 ) -> Response<ResponseBody> {
@@ -497,6 +498,63 @@ fn version_get_response(
         PreconditionOutcome::Proceed => {}
         outcome => return precondition_failure_response(outcome, Some(&facts), key, head),
     }
+    let view = match state.object_view(v.vol_offset, v.flags) {
+        Ok(view) => view,
+        Err(e) => return internal_error_response(key, &format!("could not read the version's attributes: {:?}", e)),
+    };
+    if let Some(pn) = part_num {
+        if v.flags & AWAN_FLAG_MULTIPART != 0 {
+            let extents = match state.multipart.get_completed_extents(b_id, key) {
+                Some(e) => e,
+                None => return internal_error_response(key, "the multipart object's part list is missing"),
+            };
+            let parts_count = extents.len();
+            if pn < 1 || (pn as usize) > parts_count {
+                let body = if head {
+                    empty_body()
+                } else {
+                    full_body(Bytes::from(s3_error_xml("InvalidPart", "The requested part number is not valid.", key, "req-get-part")))
+                };
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(body)
+                    .unwrap();
+            }
+            let ext = &extents[(pn - 1) as usize];
+            let body = if head {
+                empty_body()
+            } else {
+                let b = match state.part_bytes(b_id, ext) {
+                    Ok(b) => b,
+                    Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
+                };
+                full_body(b.slice(..(ext.part_size as usize).min(b.len())))
+            };
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, view.content_type())
+                .header(ETAG, etag_val)
+                .header(ACCEPT_RANGES, "bytes")
+                .header("x-amz-mp-parts-count", parts_count.to_string())
+                .header("x-amz-version-id", v.id_string())
+                .header(CONTENT_LENGTH, ext.part_size.to_string())
+                .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts))
+                .body(body)
+                .unwrap();
+        } else if pn > 1 {
+            let body = if head {
+                empty_body()
+            } else {
+                full_body(Bytes::from(s3_error_xml("InvalidPart", "The requested part number is not valid.", key, "req-get-part")))
+            };
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(body)
+                .unwrap();
+        }
+    }
     let bytes = if head {
         Bytes::new()
     } else {
@@ -505,16 +563,12 @@ fn version_get_response(
             Err(e) => return internal_error_response(key, &format!("could not read the version: {:?}", e)),
         }
     };
-    let view = match state.object_view(v.vol_offset, v.flags) {
-        Ok(view) => view,
-        Err(e) => return internal_error_response(key, &format!("could not read the version's attributes: {:?}", e)),
-    };
     let tag_count = view.attrs.tag_count();
     let cksum_mode = checksum_mode_enabled(headers);
     let builder = with_tagging_count(
         with_checksum_headers(
             Response::builder()
-        .with_object_metadata(&view, &overrides)
+                .with_object_metadata(&view, &overrides)
         .header(ETAG, etag_val)
         .header(ACCEPT_RANGES, "bytes")
         .header("x-amz-version-id", v.id_string())
@@ -1185,10 +1239,40 @@ pub async fn get_or_head_object(
         Ok(ov) => ov,
         Err(resp) => return Ok(resp),
     };
+    let part_num = match query_map.get("partNumber") {
+        Some(s) => match s.parse::<u32>() {
+            Ok(n) if (1..=10_000).contains(&n) => Some(n),
+            _ => {
+                let body = if is_head {
+                    empty_body()
+                } else {
+                    full_body(Bytes::from(s3_error_xml("InvalidArgument", "Part number must be an integer between 1 and 10000, inclusive", key, "req-get-part")))
+                };
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(body)
+                    .unwrap());
+            }
+        },
+        None => None,
+    };
+    if part_num.is_some() && headers.contains_key("Range") {
+        let body = if is_head {
+            empty_body()
+        } else {
+            full_body(Bytes::from(s3_error_xml("InvalidRequest", "Cannot specify both Range header and partNumber query parameter", key, "req-get-part")))
+        };
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(CONTENT_TYPE, "application/xml")
+            .body(body)
+            .unwrap());
+    }
     let vid = query_map.get("versionId").map(|s| s.as_str());
     if vid.is_some() || state.versions.read().has(b_id, key) {
         let range = headers.get("Range").and_then(|v| v.to_str().ok());
-        return Ok(version_get_response(&state, b_id, key, vid, is_head, range, headers, &overrides));
+        return Ok(version_get_response(&state, b_id, key, vid, is_head, range, part_num, headers, &overrides));
     }
     let (meta, is_multipart) = {
         let engine = state.engine.read();
@@ -1233,6 +1317,59 @@ pub async fn get_or_head_object(
     match precondition(headers, Some(&facts), false) {
         PreconditionOutcome::Proceed => {}
         outcome => return Ok(precondition_failure_response(outcome, Some(&facts), key, is_head)),
+    }
+
+    if let Some(pn) = part_num {
+        if is_multipart {
+            let extents = match state.multipart.get_completed_extents(b_id, key) {
+                Some(e) => e,
+                None => return Ok(internal_error_response(key, "the multipart object's part list is missing")),
+            };
+            let parts_count = extents.len();
+            if (pn as usize) > parts_count {
+                let body = if is_head {
+                    empty_body()
+                } else {
+                    full_body(Bytes::from(s3_error_xml("InvalidPart", "The requested part number is not valid.", key, "req-get-part")))
+                };
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(body)
+                    .unwrap());
+            }
+            let ext = &extents[(pn - 1) as usize];
+            let body = if is_head {
+                empty_body()
+            } else {
+                let b = match state.part_bytes(b_id, ext) {
+                    Ok(b) => b,
+                    Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
+                };
+                full_body(b.slice(..(ext.part_size as usize).min(b.len())))
+            };
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, view.content_type())
+                .header(ETAG, etag_val)
+                .header(ACCEPT_RANGES, "bytes")
+                .header("x-amz-mp-parts-count", parts_count.to_string())
+                .header(CONTENT_LENGTH, ext.part_size.to_string())
+                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
+                .body(body)
+                .unwrap());
+        } else if pn > 1 {
+            let body = if is_head {
+                empty_body()
+            } else {
+                full_body(Bytes::from(s3_error_xml("InvalidPart", "The requested part number is not valid.", key, "req-get-part")))
+            };
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(body)
+                .unwrap());
+        }
     }
 
     let range_hdr = headers.get("Range").and_then(|v| v.to_str().ok());

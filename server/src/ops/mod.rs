@@ -49,6 +49,7 @@ pub enum Operation {
     DeleteObject,
     CreateMultipartUpload,
     UploadPart,
+    UploadPartCopy,
     CompleteMultipartUpload,
     AbortMultipartUpload,
     ListParts,
@@ -300,6 +301,14 @@ pub const OPS: &[OpSpec] = &[
         requires_existing_bucket: true,
     },
     OpSpec {
+        op: Operation::UploadPartCopy,
+        name: "UploadPartCopy",
+        iam_action: Some("s3:PutObject"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
         op: Operation::CompleteMultipartUpload,
         name: "CompleteMultipartUpload",
         iam_action: Some("s3:PutObject"),
@@ -474,9 +483,7 @@ pub fn classify(
             (&Method::POST, ["uploads"]) => Ok(Operation::CreateMultipartUpload),
             (&Method::PUT, ["partNumber", "uploadId"]) => {
                 if has_copy {
-                    Err(ClassifyRefusal::NotImplemented(
-                        "UploadPartCopy is not implemented: upload the part's bytes with UploadPart.",
-                    ))
+                    Ok(Operation::UploadPartCopy)
                 } else {
                     Ok(Operation::UploadPart)
                 }
@@ -490,8 +497,14 @@ pub fn classify(
             (&Method::GET, ["attributes"]) | (&Method::GET, ["attributes", "versionId"]) => {
                 Ok(Operation::GetObjectAttributes)
             }
-            (&Method::GET, ["versionId"]) | (&Method::GET, []) => Ok(Operation::GetObject),
-            (&Method::HEAD, ["versionId"]) | (&Method::HEAD, []) => Ok(Operation::HeadObject),
+                        (&Method::GET, ["versionId"])
+            | (&Method::GET, ["partNumber"])
+            | (&Method::GET, ["partNumber", "versionId"])
+            | (&Method::GET, []) => Ok(Operation::GetObject),
+            (&Method::HEAD, ["versionId"])
+            | (&Method::HEAD, ["partNumber"])
+            | (&Method::HEAD, ["partNumber", "versionId"])
+            | (&Method::HEAD, []) => Ok(Operation::HeadObject),
             (&Method::DELETE, ["versionId"]) | (&Method::DELETE, []) => Ok(Operation::DeleteObject),
             (_, s) if !s.is_empty() => Err(ClassifyRefusal::NotImplemented("The requested sub-resource is not implemented.")),
             (&Method::PUT, []) => Ok(if has_copy { Operation::CopyObject } else { Operation::PutObject }),
@@ -518,7 +531,7 @@ pub fn iam_requirements(
         _ => return vec![],
     };
     let mut out = vec![(action, resource)];
-    if op == Operation::CopyObject {
+    if matches!(op, Operation::CopyObject | Operation::UploadPartCopy) {
         if let Some(src) = copy_source {
             let src = percent_decode_path(src.split('?').next().unwrap_or(src));
             out.push(("s3:GetObject", format!("arn:aws:s3:::{}", src.trim_start_matches('/'))));
@@ -775,7 +788,7 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         Operation::PutBucketCors => cors::put_bucket_cors(state, b_id.unwrap(), bucket, &path, c.body).await,
         Operation::DeleteBucketCors => cors::delete_bucket_cors(state, b_id.unwrap(), bucket).await,
         Operation::CorsPreflight => cors::preflight(state, b_id.unwrap(), &path, &c.parts.headers).await,
-        Operation::ListMultipartUploads => multipart::list_multipart_uploads(state, bucket).await,
+        Operation::ListMultipartUploads => multipart::list_multipart_uploads(state, bucket, &c.query_map).await,
         Operation::DeleteObjects => {
             bucket::delete_objects(state, b_id.unwrap(), bucket, &path, &principal, iam.as_deref(), c.body).await
         }
@@ -802,6 +815,9 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         }
         Operation::UploadPart => {
             multipart::upload_part(state, key, &path, &c.query_map, &c.parts.headers, iam, c.body).await
+        }
+        Operation::UploadPartCopy => {
+            multipart::upload_part_copy(state, key, &c.query_map, &c.parts.headers).await
         }
         Operation::CompleteMultipartUpload => {
             multipart::complete_multipart_upload(state, b_id.unwrap(), bucket, key, &path, &c.query_map, &c.parts.headers, c.body).await
@@ -848,6 +864,7 @@ mod tests {
             (Operation::DeleteObject, Method::DELETE, Some("bkt"), Some("obj"), "", None),
             (Operation::CreateMultipartUpload, Method::POST, Some("bkt"), Some("obj"), "uploads", None),
             (Operation::UploadPart, Method::PUT, Some("bkt"), Some("obj"), "partNumber=1&uploadId=u1", None),
+            (Operation::UploadPartCopy, Method::PUT, Some("bkt"), Some("obj"), "partNumber=1&uploadId=u1", Some("/src/key")),
             (Operation::CompleteMultipartUpload, Method::POST, Some("bkt"), Some("obj"), "uploadId=u1", None),
             (Operation::AbortMultipartUpload, Method::DELETE, Some("bkt"), Some("obj"), "uploadId=u1", None),
             (Operation::ListParts, Method::GET, Some("bkt"), Some("obj"), "uploadId=u1", None),
@@ -935,10 +952,10 @@ mod tests {
         // UploadPartCopy
         let mut copy_hdrs = HeaderMap::new();
         copy_hdrs.insert("x-amz-copy-source", "/b/s".parse().unwrap());
-        assert!(matches!(
-            classify(&Method::PUT, Some("bkt"), Some("obj"), "partNumber=1&uploadId=u1", &copy_hdrs),
-            Err(ClassifyRefusal::NotImplemented(_))
-        ));
+        assert_eq!(
+            classify(&Method::PUT, Some("bkt"), Some("obj"), "partNumber=1&uploadId=u1", &copy_hdrs).unwrap(),
+            Operation::UploadPartCopy
+        );
     }
 
     #[test]
