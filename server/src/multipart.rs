@@ -61,8 +61,22 @@ pub struct MultipartUpload {
     pub checksum_type: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct CompletedUploadResult {
+    pub bucket: String,
+    pub key: String,
+    pub composite_etag: String,
+    pub location: String,
+    pub version_id: Option<String>,
+    pub checksum: Option<(crate::checksum::ChecksumAlgorithm, String, String)>,
+}
+
 pub struct MultipartManager {
     pub uploads: RwLock<BTreeMap<String, MultipartUpload>>,
+    /// Explicit upload state tracked via `crate::fsm::upload_step` (#111).
+    pub upload_states: RwLock<HashMap<String, crate::fsm::UploadState>>,
+    /// Cached result for idempotent CompleteMultipartUpload (#111).
+    pub completed_results: RwLock<HashMap<String, CompletedUploadResult>>,
     /// Completed multipart extents: (bucket_id, key) -> Vec<PartExtent>
     pub completed_extents: RwLock<BTreeMap<(u32, String), Vec<PartExtent>>>,
     pub next_upload_id: RwLock<u64>,
@@ -93,6 +107,8 @@ impl MultipartManager {
             .unwrap_or(1);
         Self {
             uploads: RwLock::new(BTreeMap::new()),
+            upload_states: RwLock::new(HashMap::new()),
+            completed_results: RwLock::new(HashMap::new()),
             completed_extents: RwLock::new(BTreeMap::new()),
             next_upload_id: RwLock::new(next_id),
             enforce_min_part_size: AtomicBool::new(false),
@@ -192,6 +208,7 @@ impl MultipartManager {
             checksum_type: None,
         };
 
+        self.upload_states.write().insert(upload_id.clone(), crate::fsm::UploadState::Open);
         self.uploads.write().insert(upload_id.clone(), upload);
         Ok(upload_id)
     }
@@ -255,6 +272,11 @@ impl MultipartManager {
             return Err("InvalidArgument");
         }
 
+        {
+            let states = self.upload_states.read();
+            let st = states.get(upload_id).copied().ok_or("NoSuchUpload")?;
+            crate::fsm::upload_step(st, crate::fsm::UploadEvent::UploadPart).map_err(|r| r.code)?;
+        }
         let mut uploads = self.uploads.write();
         let upload = uploads.get_mut(upload_id).ok_or("NoSuchUpload")?;
 
@@ -279,6 +301,12 @@ impl MultipartManager {
     }
 
     pub fn abort_upload(&self, upload_id: &str) -> Result<(), &'static str> {
+        {
+            let mut states = self.upload_states.write();
+            let st = states.get(upload_id).copied().ok_or("NoSuchUpload")?;
+            let next = crate::fsm::upload_step(st, crate::fsm::UploadEvent::Abort).map_err(|r| r.code)?;
+            states.insert(upload_id.to_string(), next);
+        }
         let mut uploads = self.uploads.write();
         let upload = uploads.remove(upload_id).ok_or("NoSuchUpload")?;
         let upload_dir = self.staging_dir.join(&upload.upload_id);
@@ -371,9 +399,31 @@ impl MultipartManager {
     /// Ends the upload and registers the object's extents. Call it after the manifest needle
     /// is written. `NoSuchUpload` if the upload was aborted or completed meanwhile.
     pub fn commit_complete(&self, upload_id: &str, extents: Vec<PartExtent>) -> Result<(), &'static str> {
+        {
+            let mut states = self.upload_states.write();
+            let st = states.get(upload_id).copied().ok_or("NoSuchUpload")?;
+            let next = crate::fsm::upload_step(st, crate::fsm::UploadEvent::Complete).map_err(|r| r.code)?;
+            states.insert(upload_id.to_string(), next);
+        }
         let upload = self.uploads.write().remove(upload_id).ok_or("NoSuchUpload")?;
         self.completed_extents.write().insert((upload.bucket_id, upload.key.clone()), extents);
         Ok(())
+    }
+
+    pub fn record_completed_result(&self, upload_id: &str, result: CompletedUploadResult) {
+        self.completed_results.write().insert(upload_id.to_string(), result);
+    }
+
+    pub fn get_completed_result(&self, upload_id: &str) -> Option<CompletedUploadResult> {
+        let st = self.upload_states.read().get(upload_id).copied()?;
+        if st != crate::fsm::UploadState::Completed {
+            return None;
+        }
+        if crate::fsm::upload_step(st, crate::fsm::UploadEvent::Complete).is_ok() {
+            self.completed_results.read().get(upload_id).cloned()
+        } else {
+            None
+        }
     }
 
     pub fn get_completed_extents(&self, bucket_id: u32, key: &str) -> Option<Vec<PartExtent>> {
@@ -491,18 +541,39 @@ pub fn complete_multipart_upload_result_xml(
     etag: &str,
     location: &str,
 ) -> String {
+    complete_multipart_upload_result_xml_with_checksum(bucket, key, etag, location, None)
+}
+
+pub fn complete_multipart_upload_result_xml_with_checksum(
+    bucket: &str,
+    key: &str,
+    etag: &str,
+    location: &str,
+    checksum: Option<(crate::checksum::ChecksumAlgorithm, &str, &str)>,
+) -> String {
+    let mut cksum_xml = String::new();
+    if let Some((alg, ct, val)) = checksum {
+        cksum_xml.push_str(&format!(
+            "\n  <{}>{}</{}>\n  <ChecksumType>{}</ChecksumType>",
+            alg.xml_name(),
+            xml_escape(val),
+            alg.xml_name(),
+            xml_escape(ct)
+        ));
+    }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
         <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  \
           <Location>{}</Location>\n  \
           <Bucket>{}</Bucket>\n  \
           <Key>{}</Key>\n  \
-          <ETag>\"{}\"</ETag>\n\
+          <ETag>\"{}\"</ETag>{}\n\
         </CompleteMultipartUploadResult>",
         xml_escape(location),
         xml_escape(bucket),
         xml_escape(key),
-        etag
+        etag,
+        cksum_xml
     )
 }
 

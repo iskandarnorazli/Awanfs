@@ -400,6 +400,42 @@ pub fn bucket_step(state: BucketState, event: BucketEvent) -> Result<BucketState
     }
 }
 
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadState {
+    Open,
+    Completed,
+    Aborted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadEvent {
+    UploadPart,
+    ListParts,
+    Complete,
+    Abort,
+}
+
+pub const NO_SUCH_UPLOAD: Refusal = Refusal {
+    code: "NoSuchUpload",
+    status: 404,
+    why: "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
+};
+
+/// Transitions for a multipart upload (`#111`):
+/// - `Open`: `UploadPart` / `ListParts` keep it `Open`; `Complete` -> `Completed`; `Abort` -> `Aborted`.
+/// - `Completed`: `Complete` answers the completed result (`Ok(Completed)`); other events -> `NoSuchUpload`.
+/// - `Aborted`: all events -> `NoSuchUpload`.
+pub fn upload_step(state: UploadState, event: UploadEvent) -> Result<UploadState, Refusal> {
+    match (state, event) {
+        (UploadState::Open, UploadEvent::UploadPart | UploadEvent::ListParts) => Ok(UploadState::Open),
+        (UploadState::Open, UploadEvent::Complete) => Ok(UploadState::Completed),
+        (UploadState::Open, UploadEvent::Abort) => Ok(UploadState::Aborted),
+        (UploadState::Completed, UploadEvent::Complete) => Ok(UploadState::Completed),
+        (UploadState::Completed, _) | (UploadState::Aborted, _) => Err(NO_SUCH_UPLOAD),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,5 +828,46 @@ mod tests {
             assert_eq!(bucket_step(st, BucketEvent::PutConfig(k)), Err(NO_SUCH_BUCKET));
             assert_eq!(bucket_step(st, BucketEvent::DeleteConfig(k)), Err(NO_SUCH_BUCKET));
         }
+    }
+
+    #[test]
+    fn upload_every_pair_is_decided() {
+        let states = [UploadState::Open, UploadState::Completed, UploadState::Aborted];
+        let events = [UploadEvent::UploadPart, UploadEvent::ListParts, UploadEvent::Complete, UploadEvent::Abort];
+        let mut count = 0usize;
+        for s in states {
+            for e in events {
+                let res = upload_step(s, e);
+                match (s, e) {
+                    (UploadState::Open, UploadEvent::UploadPart | UploadEvent::ListParts) => {
+                        assert_eq!(res, Ok(UploadState::Open));
+                    }
+                    (UploadState::Open, UploadEvent::Complete) => {
+                        assert_eq!(res, Ok(UploadState::Completed));
+                    }
+                    (UploadState::Open, UploadEvent::Abort) => {
+                        assert_eq!(res, Ok(UploadState::Aborted));
+                    }
+                    (UploadState::Completed, UploadEvent::Complete) => {
+                        assert_eq!(res, Ok(UploadState::Completed));
+                    }
+                    (UploadState::Completed, _) | (UploadState::Aborted, _) => {
+                        assert_eq!(res, Err(NO_SUCH_UPLOAD));
+                    }
+                }
+                count += 1;
+            }
+        }
+        assert_eq!(count, states.len() * events.len());
+    }
+
+    #[test]
+    fn completed_upload_complete_is_idempotent() {
+        let s = upload_step(UploadState::Open, UploadEvent::Complete).unwrap();
+        assert_eq!(s, UploadState::Completed);
+        assert_eq!(upload_step(s, UploadEvent::Complete), Ok(UploadState::Completed));
+        assert_eq!(upload_step(s, UploadEvent::UploadPart), Err(NO_SUCH_UPLOAD));
+        assert_eq!(upload_step(s, UploadEvent::ListParts), Err(NO_SUCH_UPLOAD));
+        assert_eq!(upload_step(s, UploadEvent::Abort), Err(NO_SUCH_UPLOAD));
     }
 }

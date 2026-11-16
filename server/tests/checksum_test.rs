@@ -394,7 +394,7 @@ async fn multipart_checksum_and_get_object_attributes_parts() {
     assert_eq!(attrs_p1.status(), StatusCode::OK);
     let xml1 = attrs_p1.text().await.unwrap();
     assert_eq!(between(&xml1, "<ObjectSize>", "</ObjectSize>"), Some("3072"));
-    assert_eq!(between(&xml1, "<TotalPartsCount>", "</TotalPartsCount>"), Some("2"));
+    assert_eq!(between(&xml1, "<PartsCount>", "</PartsCount>"), Some("2"));
     assert_eq!(between(&xml1, "<MaxParts>", "</MaxParts>"), Some("1"));
     assert_eq!(between(&xml1, "<IsTruncated>", "</IsTruncated>"), Some("true"));
     assert_eq!(between(&xml1, "<NextPartNumberMarker>", "</NextPartNumberMarker>"), Some("1"));
@@ -415,7 +415,7 @@ async fn multipart_checksum_and_get_object_attributes_parts() {
     assert_eq!(attrs_after.status(), StatusCode::OK);
     let xml2 = attrs_after.text().await.unwrap();
     assert_eq!(between(&xml2, "<ChecksumSHA256>", "</ChecksumSHA256>"), Some(composite.as_str()));
-    assert_eq!(between(&xml2, "<TotalPartsCount>", "</TotalPartsCount>"), Some("2"));
+    assert_eq!(between(&xml2, "<PartsCount>", "</PartsCount>"), Some("2"));
     assert_eq!(between(&xml2, "<ObjectSize>", "</ObjectSize>"), Some("3072"));
 
     handle2.shutdown();
@@ -493,6 +493,75 @@ async fn range_get_omits_checksum_headers_while_whole_get_includes_them() {
         .unwrap();
     assert_eq!(v_partial.status(), StatusCode::PARTIAL_CONTENT);
     assert!(v_partial.headers().get("x-amz-checksum-crc32").is_none());
+
+    handle.shutdown();
+}
+
+
+#[tokio::test]
+async fn complete_multipart_returns_checksum_in_xml_and_supports_full_object_crc32() {
+    let dir = temp_dir("mp_fullobj");
+    let c = reqwest::Client::new();
+    let (_state, url, handle) = start(&dir).await;
+    assert_eq!(c.put(format!("{}/fobkt", url)).send().await.unwrap().status(), StatusCode::OK);
+
+    // 1. FULL_OBJECT CRC32 multipart upload
+    let init = c
+        .post(format!("{}/fobkt/fullobj?uploads", url))
+        .header("x-amz-checksum-algorithm", "CRC32")
+        .header("x-amz-checksum-type", "FULL_OBJECT")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(init.status(), StatusCode::OK);
+    assert_eq!(init.headers().get("x-amz-checksum-type").unwrap().to_str().unwrap(), "FULL_OBJECT");
+    let uid = between(&init.text().await.unwrap(), "<UploadId>", "</UploadId>").unwrap().to_string();
+
+    let p1 = vec![b'1'; 1024];
+    let p2 = vec![b'2'; 2048];
+    let c1 = compute_b64(ChecksumAlgorithm::Crc32, &p1);
+    let c2 = compute_b64(ChecksumAlgorithm::Crc32, &p2);
+    let mut full = Vec::new();
+    full.extend_from_slice(&p1);
+    full.extend_from_slice(&p2);
+    let full_crc = compute_b64(ChecksumAlgorithm::Crc32, &full);
+
+    let r1 = c
+        .put(format!("{}/fobkt/fullobj?partNumber=1&uploadId={}", url, uid))
+        .header("x-amz-checksum-crc32", &c1)
+        .body(p1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let e1 = r1.headers().get("etag").unwrap().to_str().unwrap().to_string();
+
+    let r2 = c
+        .put(format!("{}/fobkt/fullobj?partNumber=2&uploadId={}", url, uid))
+        .header("x-amz-checksum-crc32", &c2)
+        .body(p2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let e2 = r2.headers().get("etag").unwrap().to_str().unwrap().to_string();
+
+    let cmp = c
+        .post(format!("{}/fobkt/fullobj?uploadId={}", url, uid))
+        .header("x-amz-checksum-crc32", &full_crc)
+        .body(format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag><ChecksumCRC32>{}</ChecksumCRC32></Part><Part><PartNumber>2</PartNumber><ETag>{}</ETag><ChecksumCRC32>{}</ChecksumCRC32></Part></CompleteMultipartUpload>",
+            e1, c1, e2, c2
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cmp.status(), StatusCode::OK);
+    assert_eq!(cmp.headers().get("x-amz-checksum-crc32").unwrap().to_str().unwrap(), full_crc);
+    assert_eq!(cmp.headers().get("x-amz-checksum-type").unwrap().to_str().unwrap(), "FULL_OBJECT");
+    let cmp_xml = cmp.text().await.unwrap();
+    assert_eq!(between(&cmp_xml, "<ChecksumCRC32>", "</ChecksumCRC32>"), Some(full_crc.as_str()));
+    assert_eq!(between(&cmp_xml, "<ChecksumType>", "</ChecksumType>"), Some("FULL_OBJECT"));
 
     handle.shutdown();
 }

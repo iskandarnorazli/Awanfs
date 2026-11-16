@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Drives a fresh s3-server the way a user does (aws CLI) and keeps the evidence.
-#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing restart (default: all)
+#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata restart (default: all)
 # Needs: a built server (cargo build --release --manifest-path server/Cargo.toml), the aws CLI, curl.
 # Evidence: verification/evidence/<UTC timestamp>/ (kept after cleanup). Exit 0 only if every journey passed.
 set -uo pipefail
@@ -41,11 +41,15 @@ j_buckets() { S3 create-bucket --bucket verify-bkt && S3 list-buckets | grep -q 
   ! S3 create-bucket --bucket ab 2>"$EVID/b.err" && grep -q InvalidBucketName "$EVID/b.err" &&
   S3 create-bucket --bucket verify-gone && echo x >"$EVID/b.bin" && S3 put-object --bucket verify-gone --key k --body "$EVID/b.bin" >/dev/null &&
   ! S3 delete-bucket --bucket verify-gone 2>"$EVID/b.err" && grep -q BucketNotEmpty "$EVID/b.err" &&
+  S3 get-bucket-location --bucket verify-bkt --query LocationConstraint --output text | grep -qx None &&
+  ! S3 create-bucket --bucket verify-loc-bad --create-bucket-configuration LocationConstraint=eu-west-1 2>"$EVID/bl.err" && grep -q InvalidLocationConstraint "$EVID/bl.err" &&
   S3 delete-object --bucket verify-gone --key k && S3 delete-bucket --bucket verify-gone && ! S3 head-bucket --bucket verify-gone 2>/dev/null; }
 j_objects() { local et; head -c 70000 /dev/urandom >"$EVID/obj.bin" &&
   et=$(S3 put-object --bucket verify-bkt --key a/obj --body "$EVID/obj.bin" --query ETag --output text) && [ "$et" = "$(md5q "$EVID/obj.bin")" ] &&
   S3 get-object --bucket verify-bkt --key a/obj "$EVID/obj.out" >/dev/null && same "$EVID/obj.bin" "$EVID/obj.out" &&
   S3 head-object --bucket verify-bkt --key a/obj | grep -q '"ContentLength": 70000' &&
+  ! S3 get-object --bucket verify-bkt --key a/obj --if-none-match "$et" "$EVID/o304.out" 2>"$EVID/o304.err" && grep -qE '304|Not ?Modified' "$EVID/o304.err" &&
+  ! S3 get-object --bucket verify-bkt --key a/obj --if-match '"x"' "$EVID/o412.out" 2>"$EVID/o412.err" && grep -qE '412|PreconditionFailed' "$EVID/o412.err" &&
   : >"$EVID/z.bin" && S3 put-object --bucket verify-bkt --key z --body "$EVID/z.bin" --query ETag --output text | grep -qx '"d41d8cd98f00b204e9800998ecf8427e"' &&
   S3 get-object --bucket verify-bkt --key z "$EVID/z.out" >/dev/null && [ ! -s "$EVID/z.out" ] &&
   S3 delete-object --bucket verify-bkt --key a/obj && ! S3 head-object --bucket verify-bkt --key a/obj 2>/dev/null &&
@@ -71,11 +75,14 @@ j_multipart() { local id e1 e2 et id2; head -c 6000000 /dev/urandom >"$EVID/p1" 
   et=$(S3 complete-multipart-upload --bucket verify-bkt --key mp --upload-id "$id" --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$e1},{\"PartNumber\":2,\"ETag\":$e2}]}" --query ETag --output text) &&
   [ "$et" = "$(mpetag "$EVID/p1" "$EVID/p2")" ] &&
   cat "$EVID/p1" "$EVID/p2" >"$EVID/mp.expect" && S3 get-object --bucket verify-bkt --key mp "$EVID/mp.out" >/dev/null && same "$EVID/mp.expect" "$EVID/mp.out" &&
+  S3 get-object --bucket verify-bkt --key mp --part-number 2 "$EVID/mp-p2.out" >/dev/null && same "$EVID/p2" "$EVID/mp-p2.out" &&
   id2=$(S3 create-multipart-upload --bucket verify-bkt --key mp-gone --query UploadId --output text) &&
   S3 upload-part --bucket verify-bkt --key mp-gone --part-number 1 --upload-id "$id2" --body "$EVID/p2" >/dev/null &&
   S3 upload-part-copy --bucket verify-bkt --key mp-gone --part-number 2 --upload-id "$id2" --copy-source verify-bkt/mp >/dev/null &&
   ! S3 upload-part-copy --bucket verify-bkt --key mp-gone --part-number 3 --upload-id "$id2" --copy-source verify-bkt/missing 2>"$EVID/upc.err" &&
   grep -q NoSuchKey "$EVID/upc.err" &&
+  S3 list-parts --bucket verify-bkt --key mp-gone --upload-id "$id2" --max-parts 1 --no-paginate --query NextPartNumberMarker --output text | grep -qx 1 &&
+  S3 list-parts --bucket verify-bkt --key mp-gone --upload-id "$id2" --max-parts 1 --part-number-marker 1 --no-paginate --query 'Parts[].PartNumber' --output text | grep -qx 2 &&
   S3 abort-multipart-upload --bucket verify-bkt --key mp-gone --upload-id "$id2" &&
   ! S3 list-parts --bucket verify-bkt --key mp-gone --upload-id "$id2" 2>"$EVID/mp.err" && grep -q NoSuchUpload "$EVID/mp.err"; }
 j_copy() { local v1; echo "copy me" >"$EVID/c.bin" && S3 put-object --bucket verify-bkt --key c-src --body "$EVID/c.bin" >/dev/null &&
@@ -103,7 +110,11 @@ j_versioning() { local a b; S3 create-bucket --bucket verify-ver &&
   S3 list-object-versions --bucket verify-ver --query 'length(Versions)' --output text | grep -qx 2 &&
   S3 delete-object --bucket verify-ver --key k >/dev/null && ! S3 head-object --bucket verify-ver --key k 2>/dev/null &&
   S3 list-object-versions --bucket verify-ver --query 'length(DeleteMarkers)' --output text | grep -qx 1 &&
-  S3 get-object --bucket verify-ver --key k --version-id "$b" "$EVID/vb.out" >/dev/null && same "$EVID/v2.bin" "$EVID/vb.out"; }
+  S3 get-object --bucket verify-ver --key k --version-id "$b" "$EVID/vb.out" >/dev/null && same "$EVID/v2.bin" "$EVID/vb.out" &&
+  S3 put-bucket-versioning --bucket verify-ver --versioning-configuration Status=Suspended &&
+  S3 delete-object --bucket verify-ver --key k >/dev/null &&
+  S3 list-object-versions --bucket verify-ver --query 'length(DeleteMarkers)' --output text | grep -qx 2 &&
+  S3 delete-objects --bucket verify-ver --delete "{\"Objects\":[{\"Key\":\"k\",\"VersionId\":\"$a\"}]}" --query 'length(Deleted)' --output text | grep -qx 1; }
 j_listing() { local tok; S3 create-bucket --bucket verify-list && echo x >"$EVID/l.bin" &&
   for k in a/1 a/2 b/1 top; do S3 put-object --bucket verify-list --key "$k" --body "$EVID/l.bin" >/dev/null || return 1; done &&
   [ "$(S3 list-objects-v2 --bucket verify-list --delimiter / --query 'CommonPrefixes[].Prefix' --output text | words)" = "a/ b/ " ] &&
@@ -111,7 +122,36 @@ j_listing() { local tok; S3 create-bucket --bucket verify-list && echo x >"$EVID
   [ "$(S3 list-objects-v2 --bucket verify-list --prefix a/ --query 'Contents[].Key' --output text | words)" = "a/1 a/2 " ] &&
   tok=$(S3 list-objects-v2 --bucket verify-list --max-keys 1 --no-paginate --query NextContinuationToken --output text) &&
   [ -n "$tok" ] && [ "$tok" != None ] &&
-  [ "$(S3 list-objects-v2 --bucket verify-list --max-keys 3 --no-paginate --continuation-token "$tok" --query 'Contents[].Key' --output text | words)" = "a/2 b/1 top " ]; }
+  [ "$(S3 list-objects-v2 --bucket verify-list --max-keys 3 --no-paginate --continuation-token "$tok" --query 'Contents[].Key' --output text | words)" = "a/2 b/1 top " ] &&
+  S3 list-objects-v2 --bucket verify-list --max-keys 0 --no-paginate --query KeyCount --output text | grep -qx 0 &&
+  S3 put-object --bucket verify-list --key "sp key" --body "$EVID/l.bin" >/dev/null &&
+  S3 list-objects-v2 --bucket verify-list --prefix "sp " --encoding-type url --query 'Contents[0].Key' --output text | grep -qx 'sp%20key' &&
+  S3 list-objects --bucket verify-list --max-keys 1 --no-paginate --query 'Contents[0].Owner.ID' --output text | grep -q .; }
+j_tagging() { echo "tagged" >"$EVID/t.bin" &&
+  S3 put-object --bucket verify-bkt --key tag-obj --body "$EVID/t.bin" --tagging "a=1&b=2" >/dev/null &&
+  S3 head-object --bucket verify-bkt --key tag-obj --query TagCount --output text | grep -qx 2 &&
+  S3 get-object-tagging --bucket verify-bkt --key tag-obj --query 'length(TagSet)' --output text | grep -qx 2 &&
+  S3 put-object-tagging --bucket verify-bkt --key tag-obj --tagging 'TagSet=[{Key=c,Value=3}]' &&
+  S3 get-object-tagging --bucket verify-bkt --key tag-obj --query 'TagSet[0].Key' --output text | grep -qx c &&
+  S3 delete-object-tagging --bucket verify-bkt --key tag-obj &&
+  S3 get-object-tagging --bucket verify-bkt --key tag-obj --query 'length(TagSet)' --output text | grep -qx 0; }
+j_cors() { S3 create-bucket --bucket verify-cors && echo "cors" >"$EVID/co.bin" &&
+  S3 put-object --bucket verify-cors --key c --body "$EVID/co.bin" >/dev/null &&
+  S3 put-bucket-cors --bucket verify-cors --cors-configuration '{"CORSRules":[{"AllowedOrigins":["https://example.com"],"AllowedMethods":["GET"]}]}' &&
+  curl -si -X OPTIONS -H "Origin: https://example.com" -H "Access-Control-Request-Method: GET" "$URL/verify-cors/c" | grep -qi "Access-Control-Allow-Origin: https://example.com" &&
+  curl -si -H "Origin: https://example.com" "$URL/verify-cors/c" | grep -qi "Access-Control-Allow-Origin: https://example.com" &&
+  S3 delete-bucket-cors --bucket verify-cors; }
+j_checksums() { local cs; echo "checksum-data" >"$EVID/ck.bin" &&
+  cs=$(S3 put-object --bucket verify-bkt --key ck --body "$EVID/ck.bin" --checksum-algorithm SHA256 --query ChecksumSHA256 --output text) &&
+  [ -n "$cs" ] && [ "$cs" != None ] &&
+  S3 head-object --bucket verify-bkt --key ck --checksum-mode ENABLED --query ChecksumSHA256 --output text | grep -qx "$cs" &&
+  S3 get-object-attributes --bucket verify-bkt --key ck --object-attributes Checksum ObjectSize --query Checksum.ChecksumSHA256 --output text | grep -qx "$cs"; }
+j_metadata() { echo "meta-data" >"$EVID/md.bin" &&
+  S3 put-object --bucket verify-bkt --key md --body "$EVID/md.bin" --metadata owner=alice --cache-control max-age=60 >/dev/null &&
+  S3 head-object --bucket verify-bkt --key md --query 'Metadata.owner' --output text | grep -qx alice &&
+  S3 head-object --bucket verify-bkt --key md --query CacheControl --output text | grep -qx max-age=60 &&
+  S3 copy-object --bucket verify-bkt --key md --copy-source verify-bkt/md --metadata-directive REPLACE --metadata owner=bob >/dev/null &&
+  S3 head-object --bucket verify-bkt --key md --query 'Metadata.owner' --output text | grep -qx bob; }
 j_restart() { local id e1 e2 a; echo "survives" >"$EVID/s.bin" && S3 put-object --bucket verify-bkt --key s --body "$EVID/s.bin" >/dev/null &&
   S3 put-object --bucket verify-bkt --key s-gone --body "$EVID/s.bin" >/dev/null && S3 delete-object --bucket verify-bkt --key s-gone &&
   head -c 5300000 /dev/urandom >"$EVID/sp1" && head -c 700 /dev/urandom >"$EVID/sp2" &&
@@ -136,7 +176,7 @@ masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:
 
 start || exit 1
 check doctor doctor
-features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing restart)
+features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata restart)
 [[ " ${features[*]} " == *" buckets "* ]] || check buckets j_buckets
 for f in "${features[@]}"; do check "$f" "j_$f"; done
 ls -la "$DATA" >"$EVID/data-dir.txt" 2>&1

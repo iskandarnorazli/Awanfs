@@ -120,9 +120,14 @@ fn request_attrs_with_checksum(
         attrs.set_checksum(alg, cksum_type, val);
     }
     if let Some(ce) = headers.get(CONTENT_ENCODING) {
-        let stripped = strip_aws_chunked(valid_header_str(ce, key)?);
-        if !stripped.is_empty() {
-            attrs.set(crate::attrs::TAG_CONTENT_ENCODING, stripped.as_bytes());
+        let raw_ce = valid_header_str(ce, key)?;
+        if crate::auth::is_aws_chunked(headers) {
+            let stripped = strip_aws_chunked(raw_ce);
+            if !stripped.is_empty() {
+                attrs.set(crate::attrs::TAG_CONTENT_ENCODING, stripped.as_bytes());
+            }
+        } else if !raw_ce.is_empty() {
+            attrs.set(crate::attrs::TAG_CONTENT_ENCODING, raw_ce.as_bytes());
         }
     }
     for (hdr, tag) in [
@@ -1792,7 +1797,7 @@ pub async fn get_object_attributes(
         }
         let next_marker = page.last().map(|(n, _, _)| *n).unwrap_or(part_marker);
         xml.push_str("  <ObjectParts>\n");
-        xml.push_str(&format!("    <TotalPartsCount>{}</TotalPartsCount>\n", total));
+        xml.push_str(&format!("    <PartsCount>{}</PartsCount>\n", total));
         xml.push_str(&format!("    <PartNumberMarker>{}</PartNumberMarker>\n", part_marker));
         xml.push_str(&format!("    <NextPartNumberMarker>{}</NextPartNumberMarker>\n", next_marker));
         xml.push_str(&format!("    <MaxParts>{}</MaxParts>\n", max_parts));

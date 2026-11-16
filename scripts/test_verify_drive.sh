@@ -19,6 +19,9 @@ listing_fails_on_a_wrong_early_listing() {
         *"--prefix a/"*)                          printf 'a/1\ta/2\n' ;;
         *"--max-keys 1"*)                         printf 'tok123\n' ;;
         *"--continuation-token"*)                 printf 'a/2\tb/1\ttop\n' ;;
+        *"--max-keys 0"*)                         printf '0\n' ;;
+        *"--encoding-type url"*)                  printf 'sp%%20key\n' ;;
+        *"Owner.ID"*)                             printf 'awan-owner\n' ;;
         *) return 0 ;; esac; }
     ! j_listing ); }
 t listing_fails_on_a_wrong_early_listing
@@ -33,6 +36,9 @@ listing_passes_on_right_answers() {
         *"--prefix a/"*)                          printf 'a/1\ta/2\n' ;;
         *"--max-keys 1"*)                         printf 'tok123\n' ;;
         *"--continuation-token"*)                 printf 'a/2\tb/1\ttop\n' ;;
+        *"--max-keys 0"*)                         printf '0\n' ;;
+        *"--encoding-type url"*)                  printf 'sp%%20key\n' ;;
+        *"Owner.ID"*)                             printf 'awan-owner\n' ;;
         *) return 0 ;; esac; }
     j_listing ); }
 t listing_passes_on_right_answers

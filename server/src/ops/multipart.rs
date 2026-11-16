@@ -9,7 +9,7 @@ use crate::ffi_bridge::{AWAN_FLAG_ACTIVE, AWAN_FLAG_MULTIPART};
 use crate::iam::Iam;
 use crate::meta_index::{unpack_flags, unpack_part_count};
 use crate::multipart::{
-    complete_multipart_upload_result_xml, copy_part_result_xml, encode_extents_manifest,
+    complete_multipart_upload_result_xml_with_checksum, copy_part_result_xml, encode_extents_manifest,
     initiate_multipart_upload_result_xml, list_multipart_uploads_result_xml, list_parts_result_xml,
     ListPartsPage, ListUploadsPage,
 };
@@ -547,6 +547,29 @@ pub async fn complete_multipart_upload(
         .map(|(i, p)| (p.part_number, p.etag, part_cksums.get(i).cloned().flatten()))
         .collect();
 
+    if let Some(cached) = state.multipart.get_completed_result(upload_id) {
+        if cached.bucket == bucket && cached.key == key {
+            let xml = complete_multipart_upload_result_xml_with_checksum(
+                &cached.bucket,
+                &cached.key,
+                &cached.composite_etag,
+                &cached.location,
+                cached.checksum.as_ref().map(|(a, ct, v)| (*a, ct.as_str(), v.as_str())),
+            );
+            let mut resp = Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/xml")
+                .header(ETAG, format!("\"{}\"", cached.composite_etag));
+            if let Some(ref v) = cached.version_id {
+                resp = resp.header("x-amz-version-id", v.as_str());
+            }
+            if let Some((alg, ref ct, ref val)) = cached.checksum {
+                resp = resp.header(alg.header_name(), val.as_str()).header("x-amz-checksum-type", ct.as_str());
+            }
+            return Ok(resp.body(full_body(Bytes::from(xml))).unwrap());
+        }
+    }
+
     let declared_pairs: Vec<(u32, String)> = declared_parts.iter().map(|(n, e, _)| (*n, e.clone())).collect();
     let upload_meta = state.multipart.get_upload(upload_id);
     match state.multipart.prepare_complete(upload_id, &declared_pairs) {
@@ -569,7 +592,19 @@ pub async fn complete_multipart_upload(
                         };
                         part_raws.push(raw);
                     }
-                    let computed = crate::checksum::composite(alg, &part_raws);
+                    let computed = if cksum_type == "FULL_OBJECT" {
+                        let mut full_hasher = crate::checksum::Checksum::new(alg);
+                        for ext in &extents {
+                            let bytes = match state.part_bytes(b_id, ext) {
+                                Ok(b) => b,
+                                Err(e) => return Ok(internal_error_response(key, &format!("could not read part for checksum: {:?}", e))),
+                            };
+                            full_hasher.update(&bytes);
+                        }
+                        full_hasher.finish_base64()
+                    } else {
+                        crate::checksum::composite(alg, &part_raws)
+                    };
                     if let Some(hdr_val) = headers.get(alg.header_name()).and_then(|v| v.to_str().ok()) {
                         if hdr_val.trim() != computed {
                             return Ok(bad_request("BadDigest", "The checksum you specified did not match what we received.", key));
@@ -642,7 +677,24 @@ pub async fn complete_multipart_upload(
             }
 
             let location = format!("http://127.0.0.1:9000/{}/{}", bucket, key);
-            let xml = complete_multipart_upload_result_xml(bucket, key, &composite_etag, &location);
+            state.multipart.record_completed_result(
+                upload_id,
+                crate::multipart::CompletedUploadResult {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    composite_etag: composite_etag.clone(),
+                    location: location.clone(),
+                    version_id: version_id.clone(),
+                    checksum: final_cksum.clone(),
+                },
+            );
+            let xml = complete_multipart_upload_result_xml_with_checksum(
+                bucket,
+                key,
+                &composite_etag,
+                &location,
+                final_cksum.as_ref().map(|(a, ct, v)| (*a, ct.as_str(), v.as_str())),
+            );
             let mut resp = Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, "application/xml")
