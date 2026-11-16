@@ -154,6 +154,17 @@ that overlap another write of the same key. Versioned keys are ordered by versio
 commit, and are never copied. Ordering recovery by a commit stamp instead was weighed and not
 chosen: it changes a recovery rule for every key and makes it depend on the clock. #154.
 
+**Decision 61 (owner, 2026-11-17): a sub-resource AwanFS does not implement answers 501
+`NotImplemented`; it never falls through to another operation, even when that made a test
+pass.** Before #148 a request such as `PUT /bucket?policy`, `?acl`, `?encryption`,
+`?legal-hold` or `?publicAccessBlock` was handled as some other operation and answered 200, so
+a client was told a security setting was applied when it was ignored. 32 ceph s3-tests passed
+that way; commit dde3ca2 removed them from `tests/s3tests/passing.txt` when #148 made them 501.
+The removals stand: the 26 that still fail return with their features (#122 policy and ACLs,
+#121 encryption, #120 object lock, #119 POST object); the other 6 pass again since #115. A test
+leaves `passing.txt` only with a recorded reason and the owner's decision (#220 makes CI check
+it). Restoring the old answers was weighed and refused: it fakes security settings.
+
 **Decision 60 (2026-11-16): bucket configuration lives in `buckets.manifest` as `=` records, read lock-free via a swapped pointer (`#149`).**
 Each bucket holds one immutable `BucketConfig` inside a double-buffered `Arc` snapshot swapped after the manifest append is synced. Writes validate against registered per-kind validators (20 KiB limit for `policy`, 64 KiB otherwise) and step through `fsm::bucket_step`. Dead records are compacted at startup when they outnumber live records.
 
