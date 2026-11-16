@@ -42,16 +42,26 @@ def start(server_bin: str, data_dir: str, budget: str, boot_timeout: float):
     return proc, port, time.monotonic() - t0
 
 
-def client(client_bin: str, mode: str, port: int, objects: int, extra, on_line):
-    """Runs the client; calls on_line(record) for each JSON line it prints. Its stderr goes to
+def client(client_bin: str, mode: str, port: int, objects: int, extra, on_line, out_path):
+    """Runs the client; calls on_line(record) for each JSON line it prints, as it prints it.
+    Its output goes to out_path, which this follows, never to a pipe (#135). Its stderr goes to
     the caller's stderr. Returns its exit code."""
-    proc = subprocess.Popen([client_bin, mode, "--port", str(port), "--objects", str(objects), *extra],
-                            stdout=subprocess.PIPE, text=True)
-    for line in proc.stdout:
-        line = line.strip()
-        if line.startswith("{"):
-            on_line(json.loads(line))
-    return proc.wait()
+    with open(out_path, "w", encoding="utf-8") as sink, open(out_path, encoding="utf-8") as follow:
+        proc = subprocess.Popen([client_bin, mode, "--port", str(port), "--objects", str(objects), *extra],
+                                stdout=sink)
+        pending = ""
+        while True:
+            done = proc.poll() is not None
+            pending += follow.read()
+            *lines, pending = pending.split("\n")
+            for line in lines:
+                line = line.strip()
+                if line.startswith("{"):
+                    on_line(json.loads(line))
+            if done:
+                break
+            time.sleep(0.2)
+        return proc.returncode
 
 
 def run(a) -> list:
@@ -70,7 +80,8 @@ def run(a) -> list:
     proc, port, boot = start(a.server, a.data_dir, a.budget, 60)
     note({"phase": "first_boot", "objects": 0, "boot_secs": round(boot, 2)})
     try:
-        code = client(a.client, "load", port, a.objects, extra, lambda r: keep(proc, r))
+        code = client(a.client, "load", port, a.objects, extra, lambda r: keep(proc, r),
+                      os.path.join(a.data_dir, "client_load.jsonl"))
         if code != 0:
             note({"phase": "load_failed", "exit": code})
             return out
@@ -81,7 +92,8 @@ def run(a) -> list:
     try:
         note({"phase": "restart", "objects": a.objects, "boot_secs": round(boot, 2),
               "server_peak_rss_mib": round(get_process_peak_rss_mb(proc.pid), 1)})
-        client(a.client, "verify", port, a.objects, ["--threads", str(a.threads)], lambda r: keep(proc, r))
+        client(a.client, "verify", port, a.objects, ["--threads", str(a.threads)], lambda r: keep(proc, r),
+               os.path.join(a.data_dir, "client_verify.jsonl"))
     finally:
         proc.kill()
         proc.wait(timeout=60)
