@@ -18,6 +18,7 @@ pub mod ffi_bridge;
 pub mod form_upload;
 pub mod fsm;
 pub mod lifecycle;
+pub mod lifecycle_config;
 pub mod memory;
 pub mod meta_index;
 pub mod metrics;
