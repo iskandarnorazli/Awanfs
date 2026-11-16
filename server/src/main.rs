@@ -238,8 +238,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         state.start_auto_compaction(std::time::Duration::from_secs(600), 0.20, 1 << 30);
     }
     state.start_multipart_cleanup(std::time::Duration::from_secs(600), 7 * lifecycle_day_seconds * 1000);
-        state.start_auto_compaction(std::time::Duration::from_secs(600), 0.20, 1 << 30);
-    }
 
     // TLS (#30, owner decision 18): with --cert and --key the port serves HTTPS only; plain
     // HTTP needs --http-port.
@@ -281,8 +279,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     if !state_for_stop.scheduler.shutdown(std::time::Duration::from_secs(10)).await {
         eprintln!("some background tasks did not finish within 10 s");
-    }
-        eprintln!("some connections were still open after 30 s");
     }
     if let Err(e) = state_for_stop.sync_all_volumes() {
         eprintln!("final sync failed: {:?}", e);
