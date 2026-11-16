@@ -101,12 +101,17 @@ pub(crate) fn version_etag(v: &crate::versions::Version) -> String {
     }
 }
 
-fn no_such_version(key: &str) -> Response<ResponseBody> {
-    let xml = s3_error_xml("NoSuchVersion", "The specified version does not exist.", key, "req-version");
+fn no_such_version(key: &str, head: bool) -> Response<ResponseBody> {
+    let body = if head {
+        empty_body()
+    } else {
+        let xml = s3_error_xml("NoSuchVersion", "The specified version does not exist.", key, "req-version");
+        full_body(Bytes::from(xml))
+    };
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .header(CONTENT_TYPE, "application/xml")
-        .body(full_body(Bytes::from(xml)))
+        .body(body)
         .unwrap()
 }
 
@@ -223,7 +228,7 @@ fn version_get_response(
     let id = match vid {
         Some(s) => match crate::versions::parse_id(s) {
             Some(i) => Some(i),
-            None => return no_such_version(key),
+            None => return no_such_version(key, head),
         },
         None => None,
     };
@@ -233,13 +238,19 @@ fn version_get_response(
             return precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, head);
         }
         if id.is_some() {
-            return no_such_version(key);
+            return no_such_version(key, head);
         }
-        let xml = s3_error_xml("NoSuchKey", "The specified key does not exist.", key, "req-get-obj");
+        let body = if head {
+            empty_body()
+        } else {
+            let xml = s3_error_xml("NoSuchKey", "The specified key does not exist.", key, "req-get-obj");
+            full_body(Bytes::from(xml))
+        };
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(CONTENT_TYPE, "application/xml")
-            .body(full_body(Bytes::from(xml)))
+            .header("x-amz-delete-marker", "false")
+            .body(body)
             .unwrap();
     };
     if v.marker {
@@ -390,10 +401,10 @@ pub async fn copy_object(
     let read = match (&src_vid, &src_meta) {
         (Some(vid), _) => {
             let Some(id) = crate::versions::parse_id(vid) else {
-                return Ok(no_such_version(src_key));
+                return Ok(no_such_version(src_key, false));
             };
             let Some(v) = find_version(&state, src_b_id, src_key, Some(id)) else {
-                return Ok(no_such_version(src_key));
+                return Ok(no_such_version(src_key, false));
             };
             if v.marker {
                 let xml = s3_error_xml(
@@ -894,11 +905,17 @@ pub async fn get_or_head_object(
                 if precondition(headers, None, false) == PreconditionOutcome::PreconditionFailed {
                     return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, is_head));
                 }
-                let xml = s3_error_xml("NoSuchKey", "The specified key does not exist.", key, "req-get-obj");
+                let body = if is_head {
+                    empty_body()
+                } else {
+                    let xml = s3_error_xml("NoSuchKey", "The specified key does not exist.", key, "req-get-obj");
+                    full_body(Bytes::from(xml))
+                };
                 return Ok(Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .header(CONTENT_TYPE, "application/xml")
-                    .body(full_body(Bytes::from(xml)))
+                    .header("x-amz-delete-marker", "false")
+                    .body(body)
                     .unwrap());
             }
         };
@@ -1158,7 +1175,7 @@ pub async fn delete_object(
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     if let Some(vid) = query_map.get("versionId") {
         let Some(id) = crate::versions::parse_id(vid) else {
-            return Ok(no_such_version(key));
+            return Ok(no_such_version(key, false));
         };
         return Ok(match state.delete_version(b_id, key, id).await {
             Ok(removed) => {
