@@ -1,4 +1,5 @@
 pub mod bucket;
+pub mod cors;
 pub mod lifecycle;
 pub mod multipart;
 pub mod object;
@@ -33,6 +34,10 @@ pub enum Operation {
     GetBucketLifecycle,
     PutBucketLifecycle,
     DeleteBucketLifecycle,
+    GetBucketCors,
+    PutBucketCors,
+    DeleteBucketCors,
+    CorsPreflight,
     ListMultipartUploads,
     DeleteObjects,
     PutObject,
@@ -178,6 +183,38 @@ pub const OPS: &[OpSpec] = &[
         requires_existing_bucket: true,
     },
     OpSpec {
+        op: Operation::GetBucketCors,
+        name: "GetBucketCors",
+        iam_action: Some("s3:ListBucket"),
+        acl_permission: AclPermission::Read,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::PutBucketCors,
+        name: "PutBucketCors",
+        iam_action: Some("s3:CreateBucket"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::DeleteBucketCors,
+        name: "DeleteBucketCors",
+        iam_action: Some("s3:DeleteBucket"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::CorsPreflight,
+        name: "CorsPreflight",
+        iam_action: None,
+        acl_permission: AclPermission::Read,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
         op: Operation::ListMultipartUploads,
         name: "ListObjects",
         iam_action: Some("s3:ListBucketMultipartUploads"),
@@ -289,6 +326,7 @@ const BUILT_SUBRESOURCES: &[&str] = &[
     "versioning",
     "versions",
     "lifecycle",
+    "cors",
     "location",
     "uploads",
     "delete",
@@ -301,7 +339,6 @@ const UNBUILT_S3_SUBRESOURCES: &[&str] = &[
     "acl",
     "policy",
     "policyStatus",
-    "cors",
     "encryption",
     "object-lock",
     "legal-hold",
@@ -381,6 +418,10 @@ pub fn classify(
             (&Method::PUT, ["lifecycle"]) => Ok(Operation::PutBucketLifecycle),
             (&Method::GET, ["lifecycle"]) => Ok(Operation::GetBucketLifecycle),
             (&Method::DELETE, ["lifecycle"]) => Ok(Operation::DeleteBucketLifecycle),
+            (&Method::PUT, ["cors"]) => Ok(Operation::PutBucketCors),
+            (&Method::GET, ["cors"]) => Ok(Operation::GetBucketCors),
+            (&Method::DELETE, ["cors"]) => Ok(Operation::DeleteBucketCors),
+            (&Method::OPTIONS, []) => Ok(Operation::CorsPreflight),
             (&Method::GET, ["location"]) => Ok(Operation::GetBucketLocation),
             (&Method::GET, ["uploads"]) => Ok(Operation::ListMultipartUploads),
             (&Method::POST, ["delete"]) => Ok(Operation::DeleteObjects),
@@ -410,6 +451,7 @@ pub fn classify(
             (&Method::DELETE, ["versionId"]) | (&Method::DELETE, []) => Ok(Operation::DeleteObject),
             (_, s) if !s.is_empty() => Err(ClassifyRefusal::NotImplemented("The requested sub-resource is not implemented.")),
             (&Method::PUT, []) => Ok(if has_copy { Operation::CopyObject } else { Operation::PutObject }),
+            (&Method::OPTIONS, []) => Ok(Operation::CorsPreflight),
             _ => Err(ClassifyRefusal::MethodNotAllowed("Method not allowed")),
         },
     }
@@ -531,6 +573,9 @@ pub fn classify_request(req: Request<hyper::body::Incoming>) -> Result<Classifie
 pub fn authenticate(state: &S3ServiceState, c: Classified) -> Result<Authenticated, Response<ResponseBody>> {
     let now_sec = state.clock.now_ns() / 1_000_000_000;
     let iam = state.iam.read().as_ref().map(|r| r.current());
+    if c.op == Operation::CorsPreflight {
+        return Ok(Authenticated { classified: c, principal: Principal::Anonymous, iam });
+    }
     let path = c.parts.uri.path();
     let principal = match crate::auth::authenticate_with(
         &state.auth,
@@ -672,6 +717,10 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         Operation::GetBucketLifecycle => lifecycle::get_bucket_lifecycle(state, bucket).await,
         Operation::PutBucketLifecycle => lifecycle::put_bucket_lifecycle(state, bucket, &path, c.body).await,
         Operation::DeleteBucketLifecycle => lifecycle::delete_bucket_lifecycle(state, bucket).await,
+        Operation::GetBucketCors => cors::get_bucket_cors(state, b_id.unwrap(), bucket).await,
+        Operation::PutBucketCors => cors::put_bucket_cors(state, b_id.unwrap(), bucket, &path, c.body).await,
+        Operation::DeleteBucketCors => cors::delete_bucket_cors(state, b_id.unwrap(), bucket).await,
+        Operation::CorsPreflight => cors::preflight(state, b_id.unwrap(), &path, &c.parts.headers).await,
         Operation::ListMultipartUploads => multipart::list_multipart_uploads(state, bucket).await,
         Operation::DeleteObjects => {
             bucket::delete_objects(state, b_id.unwrap(), bucket, &path, &principal, iam.as_deref(), c.body).await
@@ -719,6 +768,10 @@ mod tests {
             (Operation::GetBucketLifecycle, Method::GET, Some("bkt"), None, "lifecycle", None),
             (Operation::PutBucketLifecycle, Method::PUT, Some("bkt"), None, "lifecycle", None),
             (Operation::DeleteBucketLifecycle, Method::DELETE, Some("bkt"), None, "lifecycle", None),
+            (Operation::GetBucketCors, Method::GET, Some("bkt"), None, "cors", None),
+            (Operation::PutBucketCors, Method::PUT, Some("bkt"), None, "cors", None),
+            (Operation::DeleteBucketCors, Method::DELETE, Some("bkt"), None, "cors", None),
+            (Operation::CorsPreflight, Method::OPTIONS, Some("bkt"), None, "", None),
             (Operation::ListMultipartUploads, Method::GET, Some("bkt"), None, "uploads", None),
             (Operation::DeleteObjects, Method::POST, Some("bkt"), None, "delete", None),
             (Operation::PutObject, Method::PUT, Some("bkt"), Some("obj"), "", None),
@@ -761,6 +814,9 @@ mod tests {
                 hdrs.insert("x-amz-copy-source", c.parse().unwrap());
             }
             let op = classify(&method, b, k, q, &hdrs).unwrap();
+            if op == Operation::CorsPreflight {
+                continue;
+            }
             let new_reqs = iam_requirements(op, b, k, copy);
             let old_reqs = crate::iam::requirements(method.as_str(), b, k, q, copy);
             assert_eq!(new_reqs, old_reqs, "parity mismatch for {:?} ({} ?{})", op, method, q);

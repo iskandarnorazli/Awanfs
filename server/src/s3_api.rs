@@ -2061,6 +2061,16 @@ pub async fn handle_s3_request(
     let bytes_in = content_length(req.headers());
     let is_head = req.method() == Method::HEAD;
     let method = req.method().clone();
+    let cors_origin = req
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let cors_req_method = req
+        .headers()
+        .get("access-control-request-method")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let (bucket, key) = match parse_s3_target(req.uri().path(), host) {
         ParsedTarget::Service => (String::new(), String::new()),
         ParsedTarget::Bucket { bucket } => (bucket, String::new()),
@@ -2089,6 +2099,25 @@ pub async fn handle_s3_request(
     });
     let (resp, error_code) = crate::request_log::with_request_id(request_id.clone(), handle_s3_inner(Arc::clone(&state), req)).instrument(span.clone()).await;
     let mut resp = resp?;
+    if matches!(method, Method::GET | Method::PUT | Method::POST | Method::DELETE | Method::HEAD)
+        && !bucket.is_empty()
+    {
+        if let Some(ref origin) = cors_origin {
+            let b_id = state.engine.read().lookup_bucket(&bucket).ok();
+            let cfg = b_id.and_then(|id| state.bucket_config_reader.load_bucket(id));
+            if let Some(rules) = cfg
+                .as_ref()
+                .and_then(|c| c.get(crate::bucket_config::ConfigKind::Cors))
+                .and_then(|p| p.parsed.as_ref())
+                .and_then(|a| a.downcast_ref::<Vec<crate::cors::CorsRule>>())
+            {
+                let cors_method = cors_req_method.as_deref().unwrap_or(method.as_str());
+                if let Some(answer) = crate::cors::match_actual(rules, origin, cors_method) {
+                    crate::ops::cors::apply_cors_headers(resp.headers_mut(), &answer, false);
+                }
+            }
+        }
+    }
     if let Ok(v) = hyper::header::HeaderValue::from_str(&request_id) {
         resp.headers_mut().insert("x-amz-request-id", v);
     }
