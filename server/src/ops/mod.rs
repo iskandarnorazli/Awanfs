@@ -4,6 +4,7 @@ pub mod lifecycle;
 pub mod multipart;
 pub mod object;
 pub mod service;
+pub mod tagging;
 
 use bytes::Bytes;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST};
@@ -50,6 +51,9 @@ pub enum Operation {
     CompleteMultipartUpload,
     AbortMultipartUpload,
     ListParts,
+    GetObjectTagging,
+    PutObjectTagging,
+    DeleteObjectTagging,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,6 +314,30 @@ pub const OPS: &[OpSpec] = &[
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
+    OpSpec {
+        op: Operation::GetObjectTagging,
+        name: "GetObjectTagging",
+        iam_action: Some("s3:GetObjectTagging"),
+        acl_permission: AclPermission::Read,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::PutObjectTagging,
+        name: "PutObjectTagging",
+        iam_action: Some("s3:PutObjectTagging"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::DeleteObjectTagging,
+        name: "DeleteObjectTagging",
+        iam_action: Some("s3:DeleteObjectTagging"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
 ];
 
 pub fn spec(op: Operation) -> &'static OpSpec {
@@ -333,6 +361,7 @@ const BUILT_SUBRESOURCES: &[&str] = &[
     "uploadId",
     "partNumber",
     "versionId",
+    "tagging",
 ];
 
 const UNBUILT_S3_SUBRESOURCES: &[&str] = &[
@@ -343,7 +372,6 @@ const UNBUILT_S3_SUBRESOURCES: &[&str] = &[
     "object-lock",
     "legal-hold",
     "retention",
-    "tagging",
     "website",
     "notification",
     "replication",
@@ -446,6 +474,9 @@ pub fn classify(
             (&Method::POST, ["uploadId"]) => Ok(Operation::CompleteMultipartUpload),
             (&Method::DELETE, ["uploadId"]) => Ok(Operation::AbortMultipartUpload),
             (&Method::GET, ["uploadId"]) => Ok(Operation::ListParts),
+            (&Method::GET, ["tagging"]) | (&Method::GET, ["tagging", "versionId"]) => Ok(Operation::GetObjectTagging),
+            (&Method::PUT, ["tagging"]) | (&Method::PUT, ["tagging", "versionId"]) => Ok(Operation::PutObjectTagging),
+            (&Method::DELETE, ["tagging"]) | (&Method::DELETE, ["tagging", "versionId"]) => Ok(Operation::DeleteObjectTagging),
             (&Method::GET, ["versionId"]) | (&Method::GET, []) => Ok(Operation::GetObject),
             (&Method::HEAD, ["versionId"]) | (&Method::HEAD, []) => Ok(Operation::HeadObject),
             (&Method::DELETE, ["versionId"]) | (&Method::DELETE, []) => Ok(Operation::DeleteObject),
@@ -745,6 +776,9 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         }
         Operation::AbortMultipartUpload => multipart::abort_multipart_upload(state, b_id.unwrap(), key, &c.query_map).await,
         Operation::ListParts => multipart::list_parts(state, bucket, key, &c.query_map).await,
+        Operation::GetObjectTagging => tagging::get_object_tagging(state, b_id.unwrap(), key, &c.query_map).await,
+        Operation::PutObjectTagging => tagging::put_object_tagging(state, b_id.unwrap(), key, &path, &c.query_map, c.body).await,
+        Operation::DeleteObjectTagging => tagging::delete_object_tagging(state, b_id.unwrap(), key, &c.query_map).await,
     }
 }
 
@@ -784,6 +818,9 @@ mod tests {
             (Operation::CompleteMultipartUpload, Method::POST, Some("bkt"), Some("obj"), "uploadId=u1", None),
             (Operation::AbortMultipartUpload, Method::DELETE, Some("bkt"), Some("obj"), "uploadId=u1", None),
             (Operation::ListParts, Method::GET, Some("bkt"), Some("obj"), "uploadId=u1", None),
+            (Operation::GetObjectTagging, Method::GET, Some("bkt"), Some("obj"), "tagging", None),
+            (Operation::PutObjectTagging, Method::PUT, Some("bkt"), Some("obj"), "tagging", None),
+            (Operation::DeleteObjectTagging, Method::DELETE, Some("bkt"), Some("obj"), "tagging", None),
         ]
     }
 

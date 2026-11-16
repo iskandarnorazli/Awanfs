@@ -329,6 +329,9 @@ pub fn requirements(method: &str, bucket: Option<&str>, key: Option<&str>, query
             let action = match method {
                 "GET" if has("uploadId") => "s3:ListMultipartUploadParts",
                 "DELETE" if has("uploadId") => "s3:AbortMultipartUpload",
+                "GET" if has("tagging") => "s3:GetObjectTagging",
+                "PUT" if has("tagging") => "s3:PutObjectTagging",
+                "DELETE" if has("tagging") => "s3:DeleteObjectTagging",
                 "PUT" | "POST" => "s3:PutObject",
                 "GET" | "HEAD" => "s3:GetObject",
                 "DELETE" => "s3:DeleteObject",

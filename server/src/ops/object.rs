@@ -73,9 +73,27 @@ fn request_attrs(headers: &HeaderMap, key: &str) -> Result<Vec<u8>, Response<Res
     if let Some(ct) = headers.get(CONTENT_TYPE) {
         attrs.set(crate::attrs::TAG_CONTENT_TYPE, ct.as_bytes());
     }
+    if let Some(tagging) = headers.get("x-amz-tagging") {
+        let raw = tagging
+            .to_str()
+            .map_err(|_| bad_request("InvalidTag", "Invalid x-amz-tagging header.", key))?;
+        let tag_set = crate::tagging::parse_tagging_header(raw)
+            .map_err(|r| bad_request(r.code, r.why, key))?;
+        if !tag_set.tags.is_empty() {
+            attrs.set(crate::attrs::TAG_TAGGING, &crate::attrs::encode_tags(&tag_set));
+        }
+    }
     attrs
         .encode()
         .map_err(|_| bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key))
+}
+
+fn with_tagging_count(b: hyper::http::response::Builder, count: usize) -> hyper::http::response::Builder {
+    if count > 0 {
+        b.header("x-amz-tagging-count", count.to_string())
+    } else {
+        b
+    }
 }
 
 pub(crate) fn null_version_of(m: &crate::meta_index::ObjectMeta) -> crate::versions::Version {
@@ -101,7 +119,7 @@ pub(crate) fn version_etag(v: &crate::versions::Version) -> String {
     }
 }
 
-fn no_such_version(key: &str, head: bool) -> Response<ResponseBody> {
+pub(crate) fn no_such_version(key: &str, head: bool) -> Response<ResponseBody> {
     let body = if head {
         empty_body()
     } else {
@@ -145,7 +163,7 @@ pub(crate) fn finish_version_put(
     }
 }
 
-fn find_version(state: &S3ServiceState, b_id: u32, key: &str, id: Option<u64>) -> Option<crate::versions::Version> {
+pub(crate) fn find_version(state: &S3ServiceState, b_id: u32, key: &str, id: Option<u64>) -> Option<crate::versions::Version> {
     let row = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| null_version_of(&m));
     let vs = state.versions.read();
     match id {
@@ -297,12 +315,16 @@ fn version_get_response(
         Ok(view) => view,
         Err(e) => return internal_error_response(key, &format!("could not read the version's attributes: {:?}", e)),
     };
-    let builder = Response::builder()
-        .header(CONTENT_TYPE, view.content_type())
-        .header(ETAG, etag_val)
-        .header(ACCEPT_RANGES, "bytes")
-        .header("x-amz-version-id", v.id_string())
-        .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts));
+    let tag_count = view.attrs.tag_count();
+    let builder = with_tagging_count(
+        Response::builder()
+            .header(CONTENT_TYPE, view.content_type())
+            .header(ETAG, etag_val)
+            .header(ACCEPT_RANGES, "bytes")
+            .header("x-amz-version-id", v.id_string())
+            .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts)),
+        tag_count,
+    );
     if let Some(h) = range {
         match parse_range_header(h, v.size) {
             Ok(Some(r)) => {
@@ -926,6 +948,7 @@ pub async fn get_or_head_object(
         Ok(v) => v,
         Err(e) => return Ok(internal_error_response(key, &format!("could not read the object's attributes: {:?}", e))),
     };
+    let tag_count = view.attrs.tag_count();
     let is_compressed = unpack_flags(meta.bucket_flags) & crate::meta_index::FLAG_COMPRESSED != 0;
 
     let etag_val = format_object_etag(meta.etag_hi, meta.etag_lo, is_multipart, unpack_part_count(meta.bucket_flags));
@@ -960,14 +983,14 @@ pub async fn get_or_head_object(
                         Ok(b) => b,
                         Err(e) => return Ok(internal_error_response(key, &format!("could not read the object: {:?}", e))),
                     };
-                    return Ok(Response::builder()
+                    return Ok(with_tagging_count(Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
                         .header(CONTENT_TYPE, view.content_type())
                         .header(ETAG, etag_val)
                         .header(ACCEPT_RANGES, "bytes")
                         .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
                         .header(CONTENT_LENGTH, len.to_string())
-                        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
+                        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count)
                         .body(body.boxed())
                         .unwrap());
                 }
@@ -1018,14 +1041,14 @@ pub async fn get_or_head_object(
                             if chunks.iter().map(|c| c.len() as u64).sum::<u64>() != range.end - range.start + 1 {
                                 return Ok(internal_error_response(key, "a part of the object is missing"));
                             }
-                            return Ok(Response::builder()
+                            return Ok(with_tagging_count(Response::builder()
                                 .status(StatusCode::PARTIAL_CONTENT)
                                 .header(CONTENT_TYPE, view.content_type())
                                 .header(ETAG, etag_val)
                                 .header(ACCEPT_RANGES, "bytes")
                                 .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
                                 .header(CONTENT_LENGTH, (range.end - range.start + 1).to_string())
-                                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
+                                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count)
                                 .body(ChunksBody(chunks).boxed())
                                 .unwrap());
                         }
@@ -1058,14 +1081,14 @@ pub async fn get_or_head_object(
                 let content_range = format!("bytes {}-{}/{}", range.start, range.end, meta.size);
                 let body = if is_head { empty_body() } else { full_body(sub_bytes) };
 
-                return Ok(Response::builder()
+                return Ok(with_tagging_count(Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
                     .header(CONTENT_TYPE, view.content_type())
                     .header(ETAG, etag_val)
                     .header(ACCEPT_RANGES, "bytes")
                     .header(CONTENT_RANGE, content_range)
                     .header(CONTENT_LENGTH, (range.end - range.start + 1).to_string())
-                    .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
+                    .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count)
                     .body(body)
                     .unwrap());
             }
@@ -1100,13 +1123,13 @@ pub async fn get_or_head_object(
         if chunks.iter().map(|c| c.len() as u64).sum::<u64>() != meta.size {
             return Ok(internal_error_response(key, "a part of the object is missing"));
         }
-        return Ok(Response::builder()
+        return Ok(with_tagging_count(Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, view.content_type())
             .header(ETAG, etag_val)
             .header(ACCEPT_RANGES, "bytes")
             .header(CONTENT_LENGTH, meta.size.to_string())
-            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
+            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count)
             .body(ChunksBody(chunks).boxed())
             .unwrap());
     }
@@ -1124,13 +1147,13 @@ pub async fn get_or_head_object(
             Ok(b) => b,
             Err(e) => return Ok(internal_error_response(key, &format!("could not read the object: {:?}", e))),
         };
-        return Ok(Response::builder()
+        return Ok(with_tagging_count(Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, view.content_type())
             .header(ETAG, etag_val)
             .header(ACCEPT_RANGES, "bytes")
             .header(CONTENT_LENGTH, meta.size.to_string())
-            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
+            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count)
             .body(body.boxed())
             .unwrap());
     }
@@ -1156,13 +1179,13 @@ pub async fn get_or_head_object(
         return Ok(internal_error_response(key, "the object's bytes could not be read or failed verification"));
     }
     let body = if is_head { empty_body() } else { full_body(payload) };
-    Ok(Response::builder()
+    Ok(with_tagging_count(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, view.content_type())
         .header(ETAG, etag_val)
         .header(ACCEPT_RANGES, "bytes")
         .header(CONTENT_LENGTH, meta.size.to_string())
-        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
+        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count)
         .body(body)
         .unwrap())
 }

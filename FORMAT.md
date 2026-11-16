@@ -77,6 +77,7 @@ A tag number is never reused. 0x8000 and above are for tests.
 | Tag | Name | Group | Owner |
 |---|---|---|---|
 | 0x0001 | Content-Type, as sent | headers (write-time) | #150 |
+| 0x0010 | Object tags (`TagSet`) | tagging (mutable) | #115 |
 
 ## Journal record (`.idx`, 42 bytes)
 
