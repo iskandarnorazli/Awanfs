@@ -34,6 +34,8 @@ pub const INVALID_BUCKET_STATE: Refusal = refuse("InvalidBucketState", 409);
 pub const MALFORMED_XML: Refusal = refuse("MalformedXML", 400);
 pub const ACCESS_DENIED: Refusal = refuse("AccessDenied", 403);
 pub const INVALID_ARGUMENT: Refusal = refuse("InvalidArgument", 400);
+pub const INVALID_BUCKET_NAME: Refusal = refuse("InvalidBucketName", 400);
+pub const KEY_TOO_LONG: Refusal = refuse("KeyTooLongError", 400);
 
 /// Bucket versioning (`PUT ?versioning`).
 ///
