@@ -44,7 +44,7 @@ Owner decisions after the 2026-11-12 unattended run (#64-#83), each the recommen
 | 20 | **On-disk format:** refuse a newer version; read older versions as they are; write new volumes in the new format. No in-place upgrade. | #50 |
 | 21 | **Versioning** after #50 and #53. | #31 |
 | 22 | **Compression:** zstd level 1, enabled per bucket in the TOML config. | #51 |
-| 23 | **Metadata scale:** close #13 if the redb spill meets its gate; #26 waits as `unmeasured` until a deployment needs over 100M objects. Superseded by decision 59: #26 is built to replace the redb spill once #207 measures it. | #13, #26, #207 |
+| 23 | **Metadata scale:** close #13 if the redb spill meets its gate; #26 waits as `unmeasured` until a deployment needs over 100M objects. Superseded by decision 59: #207 measured it (go, owner 2026-11-16), and #26 is built to replace the redb spill. | #13, #26, #207 |
 | 24 | **Compaction I/O:** token-bucket limit (50 MB/s, configurable); copy-on-write cloning only after a measurement. | #28 |
 | 25 | **Multi-node:** #15 closed as a duplicate of #27; the #52 design note after Phase 2; no code yet. | #15, #27, #52 |
 | 26 | **Benchmark hardware:** the owner's machine as a self-hosted runner (`benchmarks/RUNNER.md`); paid runners only for published numbers. | #58 |
@@ -155,7 +155,7 @@ commit, and are never copied. Ordering recovery by a commit stamp instead was we
 chosen: it changes a recovery rule for every key and makes it depend on the clock. #154.
 
 **Decision 59 (owner, 2026-11-16): the metadata index past the in-memory hot set is AwanFS's
-own sorted segments, not redb, if a measurement at 10M keys confirms it.** AwanFS uses none of
+own sorted segments, not redb. A measurement at 10M keys confirmed it (#207, go below).** AwanFS uses none of
 what redb is built for. The volumes are the record, every boot clears `metadata.db` and rebuilds
 it from them, and its commits skip fsync. What it uses is a sorted map on disk, with a 64 MiB
 page cache outside `--memory-budget` (#206) and one copy-on-write write transaction per PUT of a
@@ -167,10 +167,30 @@ spilled key. The segments of #26 do that job:
 - compaction that merges runs and drops dead rows.
 They borrow awan-lang's flat-memory designs: the 64-byte row as stored, columns within a block,
 and SIMD search over keys. awan-lang's own collections (`awan-db`, `awan-cache`, the OLC B+tree
-of its #216) are in memory and in Awan, so none of their code is reused. Order: #207 measures
-redb against a segment prototype (insert rate, reads per lookup, peak RSS, boot time). Go builds
-#26 and removes `redb`; no-go keeps redb with #206's fix. Until then nothing changes, and redb
-stays.
+of its #216) are in memory and in Awan, so none of their code is reused.
+
+**Go (owner, 2026-11-16, after #207).** At 10M keys on Linux and Windows (run 43739116538,
+`measurements/2026-11-16-metadata-index-redb-vs-segments.md`), with identical answers from both
+stores:
+- the prototype inserted 435K to 521K keys per second against redb's 1,700 to 2,389;
+- boot is 0.02 to 0.04 s from its files, against a 70 to 98 minute redb rebuild;
+- it used 1.19 GB of disk against 2.16 GB;
+- a lookup took 1.05 read calls against 1.38, and a lookup of an absent key 0.11 against 1.56;
+- peak RSS while querying was 56 to 57 MiB against 79 to 95.
+
+It lost on peak RSS while building (378 to 467 MiB against 66 to 87) and on warm prefix scans
+(1.14x to 1.36x slower). Both come from the prototype's shortcuts: a 1M-row memtable, whole
+segments buffered before writing, and no compaction. So #26 is built to replace redb, and its
+gate requires that the production segments do not lose either:
+- peak RSS while building at most redb's, with the memtable inside `--memory-budget` and
+  segments written as a stream;
+- prefix scans after compaction at least as fast as redb's on both platforms;
+- at most 1.1 read calls per present lookup and 0.15 per absent one;
+- boot at 10M keys under 1 s;
+- a run with concurrent writers.
+
+redb stays until #26 lands. #206 still applies until then. #208 (every spilled key also held
+in heap) goes away with redb.
 
 **Decision 58 (owner, 2026-11-16): stored data is read with positioned reads, not through
 mappings, wherever the bytes could grow without bound.** Pages read through a mapping stay

@@ -1,0 +1,89 @@
+name: Metadata index (experiment)
+
+# #207, decision 59: the metadata index at 10M keys, redb as AwanFS uses it (spill::SpillIndex)
+# against a segment prototype (server/examples/meta_index_bench.rs). An experiment with no
+# baseline: it fails only when the two stores did not answer alike or a phase did not run.
+
+on:
+  # A new workflow can be dispatched only once it is on the default branch; until then a push
+  # to the measurement branch runs it with the default inputs.
+  push:
+    branches: [ "measure/207-*" ]
+    paths:
+      - "server/examples/meta_index_bench.rs"
+      - "benchmarks/meta_index_report.py"
+      - ".github/workflows/bench-metaindex.yml"
+  workflow_dispatch:
+    inputs:
+      keys:
+        description: "Keys to insert"
+        default: "10000000"
+      gets:
+        description: "Gets of present keys, and as many of absent ones"
+        default: "1000000"
+      scans:
+        description: "Prefix scans of up to 1000 keys"
+        default: "1000"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: meta index (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      - name: Self-tests
+        run: python benchmarks/test_meta_index_report.py
+
+      - name: Build the benchmark
+        run: cargo build --locked --release --example meta_index_bench --manifest-path server/Cargo.toml
+
+      - name: Run it
+        shell: bash
+        env:
+          KEYS: ${{ inputs.keys || '10000000' }}
+          GETS: ${{ inputs.gets || '1000000' }}
+          SCANS: ${{ inputs.scans || '1000' }}
+          # The runner's temp directory: on Windows it is on the fast disk (D:), see AGENTS.md.
+          DATA: ${{ runner.temp }}/meta
+        run: |
+          set -euo pipefail
+          bin=server/target/release/examples/meta_index_bench
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          out=results.jsonl
+          : > "$out"
+          for s in redb seg; do
+            "$bin" build --store "$s" --dir "$DATA/$s" --keys "$KEYS" | tee -a "$out"
+            if [ "$RUNNER_OS" = "Linux" ]; then
+              # A cold open: nothing of the index in the page cache.
+              sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+              "$bin" query --store "$s" --dir "$DATA/$s" --keys "$KEYS" --gets "$GETS" --scans "$SCANS" \
+                | sed 's/"phase":"query"/"phase":"query_cold"/' | tee -a "$out"
+            fi
+            "$bin" query --store "$s" --dir "$DATA/$s" --keys "$KEYS" --gets "$GETS" --scans "$SCANS" | tee -a "$out"
+          done
+          set +e
+          python benchmarks/meta_index_report.py "$out" --title "Metadata index at $KEYS keys: redb against segments ($RUNNER_OS)" --report meta_index.md
+          code=$?
+          [ -f meta_index.md ] && cat meta_index.md >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: meta-index-${{ matrix.os }}
+          path: |
+            results.jsonl
+            meta_index.md
+          if-no-files-found: ignore
