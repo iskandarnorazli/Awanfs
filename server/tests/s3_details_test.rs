@@ -252,3 +252,30 @@ async fn expect_100_continue_valid_and_rejected_before_body() {
 
     handle.shutdown();
 }
+
+/// An `Expect` value other than `100-continue` is not refused: ceph s3-tests
+/// `test_{bucket,object}_create_bad_expect_{mismatch,empty}` send `Expect: 200` and an empty
+/// `Expect` and expect the request to succeed. Run 43845822284 found these four tests, listed
+/// in passing.txt, answered 417 ExpectationFailed (#140's commit d788491 added the refusal;
+/// the issue asked only that a refused request skip `100 Continue`).
+#[tokio::test]
+async fn other_expect_values_are_not_refused() {
+    let (base_url, _addr, _state, handle) = spawn_with_region("us-east-1", AuthConfig::open()).await;
+    let c = reqwest::Client::new();
+    for (i, expect) in ["200", ""].iter().enumerate() {
+        let bucket = format!("expect-bkt-{}", i);
+        let res = c.put(format!("{}/{}", base_url, bucket)).header("Expect", *expect).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "CreateBucket with Expect {:?}: {}", expect, res.text().await.unwrap());
+        let res = c
+            .put(format!("{}/{}/k", base_url, bucket))
+            .header("Expect", *expect)
+            .body("bar")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "PutObject with Expect {:?}: {}", expect, res.text().await.unwrap());
+        let got = c.get(format!("{}/{}/k", base_url, bucket)).send().await.unwrap().text().await.unwrap();
+        assert_eq!(got, "bar");
+    }
+    handle.shutdown();
+}

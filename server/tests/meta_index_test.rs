@@ -256,3 +256,17 @@ fn test_c_abi_ffi_panic_safety() {
         awan_storage_destroy(engine_ptr);
     }
 }
+
+/// `put_object` without a time (the path `s3_storage_index_put` takes) stamps the current
+/// time, as it did before #158. #158 made it pass 0, and lifecycle expiry compares
+/// `created_at + ttl` with now, so such objects would expire on the next pass.
+#[test]
+fn put_object_without_a_time_stamps_the_current_time() {
+    let mut engine = AwanStorageEngine::new(1000, 4096, 65536);
+    let b = engine.create_bucket("stamped").unwrap();
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    engine.put_object(b, b"k", 4096, 10, 1, 2, 0, 1).unwrap();
+    let after = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let m = engine.get_object(b, b"k").unwrap();
+    assert!(m.created_at >= before && m.created_at <= after, "created_at {} not in [{}, {}]", m.created_at, before, after);
+}
