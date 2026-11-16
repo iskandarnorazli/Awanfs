@@ -6,7 +6,6 @@ pub mod bucket_config;
 pub mod cache;
 pub mod clock;
 pub mod cluster;
-pub mod cluster;
 pub mod coalesce;
 pub mod compaction;
 pub mod compress;
