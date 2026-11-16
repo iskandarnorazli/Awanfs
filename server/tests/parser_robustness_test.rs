@@ -271,3 +271,12 @@ fn parse_s3_target_leading_slash_key_fuzz_regression() {
         }
     );
 }
+
+#[test]
+fn parse_s3_target_vhost_slash_in_host_does_not_yield_slash_bucket() {
+    use s3_server::ParsedTarget;
+    let parsed = parse_s3_target("ue3", Some("skc/.localhost"));
+    if let ParsedTarget::Bucket { bucket } | ParsedTarget::Object { bucket, .. } = parsed {
+        assert!(!bucket.contains('/'), "bucket must not contain '/': {:?}", bucket);
+    }
+}

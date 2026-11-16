@@ -413,7 +413,7 @@ pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarge
         let host_no_port = host.split(':').next().unwrap_or(host);
         for base in &["s3.localhost", "localhost", "s3.internal", "s3.amazonaws.com", "127.0.0.1"] {
             if let Some(prefix) = host_no_port.strip_suffix(base).and_then(|p| p.strip_suffix('.')) {
-                if !prefix.is_empty() && !prefix.contains('.') {
+                if !prefix.is_empty() && !prefix.contains('.') && !prefix.contains('/') {
                     let bucket = prefix.to_string();
                     if trimmed_path.is_empty() {
                         return ParsedTarget::Bucket { bucket };
