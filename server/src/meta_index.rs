@@ -202,7 +202,8 @@ pub type AwanStorageEngine = StorageEngine;
 /// Milliseconds since the epoch, for the callers of `put_object` that pass no time (the FFI
 /// path). Before #158 every insert read it here; the server's own paths pass their clock's.
 fn wall_clock_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    use crate::clock::Clock;
+    crate::clock::SystemClock.now_ns() / 1_000_000
 }
 
 impl StorageEngine {
