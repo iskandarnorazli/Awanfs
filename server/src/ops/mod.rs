@@ -719,6 +719,16 @@ pub fn validate(a: Authorized) -> Result<Validated, Response<ResponseBody>> {
     if declared.is_some_and(|n| n > body_limit) {
         return Err(entity_too_large(c.parts.uri.path(), body_limit));
     }
+    if let Some(expect) = c.parts.headers.get(hyper::header::EXPECT).and_then(|v| v.to_str().ok()) {
+        if !expect.trim().eq_ignore_ascii_case("100-continue") {
+            let xml = s3_error_xml("ExpectationFailed", "Expectation Failed", c.parts.uri.path(), "req-expect");
+            return Err(Response::builder()
+                .status(StatusCode::EXPECTATION_FAILED)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(full_body(Bytes::from(xml)))
+                .unwrap());
+        }
+    }
 
     Ok(Validated { authorized: a })
 }
@@ -736,13 +746,13 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
 
     match c.op {
         Operation::ListBuckets => service::list_buckets(state).await,
-        Operation::CreateBucket => bucket::create_bucket(state, bucket).await,
+        Operation::CreateBucket => bucket::create_bucket(state, bucket, &path, &principal, c.body).await,
         Operation::DeleteBucket => bucket::delete_bucket(state, b_id.unwrap(), bucket).await,
         Operation::HeadBucket => bucket::head_bucket().await,
         Operation::ListObjects => bucket::list_objects(state, b_id.unwrap(), bucket, &c.query_map, false).await,
         Operation::ListObjectsV2 => bucket::list_objects(state, b_id.unwrap(), bucket, &c.query_map, true).await,
         Operation::ListObjectVersions => bucket::list_object_versions(state, b_id.unwrap(), bucket, &c.query_map).await,
-        Operation::GetBucketLocation => bucket::get_bucket_location().await,
+        Operation::GetBucketLocation => bucket::get_bucket_location(state).await,
         Operation::GetBucketVersioning => bucket::get_bucket_versioning(state, b_id.unwrap()).await,
         Operation::PutBucketVersioning => bucket::put_bucket_versioning(state, b_id.unwrap(), bucket, &path, c.body).await,
         Operation::GetBucketLifecycle => lifecycle::get_bucket_lifecycle(state, bucket).await,

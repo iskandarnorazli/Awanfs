@@ -92,16 +92,153 @@ fn decode_hex_token(t: &str) -> Option<Vec<u8>> {
     (0..t.len()).step_by(2).map(|i| u8::from_str_radix(t.get(i..i + 2)?, 16).ok()).collect()
 }
 
+fn parse_create_bucket_location(body: &[u8]) -> Result<Option<String>, &'static str> {
+    let text = match std::str::from_utf8(body) {
+        Ok(s) => s.trim(),
+        Err(_) => return Err("MalformedXML"),
+    };
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let mut reader = quick_xml::Reader::from_str(text);
+    reader.config_mut().trim_text(true);
+    let mut root_seen = false;
+    let mut in_location = false;
+    let mut location: Option<String> = None;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                let name = e.local_name();
+                if !root_seen {
+                    if name.as_ref() != b"CreateBucketConfiguration" {
+                        return Err("MalformedXML");
+                    }
+                    root_seen = true;
+                } else if name.as_ref() == b"LocationConstraint" {
+                    in_location = true;
+                }
+            }
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                let name = e.local_name();
+                if !root_seen && name.as_ref() != b"CreateBucketConfiguration" {
+                    return Err("MalformedXML");
+                }
+                if name.as_ref() == b"CreateBucketConfiguration" {
+                    root_seen = true;
+                }
+            }
+            Ok(quick_xml::events::Event::Text(e)) => {
+                if in_location {
+                    let t = e.unescape().map_err(|_| "MalformedXML")?.into_owned();
+                    location = Some(t);
+                }
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                if e.local_name().as_ref() == b"LocationConstraint" {
+                    in_location = false;
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => return Err("MalformedXML"),
+            _ => {}
+        }
+    }
+    if !root_seen {
+        return Err("MalformedXML");
+    }
+    Ok(location)
+}
+
 pub async fn create_bucket(
     state: Arc<S3ServiceState>,
     bucket: &str,
+    path: &str,
+    principal: &Principal,
+    body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
+    if let Err(refusal) = crate::names::validate_bucket_name(bucket) {
+        let xml = s3_error_xml(refusal.code, "The specified bucket is not valid.", bucket, "req-b-err");
+        return Ok(Response::builder()
+            .status(StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::BAD_REQUEST))
+            .header(CONTENT_TYPE, "application/xml")
+            .body(full_body(Bytes::from(xml)))
+            .unwrap());
+    }
+
+    let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_XML_BODY, None, state.body_idle_timeout(), path).await? {
+        Ok(b) => b,
+        Err(resp) => return Ok(resp),
+    };
+    match parse_create_bucket_location(&body_bytes) {
+        Ok(Some(loc)) if !loc.is_empty() && loc != state.region => {
+            return Ok(bad_request(
+                "InvalidLocationConstraint",
+                "The specified location-constraint is not valid",
+                bucket,
+            ));
+        }
+        Ok(_) => {}
+        Err(code) => {
+            return Ok(bad_request(
+                code,
+                "The XML you provided was not well-formed or did not validate against our published schema.",
+                bucket,
+            ));
+        }
+    }
+
+    let caller_owner = match principal {
+        Principal::User(ak) => ak.as_str(),
+        Principal::Root => "root",
+        Principal::Anonymous => "",
+    };
+
     let mut engine = state.engine.write();
+    if let Ok(existing_id) = engine.lookup_bucket(bucket) {
+        let existing_owner = state
+            .bucket_config_reader
+            .load_bucket(existing_id)
+            .map(|c| c.owner.clone())
+            .unwrap_or_default();
+        let same_owner = existing_owner == caller_owner || (existing_owner.is_empty() && caller_owner == "root");
+        let step = crate::fsm::bucket_step(
+            crate::fsm::BucketState {
+                status: crate::fsm::BucketStatus::Active,
+                owner_id: 0,
+                configs: 0,
+            },
+            crate::fsm::BucketEvent::Create {
+                caller_id: if same_owner { 0 } else { 1 },
+                is_us_east_1: state.region == "us-east-1",
+            },
+        );
+        return match step {
+            Ok(_) => Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_LENGTH, "0")
+                .body(empty_body())
+                .unwrap()),
+            Err(refusal) => {
+                let msg = if refusal == crate::fsm::BUCKET_ALREADY_OWNED_BY_YOU {
+                    "Your previous request to create the named bucket succeeded and you already own it."
+                } else {
+                    "The requested bucket name is not available. The bucket namespace is shared by all users of the system. Please select a different name and try again."
+                };
+                let xml = s3_error_xml(refusal.code, msg, bucket, "req-b-err");
+                Ok(Response::builder()
+                    .status(StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::CONFLICT))
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(full_body(Bytes::from(xml)))
+                    .unwrap())
+            }
+        };
+    }
+
     match engine.create_bucket(bucket) {
         Ok(id) => {
             let created_ns = state.clock.now_ns();
             state.bucket_created_ns.write().insert(id, created_ns);
-            let _ = state.bucket_configs.lock().apply_bucket_create(id, bucket, created_ns, "", "");
+            let _ = state.bucket_configs.lock().apply_bucket_create(id, bucket, created_ns, caller_owner, "");
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_LENGTH, "0")
@@ -179,8 +316,9 @@ pub async fn delete_bucket(
     }
 }
 
-pub async fn get_bucket_location() -> Result<Response<ResponseBody>, hyper::Error> {
-    let xml = location_constraint_xml("us-east-1");
+pub async fn get_bucket_location(state: Arc<S3ServiceState>) -> Result<Response<ResponseBody>, hyper::Error> {
+    let loc = if state.region == "us-east-1" { "" } else { state.region.as_str() };
+    let xml = location_constraint_xml(loc);
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/xml")

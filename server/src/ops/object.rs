@@ -590,6 +590,16 @@ pub async fn put_object(
     let expected_len = headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok());
     let is_chunked = crate::auth::is_aws_chunked(headers);
     let content_md5_hdr = headers.get("content-md5").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+    if let Some(ref content_md5) = content_md5_hdr {
+        if !crate::bucket_config::base64_decode(content_md5).is_ok_and(|b| b.len() == 16) {
+            let xml = s3_error_xml("InvalidDigest", "The Content-MD5 you specified was invalid.", key, "req-bad-digest");
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(full_body(Bytes::from(xml)))
+                .unwrap());
+        }
+    }
     let signed_headers = headers.clone();
     let put_attrs = match request_attrs(&signed_headers, key) {
         Ok(a) => a,

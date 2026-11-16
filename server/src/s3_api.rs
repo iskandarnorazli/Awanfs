@@ -563,7 +563,7 @@ pub fn validate_s3_key(key: &str) -> Result<(), crate::error::S3ErrorCode> {
     if key.is_empty() {
         return Err(crate::error::S3ErrorCode::InvalidObjectName);
     }
-    if key.len() > 1024 {
+    if crate::names::validate_object_key(key).is_err() {
         return Err(crate::error::S3ErrorCode::KeyTooLongError);
     }
     for b in key.bytes() {
@@ -669,6 +669,8 @@ pub struct S3ServiceState {
     pub header_idle_timeout_ms: Arc<AtomicU64>,
     /// Idle timeout between consecutive request body frames (#187).
     pub body_idle_timeout_ms: Arc<AtomicU64>,
+    /// Configured S3 region (default `"us-east-1"`, `--region`) (#140).
+    pub region: String,
 }
 
 impl S3ServiceState {
@@ -746,6 +748,7 @@ impl S3ServiceState {
             body_idle_timeout_ms: Arc::new(AtomicU64::new(
                 crate::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT.as_millis() as u64,
             )),
+            region: "us-east-1".to_string(),
         }
     }
 
@@ -1008,6 +1011,7 @@ impl S3ServiceState {
             body_idle_timeout_ms: Arc::new(AtomicU64::new(
                 crate::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT.as_millis() as u64,
             )),
+            region: "us-east-1".to_string(),
         })
     }
 

@@ -56,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut memory_budget: Option<String> = None;
     let mut lifecycle_day_seconds: u64 = 86_400;
     let mut body_idle_timeout = s3_server::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT;
+    let mut region = std::env::var("AWANFS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -107,6 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     eprintln!("--body-idle-timeout: {}", e);
                     std::process::exit(2);
                 }
+            }
+        } else if arg == "--region" {
+            if let Some(r) = args.next() {
+                region = r;
             }
         } else if arg == "--allow-anonymous" {
             allow_anonymous = true;
@@ -193,6 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None => S3ServiceState::new(),
     };
     state.auth = auth;
+    state.region = region;
     if let Some(r) = iam {
         r.watch(std::time::Duration::from_secs(60));
         *state.iam.write() = Some(r);
