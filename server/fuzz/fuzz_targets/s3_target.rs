@@ -77,16 +77,17 @@ fuzz_target!(|data: &[u8]| {
         ParsedTarget::Object { bucket: bucket.clone(), key: key.clone() }
     );
 
-    // Virtual-host-style round-trip
+    // Virtual-host-style round-trip (`parse_s3_target` trims leading `/` from URI path).
     let vhost = format!("{}.s3.amazonaws.com", bucket);
     assert_eq!(
         parse_s3_target("/", Some(&vhost)),
         ParsedTarget::Bucket { bucket: bucket.clone() }
     );
-    if !key.is_empty() {
+    let vhost_key = key.trim_start_matches('/');
+    if !vhost_key.is_empty() {
         assert_eq!(
             parse_s3_target(&format!("/{}", encoded_key), Some(&vhost)),
-            ParsedTarget::Object { bucket, key }
+            ParsedTarget::Object { bucket, key: vhost_key.to_string() }
         );
     }
 });

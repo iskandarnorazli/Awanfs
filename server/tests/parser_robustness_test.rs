@@ -252,3 +252,22 @@ fn traceparent_enforces_w3c_grammar_without_panicking() {
         assert_eq!(s3_server::trace::parse_traceparent(bad), None, "{:?}", bad);
     }
 }
+
+#[test]
+fn parse_s3_target_leading_slash_key_fuzz_regression() {
+    use s3_server::ParsedTarget;
+    assert_eq!(
+        parse_s3_target("/a991//%EF%BF%BD1/%7Fm%00%26%EF%BF%BD", None),
+        ParsedTarget::Object {
+            bucket: "a991".into(),
+            key: "/\u{fffd}1/\x7fm\0&\u{fffd}".into(),
+        }
+    );
+    assert_eq!(
+        parse_s3_target("//%EF%BF%BD1/%7Fm%00%26%EF%BF%BD", Some("a991.s3.amazonaws.com")),
+        ParsedTarget::Object {
+            bucket: "a991".into(),
+            key: "\u{fffd}1/\x7fm\0&\u{fffd}".into(),
+        }
+    );
+}
