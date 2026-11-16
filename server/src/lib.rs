@@ -3,6 +3,7 @@
 
 pub mod aws_chunked;
 pub mod cache;
+pub mod checksum;
 pub mod cluster;
 pub mod coalesce;
 pub mod compaction;
