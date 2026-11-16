@@ -32,6 +32,7 @@ pub struct PartExtent {
     pub ref_count: u32,
     pub raw_md5: [u8; 16],
     pub staged_path: Option<PathBuf>,
+    pub checksum: Option<(crate::checksum::ChecksumAlgorithm, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +46,7 @@ pub struct StagedPart {
     pub raw_md5: [u8; 16],
     pub uploaded_at: u64,
     pub staged_path: Option<PathBuf>,
+    pub checksum: Option<(crate::checksum::ChecksumAlgorithm, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +57,8 @@ pub struct MultipartUpload {
     pub key: String,
     pub initiated_at: u64,
     pub parts: BTreeMap<u32, StagedPart>,
+    pub checksum_alg: Option<crate::checksum::ChecksumAlgorithm>,
+    pub checksum_type: Option<String>,
 }
 
 pub struct MultipartManager {
@@ -184,6 +188,8 @@ impl MultipartManager {
             key: key.to_string(),
             initiated_at: now_ms,
             parts: BTreeMap::new(),
+            checksum_alg: None,
+            checksum_type: None,
         };
 
         self.uploads.write().insert(upload_id.clone(), upload);
@@ -218,6 +224,21 @@ impl MultipartManager {
         self.uploads.read().get(upload_id).cloned()
     }
 
+    pub fn set_upload_checksum(&self, upload_id: &str, alg: crate::checksum::ChecksumAlgorithm, checksum_type: String) {
+        if let Some(u) = self.uploads.write().get_mut(upload_id) {
+            u.checksum_alg = Some(alg);
+            u.checksum_type = Some(checksum_type);
+        }
+    }
+
+    pub fn set_part_checksum(&self, upload_id: &str, part_number: u32, alg: crate::checksum::ChecksumAlgorithm, value: String) {
+        if let Some(u) = self.uploads.write().get_mut(upload_id) {
+            if let Some(p) = u.parts.get_mut(&part_number) {
+                p.checksum = Some((alg, value));
+            }
+        }
+    }
+
     pub fn upload_part(
         &self,
         upload_id: &str,
@@ -249,6 +270,7 @@ impl MultipartManager {
             raw_md5,
             uploaded_at: now_ms,
             staged_path,
+            checksum: None,
         };
 
         // Atomically replace prior upload of same partNumber
@@ -332,6 +354,7 @@ impl MultipartManager {
                 ref_count: 1,
                 raw_md5: staged.raw_md5,
                 staged_path: staged.staged_path.clone(),
+                checksum: staged.checksum.clone(),
             });
         }
 
@@ -629,6 +652,7 @@ fn decode_manifest_v1(staging_dir: &Path, bytes: &[u8]) -> Option<(u64, Vec<Part
             ref_count: 1,
             raw_md5,
             staged_path,
+            checksum: None,
         });
     }
     Some((total, extents))

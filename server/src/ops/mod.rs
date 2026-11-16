@@ -44,6 +44,7 @@ pub enum Operation {
     PutObject,
     CopyObject,
     GetObject,
+    GetObjectAttributes,
     HeadObject,
     DeleteObject,
     CreateMultipartUpload,
@@ -259,6 +260,14 @@ pub const OPS: &[OpSpec] = &[
         requires_existing_bucket: true,
     },
     OpSpec {
+        op: Operation::GetObjectAttributes,
+        name: "GetObjectAttributes",
+        iam_action: Some("s3:GetObject"),
+        acl_permission: AclPermission::Read,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
         op: Operation::HeadObject,
         name: "HeadObject",
         iam_action: Some("s3:GetObject"),
@@ -362,6 +371,7 @@ const BUILT_SUBRESOURCES: &[&str] = &[
     "partNumber",
     "versionId",
     "tagging",
+    "attributes",
 ];
 
 const UNBUILT_S3_SUBRESOURCES: &[&str] = &[
@@ -387,7 +397,7 @@ const UNBUILT_S3_SUBRESOURCES: &[&str] = &[
     "ownershipControls",
     "publicAccessBlock",
     "logging",
-    "attributes",
+
     "parts",
 ];
 
@@ -477,6 +487,9 @@ pub fn classify(
             (&Method::GET, ["tagging"]) | (&Method::GET, ["tagging", "versionId"]) => Ok(Operation::GetObjectTagging),
             (&Method::PUT, ["tagging"]) | (&Method::PUT, ["tagging", "versionId"]) => Ok(Operation::PutObjectTagging),
             (&Method::DELETE, ["tagging"]) | (&Method::DELETE, ["tagging", "versionId"]) => Ok(Operation::DeleteObjectTagging),
+            (&Method::GET, ["attributes"]) | (&Method::GET, ["attributes", "versionId"]) => {
+                Ok(Operation::GetObjectAttributes)
+            }
             (&Method::GET, ["versionId"]) | (&Method::GET, []) => Ok(Operation::GetObject),
             (&Method::HEAD, ["versionId"]) | (&Method::HEAD, []) => Ok(Operation::HeadObject),
             (&Method::DELETE, ["versionId"]) | (&Method::DELETE, []) => Ok(Operation::DeleteObject),
@@ -773,16 +786,21 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         Operation::GetObject => {
             object::get_or_head_object(state, b_id.unwrap(), bucket, key, &c.query_map, &c.parts.headers, false).await
         }
+        Operation::GetObjectAttributes => {
+            object::get_object_attributes(state, b_id.unwrap(), bucket, key, &c.query_map, &c.parts.headers).await
+        }
         Operation::HeadObject => {
             object::get_or_head_object(state, b_id.unwrap(), bucket, key, &c.query_map, &c.parts.headers, true).await
         }
         Operation::DeleteObject => object::delete_object(state, b_id.unwrap(), key, &c.query_map).await,
-        Operation::CreateMultipartUpload => multipart::create_multipart_upload(state, b_id.unwrap(), bucket, key).await,
+        Operation::CreateMultipartUpload => {
+            multipart::create_multipart_upload(state, b_id.unwrap(), bucket, key, &c.parts.headers).await
+        }
         Operation::UploadPart => {
             multipart::upload_part(state, key, &path, &c.query_map, &c.parts.headers, iam, c.body).await
         }
         Operation::CompleteMultipartUpload => {
-            multipart::complete_multipart_upload(state, b_id.unwrap(), bucket, key, &path, &c.query_map, c.body).await
+            multipart::complete_multipart_upload(state, b_id.unwrap(), bucket, key, &path, &c.query_map, &c.parts.headers, c.body).await
         }
         Operation::AbortMultipartUpload => multipart::abort_multipart_upload(state, b_id.unwrap(), key, &c.query_map).await,
         Operation::ListParts => multipart::list_parts(state, bucket, key, &c.query_map).await,
@@ -821,6 +839,7 @@ mod tests {
             (Operation::PutObject, Method::PUT, Some("bkt"), Some("obj"), "", None),
             (Operation::CopyObject, Method::PUT, Some("bkt"), Some("obj"), "", Some("/src/key")),
             (Operation::GetObject, Method::GET, Some("bkt"), Some("obj"), "", None),
+            (Operation::GetObjectAttributes, Method::GET, Some("bkt"), Some("obj"), "attributes", None),
             (Operation::HeadObject, Method::HEAD, Some("bkt"), Some("obj"), "", None),
             (Operation::DeleteObject, Method::DELETE, Some("bkt"), Some("obj"), "", None),
             (Operation::CreateMultipartUpload, Method::POST, Some("bkt"), Some("obj"), "uploads", None),

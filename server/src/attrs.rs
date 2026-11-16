@@ -15,6 +15,11 @@ pub const TAG_CONTENT_TYPE: u16 = 0x0001;
 
 /// Object tags (`TagSet`, #115). Mutable: rewriting the needle updates this tag.
 pub const TAG_TAGGING: u16 = 0x0010;
+/// Object checksum (`<ALG>:<TYPE>:<base64>`), #117. Write-time.
+pub const TAG_CHECKSUM: u16 = 0x0020;
+
+/// Multipart part sizes (little-endian `u64` per part), #117. Write-time.
+pub const TAG_PART_SIZES: u16 = 0x0021;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttrsError {
@@ -76,6 +81,42 @@ impl Attrs {
             .map_or(0, |s| s.tags.len())
     }
 
+    pub fn set_checksum(&mut self, alg: crate::checksum::ChecksumAlgorithm, checksum_type: &str, value: &str) {
+        let encoded = format!("{}:{}:{}", alg.name(), checksum_type, value);
+        self.set(TAG_CHECKSUM, encoded.as_bytes());
+    }
+
+    pub fn checksum(&self) -> Option<(crate::checksum::ChecksumAlgorithm, &str, &str)> {
+        let s = self.get(TAG_CHECKSUM).and_then(|v| std::str::from_utf8(v).ok())?;
+        let (alg_str, rest) = s.split_once(':')?;
+        let alg = crate::checksum::ChecksumAlgorithm::from_header_name(alg_str)?;
+        if let Some((cksum_type, val)) = rest.split_once(':') {
+            Some((alg, cksum_type, val))
+        } else {
+            let cksum_type = if rest.contains('-') { "COMPOSITE" } else { "FULL_OBJECT" };
+            Some((alg, cksum_type, rest))
+        }
+    }
+
+    pub fn set_part_sizes(&mut self, sizes: &[u64]) {
+        let mut buf = Vec::with_capacity(sizes.len() * 8);
+        for &sz in sizes {
+            buf.extend_from_slice(&sz.to_le_bytes());
+        }
+        self.set(TAG_PART_SIZES, &buf);
+    }
+
+    pub fn part_sizes(&self) -> Option<Vec<u64>> {
+        let raw = self.get(TAG_PART_SIZES)?;
+        if raw.len() % 8 != 0 {
+            return None;
+        }
+        Some(
+            raw.chunks_exact(8)
+                .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                .collect(),
+        )
+    }
     /// The tags, ascending.
     pub fn tags(&self) -> impl Iterator<Item = u16> + '_ {
         self.entries.iter().map(|e| e.0)

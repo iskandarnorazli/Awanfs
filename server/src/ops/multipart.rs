@@ -39,17 +39,47 @@ pub async fn create_multipart_upload(
     b_id: u32,
     bucket: &str,
     key: &str,
+    headers: &HeaderMap,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
+    let req_cksum = match crate::checksum::requested_checksum(headers) {
+        Ok(Some(c)) => Some(c),
+        Ok(None) => match headers.get("x-amz-checksum-algorithm").and_then(|v| v.to_str().ok()) {
+            Some(name) => match crate::checksum::ChecksumAlgorithm::from_header_name(name) {
+                Some(alg) => Some((alg, None)),
+                None => return Ok(bad_request("InvalidRequest", "unsupported checksum algorithm", key)),
+            },
+            None => None,
+        },
+        Err(r) => return Ok(bad_request(r.code, r.why, key)),
+    };
+    let cksum_type = if let Some((alg, _)) = req_cksum {
+        let explicit = headers.get("x-amz-checksum-type").and_then(|v| v.to_str().ok()).map(|s| s.trim());
+        match explicit {
+            Some(t) if t.eq_ignore_ascii_case("FULL_OBJECT") => Some("FULL_OBJECT".to_string()),
+            Some(t) if t.eq_ignore_ascii_case("COMPOSITE") => Some("COMPOSITE".to_string()),
+            Some(_) => return Ok(bad_request("InvalidRequest", "unsupported checksum type", key)),
+            None => Some(if alg == crate::checksum::ChecksumAlgorithm::Crc64Nvme { "FULL_OBJECT" } else { "COMPOSITE" }.to_string()),
+        }
+    } else {
+        None
+    };
     let upload_id = match state.multipart.create_upload(bucket, b_id, key) {
         Ok(id) => id,
         Err(e) => return Ok(internal_error_response(key, &format!("could not start the upload: {}", e))),
     };
+    if let (Some((alg, _)), Some(ref ct)) = (&req_cksum, &cksum_type) {
+        state.multipart.set_upload_checksum(&upload_id, *alg, ct.clone());
+    }
     let xml = initiate_multipart_upload_result_xml(bucket, key, &upload_id);
-    Ok(Response::builder()
+    let mut resp = Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/xml")
-        .body(full_body(Bytes::from(xml)))
-        .unwrap())
+        .header(CONTENT_TYPE, "application/xml");
+    if let (Some((alg, _)), Some(ref ct)) = (&req_cksum, &cksum_type) {
+        resp = resp
+            .header("x-amz-checksum-algorithm", alg.name())
+            .header("x-amz-checksum-type", ct.as_str());
+    }
+    Ok(resp.body(full_body(Bytes::from(xml))).unwrap())
 }
 
 pub async fn upload_part(
@@ -76,6 +106,11 @@ pub async fn upload_part(
 
     let is_chunked = crate::auth::is_aws_chunked(headers);
     let signed_headers = headers.clone();
+    let req_checksum = match crate::checksum::requested_checksum(&signed_headers) {
+        Ok(Some(c)) => Some(c),
+        Ok(None) => state.multipart.get_upload(upload_id).and_then(|u| u.checksum_alg.map(|a| (a, None))),
+        Err(r) => return Ok(bad_request(r.code, r.why, key)),
+    };
     let declared_len = signed_headers
         .get(if is_chunked { "x-amz-decoded-content-length" } else { "content-length" })
         .and_then(|v| v.to_str().ok())
@@ -100,6 +135,7 @@ pub async fn upload_part(
             .map(|h| h.to_ascii_lowercase());
         let mut sha = declared_sha.as_ref().map(|_| sha2::Sha256::new());
         let mut md5 = Md5::new();
+        let mut cksum_hasher = req_checksum.as_ref().map(|(alg, _)| crate::checksum::Checksum::new(*alg));
         let mut body = body;
         let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
         let cache = &state.sigv4_cache;
@@ -127,6 +163,9 @@ pub async fn upload_part(
                         return Err("more bytes than the declared length".to_string());
                     }
                     md5.update(d);
+                    if let Some(h) = cksum_hasher.as_mut() {
+                        h.update(d);
+                    }
                     writer.write(d).map_err(|e| e.to_string())
                 };
                 let fed = match decoder.as_mut() {
@@ -174,6 +213,18 @@ pub async fn upload_part(
                 ));
             }
         }
+        let stream_cksum_out = match (req_checksum.as_ref(), cksum_hasher) {
+            (Some((alg, expected_opt)), Some(h)) => {
+                let got = h.finish_base64();
+                if let Some(expected) = expected_opt {
+                    if &got != expected {
+                        return Ok(bad_request("BadDigest", "The checksum you specified did not match what we received.", key));
+                    }
+                }
+                Some((*alg, got))
+            }
+            _ => None,
+        };
         let raw_md5: [u8; 16] = md5.finalize().into();
         let hi = u64::from_be_bytes(raw_md5[0..8].try_into().unwrap());
         let lo = u64::from_be_bytes(raw_md5[8..16].try_into().unwrap());
@@ -184,12 +235,17 @@ pub async fn upload_part(
         };
         return Ok(
             match state.multipart.upload_part(upload_id, part_num, 0, len, raw_md5, hi, lo, hex.clone(), Some(staged_path)) {
-                Ok(_) => Response::builder()
-                    .status(StatusCode::OK)
-                    .header(ETAG, format!("\"{}\"", hex))
-                    .header(CONTENT_LENGTH, "0")
-                    .body(empty_body())
-                    .unwrap(),
+                Ok(_) => {
+                    let mut b = Response::builder()
+                        .status(StatusCode::OK)
+                        .header(ETAG, format!("\"{}\"", hex))
+                        .header(CONTENT_LENGTH, "0");
+                    if let Some((alg, val)) = stream_cksum_out {
+                        state.multipart.set_part_checksum(upload_id, part_num, alg, val.clone());
+                        b = b.header(alg.header_name(), val);
+                    }
+                    b.body(empty_body()).unwrap()
+                }
                 Err(err) => {
                     let status = if err == "NoSuchUpload" {
                         StatusCode::NOT_FOUND
@@ -246,6 +302,19 @@ pub async fn upload_part(
         raw_bytes
     };
 
+    let buf_cksum_out = if let Some((alg, expected_opt)) = req_checksum {
+        let mut h = crate::checksum::Checksum::new(alg);
+        h.update(&decoded_bytes);
+        let got = h.finish_base64();
+        if let Some(expected) = expected_opt {
+            if got != expected {
+                return Ok(bad_request("BadDigest", "The checksum you specified did not match what we received.", key));
+            }
+        }
+        Some((alg, got))
+    } else {
+        None
+    };
     let (hi, lo, hex, raw_md5) = compute_md5(&decoded_bytes);
     let staged_path = match state.multipart.write_staged_part(upload_id, part_num, &decoded_bytes) {
         Ok(p) => Some(p),
@@ -264,12 +333,17 @@ pub async fn upload_part(
         hex.clone(),
         staged_path,
     ) {
-        Ok(_) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(ETAG, format!("\"{}\"", hex))
-            .header(CONTENT_LENGTH, "0")
-            .body(empty_body())
-            .unwrap()),
+        Ok(_) => {
+            let mut b = Response::builder()
+                .status(StatusCode::OK)
+                .header(ETAG, format!("\"{}\"", hex))
+                .header(CONTENT_LENGTH, "0");
+            if let Some((alg, val)) = buf_cksum_out {
+                state.multipart.set_part_checksum(upload_id, part_num, alg, val.clone());
+                b = b.header(alg.header_name(), val);
+            }
+            Ok(b.body(empty_body()).unwrap())
+        }
         Err(err) => {
             let xml = s3_error_xml(err, "Failed to upload part", key, "req-up-part");
             let status = if err == "NoSuchUpload" {
@@ -293,6 +367,7 @@ pub async fn complete_multipart_upload(
     key: &str,
     path: &str,
     query_map: &HashMap<String, String>,
+    headers: &HeaderMap,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let upload_id = &query_map["uploadId"];
@@ -331,11 +406,66 @@ pub async fn complete_multipart_upload(
             })
             .unwrap_or_default();
 
-        declared_parts.push((p_num, etag));
+        let part_cksum = if let Some(upload) = state.multipart.get_upload(upload_id) {
+            upload.checksum_alg.and_then(|alg| {
+                let open = format!("<{}>", alg.xml_name());
+                let close = format!("</{}>", alg.xml_name());
+                part_block.find(&open).and_then(|s| {
+                    let r = &part_block[s + open.len()..];
+                    let e = r.find(&close)?;
+                    Some(r[..e].trim().to_string())
+                })
+            })
+        } else {
+            None
+        };
+        declared_parts.push((p_num, etag, part_cksum));
     }
 
-    match state.multipart.prepare_complete(upload_id, &declared_parts) {
+    let declared_pairs: Vec<(u32, String)> = declared_parts.iter().map(|(n, e, _)| (*n, e.clone())).collect();
+    let upload_meta = state.multipart.get_upload(upload_id);
+    match state.multipart.prepare_complete(upload_id, &declared_pairs) {
         Ok((composite_etag, total_size, extents)) => {
+            let final_cksum: Option<(crate::checksum::ChecksumAlgorithm, String, String)> = if let Some(ref u) = upload_meta {
+                if let Some(alg) = u.checksum_alg {
+                    let cksum_type = u.checksum_type.clone().unwrap_or_else(|| "COMPOSITE".to_string());
+                    let mut part_raws = Vec::with_capacity(extents.len());
+                    for (idx, ext) in extents.iter().enumerate() {
+                        let Some((_, ref recorded)) = ext.checksum else {
+                            return Ok(bad_request("InvalidRequest", "Missing part checksum for multipart upload.", key));
+                        };
+                        if let Some(ref decl) = declared_parts[idx].2 {
+                            if decl != recorded {
+                                return Ok(bad_request("InvalidRequest", "Part checksum in CompleteMultipartUpload does not match uploaded part.", key));
+                            }
+                        }
+                        let Some(raw) = crate::checksum::base64_decode(recorded) else {
+                            return Ok(bad_request("InvalidRequest", "Invalid recorded part checksum.", key));
+                        };
+                        part_raws.push(raw);
+                    }
+                    let computed = crate::checksum::composite(alg, &part_raws);
+                    if let Some(hdr_val) = headers.get(alg.header_name()).and_then(|v| v.to_str().ok()) {
+                        if hdr_val.trim() != computed {
+                            return Ok(bad_request("BadDigest", "The checksum you specified did not match what we received.", key));
+                        }
+                    }
+                    Some((alg, cksum_type, computed))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let mut attrs = crate::attrs::Attrs::new();
+            let part_sizes: Vec<u64> = extents.iter().map(|e| e.part_size).collect();
+            attrs.set_part_sizes(&part_sizes);
+            if let Some((alg, ref ct, ref val)) = final_cksum {
+                attrs.set_checksum(alg, ct, val);
+            }
+            let attrs_bytes = attrs.encode().unwrap_or_default();
+            let attrs_flag = if attrs_bytes.is_empty() { 0 } else { crate::meta_index::FLAG_ATTRS };
+
             let (hi, lo, _, _) = compute_md5(composite_etag.as_bytes());
             let _key_guard = state.lock_key(b_id, key).await;
             if let Err(code) = state.engine.read().has_room_for(b_id, key.as_bytes()) {
@@ -344,9 +474,9 @@ pub async fn complete_multipart_upload(
             let manifest = Bytes::from(encode_extents_manifest(&state.multipart.staging_dir, total_size, &extents));
             let stamp = state.version_stamp(b_id, key);
             let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
-            let mp_flags = AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART | stamp.map_or(0, |s| s.0);
+            let mp_flags = AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART | attrs_flag | stamp.map_or(0, |s| s.0);
             let manifest_offset = match state
-                .store_payload_at(b_id, key, &manifest, mp_flags, hi, lo, Some(created_ns))
+                .store_payload_with(b_id, key, &attrs_bytes, &manifest, mp_flags, hi, lo, Some(created_ns))
                 .await
             {
                 Ok(off) => off,
@@ -377,7 +507,7 @@ pub async fn complete_multipart_upload(
                     hi,
                     lo,
                     extents.len() as u16,
-                    AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART,
+                    mp_flags,
                     created_ns / 1_000_000,
                 ) {
                     return Ok(engine_error_response(code, key));
@@ -392,6 +522,9 @@ pub async fn complete_multipart_upload(
                 .header(ETAG, format!("\"{}\"", composite_etag));
             if let Some(v) = version_id {
                 resp = resp.header("x-amz-version-id", v);
+            }
+            if let Some((alg, ct, val)) = final_cksum {
+                resp = resp.header(alg.header_name(), val).header("x-amz-checksum-type", ct);
             }
             Ok(resp.body(full_body(Bytes::from(xml))).unwrap())
         }

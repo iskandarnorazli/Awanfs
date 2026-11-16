@@ -121,13 +121,23 @@ impl ChecksumAlgorithm {
         }
     }
 
-    fn header_name(self) -> &'static str {
+    pub fn header_name(self) -> &'static str {
         match self {
             Self::Crc32 => "x-amz-checksum-crc32",
             Self::Crc32c => "x-amz-checksum-crc32c",
             Self::Crc64Nvme => "x-amz-checksum-crc64nvme",
             Self::Sha1 => "x-amz-checksum-sha1",
             Self::Sha256 => "x-amz-checksum-sha256",
+        }
+    }
+
+    pub fn xml_name(self) -> &'static str {
+        match self {
+            Self::Crc32 => "ChecksumCRC32",
+            Self::Crc32c => "ChecksumCRC32C",
+            Self::Crc64Nvme => "ChecksumCRC64NVME",
+            Self::Sha1 => "ChecksumSHA1",
+            Self::Sha256 => "ChecksumSHA256",
         }
     }
 
@@ -254,7 +264,7 @@ pub fn composite(alg: ChecksumAlgorithm, part_checksums: &[Vec<u8>]) -> String {
 }
 
 /// Strict RFC 4648 standard base64 decoder.
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     if bytes.is_empty() || bytes.len() % 4 != 0 {
         return None;

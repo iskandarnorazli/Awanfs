@@ -78,6 +78,8 @@ A tag number is never reused. 0x8000 and above are for tests.
 |---|---|---|---|
 | 0x0001 | Content-Type, as sent | headers (write-time) | #150 |
 | 0x0010 | Object tags (`TagSet`) | tagging (mutable) | #115 |
+| 0x0020 | Object checksum (`<ALG>:<TYPE>:<base64>`) | checksum (write-time) | #117 |
+| 0x0021 | Multipart part sizes (LE `u64` array) | multipart (write-time) | #117 |
 
 ## Journal record (`.idx`, 42 bytes)
 
