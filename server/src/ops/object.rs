@@ -599,7 +599,7 @@ pub async fn put_object(
             .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
             .map(|h| h.to_ascii_lowercase());
         let mut sha = declared_sha.as_ref().map(|_| sha2::Sha256::new());
-        let mut digest = crate::digest::StreamingDigest::new();
+        let mut digest = crate::digest::StreamingDigest::new_md5_only();
         let mut body = body;
         let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
         let cache = &state.sigv4_cache;
@@ -807,7 +807,7 @@ pub async fn put_object(
     };
 
     let payload_len = decoded_bytes.len() as u64;
-    let mut digest = crate::digest::StreamingDigest::new();
+    let mut digest = crate::digest::StreamingDigest::new_md5_only();
     digest.update(&decoded_bytes);
     let (etag_hi, etag_lo, etag_hex, raw_md5, _) = digest.finalize();
 

@@ -69,6 +69,7 @@ pub struct StreamingDigest {
     crc32c_val: u32,
     total_bytes: u64,
     force_software: bool,
+    compute_crc32c: bool,
 }
 
 impl StreamingDigest {
@@ -94,6 +95,7 @@ impl StreamingDigest {
             crc32c_val: 0,
             total_bytes: 0,
             force_software: !has_hardware_accel,
+            compute_crc32c: true,
         }
     }
 
@@ -104,16 +106,31 @@ impl StreamingDigest {
             crc32c_val: 0,
             total_bytes: 0,
             force_software: true,
+            compute_crc32c: true,
         }
     }
 
-    /// Feeds an incoming streaming frame / buffer chunk through MD5 and CRC32C simultaneously.
+    /// Creates a streaming digest pipeline computing MD5 only (skipping CRC32C when the caller
+    /// writes through `NeedleWriter::write`, which already computes `payload_crc32c`).
+    pub fn new_md5_only() -> Self {
+        Self {
+            md5_hasher: Md5::new(),
+            crc32c_val: 0,
+            total_bytes: 0,
+            force_software: false,
+            compute_crc32c: false,
+        }
+    }
+
+    /// Feeds an incoming streaming frame / buffer chunk through MD5 (and CRC32C if enabled).
     pub fn update(&mut self, chunk: &[u8]) {
         self.md5_hasher.update(chunk);
-        if self.force_software {
-            self.crc32c_val = software_crc32c(self.crc32c_val, chunk);
-        } else {
-            self.crc32c_val = crc32c::crc32c_append(self.crc32c_val, chunk);
+        if self.compute_crc32c {
+            if self.force_software {
+                self.crc32c_val = software_crc32c(self.crc32c_val, chunk);
+            } else {
+                self.crc32c_val = crc32c::crc32c_append(self.crc32c_val, chunk);
+            }
         }
         self.total_bytes += chunk.len() as u64;
     }
@@ -124,6 +141,10 @@ impl StreamingDigest {
 
     pub fn is_software_fallback(&self) -> bool {
         self.force_software
+    }
+
+    pub fn computes_crc32c(&self) -> bool {
+        self.compute_crc32c
     }
 
     /// Finalizes digests and returns (hi, lo, hex, raw_md5, crc32c).
@@ -143,5 +164,31 @@ impl StreamingDigest {
 impl Default for StreamingDigest {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn md5_only_matches_full_digest_across_chunk_splits_and_skips_crc32c() {
+        let data: Vec<u8> = (0..100_000).map(|i| ((i * 73 + 19) % 251) as u8).collect();
+        let mut full = StreamingDigest::new();
+        full.update(&data);
+        let (exp_hi, exp_lo, exp_hex, exp_raw, exp_crc) = full.finalize();
+        assert_ne!(exp_crc, 0);
+
+        for chunk_size in [1usize, 7, 63, 64, 1337, 4096, 65536] {
+            let mut md5_only = StreamingDigest::new_md5_only();
+            assert!(!md5_only.computes_crc32c());
+            for chunk in data.chunks(chunk_size) {
+                md5_only.update(chunk);
+            }
+            assert_eq!(md5_only.total_bytes(), data.len() as u64);
+            let (hi, lo, hex, raw, crc) = md5_only.finalize();
+            assert_eq!((hi, lo, hex, raw), (exp_hi, exp_lo, exp_hex.clone(), exp_raw), "chunk_size={chunk_size}");
+            assert_eq!(crc, 0, "crc32c must be skipped in md5-only mode (chunk_size={chunk_size})");
+        }
     }
 }
