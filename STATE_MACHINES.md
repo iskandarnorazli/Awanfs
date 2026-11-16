@@ -29,7 +29,7 @@ or a test that is not in the file.
 | Volume | active, sealed, compacting, retired; writes in flight; written end and allocated end (#178: the file is extended ahead of the written end, trimmed at open) | implicit (the seal and the in-flight count are in `server/src/volume.rs`: `seal`, `writers_in_flight`) | `compact_oldest_volume` in `server/src/s3_api.rs` | compaction tests, `server/tests/compaction_inflight_test.rs` | `ObjectVersions.tla` (CSeal, CScan, CCopy, CDrop; `fixed_compact.cfg`, `compact_no_wait.cfg`) | #167 modelled it; `volume_step` still to write |
 | Lifecycle of an object under a rule | live, expired, removed | implicit | `server/src/lifecycle.rs` | lifecycle tests | none | #118 |
 | Encrypted multipart upload | key and nonce state per part | not built | | | | #121 |
-| A scheduled background task | idle, running, stopping, stopped | not built | | | none | #158 |
+| A scheduled background task | idle, running, stopping, stopped | wired | `server/src/fsm.rs::task_step`, called by `Scheduler` in `server/src/scheduler.rs` | `task_every_pair_is_decided`, server/tests/scheduler_test.rs | none | #158 |
 | A streamed response | opening, streaming, done, aborted (read error, checksum mismatch, client gone) | wired | `server/src/fsm.rs::stream_step`, called by the reader in `server/src/stream_read.rs` | `stream_every_pair_is_decided`, `server/tests/stream_read_test.rs`, `server/tests/stream_read_disconnect_test.rs` | none: one reader per response | #155 step two |
 | Scrub of a needle | unchecked, good, bad | not built | | | none | #155 |
 | POST object form parser | preamble, part headers, part body, epilogue | not built | | | none | #119 |

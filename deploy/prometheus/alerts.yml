@@ -45,3 +45,11 @@ groups:
         annotations:
           summary: "AwanFS {{ $labels.instance }} is dropping log lines"
           description: "Whatever reads the server's stderr (a container log driver, journald), or the --access-log target, is not keeping up, so lines are dropped rather than stalling requests (#138). Requests are unaffected; the request log or the access log has gaps."
+      - alert: AwanFSBackgroundTaskStalled
+        expr: |
+          increase(awanfs_background_ticks_total[100m]) == 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "AwanFS background task {{ $labels.task }} has not completed a tick in 10 periods on {{ $labels.instance }}"
