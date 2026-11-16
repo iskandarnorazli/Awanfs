@@ -2,9 +2,8 @@
 //! High-Performance Non-Blocking Network Reactor & Connection Loop
 //! Reference: awan-storage/HYBRID_POC_SPECIFICATION.md Section 2
 
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
-use hyper_util::rt::TokioExecutor;
 use hyper::service::service_fn;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -61,7 +60,11 @@ pub async fn start_s3_reactor_with(
     let (done_tx, done_rx) = oneshot::channel();
     let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
 
-    let auto_builder = AutoConnBuilder::new(TokioExecutor::new());
+    let mut auto_builder = AutoConnBuilder::new(TokioExecutor::new());
+    auto_builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(state.header_idle_timeout());
 
     tokio::spawn(async move {
         let graceful = GracefulShutdown::new();

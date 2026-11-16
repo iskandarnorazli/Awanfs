@@ -2,6 +2,7 @@
 //! High-Performance S3 Storage Server — Columnar SoA Index & Needle Storage Substrate
 
 pub mod aws_chunked;
+pub mod body_timeout;
 pub mod bucket_config;
 pub mod cache;
 pub mod clock;
@@ -50,6 +51,7 @@ pub mod work;
 pub mod xml;
 
 pub use aws_chunked::*;
+pub use body_timeout::*;
 pub use cache::*;
 pub use cluster::*;
 pub use coalesce::*;

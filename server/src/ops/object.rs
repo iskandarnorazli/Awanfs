@@ -1,6 +1,10 @@
 use bytes::Bytes;
 use http_body_util::BodyExt;
-use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED};
+use hyper::header::{
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH,
+    CONTENT_RANGE, CONTENT_TYPE, ETAG, EXPIRES, LAST_MODIFIED,
+};
+use std::collections::BTreeMap;
 use hyper::{HeaderMap, Response, StatusCode};
 use sha2::Digest;
 use std::collections::HashMap;
@@ -17,6 +21,7 @@ use crate::precondition::{
 use crate::s3_api::{
     bad_request, drain_body, empty_body, engine_error_response, full_body,
     internal_error_response, md5_to_etag_hex, parse_range_header, percent_decode_path, read_body_admitted,
+    request_timeout_response,
     ChunksBody, ResponseBody, S3ServiceState, CHUNK_FRAMING_SLACK, FORMAT_2_FLAGS, MAX_OBJECT_BODY,
     STREAM_PUT_MIN, VERIFY_WHILE_SENDING_MIN,
 };
@@ -35,6 +40,7 @@ fn finish_put(
     flags: u16,
     etag_hex: &str,
     created_at_ms: u64,
+    checksum: Option<(crate::checksum::ChecksumAlgorithm, &str)>,
 ) -> Response<ResponseBody> {
     if let Some((prev_off, prev_sz)) = old_info {
         if prev_off > 0 && prev_off != vol_offset {
@@ -48,15 +54,17 @@ fn finish_put(
     if let Err(code) = state.engine.write().put_object_at(b_id, key.as_bytes(), vol_offset, payload_len, etag_hi, etag_lo, 0, flags, created_at_ms) {
         return engine_error_response(code, key);
     }
-    Response::builder()
+    let mut b = Response::builder()
         .status(StatusCode::OK)
         .header(ETAG, format!("\"{}\"", etag_hex))
-        .header(CONTENT_LENGTH, "0")
-        .body(empty_body())
-        .unwrap()
+        .header(CONTENT_LENGTH, "0");
+    if let Some((alg, val)) = checksum {
+        b = b.header(alg.header_name(), val);
+    }
+    b.body(empty_body()).unwrap()
 }
 
-fn put_ok_response(etag_hex: &str, version_id: Option<&str>) -> Response<ResponseBody> {
+fn put_ok_response(etag_hex: &str, version_id: Option<&str>, checksum: Option<(crate::checksum::ChecksumAlgorithm, &str)>) -> Response<ResponseBody> {
     let mut b = Response::builder()
         .status(StatusCode::OK)
         .header(ETAG, format!("\"{}\"", etag_hex))
@@ -64,17 +72,221 @@ fn put_ok_response(etag_hex: &str, version_id: Option<&str>) -> Response<Respons
     if let Some(v) = version_id {
         b = b.header("x-amz-version-id", v);
     }
+    if let Some((alg, val)) = checksum {
+        b = b.header(alg.header_name(), val);
+    }
     b.body(empty_body()).unwrap()
 }
 
-fn request_attrs(headers: &HeaderMap, key: &str) -> Result<Vec<u8>, Response<ResponseBody>> {
+const MAX_USER_METADATA_BYTES: usize = 2048;
+
+fn valid_header_str<'a>(val: &'a hyper::header::HeaderValue, key: &str) -> Result<&'a str, Response<ResponseBody>> {
+    let bytes = val.as_bytes();
+    if bytes.iter().any(|&b| b == b'\r' || b == b'\n') {
+        return Err(bad_request("InvalidArgument", "Metadata header value must not contain CR or LF.", key));
+    }
+    val.to_str()
+        .map_err(|_| bad_request("InvalidArgument", "Metadata header value must be valid UTF-8.", key))
+}
+
+fn strip_aws_chunked(raw: &str) -> String {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("aws-chunked"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn request_attrs_with_checksum(
+    headers: &HeaderMap,
+    key: &str,
+    checksum: Option<(crate::checksum::ChecksumAlgorithm, &str, &str)>,
+) -> Result<Vec<u8>, Response<ResponseBody>> {
     let mut attrs = crate::attrs::Attrs::new();
     if let Some(ct) = headers.get(CONTENT_TYPE) {
-        attrs.set(crate::attrs::TAG_CONTENT_TYPE, ct.as_bytes());
+        attrs.set(crate::attrs::TAG_CONTENT_TYPE, valid_header_str(ct, key)?.as_bytes());
     }
+    if let Some(tagging) = headers.get("x-amz-tagging") {
+        let raw = tagging
+            .to_str()
+            .map_err(|_| bad_request("InvalidTag", "Invalid x-amz-tagging header.", key))?;
+        let tag_set = crate::tagging::parse_tagging_header(raw)
+            .map_err(|r| bad_request(r.code, r.why, key))?;
+        if !tag_set.tags.is_empty() {
+            attrs.set(crate::attrs::TAG_TAGGING, &crate::attrs::encode_tags(&tag_set));
+        }
+    }
+    if let Some((alg, cksum_type, val)) = checksum {
+        attrs.set_checksum(alg, cksum_type, val);
+    }
+    if let Some(ce) = headers.get(CONTENT_ENCODING) {
+        let stripped = strip_aws_chunked(valid_header_str(ce, key)?);
+        if !stripped.is_empty() {
+            attrs.set(crate::attrs::TAG_CONTENT_ENCODING, stripped.as_bytes());
+        }
+    }
+    for (hdr, tag) in [
+        (CONTENT_DISPOSITION.as_str(), crate::attrs::TAG_CONTENT_DISPOSITION),
+        (CONTENT_LANGUAGE.as_str(), crate::attrs::TAG_CONTENT_LANGUAGE),
+        (CACHE_CONTROL.as_str(), crate::attrs::TAG_CACHE_CONTROL),
+        (EXPIRES.as_str(), crate::attrs::TAG_EXPIRES),
+        ("x-amz-website-redirect-location", crate::attrs::TAG_WEBSITE_REDIRECT),
+    ] {
+        if let Some(v) = headers.get(hdr) {
+            attrs.set(tag, valid_header_str(v, key)?.as_bytes());
+        }
+    }
+
+    let mut user_meta: BTreeMap<String, String> = BTreeMap::new();
+    for (name, value) in headers.iter() {
+        if let Some(suffix) = name.as_str().strip_prefix("x-amz-meta-") {
+            if suffix.is_empty() {
+                continue;
+            }
+            let val = valid_header_str(value, key)?;
+            let lower = suffix.to_ascii_lowercase();
+            user_meta
+                .entry(lower)
+                .and_modify(|existing| {
+                    existing.push_str(", ");
+                    existing.push_str(val);
+                })
+                .or_insert_with(|| val.to_string());
+        }
+    }
+    let total_user_meta: usize = user_meta.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if total_user_meta > MAX_USER_METADATA_BYTES {
+        return Err(bad_request(
+            "MetadataTooLarge",
+            "Your metadata headers exceed the maximum allowed metadata size.",
+            key,
+        ));
+    }
+    attrs.set_user_meta(user_meta.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+
     attrs
         .encode()
         .map_err(|_| bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key))
+}
+
+fn with_tagging_count(b: hyper::http::response::Builder, count: usize) -> hyper::http::response::Builder {
+    if count > 0 {
+        b.header("x-amz-tagging-count", count.to_string())
+    } else {
+        b
+    }
+}
+
+fn request_attrs(headers: &HeaderMap, key: &str) -> Result<Vec<u8>, Response<ResponseBody>> {
+    request_attrs_with_checksum(headers, key, None)
+}
+
+pub(crate) fn checksum_mode_enabled(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-amz-checksum-mode")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("ENABLED"))
+}
+
+pub(crate) fn with_checksum_headers(
+    mut builder: hyper::http::response::Builder,
+    attrs: &crate::attrs::Attrs,
+    mode_enabled: bool,
+) -> hyper::http::response::Builder {
+    if mode_enabled {
+        if let Some((alg, cksum_type, val)) = attrs.checksum() {
+            builder = builder.header(alg.header_name(), val).header("x-amz-checksum-type", cksum_type);
+        }
+    }
+    builder
+}
+
+#[derive(Default)]
+struct ResponseOverrides<'a> {
+    content_type: Option<&'a str>,
+    content_language: Option<&'a str>,
+    expires: Option<&'a str>,
+    cache_control: Option<&'a str>,
+    content_disposition: Option<&'a str>,
+    content_encoding: Option<&'a str>,
+}
+
+impl<'a> ResponseOverrides<'a> {
+    fn from_query(
+        query_map: &'a HashMap<String, String>,
+        key: &str,
+        is_anon_with_auth: bool,
+    ) -> Result<Self, Response<ResponseBody>> {
+        let ov = Self {
+            content_type: query_map.get("response-content-type").map(String::as_str),
+            content_language: query_map.get("response-content-language").map(String::as_str),
+            expires: query_map.get("response-expires").map(String::as_str),
+            cache_control: query_map.get("response-cache-control").map(String::as_str),
+            content_disposition: query_map.get("response-content-disposition").map(String::as_str),
+            content_encoding: query_map.get("response-content-encoding").map(String::as_str),
+        };
+        let any = ov.content_type.is_some()
+            || ov.content_language.is_some()
+            || ov.expires.is_some()
+            || ov.cache_control.is_some()
+            || ov.content_disposition.is_some()
+            || ov.content_encoding.is_some();
+        if any && is_anon_with_auth {
+            return Err(bad_request(
+                "InvalidRequest",
+                "Request specific response headers cannot be used for anonymous GET requests.",
+                key,
+            ));
+        }
+        for val in [
+            ov.content_type,
+            ov.content_language,
+            ov.expires,
+            ov.cache_control,
+            ov.content_disposition,
+            ov.content_encoding,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if val.bytes().any(|b| b == b'\r' || b == b'\n') {
+                return Err(bad_request("InvalidArgument", "Response override value must not contain CR or LF.", key));
+            }
+        }
+        Ok(ov)
+    }
+}
+
+trait MetadataHeadersExt {
+    fn with_object_metadata(self, view: &crate::s3_api::ObjectView, ov: &ResponseOverrides<'_>) -> Self;
+}
+
+impl MetadataHeadersExt for hyper::http::response::Builder {
+    fn with_object_metadata(mut self, view: &crate::s3_api::ObjectView, ov: &ResponseOverrides<'_>) -> Self {
+        self = self.header(CONTENT_TYPE, ov.content_type.unwrap_or_else(|| view.content_type()));
+        if let Some(v) = ov.content_encoding.or_else(|| view.attrs.content_encoding()) {
+            self = self.header(CONTENT_ENCODING, v);
+        }
+        if let Some(v) = ov.content_disposition.or_else(|| view.attrs.content_disposition()) {
+            self = self.header(CONTENT_DISPOSITION, v);
+        }
+        if let Some(v) = ov.content_language.or_else(|| view.attrs.content_language()) {
+            self = self.header(CONTENT_LANGUAGE, v);
+        }
+        if let Some(v) = ov.cache_control.or_else(|| view.attrs.cache_control()) {
+            self = self.header(CACHE_CONTROL, v);
+        }
+        if let Some(v) = ov.expires.or_else(|| view.attrs.expires()) {
+            self = self.header(EXPIRES, v);
+        }
+        if let Some(v) = view.attrs.website_redirect() {
+            self = self.header("x-amz-website-redirect-location", v);
+        }
+        for (k, v) in view.attrs.user_meta() {
+            self = self.header(format!("x-amz-meta-{}", k), v);
+        }
+        self
+    }
 }
 
 pub(crate) fn null_version_of(m: &crate::meta_index::ObjectMeta) -> crate::versions::Version {
@@ -100,12 +312,17 @@ pub(crate) fn version_etag(v: &crate::versions::Version) -> String {
     }
 }
 
-fn no_such_version(key: &str) -> Response<ResponseBody> {
-    let xml = s3_error_xml("NoSuchVersion", "The specified version does not exist.", key, "req-version");
+pub(crate) fn no_such_version(key: &str, head: bool) -> Response<ResponseBody> {
+    let body = if head {
+        empty_body()
+    } else {
+        let xml = s3_error_xml("NoSuchVersion", "The specified version does not exist.", key, "req-version");
+        full_body(Bytes::from(xml))
+    };
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .header(CONTENT_TYPE, "application/xml")
-        .body(full_body(Bytes::from(xml)))
+        .body(body)
         .unwrap()
 }
 
@@ -139,7 +356,7 @@ pub(crate) fn finish_version_put(
     }
 }
 
-fn find_version(state: &S3ServiceState, b_id: u32, key: &str, id: Option<u64>) -> Option<crate::versions::Version> {
+pub(crate) fn find_version(state: &S3ServiceState, b_id: u32, key: &str, id: Option<u64>) -> Option<crate::versions::Version> {
     let row = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| null_version_of(&m));
     let vs = state.versions.read();
     match id {
@@ -150,7 +367,7 @@ fn find_version(state: &S3ServiceState, b_id: u32, key: &str, id: Option<u64>) -
     }
 }
 
-fn last_modified_secs_from_ms(ms: u64) -> u64 {
+pub(super) fn last_modified_secs_from_ms(ms: u64) -> u64 {
     if ms == 0 {
         DEFAULT_LAST_MODIFIED_SECS
     } else {
@@ -158,7 +375,7 @@ fn last_modified_secs_from_ms(ms: u64) -> u64 {
     }
 }
 
-fn last_modified_secs_from_ns(ns: u64) -> u64 {
+pub(super) fn last_modified_secs_from_ns(ns: u64) -> u64 {
     if ns == 0 {
         DEFAULT_LAST_MODIFIED_SECS
     } else {
@@ -166,7 +383,7 @@ fn last_modified_secs_from_ns(ns: u64) -> u64 {
     }
 }
 
-fn format_object_etag(etag_hi: u64, etag_lo: u64, is_multipart: bool, part_count: u16) -> String {
+pub(super) fn format_object_etag(etag_hi: u64, etag_lo: u64, is_multipart: bool, part_count: u16) -> String {
     let hex = md5_to_etag_hex(etag_hi, etag_lo);
     if is_multipart {
         format!("\"{}-{}\"", hex, part_count)
@@ -175,7 +392,7 @@ fn format_object_etag(etag_hi: u64, etag_lo: u64, is_multipart: bool, part_count
     }
 }
 
-fn precondition_failure_response(
+pub(super) fn precondition_failure_response(
     outcome: PreconditionOutcome,
     facts: Option<&ObjectFacts>,
     key: &str,
@@ -217,12 +434,14 @@ fn version_get_response(
     vid: Option<&str>,
     head: bool,
     range: Option<&str>,
+    part_num: Option<u32>,
     headers: &HeaderMap,
+    overrides: &ResponseOverrides<'_>,
 ) -> Response<ResponseBody> {
     let id = match vid {
         Some(s) => match crate::versions::parse_id(s) {
             Some(i) => Some(i),
-            None => return no_such_version(key),
+            None => return no_such_version(key, head),
         },
         None => None,
     };
@@ -232,13 +451,19 @@ fn version_get_response(
             return precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, head);
         }
         if id.is_some() {
-            return no_such_version(key);
+            return no_such_version(key, head);
         }
-        let xml = s3_error_xml("NoSuchKey", "The specified key does not exist.", key, "req-get-obj");
+        let body = if head {
+            empty_body()
+        } else {
+            let xml = s3_error_xml("NoSuchKey", "The specified key does not exist.", key, "req-get-obj");
+            full_body(Bytes::from(xml))
+        };
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(CONTENT_TYPE, "application/xml")
-            .body(full_body(Bytes::from(xml)))
+            .header("x-amz-delete-marker", "false")
+            .body(body)
             .unwrap();
     };
     if v.marker {
@@ -273,6 +498,63 @@ fn version_get_response(
         PreconditionOutcome::Proceed => {}
         outcome => return precondition_failure_response(outcome, Some(&facts), key, head),
     }
+    let view = match state.object_view(v.vol_offset, v.flags) {
+        Ok(view) => view,
+        Err(e) => return internal_error_response(key, &format!("could not read the version's attributes: {:?}", e)),
+    };
+    if let Some(pn) = part_num {
+        if v.flags & AWAN_FLAG_MULTIPART != 0 {
+            let extents = match state.multipart.get_completed_extents(b_id, key) {
+                Some(e) => e,
+                None => return internal_error_response(key, "the multipart object's part list is missing"),
+            };
+            let parts_count = extents.len();
+            if pn < 1 || (pn as usize) > parts_count {
+                let body = if head {
+                    empty_body()
+                } else {
+                    full_body(Bytes::from(s3_error_xml("InvalidPart", "The requested part number is not valid.", key, "req-get-part")))
+                };
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(body)
+                    .unwrap();
+            }
+            let ext = &extents[(pn - 1) as usize];
+            let body = if head {
+                empty_body()
+            } else {
+                let b = match state.part_bytes(b_id, ext) {
+                    Ok(b) => b,
+                    Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
+                };
+                full_body(b.slice(..(ext.part_size as usize).min(b.len())))
+            };
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, view.content_type())
+                .header(ETAG, etag_val)
+                .header(ACCEPT_RANGES, "bytes")
+                .header("x-amz-mp-parts-count", parts_count.to_string())
+                .header("x-amz-version-id", v.id_string())
+                .header(CONTENT_LENGTH, ext.part_size.to_string())
+                .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts))
+                .body(body)
+                .unwrap();
+        } else if pn > 1 {
+            let body = if head {
+                empty_body()
+            } else {
+                full_body(Bytes::from(s3_error_xml("InvalidPart", "The requested part number is not valid.", key, "req-get-part")))
+            };
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(body)
+                .unwrap();
+        }
+    }
     let bytes = if head {
         Bytes::new()
     } else {
@@ -281,16 +563,17 @@ fn version_get_response(
             Err(e) => return internal_error_response(key, &format!("could not read the version: {:?}", e)),
         }
     };
-    let view = match state.object_view(v.vol_offset, v.flags) {
-        Ok(view) => view,
-        Err(e) => return internal_error_response(key, &format!("could not read the version's attributes: {:?}", e)),
-    };
-    let builder = Response::builder()
-        .header(CONTENT_TYPE, view.content_type())
-        .header(ETAG, etag_val)
-        .header(ACCEPT_RANGES, "bytes")
-        .header("x-amz-version-id", v.id_string())
-        .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts));
+    let tag_count = view.attrs.tag_count();
+    let cksum_mode = checksum_mode_enabled(headers);
+    let builder = with_tagging_count(
+        Response::builder()
+            .with_object_metadata(&view, &overrides)
+            .header(ETAG, etag_val)
+            .header(ACCEPT_RANGES, "bytes")
+            .header("x-amz-version-id", v.id_string())
+            .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts)),
+        tag_count,
+    );
     if let Some(h) = range {
         match parse_range_header(h, v.size) {
             Ok(Some(r)) => {
@@ -323,7 +606,11 @@ fn version_get_response(
         }
     }
     let body = if head { empty_body() } else { full_body(bytes) };
-    builder.status(StatusCode::OK).header(CONTENT_LENGTH, v.size.to_string()).body(body).unwrap()
+    with_checksum_headers(builder, &view.attrs, cksum_mode)
+        .status(StatusCode::OK)
+        .header(CONTENT_LENGTH, v.size.to_string())
+        .body(body)
+        .unwrap()
 }
 
 pub async fn copy_object(
@@ -389,10 +676,10 @@ pub async fn copy_object(
     let read = match (&src_vid, &src_meta) {
         (Some(vid), _) => {
             let Some(id) = crate::versions::parse_id(vid) else {
-                return Ok(no_such_version(src_key));
+                return Ok(no_such_version(src_key, false));
             };
             let Some(v) = find_version(&state, src_b_id, src_key, Some(id)) else {
-                return Ok(no_such_version(src_key));
+                return Ok(no_such_version(src_key, false));
             };
             if v.marker {
                 let xml = s3_error_xml(
@@ -440,9 +727,19 @@ pub async fn copy_object(
         Ok(r) => r,
         Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
     };
-    let replace = headers
-        .get("x-amz-metadata-directive")
-        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"REPLACE"));
+    let replace = match headers.get("x-amz-metadata-directive").and_then(|v| v.to_str().ok()) {
+        None => false,
+        Some(v) if v.eq_ignore_ascii_case("COPY") => false,
+        Some(v) if v.eq_ignore_ascii_case("REPLACE") => true,
+        Some(_) => return Ok(bad_request("InvalidArgument", "Unknown metadata directive.", key)),
+    };
+    if src_bucket == bucket && src_key == key && src_vid.is_none() && !replace {
+        return Ok(bad_request(
+            "InvalidRequest",
+            "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.",
+            key,
+        ));
+    }
     let copy_attrs = if replace {
         match request_attrs(headers, key) {
             Ok(a) => a,
@@ -556,8 +853,26 @@ pub async fn put_object(
     let expected_len = headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok());
     let is_chunked = crate::auth::is_aws_chunked(headers);
     let content_md5_hdr = headers.get("content-md5").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+    if let Some(ref content_md5) = content_md5_hdr {
+        if !crate::bucket_config::base64_decode(content_md5).is_ok_and(|b| b.len() == 16) {
+            let xml = s3_error_xml("InvalidDigest", "The Content-MD5 you specified was invalid.", key, "req-bad-digest");
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(full_body(Bytes::from(xml)))
+                .unwrap());
+        }
+    }
     let signed_headers = headers.clone();
-    let put_attrs = match request_attrs(&signed_headers, key) {
+    let req_checksum = match crate::checksum::requested_checksum(&signed_headers) {
+        Ok(c) => c,
+        Err(r) => return Ok(bad_request(r.code, r.why, key)),
+    };
+    let put_attrs = match request_attrs_with_checksum(
+        &signed_headers,
+        key,
+        req_checksum.as_ref().and_then(|(alg, exp)| exp.as_deref().map(|v| (*alg, "FULL_OBJECT", v))),
+    ) {
         Ok(a) => a,
         Err(resp) => return Ok(resp),
     };
@@ -598,7 +913,8 @@ pub async fn put_object(
             .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
             .map(|h| h.to_ascii_lowercase());
         let mut sha = declared_sha.as_ref().map(|_| sha2::Sha256::new());
-        let mut digest = crate::digest::StreamingDigest::new();
+        let mut digest = crate::digest::StreamingDigest::new_md5_only();
+        let mut cksum_hasher = req_checksum.as_ref().map(|(alg, _)| crate::checksum::Checksum::new(*alg));
         let mut body = body;
         let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
         let cache = &state.sigv4_cache;
@@ -607,7 +923,17 @@ pub async fn put_object(
                 verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))
             })
         });
-        while let Some(frame) = body.frame().await {
+        let idle_timeout = state.body_idle_timeout();
+        loop {
+            let frame = match crate::body_timeout::next_frame_with_idle(&mut body, idle_timeout).await {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(crate::body_timeout::BodyIdleTimeout) => {
+                    drop(writer);
+                    drop(ticket);
+                    return Ok(request_timeout_response(key));
+                }
+            };
             if let Ok(data) = frame?.into_data() {
                 if let Some(h) = sha.as_mut() {
                     h.update(&data);
@@ -617,6 +943,9 @@ pub async fn put_object(
                         return Err("more bytes than the declared length".to_string());
                     }
                     digest.update(d);
+                    if let Some(h) = cksum_hasher.as_mut() {
+                        h.update(d);
+                    }
                     writer.write(d).map_err(|e| format!("{:?}", e))
                 };
                 let fed = match decoder.as_mut() {
@@ -670,6 +999,18 @@ pub async fn put_object(
                 return Ok(bad_request("BadDigest", "The Content-MD5 you specified did not match what we received.", key));
             }
         }
+        let stream_cksum_out = match (req_checksum.as_ref(), cksum_hasher) {
+            (Some((alg, expected_opt)), Some(h)) => {
+                let got = h.finish_base64();
+                if let Some(expected) = expected_opt {
+                    if &got != expected {
+                        return Ok(bad_request("BadDigest", "The checksum you specified did not match what we received.", key));
+                    }
+                }
+                Some((*alg, got))
+            }
+            _ => None,
+        };
         let _key_guard = state.lock_key(b_id, key).await;
         if if_none_match_star && state.engine.read().get_object(b_id, key.as_bytes()).is_ok() {
             return Ok(Response::builder()
@@ -729,15 +1070,16 @@ pub async fn put_object(
         state.needle_crc_map.write().insert((b_id, vol_offset), loc.payload_crc32c);
         state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
         state.hook("put_stored", key);
+        let stream_cksum_ref = stream_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
         if let Some((_, ts)) = stamp {
             return Ok(match finish_version_put(&state, b_id, key, ts, flags, vol_offset, len, etag_hi, etag_lo, 0) {
-                Ok(vid) => put_ok_response(&etag_hex, Some(&vid)),
+                Ok(vid) => put_ok_response(&etag_hex, Some(&vid), stream_cksum_ref),
                 Err(r) => r,
             });
         }
-        return Ok(finish_put(&state, b_id, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns / 1_000_000));
+        return Ok(finish_put(&state, b_id, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns / 1_000_000, stream_cksum_ref));
     }
-    let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, expected_len.map(|n| n as u64), path).await? {
+    let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, expected_len.map(|n| n as u64), state.body_idle_timeout(), path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };
@@ -796,7 +1138,7 @@ pub async fn put_object(
     };
 
     let payload_len = decoded_bytes.len() as u64;
-    let mut digest = crate::digest::StreamingDigest::new();
+    let mut digest = crate::digest::StreamingDigest::new_md5_only();
     digest.update(&decoded_bytes);
     let (etag_hi, etag_lo, etag_hex, raw_md5, _) = digest.finalize();
 
@@ -841,24 +1183,46 @@ pub async fn put_object(
         engine.get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size))
     };
 
+    let buf_cksum_out = if let Some((alg, expected_opt)) = req_checksum {
+        let mut h = crate::checksum::Checksum::new(alg);
+        h.update(&decoded_bytes);
+        let got = h.finish_base64();
+        if let Some(expected) = expected_opt {
+            if got != expected {
+                return Ok(bad_request("BadDigest", "The checksum you specified did not match what we received.", key));
+            }
+        }
+        Some((alg, got))
+    } else {
+        None
+    };
+    let buf_attrs = match request_attrs_with_checksum(
+        &signed_headers,
+        key,
+        buf_cksum_out.as_ref().map(|(a, v)| (*a, "FULL_OBJECT", v.as_str())),
+    ) {
+        Ok(a) => a,
+        Err(resp) => return Ok(resp),
+    };
     let stamp = state.version_stamp(b_id, key);
     let flags = flags | stamp.map_or(0, |s| s.0);
     let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
     let (vol_offset, flags) = match state
-        .store_object(b_id, bucket, key, &put_attrs, &decoded_bytes, flags, etag_hi, etag_lo, Some(created_ns))
+        .store_object(b_id, bucket, key, &buf_attrs, &decoded_bytes, flags, etag_hi, etag_lo, Some(created_ns))
         .await
     {
         Ok(written) => written,
         Err(e) => return Ok(internal_error_response(key, &format!("could not store the object: {:?}", e))),
     };
     state.hook("put_stored", key);
+    let buf_cksum_ref = buf_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
     if let Some((_, ts)) = stamp {
         return Ok(match finish_version_put(&state, b_id, key, ts, flags, vol_offset, payload_len, etag_hi, etag_lo, 0) {
-            Ok(vid) => put_ok_response(&final_etag_hex, Some(&vid)),
+            Ok(vid) => put_ok_response(&final_etag_hex, Some(&vid), buf_cksum_ref),
             Err(r) => r,
         });
     }
-    Ok(finish_put(&state, b_id, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns / 1_000_000))
+    Ok(finish_put(&state, b_id, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns / 1_000_000, buf_cksum_ref))
 }
 
 pub async fn get_or_head_object(
@@ -869,11 +1233,46 @@ pub async fn get_or_head_object(
     query_map: &HashMap<String, String>,
     headers: &HeaderMap,
     is_head: bool,
+    is_anon_with_auth: bool,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
+    let overrides = match ResponseOverrides::from_query(query_map, key, is_anon_with_auth) {
+        Ok(ov) => ov,
+        Err(resp) => return Ok(resp),
+    };
+    let part_num = match query_map.get("partNumber") {
+        Some(s) => match s.parse::<u32>() {
+            Ok(n) if (1..=10_000).contains(&n) => Some(n),
+            _ => {
+                let body = if is_head {
+                    empty_body()
+                } else {
+                    full_body(Bytes::from(s3_error_xml("InvalidArgument", "Part number must be an integer between 1 and 10000, inclusive", key, "req-get-part")))
+                };
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(body)
+                    .unwrap());
+            }
+        },
+        None => None,
+    };
+    if part_num.is_some() && headers.contains_key("Range") {
+        let body = if is_head {
+            empty_body()
+        } else {
+            full_body(Bytes::from(s3_error_xml("InvalidRequest", "Cannot specify both Range header and partNumber query parameter", key, "req-get-part")))
+        };
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(CONTENT_TYPE, "application/xml")
+            .body(body)
+            .unwrap());
+    }
     let vid = query_map.get("versionId").map(|s| s.as_str());
     if vid.is_some() || state.versions.read().has(b_id, key) {
         let range = headers.get("Range").and_then(|v| v.to_str().ok());
-        return Ok(version_get_response(&state, b_id, key, vid, is_head, range, headers));
+        return Ok(version_get_response(&state, b_id, key, vid, is_head, range, part_num, headers, &overrides));
     }
     let (meta, is_multipart) = {
         let engine = state.engine.read();
@@ -883,11 +1282,17 @@ pub async fn get_or_head_object(
                 if precondition(headers, None, false) == PreconditionOutcome::PreconditionFailed {
                     return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, is_head));
                 }
-                let xml = s3_error_xml("NoSuchKey", "The specified key does not exist.", key, "req-get-obj");
+                let body = if is_head {
+                    empty_body()
+                } else {
+                    let xml = s3_error_xml("NoSuchKey", "The specified key does not exist.", key, "req-get-obj");
+                    full_body(Bytes::from(xml))
+                };
                 return Ok(Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .header(CONTENT_TYPE, "application/xml")
-                    .body(full_body(Bytes::from(xml)))
+                    .header("x-amz-delete-marker", "false")
+                    .body(body)
                     .unwrap());
             }
         };
@@ -898,7 +1303,9 @@ pub async fn get_or_head_object(
         Ok(v) => v,
         Err(e) => return Ok(internal_error_response(key, &format!("could not read the object's attributes: {:?}", e))),
     };
+    let tag_count = view.attrs.tag_count();
     let is_compressed = unpack_flags(meta.bucket_flags) & crate::meta_index::FLAG_COMPRESSED != 0;
+    let cksum_mode = checksum_mode_enabled(headers);
 
     let etag_val = format_object_etag(meta.etag_hi, meta.etag_lo, is_multipart, unpack_part_count(meta.bucket_flags));
     let lm_secs = last_modified_secs_from_ms(meta.created_at);
@@ -910,6 +1317,59 @@ pub async fn get_or_head_object(
     match precondition(headers, Some(&facts), false) {
         PreconditionOutcome::Proceed => {}
         outcome => return Ok(precondition_failure_response(outcome, Some(&facts), key, is_head)),
+    }
+
+    if let Some(pn) = part_num {
+        if is_multipart {
+            let extents = match state.multipart.get_completed_extents(b_id, key) {
+                Some(e) => e,
+                None => return Ok(internal_error_response(key, "the multipart object's part list is missing")),
+            };
+            let parts_count = extents.len();
+            if (pn as usize) > parts_count {
+                let body = if is_head {
+                    empty_body()
+                } else {
+                    full_body(Bytes::from(s3_error_xml("InvalidPart", "The requested part number is not valid.", key, "req-get-part")))
+                };
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(body)
+                    .unwrap());
+            }
+            let ext = &extents[(pn - 1) as usize];
+            let body = if is_head {
+                empty_body()
+            } else {
+                let b = match state.part_bytes(b_id, ext) {
+                    Ok(b) => b,
+                    Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
+                };
+                full_body(b.slice(..(ext.part_size as usize).min(b.len())))
+            };
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, view.content_type())
+                .header(ETAG, etag_val)
+                .header(ACCEPT_RANGES, "bytes")
+                .header("x-amz-mp-parts-count", parts_count.to_string())
+                .header(CONTENT_LENGTH, ext.part_size.to_string())
+                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
+                .body(body)
+                .unwrap());
+        } else if pn > 1 {
+            let body = if is_head {
+                empty_body()
+            } else {
+                full_body(Bytes::from(s3_error_xml("InvalidPart", "The requested part number is not valid.", key, "req-get-part")))
+            };
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(body)
+                .unwrap());
+        }
     }
 
     let range_hdr = headers.get("Range").and_then(|v| v.to_str().ok());
@@ -932,14 +1392,14 @@ pub async fn get_or_head_object(
                         Ok(b) => b,
                         Err(e) => return Ok(internal_error_response(key, &format!("could not read the object: {:?}", e))),
                     };
-                    return Ok(Response::builder()
+                    return Ok(with_tagging_count(Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
-                        .header(CONTENT_TYPE, view.content_type())
+                        .with_object_metadata(&view, &overrides)
                         .header(ETAG, etag_val)
                         .header(ACCEPT_RANGES, "bytes")
                         .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
                         .header(CONTENT_LENGTH, len.to_string())
-                        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
+                        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count)
                         .body(body.boxed())
                         .unwrap());
                 }
@@ -990,14 +1450,14 @@ pub async fn get_or_head_object(
                             if chunks.iter().map(|c| c.len() as u64).sum::<u64>() != range.end - range.start + 1 {
                                 return Ok(internal_error_response(key, "a part of the object is missing"));
                             }
-                            return Ok(Response::builder()
+                            return Ok(with_tagging_count(Response::builder()
                                 .status(StatusCode::PARTIAL_CONTENT)
-                                .header(CONTENT_TYPE, view.content_type())
+                                .with_object_metadata(&view, &overrides)
                                 .header(ETAG, etag_val)
                                 .header(ACCEPT_RANGES, "bytes")
                                 .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
                                 .header(CONTENT_LENGTH, (range.end - range.start + 1).to_string())
-                                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
+                                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count)
                                 .body(ChunksBody(chunks).boxed())
                                 .unwrap());
                         }
@@ -1030,14 +1490,14 @@ pub async fn get_or_head_object(
                 let content_range = format!("bytes {}-{}/{}", range.start, range.end, meta.size);
                 let body = if is_head { empty_body() } else { full_body(sub_bytes) };
 
-                return Ok(Response::builder()
+                return Ok(with_tagging_count(Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
-                    .header(CONTENT_TYPE, view.content_type())
+                    .with_object_metadata(&view, &overrides)
                     .header(ETAG, etag_val)
                     .header(ACCEPT_RANGES, "bytes")
                     .header(CONTENT_RANGE, content_range)
                     .header(CONTENT_LENGTH, (range.end - range.start + 1).to_string())
-                    .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
+                    .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count)
                     .body(body)
                     .unwrap());
             }
@@ -1072,13 +1532,13 @@ pub async fn get_or_head_object(
         if chunks.iter().map(|c| c.len() as u64).sum::<u64>() != meta.size {
             return Ok(internal_error_response(key, "a part of the object is missing"));
         }
-        return Ok(Response::builder()
+        return Ok(with_tagging_count(with_checksum_headers(Response::builder()
             .status(StatusCode::OK)
-            .header(CONTENT_TYPE, view.content_type())
+            .with_object_metadata(&view, &overrides)
             .header(ETAG, etag_val)
             .header(ACCEPT_RANGES, "bytes")
             .header(CONTENT_LENGTH, meta.size.to_string())
-            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
+            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count)
             .body(ChunksBody(chunks).boxed())
             .unwrap());
     }
@@ -1096,13 +1556,13 @@ pub async fn get_or_head_object(
             Ok(b) => b,
             Err(e) => return Ok(internal_error_response(key, &format!("could not read the object: {:?}", e))),
         };
-        return Ok(Response::builder()
+        return Ok(with_tagging_count(with_checksum_headers(Response::builder()
             .status(StatusCode::OK)
-            .header(CONTENT_TYPE, view.content_type())
+            .with_object_metadata(&view, &overrides)
             .header(ETAG, etag_val)
             .header(ACCEPT_RANGES, "bytes")
             .header(CONTENT_LENGTH, meta.size.to_string())
-            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
+            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count)
             .body(body.boxed())
             .unwrap());
     }
@@ -1128,13 +1588,13 @@ pub async fn get_or_head_object(
         return Ok(internal_error_response(key, "the object's bytes could not be read or failed verification"));
     }
     let body = if is_head { empty_body() } else { full_body(payload) };
-    Ok(Response::builder()
+    Ok(with_tagging_count(with_checksum_headers(Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, view.content_type())
+        .with_object_metadata(&view, &overrides)
         .header(ETAG, etag_val)
         .header(ACCEPT_RANGES, "bytes")
         .header(CONTENT_LENGTH, meta.size.to_string())
-        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
+        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count)
         .body(body)
         .unwrap())
 }
@@ -1147,7 +1607,7 @@ pub async fn delete_object(
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     if let Some(vid) = query_map.get("versionId") {
         let Some(id) = crate::versions::parse_id(vid) else {
-            return Ok(no_such_version(key));
+            return Ok(no_such_version(key, false));
         };
         return Ok(match state.delete_version(b_id, key, id).await {
             Ok(removed) => {
@@ -1172,4 +1632,196 @@ pub async fn delete_object(
         b = b.header("x-amz-delete-marker", "true").header("x-amz-version-id", m);
     }
     Ok(b.body(empty_body()).unwrap())
+}
+
+
+pub async fn get_object_attributes(
+    state: Arc<S3ServiceState>,
+    b_id: u32,
+    _bucket: &str,
+    key: &str,
+    query_map: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Result<Response<ResponseBody>, hyper::Error> {
+    let mut want_etag = false;
+    let mut want_checksum = false;
+    let mut want_parts = false;
+    let mut want_storage_class = false;
+    let mut want_size = false;
+    let mut any_attr = false;
+
+    for hdr_val in headers.get_all("x-amz-object-attributes") {
+        let Ok(raw) = hdr_val.to_str() else {
+            return Ok(bad_request("InvalidArgument", "Invalid x-amz-object-attributes header.", key));
+        };
+        for token in raw.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
+            any_attr = true;
+            match token {
+                "ETag" => want_etag = true,
+                "Checksum" => want_checksum = true,
+                "ObjectParts" => want_parts = true,
+                "StorageClass" => want_storage_class = true,
+                "ObjectSize" => want_size = true,
+                _ => return Ok(bad_request("InvalidArgument", "Unsupported x-amz-object-attributes value.", key)),
+            }
+        }
+    }
+    if !any_attr {
+        return Ok(bad_request("InvalidArgument", "Missing required x-amz-object-attributes header.", key));
+    }
+
+    let max_parts: usize = match headers.get("x-amz-max-parts").and_then(|v| v.to_str().ok()) {
+        Some(s) => match s.trim().parse::<usize>() {
+            Ok(n) if n > 0 => n.min(1000),
+            _ => return Ok(bad_request("InvalidArgument", "Invalid x-amz-max-parts header.", key)),
+        },
+        None => 1000,
+    };
+    let part_marker: usize = match headers.get("x-amz-part-number-marker").and_then(|v| v.to_str().ok()) {
+        Some(s) => match s.trim().parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => return Ok(bad_request("InvalidArgument", "Invalid x-amz-part-number-marker header.", key)),
+        },
+        None => 0,
+    };
+
+    let vid = query_map.get("versionId").map(|s| s.as_str());
+    let (vol_offset, flags, size, etag_hi, etag_lo, part_count, last_mod_http, version_id_str) = if vid.is_some() || state.versions.read().has(b_id, key) {
+        let id = match vid {
+            Some(s) => match crate::versions::parse_id(s) {
+                Some(i) => Some(i),
+                None => return Ok(no_such_version(key, false)),
+            },
+            None => None,
+        };
+        let Some(v) = find_version(&state, b_id, key, id) else {
+            if id.is_some() {
+                return Ok(no_such_version(key, false));
+            }
+            let xml = s3_error_xml("NoSuchKey", "The specified key does not exist.", key, "req-get-attrs");
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(full_body(Bytes::from(xml)))
+                .unwrap());
+        };
+        if v.marker {
+            let (status, code, msg) = if id.is_some() {
+                (StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against a delete marker.")
+            } else {
+                (StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.")
+            };
+            let xml = s3_error_xml(code, msg, key, "req-get-attrs");
+            return Ok(Response::builder()
+                .status(status)
+                .header(CONTENT_TYPE, "application/xml")
+                .header("x-amz-delete-marker", "true")
+                .header("x-amz-version-id", v.id_string())
+                .body(full_body(Bytes::from(xml)))
+                .unwrap());
+        }
+        (v.vol_offset, v.flags, v.size, v.etag_hi, v.etag_lo, v.part_count, crate::clock::format_http_date(v.ts), Some(v.id_string()))
+    } else {
+        let meta = {
+            let engine = state.engine.read();
+            match engine.get_object(b_id, key.as_bytes()) {
+                Ok(m) => m,
+                Err(_) => {
+                    let xml = s3_error_xml("NoSuchKey", "The specified key does not exist.", key, "req-get-attrs");
+                    return Ok(Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .header(CONTENT_TYPE, "application/xml")
+                        .body(full_body(Bytes::from(xml)))
+                        .unwrap());
+                }
+            }
+        };
+        (meta.vol_offset, unpack_flags(meta.bucket_flags), meta.size, meta.etag_hi, meta.etag_lo, unpack_part_count(meta.bucket_flags), crate::clock::format_http_date_ms(meta.created_at), None)
+    };
+
+    let is_multipart = flags & AWAN_FLAG_MULTIPART != 0;
+    let view = match state.object_view(vol_offset, flags) {
+        Ok(v) => v,
+        Err(e) => return Ok(internal_error_response(key, &format!("could not read the object's attributes: {:?}", e))),
+    };
+
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<GetObjectAttributesResponse xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n");
+    if want_etag {
+        let hex = md5_to_etag_hex(etag_hi, etag_lo);
+        if is_multipart {
+            xml.push_str(&format!("  <ETag>{}-{}</ETag>\n", hex, part_count));
+        } else {
+            xml.push_str(&format!("  <ETag>{}</ETag>\n", hex));
+        }
+    }
+    if want_checksum {
+        if let Some((alg, cksum_type, val)) = view.attrs.checksum() {
+            xml.push_str("  <Checksum>\n");
+            xml.push_str(&format!("    <{}>{}</{}>\n", alg.xml_name(), crate::xml::xml_escape(val), alg.xml_name()));
+            xml.push_str(&format!("    <ChecksumType>{}</ChecksumType>\n", crate::xml::xml_escape(cksum_type)));
+            xml.push_str("  </Checksum>\n");
+        }
+    }
+    if want_parts && is_multipart {
+        let part_sizes: Vec<u64> = if let Some(sizes) = view.attrs.part_sizes() {
+            sizes
+        } else if let Some(extents) = state.multipart.get_completed_extents(b_id, key) {
+            extents.into_iter().map(|e| e.part_size).collect()
+        } else {
+            Vec::new()
+        };
+        let extents_opt = state.multipart.get_completed_extents(b_id, key);
+        let total = part_sizes.len();
+        let mut page: Vec<(usize, u64, Option<(crate::checksum::ChecksumAlgorithm, String)>)> = Vec::new();
+        let mut has_more = false;
+        for (idx, &psz) in part_sizes.iter().enumerate() {
+            let p_num = idx + 1;
+            if p_num <= part_marker {
+                continue;
+            }
+            if page.len() < max_parts {
+                let p_cksum = extents_opt
+                    .as_ref()
+                    .and_then(|exts| exts.get(idx))
+                    .and_then(|e| e.checksum.clone());
+                page.push((p_num, psz, p_cksum));
+            } else {
+                has_more = true;
+                break;
+            }
+        }
+        let next_marker = page.last().map(|(n, _, _)| *n).unwrap_or(part_marker);
+        xml.push_str("  <ObjectParts>\n");
+        xml.push_str(&format!("    <TotalPartsCount>{}</TotalPartsCount>\n", total));
+        xml.push_str(&format!("    <PartNumberMarker>{}</PartNumberMarker>\n", part_marker));
+        xml.push_str(&format!("    <NextPartNumberMarker>{}</NextPartNumberMarker>\n", next_marker));
+        xml.push_str(&format!("    <MaxParts>{}</MaxParts>\n", max_parts));
+        xml.push_str(&format!("    <IsTruncated>{}</IsTruncated>\n", has_more));
+        for (p_num, p_size, p_cksum) in page {
+            xml.push_str("    <Part>\n");
+            xml.push_str(&format!("      <PartNumber>{}</PartNumber>\n", p_num));
+            xml.push_str(&format!("      <Size>{}</Size>\n", p_size));
+            if let Some((alg, val)) = p_cksum {
+                xml.push_str(&format!("      <{}>{}</{}>\n", alg.xml_name(), crate::xml::xml_escape(&val), alg.xml_name()));
+            }
+            xml.push_str("    </Part>\n");
+        }
+        xml.push_str("  </ObjectParts>\n");
+    }
+    if want_storage_class {
+        xml.push_str("  <StorageClass>STANDARD</StorageClass>\n");
+    }
+    if want_size {
+        xml.push_str(&format!("  <ObjectSize>{}</ObjectSize>\n", size));
+    }
+    xml.push_str("</GetObjectAttributesResponse>");
+
+    let mut b = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/xml")
+        .header(LAST_MODIFIED, last_mod_http);
+    if let Some(vid_str) = version_id_str {
+        b = b.header("x-amz-version-id", vid_str);
+    }
+    Ok(b.body(full_body(Bytes::from(xml))).unwrap())
 }

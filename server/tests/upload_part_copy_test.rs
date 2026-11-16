@@ -41,15 +41,15 @@ async fn a_part_with_a_copy_source_is_refused_and_stores_nothing() {
     // UploadPartCopy, as the aws CLI sends it: no body, the source in a header.
     let res = c
         .put(format!("{}/bkt/dst?partNumber=1&uploadId={}", base, id))
-        .header("x-amz-copy-source", "/bkt/src")
+        .header("x-amz-copy-source", "/bkt/missing")
         .header("x-amz-copy-source-range", "bytes=0-99999")
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED, "refused, not stored as an empty part");
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "missing copy source is refused, not stored as an empty part");
     let etag = res.headers().get("etag").map(|v| v.to_str().unwrap().to_string());
     let body = res.text().await.unwrap();
-    assert_eq!(between(&body, "<Code>", "</Code>"), Some("NotImplemented"), "{}", body);
+    assert_eq!(between(&body, "<Code>", "</Code>"), Some("NoSuchKey"), "{}", body);
     assert!(etag.as_deref().map_or(true, |e| !e.contains(EMPTY_MD5)), "no empty-part ETag handed back: {:?}", etag);
 
     // Nothing was stored for that part number.

@@ -12,6 +12,28 @@ pub const MAX_BLOCK: usize = u16::MAX as usize;
 
 /// `Content-Type` as sent with the object (#150). Write-time.
 pub const TAG_CONTENT_TYPE: u16 = 0x0001;
+/// `Content-Encoding` with `aws-chunked` stripped (#152). Write-time.
+pub const TAG_CONTENT_ENCODING: u16 = 0x0002;
+/// `Content-Disposition` (#152). Write-time.
+pub const TAG_CONTENT_DISPOSITION: u16 = 0x0003;
+/// `Content-Language` (#152). Write-time.
+pub const TAG_CONTENT_LANGUAGE: u16 = 0x0004;
+/// `Cache-Control` (#152). Write-time.
+pub const TAG_CACHE_CONTROL: u16 = 0x0005;
+/// `Expires` (#152). Write-time.
+pub const TAG_EXPIRES: u16 = 0x0006;
+/// `x-amz-website-redirect-location` (#152). Write-time.
+pub const TAG_WEBSITE_REDIRECT: u16 = 0x0007;
+/// User metadata (`x-amz-meta-*`) packed as `name_len (u16 LE) | name | val_len (u16 LE) | val` (#152).
+pub const TAG_USER_META: u16 = 0x0008;
+
+/// Object tags (`TagSet`, #115). Mutable: rewriting the needle updates this tag.
+pub const TAG_TAGGING: u16 = 0x0010;
+/// Object checksum (`<ALG>:<TYPE>:<base64>`), #117. Write-time.
+pub const TAG_CHECKSUM: u16 = 0x0020;
+
+/// Multipart part sizes (little-endian `u64` per part), #117. Write-time.
+pub const TAG_PART_SIZES: u16 = 0x0021;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttrsError {
@@ -49,8 +71,142 @@ impl Attrs {
         self.entries.binary_search_by_key(&tag, |e| e.0).ok().map(|i| &self.entries[i].1[..])
     }
 
+    /// Removes `tag` if present.
+    pub fn remove(&mut self, tag: u16) {
+        if let Ok(i) = self.entries.binary_search_by_key(&tag, |e| e.0) {
+            self.entries.remove(i);
+        }
+    }
+
     pub fn content_type(&self) -> Option<&str> {
         self.get(TAG_CONTENT_TYPE).and_then(|v| std::str::from_utf8(v).ok())
+    }
+
+    pub fn tag_set(&self) -> Result<crate::tagging::TagSet, AttrsError> {
+        match self.get(TAG_TAGGING) {
+            Some(bytes) => decode_tags(bytes),
+            None => Ok(crate::tagging::TagSet::default()),
+        }
+    }
+
+    pub fn tag_count(&self) -> usize {
+        self.get(TAG_TAGGING)
+            .and_then(|b| decode_tags(b).ok())
+            .map_or(0, |s| s.tags.len())
+    }
+
+    pub fn set_checksum(&mut self, alg: crate::checksum::ChecksumAlgorithm, checksum_type: &str, value: &str) {
+        let encoded = format!("{}:{}:{}", alg.name(), checksum_type, value);
+        self.set(TAG_CHECKSUM, encoded.as_bytes());
+    }
+
+    pub fn checksum(&self) -> Option<(crate::checksum::ChecksumAlgorithm, &str, &str)> {
+        let s = self.get(TAG_CHECKSUM).and_then(|v| std::str::from_utf8(v).ok())?;
+        let (alg_str, rest) = s.split_once(':')?;
+        let alg = crate::checksum::ChecksumAlgorithm::from_header_name(alg_str)?;
+        if let Some((cksum_type, val)) = rest.split_once(':') {
+            Some((alg, cksum_type, val))
+        } else {
+            let cksum_type = if rest.contains('-') { "COMPOSITE" } else { "FULL_OBJECT" };
+            Some((alg, cksum_type, rest))
+        }
+    }
+
+    pub fn set_part_sizes(&mut self, sizes: &[u64]) {
+        let mut buf = Vec::with_capacity(sizes.len() * 8);
+        for &sz in sizes {
+            buf.extend_from_slice(&sz.to_le_bytes());
+        }
+        self.set(TAG_PART_SIZES, &buf);
+    }
+
+    pub fn part_sizes(&self) -> Option<Vec<u64>> {
+        let raw = self.get(TAG_PART_SIZES)?;
+        if raw.len() % 8 != 0 {
+            return None;
+        }
+        Some(
+            raw.chunks_exact(8)
+                .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                .collect(),
+        )
+    }
+    fn get_str(&self, tag: u16) -> Option<&str> {
+        self.get(tag).and_then(|v| std::str::from_utf8(v).ok())
+    }
+
+    pub fn content_encoding(&self) -> Option<&str> {
+        self.get_str(TAG_CONTENT_ENCODING)
+    }
+
+    pub fn content_disposition(&self) -> Option<&str> {
+        self.get_str(TAG_CONTENT_DISPOSITION)
+    }
+
+    pub fn content_language(&self) -> Option<&str> {
+        self.get_str(TAG_CONTENT_LANGUAGE)
+    }
+
+    pub fn cache_control(&self) -> Option<&str> {
+        self.get_str(TAG_CACHE_CONTROL)
+    }
+
+    pub fn expires(&self) -> Option<&str> {
+        self.get_str(TAG_EXPIRES)
+    }
+
+    pub fn website_redirect(&self) -> Option<&str> {
+        self.get_str(TAG_WEBSITE_REDIRECT)
+    }
+
+    /// Encodes `x-amz-meta-*` entries (already lower-cased names) into `TAG_USER_META`.
+    /// Does nothing when `entries` is empty so needles without metadata stay format 2.
+    pub fn set_user_meta<'a, I>(&mut self, entries: I)
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        let mut buf = Vec::new();
+        for (name, val) in entries {
+            let nb = name.as_bytes();
+            let vb = val.as_bytes();
+            buf.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+            buf.extend_from_slice(nb);
+            buf.extend_from_slice(&(vb.len() as u16).to_le_bytes());
+            buf.extend_from_slice(vb);
+        }
+        if !buf.is_empty() {
+            self.set(TAG_USER_META, &buf);
+        }
+    }
+
+    /// Decodes `x-amz-meta-*` entries from `TAG_USER_META`.
+    pub fn user_meta(&self) -> Vec<(&str, &str)> {
+        let Some(mut rest) = self.get(TAG_USER_META) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while rest.len() >= 2 {
+            let nlen = u16::from_le_bytes([rest[0], rest[1]]) as usize;
+            rest = &rest[2..];
+            if rest.len() < nlen + 2 {
+                break;
+            }
+            let Ok(name) = std::str::from_utf8(&rest[..nlen]) else {
+                break;
+            };
+            rest = &rest[nlen..];
+            let vlen = u16::from_le_bytes([rest[0], rest[1]]) as usize;
+            rest = &rest[2..];
+            if rest.len() < vlen {
+                break;
+            }
+            let Ok(val) = std::str::from_utf8(&rest[..vlen]) else {
+                break;
+            };
+            rest = &rest[vlen..];
+            out.push((name, val));
+        }
+        out
     }
 
     /// The tags, ascending.
@@ -112,6 +268,59 @@ impl Attrs {
         }
         Ok(Self { entries })
     }
+}
+
+/// Encodes a `TagSet` for `TAG_TAGGING`: `u16` count, then `(u16 key_len, key, u16 val_len, val)`.
+pub fn encode_tags(set: &crate::tagging::TagSet) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + set.tags.len() * 16);
+    out.extend_from_slice(&(set.tags.len() as u16).to_le_bytes());
+    for tag in &set.tags {
+        let kb = tag.key.as_bytes();
+        let vb = tag.value.as_bytes();
+        out.extend_from_slice(&(kb.len() as u16).to_le_bytes());
+        out.extend_from_slice(kb);
+        out.extend_from_slice(&(vb.len() as u16).to_le_bytes());
+        out.extend_from_slice(vb);
+    }
+    out
+}
+
+/// Decodes a `TagSet` from `TAG_TAGGING` bytes.
+pub fn decode_tags(bytes: &[u8]) -> Result<crate::tagging::TagSet, AttrsError> {
+    if bytes.len() < 2 {
+        return Err(AttrsError::Corrupt("tag block length"));
+    }
+    let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+    let mut rest = &bytes[2..];
+    let mut tags = Vec::with_capacity(count);
+    for _ in 0..count {
+        if rest.len() < 2 {
+            return Err(AttrsError::Corrupt("tag key length"));
+        }
+        let klen = u16::from_le_bytes([rest[0], rest[1]]) as usize;
+        rest = &rest[2..];
+        if rest.len() < klen + 2 {
+            return Err(AttrsError::Corrupt("tag key"));
+        }
+        let key = std::str::from_utf8(&rest[..klen])
+            .map_err(|_| AttrsError::Corrupt("tag key utf8"))?
+            .to_string();
+        rest = &rest[klen..];
+        let vlen = u16::from_le_bytes([rest[0], rest[1]]) as usize;
+        rest = &rest[2..];
+        if rest.len() < vlen {
+            return Err(AttrsError::Corrupt("tag value"));
+        }
+        let value = std::str::from_utf8(&rest[..vlen])
+            .map_err(|_| AttrsError::Corrupt("tag value utf8"))?
+            .to_string();
+        rest = &rest[vlen..];
+        tags.push(crate::tagging::Tag { key, value });
+    }
+    if !rest.is_empty() {
+        return Err(AttrsError::Corrupt("trailing tag bytes"));
+    }
+    Ok(crate::tagging::TagSet { tags })
 }
 
 #[cfg(test)]

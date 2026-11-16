@@ -215,6 +215,25 @@ impl ValidatorRegistry {
                 Arc::new(|bytes: &[u8]| Ok(ParsedConfig::raw(Bytes::copy_from_slice(bytes)))),
             );
         }
+        reg.register(
+            ConfigKind::Cors,
+            Arc::new(|bytes: &[u8]| {
+                let xml_str = std::str::from_utf8(bytes).map_err(|_| ConfigError::Rejected {
+                    status: 400,
+                    code: "MalformedXML",
+                    message: "CORS configuration is not valid UTF-8".to_string(),
+                })?;
+                let rules = crate::cors::parse_cors_xml(xml_str).map_err(|r| ConfigError::Rejected {
+                    status: r.status,
+                    code: r.code,
+                    message: r.why.to_string(),
+                })?;
+                Ok(ParsedConfig::with_parsed(
+                    Bytes::copy_from_slice(bytes),
+                    Arc::new(rules),
+                ))
+            }),
+        );
         reg
     }
 

@@ -77,6 +77,16 @@ A tag number is never reused. 0x8000 and above are for tests.
 | Tag | Name | Group | Owner |
 |---|---|---|---|
 | 0x0001 | Content-Type, as sent | headers (write-time) | #150 |
+| 0x0010 | Object tags (`TagSet`) | tagging (mutable) | #115 |
+| 0x0020 | Object checksum (`<ALG>:<TYPE>:<base64>`) | checksum (write-time) | #117 |
+| 0x0021 | Multipart part sizes (LE `u64` array) | multipart (write-time) | #117 |
+| 0x0002 | Content-Encoding (with `aws-chunked` stripped) | headers (write-time) | #152 |
+| 0x0003 | Content-Disposition | headers (write-time) | #152 |
+| 0x0004 | Content-Language | headers (write-time) | #152 |
+| 0x0005 | Cache-Control | headers (write-time) | #152 |
+| 0x0006 | Expires | headers (write-time) | #152 |
+| 0x0007 | x-amz-website-redirect-location | headers (write-time) | #152 |
+| 0x0008 | User metadata (`x-amz-meta-*`) | metadata | #152 |
 
 ## Journal record (`.idx`, 42 bytes)
 

@@ -32,6 +32,7 @@ pub struct PartExtent {
     pub ref_count: u32,
     pub raw_md5: [u8; 16],
     pub staged_path: Option<PathBuf>,
+    pub checksum: Option<(crate::checksum::ChecksumAlgorithm, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +46,7 @@ pub struct StagedPart {
     pub raw_md5: [u8; 16],
     pub uploaded_at: u64,
     pub staged_path: Option<PathBuf>,
+    pub checksum: Option<(crate::checksum::ChecksumAlgorithm, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +57,8 @@ pub struct MultipartUpload {
     pub key: String,
     pub initiated_at: u64,
     pub parts: BTreeMap<u32, StagedPart>,
+    pub checksum_alg: Option<crate::checksum::ChecksumAlgorithm>,
+    pub checksum_type: Option<String>,
 }
 
 pub struct MultipartManager {
@@ -184,6 +188,8 @@ impl MultipartManager {
             key: key.to_string(),
             initiated_at: now_ms,
             parts: BTreeMap::new(),
+            checksum_alg: None,
+            checksum_type: None,
         };
 
         self.uploads.write().insert(upload_id.clone(), upload);
@@ -218,6 +224,21 @@ impl MultipartManager {
         self.uploads.read().get(upload_id).cloned()
     }
 
+    pub fn set_upload_checksum(&self, upload_id: &str, alg: crate::checksum::ChecksumAlgorithm, checksum_type: String) {
+        if let Some(u) = self.uploads.write().get_mut(upload_id) {
+            u.checksum_alg = Some(alg);
+            u.checksum_type = Some(checksum_type);
+        }
+    }
+
+    pub fn set_part_checksum(&self, upload_id: &str, part_number: u32, alg: crate::checksum::ChecksumAlgorithm, value: String) {
+        if let Some(u) = self.uploads.write().get_mut(upload_id) {
+            if let Some(p) = u.parts.get_mut(&part_number) {
+                p.checksum = Some((alg, value));
+            }
+        }
+    }
+
     pub fn upload_part(
         &self,
         upload_id: &str,
@@ -249,6 +270,7 @@ impl MultipartManager {
             raw_md5,
             uploaded_at: now_ms,
             staged_path,
+            checksum: None,
         };
 
         // Atomically replace prior upload of same partNumber
@@ -332,6 +354,7 @@ impl MultipartManager {
                 ref_count: 1,
                 raw_md5: staged.raw_md5,
                 staged_path: staged.staged_path.clone(),
+                checksum: staged.checksum.clone(),
             });
         }
 
@@ -483,12 +506,31 @@ pub fn complete_multipart_upload_result_xml(
     )
 }
 
-pub fn list_parts_result_xml(
-    bucket: &str,
-    key: &str,
-    upload_id: &str,
-    parts: &[StagedPart],
-) -> String {
+pub fn copy_part_result_xml(etag: &str, last_modified: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+        <CopyPartResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  \
+          <LastModified>{}</LastModified>\n  \
+          <ETag>\"{}\"</ETag>\n\
+        </CopyPartResult>",
+        xml_escape(last_modified),
+        xml_escape(etag)
+    )
+}
+
+pub struct ListPartsPage<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub upload_id: &'a str,
+    pub part_number_marker: u32,
+    pub next_part_number_marker: u32,
+    pub max_parts: usize,
+    pub is_truncated: bool,
+    pub encoding_url: bool,
+    pub parts: &'a [StagedPart],
+}
+
+pub fn list_parts_result_xml(p: &ListPartsPage<'_>) -> String {
     let mut out = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
         <ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  \
@@ -496,21 +538,28 @@ pub fn list_parts_result_xml(
           <Key>{}</Key>\n  \
           <UploadId>{}</UploadId>\n  \
           <StorageClass>STANDARD</StorageClass>\n  \
-          <PartNumberMarker>0</PartNumberMarker>\n  \
-          <NextPartNumberMarker>0</NextPartNumberMarker>\n  \
-          <MaxParts>1000</MaxParts>\n  \
-          <IsTruncated>false</IsTruncated>\n",
-        xml_escape(bucket),
-        xml_escape(key),
-        xml_escape(upload_id)
+          <PartNumberMarker>{}</PartNumberMarker>\n  \
+          <NextPartNumberMarker>{}</NextPartNumberMarker>\n  \
+          <MaxParts>{}</MaxParts>\n  \
+          <IsTruncated>{}</IsTruncated>\n",
+        xml_escape(p.bucket),
+        xml_escape(p.key),
+        xml_escape(p.upload_id),
+        p.part_number_marker,
+        p.next_part_number_marker,
+        p.max_parts,
+        p.is_truncated
     );
+    if p.encoding_url {
+        out.push_str("  <EncodingType>url</EncodingType>\n");
+    }
 
-    for p in parts {
+    for part in p.parts {
         out.push_str("  <Part>\n");
-        out.push_str(&format!("    <PartNumber>{}</PartNumber>\n", p.part_number));
-        out.push_str(&format!("    <LastModified>{}</LastModified>\n", crate::versions::iso8601(p.uploaded_at.saturating_mul(1_000_000))));
-        out.push_str(&format!("    <ETag>\"{}\"</ETag>\n", p.etag_hex));
-        out.push_str(&format!("    <Size>{}</Size>\n", p.size));
+        out.push_str(&format!("    <PartNumber>{}</PartNumber>\n", part.part_number));
+        out.push_str(&format!("    <LastModified>{}</LastModified>\n", crate::versions::iso8601(part.uploaded_at.saturating_mul(1_000_000))));
+        out.push_str(&format!("    <ETag>\"{}\"</ETag>\n", part.etag_hex));
+        out.push_str(&format!("    <Size>{}</Size>\n", part.size));
         out.push_str("  </Part>\n");
     }
 
@@ -518,32 +567,63 @@ pub fn list_parts_result_xml(
     out
 }
 
-pub fn list_multipart_uploads_result_xml(
-    bucket: &str,
-    uploads: &[MultipartUpload],
-) -> String {
+pub struct ListUploadsPage<'a> {
+    pub bucket: &'a str,
+    pub prefix: &'a str,
+    pub delimiter: &'a str,
+    pub key_marker: &'a str,
+    pub upload_id_marker: &'a str,
+    pub next_key_marker: &'a str,
+    pub next_upload_id_marker: &'a str,
+    pub max_uploads: usize,
+    pub is_truncated: bool,
+    pub encoding_url: bool,
+    pub uploads: &'a [(String, String, u64)],
+    pub common_prefixes: &'a [String],
+}
+
+pub fn list_multipart_uploads_result_xml(p: &ListUploadsPage<'_>) -> String {
     let mut out = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
         <ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  \
           <Bucket>{}</Bucket>\n  \
-          <KeyMarker></KeyMarker>\n  \
-          <UploadIdMarker></UploadIdMarker>\n  \
-          <NextKeyMarker></NextKeyMarker>\n  \
-          <NextUploadIdMarker></NextUploadIdMarker>\n  \
-          <MaxUploads>1000</MaxUploads>\n  \
-          <IsTruncated>false</IsTruncated>\n",
-        xml_escape(bucket)
+          <KeyMarker>{}</KeyMarker>\n  \
+          <UploadIdMarker>{}</UploadIdMarker>\n  \
+          <NextKeyMarker>{}</NextKeyMarker>\n  \
+          <NextUploadIdMarker>{}</NextUploadIdMarker>\n  \
+          <MaxUploads>{}</MaxUploads>\n  \
+          <IsTruncated>{}</IsTruncated>\n",
+        xml_escape(p.bucket),
+        xml_escape(p.key_marker),
+        xml_escape(p.upload_id_marker),
+        xml_escape(p.next_key_marker),
+        xml_escape(p.next_upload_id_marker),
+        p.max_uploads,
+        p.is_truncated
     );
+    if !p.prefix.is_empty() {
+        out.push_str(&format!("  <Prefix>{}</Prefix>\n", xml_escape(p.prefix)));
+    }
+    if !p.delimiter.is_empty() {
+        out.push_str(&format!("  <Delimiter>{}</Delimiter>\n", xml_escape(p.delimiter)));
+    }
+    if p.encoding_url {
+        out.push_str("  <EncodingType>url</EncodingType>\n");
+    }
 
-    for u in uploads {
+    for (key, upload_id, initiated_at) in p.uploads {
         out.push_str("  <Upload>\n");
-        out.push_str(&format!("    <Key>{}</Key>\n", xml_escape(&u.key)));
-        out.push_str(&format!("    <UploadId>{}</UploadId>\n", xml_escape(&u.upload_id)));
+        out.push_str(&format!("    <Key>{}</Key>\n", xml_escape(key)));
+        out.push_str(&format!("    <UploadId>{}</UploadId>\n", xml_escape(upload_id)));
         out.push_str("    <Initiator><ID>root</ID><DisplayName>root</DisplayName></Initiator>\n");
         out.push_str("    <Owner><ID>root</ID><DisplayName>root</DisplayName></Owner>\n");
         out.push_str("    <StorageClass>STANDARD</StorageClass>\n");
-        out.push_str(&format!("    <Initiated>{}</Initiated>\n", crate::versions::iso8601(u.initiated_at.saturating_mul(1_000_000))));
+        out.push_str(&format!("    <Initiated>{}</Initiated>\n", crate::versions::iso8601(initiated_at.saturating_mul(1_000_000))));
         out.push_str("  </Upload>\n");
+    }
+
+    for cp in p.common_prefixes {
+        out.push_str(&format!("  <CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>\n", xml_escape(cp)));
     }
 
     out.push_str("</ListMultipartUploadsResult>");
@@ -629,6 +709,7 @@ fn decode_manifest_v1(staging_dir: &Path, bytes: &[u8]) -> Option<(u64, Vec<Part
             ref_count: 1,
             raw_md5,
             staged_path,
+            checksum: None,
         });
     }
     Some((total, extents))

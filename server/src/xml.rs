@@ -140,28 +140,50 @@ pub struct VersionListing {
     pub size: u64,
 }
 
-/// ListObjectVersions with real version ids and delete markers (#31). Keys are already
-/// url-encoded when the request asked for it.
-#[allow(clippy::too_many_arguments)]
-pub fn list_versions_xml(bucket: &str, prefix: &str, key_marker: &str, max_keys: u32, truncated: bool, next_key_marker: Option<&str>, url: bool, entries: &[VersionListing]) -> String {
+/// Parameters for `list_versions_xml`.
+pub struct ListVersionsParams<'a> {
+    pub bucket: &'a str,
+    pub prefix: &'a str,
+    pub delimiter: &'a str,
+    pub key_marker: &'a str,
+    pub version_id_marker: &'a str,
+    pub max_keys: u32,
+    pub truncated: bool,
+    pub next_key_marker: Option<&'a str>,
+    pub next_version_id_marker: Option<&'a str>,
+    pub url: bool,
+    pub entries: &'a [VersionListing],
+    pub common_prefixes: &'a [&'a str],
+}
+
+/// ListObjectVersions with real version ids, delete markers, and common prefixes (#31, #113).
+/// Keys and prefixes are already url-encoded when the request asked for it.
+pub fn list_versions_xml(p: &ListVersionsParams<'_>) -> String {
     let mut out = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
         <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  \
-          <Name>{}</Name>\n  <Prefix>{}</Prefix>\n  <KeyMarker>{}</KeyMarker>\n  <VersionIdMarker></VersionIdMarker>\n  \
+          <Name>{}</Name>\n  <Prefix>{}</Prefix>\n  <KeyMarker>{}</KeyMarker>\n  <VersionIdMarker>{}</VersionIdMarker>\n  \
           <MaxKeys>{}</MaxKeys>\n  <IsTruncated>{}</IsTruncated>\n",
-        xml_escape(bucket),
-        xml_escape(prefix),
-        xml_escape(key_marker),
-        max_keys,
-        truncated
+        xml_escape(p.bucket),
+        xml_escape(p.prefix),
+        xml_escape(p.key_marker),
+        xml_escape(p.version_id_marker),
+        p.max_keys,
+        p.truncated
     );
-    if url {
+    if !p.delimiter.is_empty() {
+        out.push_str(&format!("  <Delimiter>{}</Delimiter>\n", xml_escape(p.delimiter)));
+    }
+    if p.url {
         out.push_str("  <EncodingType>url</EncodingType>\n");
     }
-    if let Some(n) = next_key_marker {
+    if let Some(n) = p.next_key_marker {
         out.push_str(&format!("  <NextKeyMarker>{}</NextKeyMarker>\n", xml_escape(n)));
     }
-    for e in entries {
+    if let Some(nv) = p.next_version_id_marker {
+        out.push_str(&format!("  <NextVersionIdMarker>{}</NextVersionIdMarker>\n", xml_escape(nv)));
+    }
+    for e in p.entries {
         let tag = if e.marker { "DeleteMarker" } else { "Version" };
         out.push_str(&format!("  <{}>\n", tag));
         out.push_str(&format!("    <Key>{}</Key>\n", xml_escape(&e.key)));
@@ -175,6 +197,12 @@ pub fn list_versions_xml(bucket: &str, prefix: &str, key_marker: &str, max_keys:
         }
         out.push_str("    <Owner><ID>awanfs</ID><DisplayName>awanfs</DisplayName></Owner>\n");
         out.push_str(&format!("  </{}>\n", tag));
+    }
+    for cp in p.common_prefixes {
+        out.push_str(&format!(
+            "  <CommonPrefixes>\n    <Prefix>{}</Prefix>\n  </CommonPrefixes>\n",
+            xml_escape(cp)
+        ));
     }
     out.push_str("</ListVersionsResult>");
     out
@@ -191,17 +219,21 @@ pub struct ListV2<'a> {
     pub truncated: bool,
     pub next_token: Option<&'a str>,
     pub encoding_url: bool,
+    pub fetch_owner: bool,
     pub contents: &'a [S3ObjectEntry<'a>],
     pub prefixes: &'a [&'a str],
 }
 
-fn contents_and_prefixes(out: &mut String, contents: &[S3ObjectEntry], prefixes: &[&str]) {
+fn contents_and_prefixes(out: &mut String, contents: &[S3ObjectEntry], prefixes: &[&str], include_owner: bool) {
     for obj in contents {
         out.push_str("  <Contents>\n");
         out.push_str(&format!("    <Key>{}</Key>\n", xml_escape(obj.key)));
         out.push_str(&format!("    <LastModified>{}</LastModified>\n", obj.last_modified));
         out.push_str(&format!("    <ETag>\"{}\"</ETag>\n", obj.etag));
         out.push_str(&format!("    <Size>{}</Size>\n", obj.size));
+        if include_owner {
+            out.push_str("    <Owner><ID>awanfs</ID><DisplayName>awanfs</DisplayName></Owner>\n");
+        }
         out.push_str("    <StorageClass>STANDARD</StorageClass>\n");
         out.push_str("  </Contents>\n");
     }
@@ -237,7 +269,7 @@ pub fn list_objects_v2_xml_full(l: &ListV2) -> String {
     if let Some(t) = l.next_token {
         out.push_str(&format!("  <NextContinuationToken>{}</NextContinuationToken>\n", xml_escape(t)));
     }
-    contents_and_prefixes(&mut out, l.contents, l.prefixes);
+    contents_and_prefixes(&mut out, l.contents, l.prefixes, l.fetch_owner);
     out.push_str("</ListBucketResult>");
     out
 }
@@ -273,7 +305,7 @@ pub fn list_objects_v1_xml(
     if let Some(m) = next_marker {
         out.push_str(&format!("  <NextMarker>{}</NextMarker>\n", xml_escape(m)));
     }
-    contents_and_prefixes(&mut out, contents, prefixes);
+    contents_and_prefixes(&mut out, contents, prefixes, true);
     out.push_str("</ListBucketResult>");
     out
 }
@@ -332,6 +364,8 @@ pub fn list_objects_v2_xml(
 pub struct DeleteItemResult<'a> {
     pub key: &'a str,
     pub version_id: Option<&'a str>,
+    pub delete_marker: bool,
+    pub delete_marker_version_id: Option<&'a str>,
 }
 
 pub struct DeleteErrorItem<'a> {
@@ -353,6 +387,12 @@ pub fn delete_objects_result_xml(
         out.push_str(&format!("    <Key>{}</Key>\n", xml_escape(item.key)));
         if let Some(v) = item.version_id {
             out.push_str(&format!("    <VersionId>{}</VersionId>\n", xml_escape(v)));
+        }
+        if item.delete_marker {
+            out.push_str("    <DeleteMarker>true</DeleteMarker>\n");
+        }
+        if let Some(dm_vid) = item.delete_marker_version_id {
+            out.push_str(&format!("    <DeleteMarkerVersionId>{}</DeleteMarkerVersionId>\n", xml_escape(dm_vid)));
         }
         out.push_str("  </Deleted>\n");
     }

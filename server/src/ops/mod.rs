@@ -1,8 +1,10 @@
 pub mod bucket;
+pub mod cors;
 pub mod lifecycle;
 pub mod multipart;
 pub mod object;
 pub mod service;
+pub mod tagging;
 
 use bytes::Bytes;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST};
@@ -33,18 +35,27 @@ pub enum Operation {
     GetBucketLifecycle,
     PutBucketLifecycle,
     DeleteBucketLifecycle,
+    GetBucketCors,
+    PutBucketCors,
+    DeleteBucketCors,
+    CorsPreflight,
     ListMultipartUploads,
     DeleteObjects,
     PutObject,
     CopyObject,
     GetObject,
+    GetObjectAttributes,
     HeadObject,
     DeleteObject,
     CreateMultipartUpload,
     UploadPart,
+    UploadPartCopy,
     CompleteMultipartUpload,
     AbortMultipartUpload,
     ListParts,
+    GetObjectTagging,
+    PutObjectTagging,
+    DeleteObjectTagging,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +189,38 @@ pub const OPS: &[OpSpec] = &[
         requires_existing_bucket: true,
     },
     OpSpec {
+        op: Operation::GetBucketCors,
+        name: "GetBucketCors",
+        iam_action: Some("s3:ListBucket"),
+        acl_permission: AclPermission::Read,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::PutBucketCors,
+        name: "PutBucketCors",
+        iam_action: Some("s3:CreateBucket"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::DeleteBucketCors,
+        name: "DeleteBucketCors",
+        iam_action: Some("s3:DeleteBucket"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::CorsPreflight,
+        name: "CorsPreflight",
+        iam_action: None,
+        acl_permission: AclPermission::Read,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
         op: Operation::ListMultipartUploads,
         name: "ListObjects",
         iam_action: Some("s3:ListBucketMultipartUploads"),
@@ -218,6 +261,14 @@ pub const OPS: &[OpSpec] = &[
         requires_existing_bucket: true,
     },
     OpSpec {
+        op: Operation::GetObjectAttributes,
+        name: "GetObjectAttributes",
+        iam_action: Some("s3:GetObject"),
+        acl_permission: AclPermission::Read,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
         op: Operation::HeadObject,
         name: "HeadObject",
         iam_action: Some("s3:GetObject"),
@@ -250,6 +301,14 @@ pub const OPS: &[OpSpec] = &[
         requires_existing_bucket: true,
     },
     OpSpec {
+        op: Operation::UploadPartCopy,
+        name: "UploadPartCopy",
+        iam_action: Some("s3:PutObject"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
         op: Operation::CompleteMultipartUpload,
         name: "CompleteMultipartUpload",
         iam_action: Some("s3:PutObject"),
@@ -273,6 +332,30 @@ pub const OPS: &[OpSpec] = &[
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
+    OpSpec {
+        op: Operation::GetObjectTagging,
+        name: "GetObjectTagging",
+        iam_action: Some("s3:GetObjectTagging"),
+        acl_permission: AclPermission::Read,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::PutObjectTagging,
+        name: "PutObjectTagging",
+        iam_action: Some("s3:PutObjectTagging"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::DeleteObjectTagging,
+        name: "DeleteObjectTagging",
+        iam_action: Some("s3:DeleteObjectTagging"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
 ];
 
 pub fn spec(op: Operation) -> &'static OpSpec {
@@ -289,24 +372,25 @@ const BUILT_SUBRESOURCES: &[&str] = &[
     "versioning",
     "versions",
     "lifecycle",
+    "cors",
     "location",
     "uploads",
     "delete",
     "uploadId",
     "partNumber",
     "versionId",
+    "tagging",
+    "attributes",
 ];
 
 const UNBUILT_S3_SUBRESOURCES: &[&str] = &[
     "acl",
     "policy",
     "policyStatus",
-    "cors",
     "encryption",
     "object-lock",
     "legal-hold",
     "retention",
-    "tagging",
     "website",
     "notification",
     "replication",
@@ -322,7 +406,7 @@ const UNBUILT_S3_SUBRESOURCES: &[&str] = &[
     "ownershipControls",
     "publicAccessBlock",
     "logging",
-    "attributes",
+
     "parts",
 ];
 
@@ -381,6 +465,10 @@ pub fn classify(
             (&Method::PUT, ["lifecycle"]) => Ok(Operation::PutBucketLifecycle),
             (&Method::GET, ["lifecycle"]) => Ok(Operation::GetBucketLifecycle),
             (&Method::DELETE, ["lifecycle"]) => Ok(Operation::DeleteBucketLifecycle),
+            (&Method::PUT, ["cors"]) => Ok(Operation::PutBucketCors),
+            (&Method::GET, ["cors"]) => Ok(Operation::GetBucketCors),
+            (&Method::DELETE, ["cors"]) => Ok(Operation::DeleteBucketCors),
+            (&Method::OPTIONS, []) => Ok(Operation::CorsPreflight),
             (&Method::GET, ["location"]) => Ok(Operation::GetBucketLocation),
             (&Method::GET, ["uploads"]) => Ok(Operation::ListMultipartUploads),
             (&Method::POST, ["delete"]) => Ok(Operation::DeleteObjects),
@@ -395,9 +483,7 @@ pub fn classify(
             (&Method::POST, ["uploads"]) => Ok(Operation::CreateMultipartUpload),
             (&Method::PUT, ["partNumber", "uploadId"]) => {
                 if has_copy {
-                    Err(ClassifyRefusal::NotImplemented(
-                        "UploadPartCopy is not implemented: upload the part's bytes with UploadPart.",
-                    ))
+                    Ok(Operation::UploadPartCopy)
                 } else {
                     Ok(Operation::UploadPart)
                 }
@@ -405,11 +491,24 @@ pub fn classify(
             (&Method::POST, ["uploadId"]) => Ok(Operation::CompleteMultipartUpload),
             (&Method::DELETE, ["uploadId"]) => Ok(Operation::AbortMultipartUpload),
             (&Method::GET, ["uploadId"]) => Ok(Operation::ListParts),
-            (&Method::GET, ["versionId"]) | (&Method::GET, []) => Ok(Operation::GetObject),
-            (&Method::HEAD, ["versionId"]) | (&Method::HEAD, []) => Ok(Operation::HeadObject),
+            (&Method::GET, ["tagging"]) | (&Method::GET, ["tagging", "versionId"]) => Ok(Operation::GetObjectTagging),
+            (&Method::PUT, ["tagging"]) | (&Method::PUT, ["tagging", "versionId"]) => Ok(Operation::PutObjectTagging),
+            (&Method::DELETE, ["tagging"]) | (&Method::DELETE, ["tagging", "versionId"]) => Ok(Operation::DeleteObjectTagging),
+            (&Method::GET, ["attributes"]) | (&Method::GET, ["attributes", "versionId"]) => {
+                Ok(Operation::GetObjectAttributes)
+            }
+                        (&Method::GET, ["versionId"])
+            | (&Method::GET, ["partNumber"])
+            | (&Method::GET, ["partNumber", "versionId"])
+            | (&Method::GET, []) => Ok(Operation::GetObject),
+            (&Method::HEAD, ["versionId"])
+            | (&Method::HEAD, ["partNumber"])
+            | (&Method::HEAD, ["partNumber", "versionId"])
+            | (&Method::HEAD, []) => Ok(Operation::HeadObject),
             (&Method::DELETE, ["versionId"]) | (&Method::DELETE, []) => Ok(Operation::DeleteObject),
             (_, s) if !s.is_empty() => Err(ClassifyRefusal::NotImplemented("The requested sub-resource is not implemented.")),
             (&Method::PUT, []) => Ok(if has_copy { Operation::CopyObject } else { Operation::PutObject }),
+            (&Method::OPTIONS, []) => Ok(Operation::CorsPreflight),
             _ => Err(ClassifyRefusal::MethodNotAllowed("Method not allowed")),
         },
     }
@@ -432,7 +531,7 @@ pub fn iam_requirements(
         _ => return vec![],
     };
     let mut out = vec![(action, resource)];
-    if op == Operation::CopyObject {
+    if matches!(op, Operation::CopyObject | Operation::UploadPartCopy) {
         if let Some(src) = copy_source {
             let src = percent_decode_path(src.split('?').next().unwrap_or(src));
             out.push(("s3:GetObject", format!("arn:aws:s3:::{}", src.trim_start_matches('/'))));
@@ -531,6 +630,9 @@ pub fn classify_request(req: Request<hyper::body::Incoming>) -> Result<Classifie
 pub fn authenticate(state: &S3ServiceState, c: Classified) -> Result<Authenticated, Response<ResponseBody>> {
     let now_sec = state.clock.now_ns() / 1_000_000_000;
     let iam = state.iam.read().as_ref().map(|r| r.current());
+    if c.op == Operation::CorsPreflight {
+        return Ok(Authenticated { classified: c, principal: Principal::Anonymous, iam });
+    }
     let path = c.parts.uri.path();
     let principal = match crate::auth::authenticate_with(
         &state.auth,
@@ -643,6 +745,16 @@ pub fn validate(a: Authorized) -> Result<Validated, Response<ResponseBody>> {
     if declared.is_some_and(|n| n > body_limit) {
         return Err(entity_too_large(c.parts.uri.path(), body_limit));
     }
+    if let Some(expect) = c.parts.headers.get(hyper::header::EXPECT).and_then(|v| v.to_str().ok()) {
+        if !expect.trim().eq_ignore_ascii_case("100-continue") {
+            let xml = s3_error_xml("ExpectationFailed", "Expectation Failed", c.parts.uri.path(), "req-expect");
+            return Err(Response::builder()
+                .status(StatusCode::EXPECTATION_FAILED)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(full_body(Bytes::from(xml)))
+                .unwrap());
+        }
+    }
 
     Ok(Validated { authorized: a })
 }
@@ -660,19 +772,23 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
 
     match c.op {
         Operation::ListBuckets => service::list_buckets(state).await,
-        Operation::CreateBucket => bucket::create_bucket(state, bucket).await,
+        Operation::CreateBucket => bucket::create_bucket(state, bucket, &path, &principal, c.body).await,
         Operation::DeleteBucket => bucket::delete_bucket(state, b_id.unwrap(), bucket).await,
         Operation::HeadBucket => bucket::head_bucket().await,
         Operation::ListObjects => bucket::list_objects(state, b_id.unwrap(), bucket, &c.query_map, false).await,
         Operation::ListObjectsV2 => bucket::list_objects(state, b_id.unwrap(), bucket, &c.query_map, true).await,
         Operation::ListObjectVersions => bucket::list_object_versions(state, b_id.unwrap(), bucket, &c.query_map).await,
-        Operation::GetBucketLocation => bucket::get_bucket_location().await,
+        Operation::GetBucketLocation => bucket::get_bucket_location(state).await,
         Operation::GetBucketVersioning => bucket::get_bucket_versioning(state, b_id.unwrap()).await,
         Operation::PutBucketVersioning => bucket::put_bucket_versioning(state, b_id.unwrap(), bucket, &path, c.body).await,
         Operation::GetBucketLifecycle => lifecycle::get_bucket_lifecycle(state, bucket).await,
         Operation::PutBucketLifecycle => lifecycle::put_bucket_lifecycle(state, bucket, &path, c.body).await,
         Operation::DeleteBucketLifecycle => lifecycle::delete_bucket_lifecycle(state, bucket).await,
-        Operation::ListMultipartUploads => multipart::list_multipart_uploads(state, bucket).await,
+        Operation::GetBucketCors => cors::get_bucket_cors(state, b_id.unwrap(), bucket).await,
+        Operation::PutBucketCors => cors::put_bucket_cors(state, b_id.unwrap(), bucket, &path, c.body).await,
+        Operation::DeleteBucketCors => cors::delete_bucket_cors(state, b_id.unwrap(), bucket).await,
+        Operation::CorsPreflight => cors::preflight(state, b_id.unwrap(), &path, &c.parts.headers).await,
+        Operation::ListMultipartUploads => multipart::list_multipart_uploads(state, bucket, &c.query_map).await,
         Operation::DeleteObjects => {
             bucket::delete_objects(state, b_id.unwrap(), bucket, &path, &principal, iam.as_deref(), c.body).await
         }
@@ -681,21 +797,36 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         }
         Operation::CopyObject => object::copy_object(state, b_id.unwrap(), bucket, key, &c.parts.headers).await,
         Operation::GetObject => {
-            object::get_or_head_object(state, b_id.unwrap(), bucket, key, &c.query_map, &c.parts.headers, false).await
+            let auth_enabled = state.auth.credentials.is_some() || iam.as_deref().is_some_and(|i| !i.is_empty());
+            let is_anon_with_auth = auth_enabled && matches!(principal, Principal::Anonymous);
+            object::get_or_head_object(state, b_id.unwrap(), bucket, key, &c.query_map, &c.parts.headers, false, is_anon_with_auth).await
+        }
+        Operation::GetObjectAttributes => {
+            object::get_object_attributes(state, b_id.unwrap(), bucket, key, &c.query_map, &c.parts.headers).await
         }
         Operation::HeadObject => {
-            object::get_or_head_object(state, b_id.unwrap(), bucket, key, &c.query_map, &c.parts.headers, true).await
+            let auth_enabled = state.auth.credentials.is_some() || iam.as_deref().is_some_and(|i| !i.is_empty());
+            let is_anon_with_auth = auth_enabled && matches!(principal, Principal::Anonymous);
+            object::get_or_head_object(state, b_id.unwrap(), bucket, key, &c.query_map, &c.parts.headers, true, is_anon_with_auth).await
         }
         Operation::DeleteObject => object::delete_object(state, b_id.unwrap(), key, &c.query_map).await,
-        Operation::CreateMultipartUpload => multipart::create_multipart_upload(state, b_id.unwrap(), bucket, key).await,
+        Operation::CreateMultipartUpload => {
+            multipart::create_multipart_upload(state, b_id.unwrap(), bucket, key, &c.parts.headers).await
+        }
         Operation::UploadPart => {
             multipart::upload_part(state, key, &path, &c.query_map, &c.parts.headers, iam, c.body).await
         }
+        Operation::UploadPartCopy => {
+            multipart::upload_part_copy(state, key, &c.query_map, &c.parts.headers).await
+        }
         Operation::CompleteMultipartUpload => {
-            multipart::complete_multipart_upload(state, b_id.unwrap(), bucket, key, &path, &c.query_map, c.body).await
+            multipart::complete_multipart_upload(state, b_id.unwrap(), bucket, key, &path, &c.query_map, &c.parts.headers, c.body).await
         }
         Operation::AbortMultipartUpload => multipart::abort_multipart_upload(state, b_id.unwrap(), key, &c.query_map).await,
         Operation::ListParts => multipart::list_parts(state, bucket, key, &c.query_map).await,
+        Operation::GetObjectTagging => tagging::get_object_tagging(state, b_id.unwrap(), key, &c.query_map).await,
+        Operation::PutObjectTagging => tagging::put_object_tagging(state, b_id.unwrap(), key, &path, &c.query_map, c.body).await,
+        Operation::DeleteObjectTagging => tagging::delete_object_tagging(state, b_id.unwrap(), key, &c.query_map).await,
     }
 }
 
@@ -719,18 +850,27 @@ mod tests {
             (Operation::GetBucketLifecycle, Method::GET, Some("bkt"), None, "lifecycle", None),
             (Operation::PutBucketLifecycle, Method::PUT, Some("bkt"), None, "lifecycle", None),
             (Operation::DeleteBucketLifecycle, Method::DELETE, Some("bkt"), None, "lifecycle", None),
+            (Operation::GetBucketCors, Method::GET, Some("bkt"), None, "cors", None),
+            (Operation::PutBucketCors, Method::PUT, Some("bkt"), None, "cors", None),
+            (Operation::DeleteBucketCors, Method::DELETE, Some("bkt"), None, "cors", None),
+            (Operation::CorsPreflight, Method::OPTIONS, Some("bkt"), None, "", None),
             (Operation::ListMultipartUploads, Method::GET, Some("bkt"), None, "uploads", None),
             (Operation::DeleteObjects, Method::POST, Some("bkt"), None, "delete", None),
             (Operation::PutObject, Method::PUT, Some("bkt"), Some("obj"), "", None),
             (Operation::CopyObject, Method::PUT, Some("bkt"), Some("obj"), "", Some("/src/key")),
             (Operation::GetObject, Method::GET, Some("bkt"), Some("obj"), "", None),
+            (Operation::GetObjectAttributes, Method::GET, Some("bkt"), Some("obj"), "attributes", None),
             (Operation::HeadObject, Method::HEAD, Some("bkt"), Some("obj"), "", None),
             (Operation::DeleteObject, Method::DELETE, Some("bkt"), Some("obj"), "", None),
             (Operation::CreateMultipartUpload, Method::POST, Some("bkt"), Some("obj"), "uploads", None),
             (Operation::UploadPart, Method::PUT, Some("bkt"), Some("obj"), "partNumber=1&uploadId=u1", None),
+            (Operation::UploadPartCopy, Method::PUT, Some("bkt"), Some("obj"), "partNumber=1&uploadId=u1", Some("/src/key")),
             (Operation::CompleteMultipartUpload, Method::POST, Some("bkt"), Some("obj"), "uploadId=u1", None),
             (Operation::AbortMultipartUpload, Method::DELETE, Some("bkt"), Some("obj"), "uploadId=u1", None),
             (Operation::ListParts, Method::GET, Some("bkt"), Some("obj"), "uploadId=u1", None),
+            (Operation::GetObjectTagging, Method::GET, Some("bkt"), Some("obj"), "tagging", None),
+            (Operation::PutObjectTagging, Method::PUT, Some("bkt"), Some("obj"), "tagging", None),
+            (Operation::DeleteObjectTagging, Method::DELETE, Some("bkt"), Some("obj"), "tagging", None),
         ]
     }
 
@@ -761,6 +901,9 @@ mod tests {
                 hdrs.insert("x-amz-copy-source", c.parse().unwrap());
             }
             let op = classify(&method, b, k, q, &hdrs).unwrap();
+            if op == Operation::CorsPreflight {
+                continue;
+            }
             let new_reqs = iam_requirements(op, b, k, copy);
             let old_reqs = crate::iam::requirements(method.as_str(), b, k, q, copy);
             assert_eq!(new_reqs, old_reqs, "parity mismatch for {:?} ({} ?{})", op, method, q);
@@ -809,10 +952,10 @@ mod tests {
         // UploadPartCopy
         let mut copy_hdrs = HeaderMap::new();
         copy_hdrs.insert("x-amz-copy-source", "/b/s".parse().unwrap());
-        assert!(matches!(
-            classify(&Method::PUT, Some("bkt"), Some("obj"), "partNumber=1&uploadId=u1", &copy_hdrs),
-            Err(ClassifyRefusal::NotImplemented(_))
-        ));
+        assert_eq!(
+            classify(&Method::PUT, Some("bkt"), Some("obj"), "partNumber=1&uploadId=u1", &copy_hdrs).unwrap(),
+            Operation::UploadPartCopy
+        );
     }
 
     #[test]

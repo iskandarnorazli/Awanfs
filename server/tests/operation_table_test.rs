@@ -99,7 +99,6 @@ async fn unknown_subresources_answer_501_and_store_nothing() {
         (Method::GET, "/bkt?analytics"),
         (Method::GET, "/bkt?metrics"),
         (Method::GET, "/bkt?intelligent-tiering"),
-        (Method::GET, "/bkt/obj?tagging"),
         (Method::POST, "/bkt/obj?select"),
         (Method::POST, "/bkt/obj?restore"),
         (Method::GET, "/bkt/obj?torrent"),
