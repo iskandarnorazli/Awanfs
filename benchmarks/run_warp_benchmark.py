@@ -40,6 +40,9 @@ class BenchmarkMetrics:
     peak_rss_mb: float
     measured: bool = True
     note: str = ""
+    server_cpu_s: float = 0.0
+    client_cpu_s: float = 0.0
+    system_cpu_s: float = 0.0
 
 
 def calculate_percentiles(latencies: List[float]) -> Tuple[float, float, float, float]:
@@ -98,6 +101,44 @@ def get_process_peak_rss_mb(pid: int) -> float:
         except Exception:
             pass
     return 0.0
+
+
+def get_process_cpu_times(pid: int) -> Tuple[float, float]:
+    """Returns `(user_seconds, system_seconds)` for `pid` using psutil or OS APIs."""
+    try:
+        import psutil  # type: ignore
+        ct = psutil.Process(pid).cpu_times()
+        return float(ct.user), float(ct.system)
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        class FILETIME(ctypes.Structure):
+            _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            try:
+                ct, et, kt, ut = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+                if ctypes.windll.kernel32.GetProcessTimes(
+                    handle, ctypes.byref(ct), ctypes.byref(et), ctypes.byref(kt), ctypes.byref(ut)
+                ):
+                    def ft_to_s(ft: FILETIME) -> float:
+                        return ((ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 1e7
+                    return ft_to_s(ut), ft_to_s(kt)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+    else:
+        try:
+            with open(f"/proc/{pid}/stat", "r") as f:
+                data = f.read()
+            rparen = data.rfind(")")
+            fields = data[rparen + 2:].split()
+            hz = float(os.sysconf("SC_CLK_TCK"))
+            return int(fields[11]) / hz, int(fields[12]) / hz
+        except Exception:
+            pass
+    return 0.0, 0.0
 
 
 def minio_durability_note(os_name: str = os.name) -> str:
@@ -269,6 +310,18 @@ def format_markdown_report(
         "| **Small-File Disk Layout** | **4096B WORM Needle Volume** | 2+ files/inodes per object | Multi-volume File Store |",
         "| **License** | **Permissive (Workspace / MIT / Apache-2.0)** | AGPLv3 (Active Community OSS) | Apache 2.0 (Active Rust OSS) |",
     ])
+
+    cpu_rows = [(k, v) for k, v in awan.items() if v.server_cpu_s > 0 or v.client_cpu_s > 0]
+    if cpu_rows:
+        lines.extend([
+            "",
+            "## CPU Breakdown (per process, AwanFS phases)",
+            "",
+            "| Phase | Server CPU (s) | Client CPU (s) | System/Kernel CPU (s) |",
+            "| :--- | :--- | :--- | :--- |",
+        ])
+        for k, v in cpu_rows:
+            lines.append(f"| `{k}` | {v.server_cpu_s:.2f} | {v.client_cpu_s:.2f} | {v.system_cpu_s:.2f} |")
 
     return "\n".join(lines) + "\n"
 
@@ -645,6 +698,8 @@ def run_workload_phase(
                 error_statuses[st] = error_statuses.get(st, 0) + n
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(concurrency)]
+    srv_cpu_0 = get_process_cpu_times(server_pid) if server_pid else (0.0, 0.0)
+    cli_cpu_0 = get_process_cpu_times(os.getpid())
     t_start = time.perf_counter()
     for t in threads:
         t.start()
@@ -654,6 +709,11 @@ def run_workload_phase(
 
     stuck = join_all(threads, phase_label)
     t_total = time.perf_counter() - t_start
+    srv_cpu_1 = get_process_cpu_times(server_pid) if server_pid else (0.0, 0.0)
+    cli_cpu_1 = get_process_cpu_times(os.getpid())
+    srv_cpu_s = max(0.0, (srv_cpu_1[0] - srv_cpu_0[0]) + (srv_cpu_1[1] - srv_cpu_0[1])) if server_pid else 0.0
+    cli_cpu_s = max(0.0, (cli_cpu_1[0] - cli_cpu_0[0]) + (cli_cpu_1[1] - cli_cpu_0[1]))
+    sys_cpu_s = max(0.0, (srv_cpu_1[1] - srv_cpu_0[1]) if server_pid else 0.0) + max(0.0, cli_cpu_1[1] - cli_cpu_0[1])
 
     ops = len(latencies)
     ops_per_sec = ops / t_total if t_total > 0 else 0.0
@@ -669,6 +729,9 @@ def run_workload_phase(
         p99_ms=p99,
         p999_ms=p999,
         peak_rss_mb=peak_rss,
+        server_cpu_s=srv_cpu_s,
+        client_cpu_s=cli_cpu_s,
+        system_cpu_s=sys_cpu_s,
         measured=not stuck and not warm_short and warm_fail == 0 and errors == 0,
         note=", ".join(
             x for x in (
