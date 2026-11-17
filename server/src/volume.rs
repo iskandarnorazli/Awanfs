@@ -449,6 +449,26 @@ const IDX_RECORD: usize = 42;
 
 /// The next needle offset the journal knows about after `after`: recovery jumps there over a
 /// gap left by a failed or interrupted write (#38).
+/// Appends the pending journal records in order. A write that fails is cut back off the file,
+/// so a partly written record never shifts the records after it, and it and the ones after
+/// it stay pending.
+fn write_pending(idx: &mut File, pending: &mut Vec<[u8; IDX_RECORD]>) -> Result<(), VolumeError> {
+    let mut written = 0;
+    let mut result = Ok(());
+    for rec in pending.iter() {
+        let start = idx.seek(SeekFrom::End(0))?;
+        if let Err(e) = idx.write_all(rec) {
+            let _ = idx.set_len(start);
+            let _ = idx.seek(SeekFrom::End(0));
+            result = Err(VolumeError::Io(e));
+            break;
+        }
+        written += 1;
+    }
+    pending.drain(..written);
+    result
+}
+
 fn next_indexed(indexed: &BTreeSet<u64>, after: u64) -> Option<u64> {
     indexed.range(after + 1..).next().copied()
 }
@@ -493,6 +513,8 @@ pub struct VolumeManager {
     /// Tests: the next journal append fails, after the needle is on disk (#184).
     fail_next_index: std::sync::atomic::AtomicBool,
     fail_next_sync: std::sync::atomic::AtomicBool,
+    /// Journal records whose append failed, written before the next one (#184).
+    pending_journal: Mutex<Vec<[u8; IDX_RECORD]>>,
     /// Writes that have reserved an offset here and not yet written their header (#167). A
     /// streamed PUT counts from `begin_needle` until its `NeedleWriter` is dropped.
     writers_in_flight: std::sync::atomic::AtomicUsize,
@@ -714,6 +736,7 @@ impl VolumeManager {
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
             fail_next_index: std::sync::atomic::AtomicBool::new(false),
             fail_next_sync: std::sync::atomic::AtomicBool::new(false),
+            pending_journal: Mutex::new(Vec::new()),
             writers_in_flight: std::sync::atomic::AtomicUsize::new(0),
             sealed: std::sync::atomic::AtomicBool::new(false),
             gaps: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
@@ -833,6 +856,7 @@ impl VolumeManager {
             return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected sync failure")));
         }
         let target = self.written_seq.load(Ordering::SeqCst);
+        self.flush_pending_journal()?;
         self.file_sync.sync_data()?;
         self.work.disk_sync();
         self.idx_sync.sync_data()?;
@@ -842,11 +866,13 @@ impl VolumeManager {
         Ok(())
     }
 
-    /// Appends one record to the `.idx` journal.
+    /// Appends one record to the `.idx` journal. A record that cannot be written stays pending
+    /// and is written before the next one, or by the next sync (#184): recovery steps over a
+    /// gap only through the journal, so a needle whose journal append failed would otherwise
+    /// be lost at a restart when it sits after a gap. Scanning the gap for a header instead
+    /// was rejected: a gap can hold a client's own bytes (an abandoned streamed PUT), and a
+    /// header CRC is not a secret, so a planted header would come back as a real object.
     fn append_index(&self, key_hash: u64, offset: u64, total_len: u64, payload_size: u64, flags: u16, crc: u32) -> Result<(), VolumeError> {
-        if self.fail_next_index.swap(false, Ordering::SeqCst) {
-            return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected index failure")));
-        }
         let mut rec = [0u8; IDX_RECORD];
         rec[0..8].copy_from_slice(&key_hash.to_le_bytes());
         rec[8..12].copy_from_slice(&self.volume_id.to_le_bytes());
@@ -855,8 +881,25 @@ impl VolumeManager {
         rec[28..36].copy_from_slice(&payload_size.to_le_bytes());
         rec[36..38].copy_from_slice(&flags.to_le_bytes());
         rec[38..42].copy_from_slice(&crc.to_le_bytes());
-        self.idx_file.lock().write_all(&rec)?;
-        Ok(())
+        let mut idx = self.idx_file.lock();
+        let mut pending = self.pending_journal.lock();
+        pending.push(rec);
+        if self.fail_next_index.swap(false, Ordering::SeqCst) {
+            return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected index failure")));
+        }
+        write_pending(&mut idx, &mut pending)
+    }
+
+    /// Writes journal records left pending by a failed append (#184).
+    fn flush_pending_journal(&self) -> Result<(), VolumeError> {
+        let mut idx = self.idx_file.lock();
+        let mut pending = self.pending_journal.lock();
+        write_pending(&mut idx, &mut pending)
+    }
+
+    /// Tests: journal records not yet written.
+    pub fn pending_journal_len(&self) -> usize {
+        self.pending_journal.lock().len()
     }
 
     /// Syncs the volume and its journal now, whatever the durability mode.
