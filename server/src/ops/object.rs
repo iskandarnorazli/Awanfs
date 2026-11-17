@@ -949,37 +949,91 @@ pub async fn put_object(
             })
         });
         let idle_timeout = state.body_idle_timeout();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let mut writer_task = Some(tokio::task::spawn_blocking(
+            move || -> Result<crate::volume::NeedleWriter, (&'static str, String)> {
+                while let Some(chunk) = rx.blocking_recv() {
+                    if writer.written() + chunk.len() as u64 > len {
+                        return Err((
+                            "IncompleteBody",
+                            "The body is longer than its declared length.".to_string(),
+                        ));
+                    }
+                    if let Err(e) = writer.write(&chunk) {
+                        return Err(("InternalError", format!("could not store the object: {:?}", e)));
+                    }
+                }
+                Ok(writer)
+            },
+        ));
+        let mut pipe_state = crate::fsm::PipelineState::Filling;
+        let mut early_writer_err: Option<(&'static str, String)> = None;
         loop {
             let frame = match crate::body_timeout::next_frame_with_idle(&mut body, idle_timeout).await {
                 Ok(Some(f)) => f,
                 Ok(None) => break,
                 Err(crate::body_timeout::BodyIdleTimeout) => {
-                    drop(writer);
+                    let _ = crate::fsm::pipeline_step(pipe_state, crate::fsm::PipelineEvent::Disconnect);
+                    drop(tx);
+                    if let Some(t) = writer_task.take() {
+                        let _ = t.await;
+                    }
                     drop(ticket);
                     return Ok(request_timeout_response(key));
                 }
             };
-            if let Ok(data) = frame?.into_data() {
+            let frame = match frame {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = crate::fsm::pipeline_step(pipe_state, crate::fsm::PipelineEvent::Disconnect);
+                    drop(tx);
+                    if let Some(t) = writer_task.take() {
+                        let _ = t.await;
+                    }
+                    return Err(e);
+                }
+            };
+            if let Ok(data) = frame.into_data() {
+                pipe_state = crate::fsm::pipeline_step(pipe_state, crate::fsm::PipelineEvent::Frame)
+                    .unwrap_or(crate::fsm::PipelineState::Failed);
                 if let Some(h) = sha.as_mut() {
                     h.update(&data);
                 }
-                let mut sink = |d: &[u8]| -> Result<(), String> {
-                    if writer.written() + d.len() as u64 > len {
-                        return Err("more bytes than the declared length".to_string());
-                    }
-                    digest.update(d);
+                if decoder.is_none() {
+                    digest.update(&data);
                     if let Some(h) = cksum_hasher.as_mut() {
-                        h.update(d);
+                        h.update(&data);
                     }
-                    writer.write(d).map_err(|e| format!("{:?}", e))
-                };
-                let fed = match decoder.as_mut() {
-                    Some(dec) => dec.push(&data, &mut sink),
-                    None => sink(&data).map_err(crate::aws_chunked::PushError::Sink),
-                };
-                match fed {
-                    Ok(()) => {}
-                    Err(crate::aws_chunked::PushError::Decode(e)) => {
+                    if !data.is_empty() && tx.send(data).await.is_err() {
+                        let _ = crate::fsm::pipeline_step(pipe_state, crate::fsm::PipelineEvent::WriteError);
+                        if let Some(t) = writer_task.take() {
+                            match t.await {
+                                Ok(Err(e)) => early_writer_err = Some(e),
+                                Ok(Ok(_)) => {}
+                                Err(e) => early_writer_err = Some(("InternalError", format!("writer task panicked: {:?}", e))),
+                            }
+                        }
+                        break;
+                    }
+                } else {
+                    let mut decoded_chunks: Vec<Bytes> = Vec::new();
+                    let mut sink = |d: &[u8]| -> Result<(), String> {
+                        digest.update(d);
+                        if let Some(h) = cksum_hasher.as_mut() {
+                            h.update(d);
+                        }
+                        if !d.is_empty() {
+                            decoded_chunks.push(data.slice_ref(d));
+                        }
+                        Ok(())
+                    };
+                    let dec = decoder.as_mut().expect("checked is_some");
+                    if let Err(crate::aws_chunked::PushError::Decode(e)) = dec.push(&data, &mut sink) {
+                        let _ = crate::fsm::pipeline_step(pipe_state, crate::fsm::PipelineEvent::HashError);
+                        drop(tx);
+                        if let Some(t) = writer_task.take() {
+                            let _ = t.await;
+                        }
                         drain_body(&mut body, 64 << 20).await;
                         let status = if e == "SignatureDoesNotMatch" {
                             StatusCode::FORBIDDEN
@@ -992,16 +1046,52 @@ pub async fn put_object(
                             .body(full_body(Bytes::from(s3_error_xml(e, "Error decoding chunked body", key, "req-put-obj"))))
                             .unwrap());
                     }
-                    Err(crate::aws_chunked::PushError::Sink(e)) if e.starts_with("more bytes") => {
-                        return Ok(bad_request("IncompleteBody", "The body is longer than its declared length.", key));
+                    for piece in decoded_chunks {
+                        if tx.send(piece).await.is_err() {
+                            let _ = crate::fsm::pipeline_step(pipe_state, crate::fsm::PipelineEvent::WriteError);
+                            if let Some(t) = writer_task.take() {
+                                match t.await {
+                                    Ok(Err(e)) => early_writer_err = Some(e),
+                                    Ok(Ok(_)) => {}
+                                    Err(e) => early_writer_err = Some(("InternalError", format!("writer task panicked: {:?}", e))),
+                                }
+                            }
+                            break;
+                        }
                     }
-                    Err(crate::aws_chunked::PushError::Sink(e)) => {
-                        return Ok(internal_error_response(key, &format!("could not store the object: {}", e)));
+                    if early_writer_err.is_some() {
+                        break;
                     }
                 }
             }
         }
+        drop(tx);
+        if let Some((code, msg)) = early_writer_err {
+            if code == "IncompleteBody" {
+                return Ok(bad_request("IncompleteBody", &msg, key));
+            }
+            return Ok(internal_error_response(key, &msg));
+        }
+        pipe_state = crate::fsm::pipeline_step(pipe_state, crate::fsm::PipelineEvent::EndOfBody)
+            .unwrap_or(crate::fsm::PipelineState::Failed);
+        let mut writer = match writer_task.take().expect("writer task present").await {
+            Ok(Ok(w)) => w,
+            Ok(Err(("IncompleteBody", msg))) => {
+                let _ = crate::fsm::pipeline_step(pipe_state, crate::fsm::PipelineEvent::LengthMismatch);
+                return Ok(bad_request("IncompleteBody", &msg, key));
+            }
+            Ok(Err((_, msg))) => {
+                let _ = crate::fsm::pipeline_step(pipe_state, crate::fsm::PipelineEvent::WriteError);
+                return Ok(internal_error_response(key, &msg));
+            }
+            Err(e) => {
+                let _ = crate::fsm::pipeline_step(pipe_state, crate::fsm::PipelineEvent::WriteError);
+                return Ok(internal_error_response(key, &format!("writer task failed: {:?}", e)));
+            }
+        };
         if decoder.as_ref().is_some_and(|d| d.finish().is_err()) || writer.written() != len {
+            let _ = crate::fsm::pipeline_step(pipe_state, crate::fsm::PipelineEvent::LengthMismatch);
+            drop(writer);
             return Ok(bad_request(
                 "IncompleteBody",
                 "You did not provide the number of bytes specified by the Content-Length HTTP header.",
@@ -1011,6 +1101,8 @@ pub async fn put_object(
         if let (Some(h), Some(want)) = (sha, declared_sha) {
             let got: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
             if got != want {
+                let _ = crate::fsm::pipeline_step(pipe_state, crate::fsm::PipelineEvent::HashError);
+                drop(writer);
                 return Ok(bad_request(
                     "XAmzContentSHA256Mismatch",
                     "The provided 'x-amz-content-sha256' header does not match what was computed.",
@@ -1021,6 +1113,8 @@ pub async fn put_object(
         let (etag_hi, etag_lo, etag_hex, raw_md5, _) = digest.finalize();
         if let Some(ref content_md5) = content_md5_hdr {
             if content_md5 != &crate::digest::base64_encode(&raw_md5) {
+                let _ = crate::fsm::pipeline_step(pipe_state, crate::fsm::PipelineEvent::HashError);
+                drop(writer);
                 return Ok(bad_request("BadDigest", "The Content-MD5 you specified did not match what we received.", key));
             }
         }
@@ -1029,6 +1123,8 @@ pub async fn put_object(
                 let got = h.finish_base64();
                 if let Some(expected) = expected_opt {
                     if &got != expected {
+                        let _ = crate::fsm::pipeline_step(pipe_state, crate::fsm::PipelineEvent::HashError);
+                        drop(writer);
                         return Ok(bad_request("BadDigest", "The checksum you specified did not match what we received.", key));
                     }
                 }
@@ -1036,6 +1132,9 @@ pub async fn put_object(
             }
             _ => None,
         };
+        pipe_state = crate::fsm::pipeline_step(pipe_state, crate::fsm::PipelineEvent::Drained)
+            .unwrap_or(crate::fsm::PipelineState::Failed);
+        debug_assert_eq!(pipe_state, crate::fsm::PipelineState::Done);
         let _key_guard = state.lock_key(b_id, key).await;
         if if_none_match_star && state.engine.read().get_object(b_id, key.as_bytes()).is_ok() {
             return Ok(Response::builder()
