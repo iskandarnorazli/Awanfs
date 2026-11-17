@@ -257,5 +257,27 @@ class UniqueKeys(unittest.TestCase):
             srv.server_close()
 
 
+class HeapLessCacheCeiling(unittest.TestCase):
+    """#218: --max-heap-less-cache catches uncounted heap growth (e.g. pinned request buffers)."""
+
+    KIB = 4096
+
+    def test_cli_flag_defaults_none_and_accepts_float(self):
+        self.assertIsNone(br.build_parser().parse_args(["--server-bin", "x"]).max_heap_less_cache)
+        self.assertEqual(
+            br.build_parser().parse_args(["--server-bin", "x", "--max-heap-less-cache", "180"]).max_heap_less_cache,
+            180.0,
+        )
+
+    def test_verdict_checks_heap_less_cache_when_set(self):
+        ok_rows = [("put", 5.0, 1200.0, 10.0, 240.0, 240.0, 1.0, 105.0)]
+        self.assertEqual(br.verdict(ok_rows, 240.0, 256, 200, self.KIB, max_heap_less_cache=180.0), ("ok", []))
+
+        leak_rows = [("put", 5.0, 1200.0, 10.0, 400.0, 390.0, 1.0, 180.0)]  # heap less cache = 210 > 180
+        res, reasons = br.verdict(leak_rows, 400.0, 256, 200, self.KIB, max_heap_less_cache=180.0)
+        self.assertEqual(res, "OVER")
+        self.assertIn("heap less cache 210.0 MiB over 180.0 MiB", reasons)
+
+
 if __name__ == "__main__":
     unittest.main()

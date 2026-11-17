@@ -153,6 +153,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "(#127), e.g. MALLOC_ARENA_MAX=2 or MALLOC_MMAP_THRESHOLD_=131072")
     ap.add_argument("--unique-keys", action="store_true",
                     help="write a new key on every PUT instead of reusing the warm-up pool (#218)")
+    ap.add_argument("--max-heap-less-cache", type=float, default=None,
+                    help="optional ceiling in MiB on (RssAnon - payload_cache) (#218)")
     return ap
 
 
@@ -165,7 +167,8 @@ def over_ceiling(peak_mib: float, budget_mib: float, overhead: float) -> bool:
     return peak_mib > ceiling_mib(budget_mib, overhead)
 
 
-def verdict(rows, peak_mib: float, budget_mib: float, overhead: float, size_bytes: int) -> "tuple[str, list]":
+def verdict(rows, peak_mib: float, budget_mib: float, overhead: float, size_bytes: int,
+            max_heap_less_cache: "float | None" = None) -> "tuple[str, list]":
     """("ok" | "OVER" | "NOT MEASURED", reasons). A phase that moved fewer bytes than one object
     did not measure anything: the first runs of this script answered every request 404
     (no bucket) and reported 532 ops/s, 0.00 MiB/s and an idle server's 17 MiB as "ok"."""
@@ -175,8 +178,15 @@ def verdict(rows, peak_mib: float, budget_mib: float, overhead: float, size_byte
             reasons.append(f"{mode} moved {mib:.2f} MiB/s at {ops:.1f} ops/s: the requests failed")
     if reasons:
         return "NOT MEASURED", reasons
+    over_reasons = []
     if over_ceiling(peak_mib, budget_mib, overhead):
-        return "OVER", [f"peak RSS {peak_mib:.1f} MiB over {ceiling_mib(budget_mib, overhead):.1f} MiB"]
+        over_reasons.append(f"peak RSS {peak_mib:.1f} MiB over {ceiling_mib(budget_mib, overhead):.1f} MiB")
+    if max_heap_less_cache is not None:
+        rests = [r[5] - r[7] for r in rows if len(r) >= 8 and r[5] is not None and r[7] is not None]
+        if rests and max(rests) > max_heap_less_cache:
+            over_reasons.append(f"heap less cache {max(rests):.1f} MiB over {max_heap_less_cache:.1f} MiB")
+    if over_reasons:
+        return "OVER", over_reasons
     return "ok", []
 
 
@@ -241,10 +251,11 @@ def main(argv=None) -> int:
         proc.wait()
 
     ceiling = ceiling_mib(a.budget_mib, a.overhead)
-    result, reasons = verdict(rows, peak, a.budget_mib, a.overhead, SIZES[a.size])
+    result, reasons = verdict(rows, peak, a.budget_mib, a.overhead, SIZES[a.size], a.max_heap_less_cache)
     cmd = (f"python benchmarks/budget_rss.py --budget {a.budget} --concurrency {a.concurrency} "
            f"--size {a.size} --duration {a.duration} --overhead {a.overhead}"
-           + (" --unique-keys" if a.unique_keys else ""))
+           + (" --unique-keys" if a.unique_keys else "")
+           + (f" --max-heap-less-cache {a.max_heap_less_cache}" if a.max_heap_less_cache is not None else ""))
     lines = [
         f"Command: `{cmd}`",
         "",

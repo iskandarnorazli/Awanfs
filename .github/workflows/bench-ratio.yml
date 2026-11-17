@@ -107,8 +107,8 @@ jobs:
         run: |
           set +e
           python -u benchmarks/budget_rss.py --server-bin server/target/release/s3-server \
-            --budget 256MiB --budget-mib 256 --size 4KiB --unique-keys --concurrency 64 --duration 20 \
-            --overhead 200 --report budget_unique_keys_report.md
+            --budget 256MiB --budget-mib 256 --size 4KiB --unique-keys --concurrency 64 --duration 60 \
+            --overhead 200 --max-heap-less-cache 180 --report budget_unique_keys_report.md
           code=$?
           echo "code=$code" >> "$GITHUB_OUTPUT"
           [ -f budget_unique_keys_report.md ] && cat budget_unique_keys_report.md >> "$GITHUB_STEP_SUMMARY"
