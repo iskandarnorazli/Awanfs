@@ -303,5 +303,14 @@ class FailedResponsesAreErrors(unittest.TestCase):
         self.assertTrue(m.measured, m.note)
 
 
+
+
+class CpuSamplerTests(unittest.TestCase):
+    def test_get_process_cpu_times_returns_non_negative_pair(self):
+        from run_warp_benchmark import get_process_cpu_times
+        u, s = get_process_cpu_times(os.getpid())
+        self.assertGreaterEqual(u, 0.0)
+        self.assertGreaterEqual(s, 0.0)
+
 if __name__ == "__main__":
     unittest.main()

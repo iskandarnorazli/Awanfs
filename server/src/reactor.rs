@@ -73,6 +73,7 @@ pub async fn start_s3_reactor_with(
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((stream, remote_addr)) => {
+                            let _ = stream.set_nodelay(true);
                             let state_clone = Arc::clone(&state);
                             let service = service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
                                 req.extensions_mut().insert(crate::s3_api::RemoteAddr(remote_addr));
@@ -119,4 +120,19 @@ pub async fn start_s3_reactor_with(
         shutdown_tx: Some(shutdown_tx),
         done_rx: Some(done_rx),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn accepted_socket_enables_tcp_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_fut = tokio::net::TcpStream::connect(addr);
+        let (accept_res, client_res) = tokio::join!(listener.accept(), client_fut);
+        let (stream, _) = accept_res.unwrap();
+        let _client = client_res.unwrap();
+        let _ = stream.set_nodelay(true);
+        assert_eq!(stream.nodelay().unwrap(), true);
+    }
 }
