@@ -549,3 +549,34 @@ async fn test_multipart_upload_tagging() {
     assert!(tags.contains("<Key>k1</Key>") && tags.contains("<Value>v1</Value>"));
     assert!(tags.contains("<Key>k2</Key>") && tags.contains("<Value>v2</Value>"));
 }
+
+#[tokio::test]
+async fn test_get_object_tagging_sorted_by_key() {
+    let (base_url, _state, _handle) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    assert_eq!(client.put(format!("{}/sort-bkt", base_url)).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        client
+            .put(format!("{}/sort-bkt/obj", base_url))
+            .header("x-amz-tagging", "foo=bar&bar")
+            .body("payload")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    let xml = client
+        .get(format!("{}/sort-bkt/obj?tagging", base_url))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let bar_pos = xml.find("<Key>bar</Key>").expect("bar tag");
+    let foo_pos = xml.find("<Key>foo</Key>").expect("foo tag");
+    assert!(bar_pos < foo_pos, "expected bar before foo in:\n{xml}");
+}

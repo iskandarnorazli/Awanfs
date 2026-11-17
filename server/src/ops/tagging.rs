@@ -169,10 +169,11 @@ pub async fn get_object_tagging(
         Ok(a) => a,
         Err(e) => return Ok(internal_error_response(key, &format!("could not read the object's attributes: {:?}", e))),
     };
-    let tag_set = match attrs.tag_set() {
+    let mut tag_set = match attrs.tag_set() {
         Ok(s) => s,
         Err(e) => return Ok(internal_error_response(key, &format!("could not decode the object's tags: {:?}", e))),
     };
+    tag_set.tags.sort_by(|a, b| a.key.cmp(&b.key));
     let xml = tagging_xml(&tag_set);
     let mut b = Response::builder()
         .status(StatusCode::OK)
