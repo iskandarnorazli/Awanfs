@@ -170,6 +170,23 @@ commit marker (option A), which changes the volume format. In the model,
 `AckedStateSurvivesRestart`. Recovery stepping over a gap without the journal, which a
 record whose journal append failed needs when it sits after a gap, is the next step of #184.
 
+**Decision 63 (Claude, 2026-11-17, #186; for the owner to confirm): recovery applies an
+unversioned record of a key that already has a version history to that key's null version, as
+the live index did.** A streamed PUT stamps its version at commit (decision 51), so it can
+reserve while the bucket is unversioned and commit versioned after an unversioned write of the
+same key that sits later in the log. Live, that write changed the row before the history began.
+Recovery met it after the history began and added it as a null version at its own creation
+time: the null version's time differed after a restart, and when the clock had stepped back an
+unversioned DELETE came out above the versioned PUT the client saw become current. An
+unversioned record can only have been stamped while the bucket was unversioned, and a bucket
+never returns to unversioned, so such a record always predates the history live. Recovery now
+makes a PUT the null version at time 0 (`null_version_of`) and lets a DELETE remove the null
+version. No clock reading decides the order. Not chosen: stamping the versioned PUT above every
+record noted since its reservation, which fixes the current version only, needs the clock of
+each record, and leaves the null version's time different. In the model,
+`fixed_versioning.cfg` passes; `versioning_replay_by_time.cfg` breaks
+`AckedStateSurvivesRestart` and `versioning_null_time.cfg` breaks `HistorySurvivesRestart`.
+
 **Decision 61 (owner, 2026-11-17): a sub-resource AwanFS does not implement answers 501
 `NotImplemented`; it never falls through to another operation, even when that made a test
 pass.** Before #148 a request such as `PUT /bucket?policy`, `?acl`, `?encryption`,
