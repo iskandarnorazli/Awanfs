@@ -279,3 +279,66 @@ async fn other_expect_values_are_not_refused() {
     }
     handle.shutdown();
 }
+
+
+#[tokio::test]
+async fn invalid_utf8_and_control_char_keys_return_400() {
+    let (base_url, addr, state, handle) = spawn_with_region("us-east-1", AuthConfig::open()).await;
+    state.engine.write().create_bucket("uri-bkt").unwrap();
+    let client = reqwest::Client::new();
+
+    // 1. Valid non-ASCII UTF-8 key works
+    let resp = client
+        .put(format!("{}/uri-bkt/caf%C3%A9-%C2%AE", base_url))
+        .body("ok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = client
+        .get(format!("{}/uri-bkt/caf%C3%A9-%C2%AE", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 2. Percent-decoded bytes that are not valid UTF-8 -> 400 InvalidURI on every operation
+    for method in ["GET", "PUT", "HEAD", "DELETE"] {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "{} /uri-bkt/%AE%8A- HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            method, addr
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&buf);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 400 "),
+            "expected 400 on {} for invalid UTF-8 key, got: {:?}",
+            method,
+            resp_str
+        );
+        if method != "HEAD" {
+            assert!(resp_str.contains("<Code>InvalidURI</Code>"), "got: {:?}", resp_str);
+            assert!(resp_str.contains("Couldn&apos;t parse the specified URI."), "got: {:?}", resp_str);
+        }
+    }
+
+    // 3. C1 control character (e.g. U+008A from Python '\xae\x8a-' -> %C2%AE%C2%8A-) -> 400
+    for method in [reqwest::Method::GET, reqwest::Method::PUT, reqwest::Method::HEAD, reqwest::Method::DELETE] {
+        let resp = client
+            .request(method.clone(), format!("{}/uri-bkt/%C2%AE%C2%8A-", base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400 on {} for C1 control char key",
+            method
+        );
+    }
+
+    handle.shutdown();
+}

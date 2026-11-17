@@ -11,6 +11,7 @@ This document states the exact `s3-server` and client configuration that `tests/
 | `--port` | `9000` | `9000` | All (`s3tests.conf` targets `127.0.0.1:9000`) | Yes |
 | `--data-dir` | `/tmp/awanfs-data` (`$AWANFS_DATA_DIR`) | `S3_DATA_DIR` / temp | All (fresh storage directory per suite run) | Yes (use persistent storage) |
 | `--auto-compaction` | `off` | `on` | All (avoids background compaction during short suite runs) | No (keep `on` in production to reclaim dead space) |
+| `--region` | `default` | `us-east-1` | `test_bucket_get_location` (`s3tests.conf` sets `api_name = default`) | Yes |
 | `--config` | `/tmp/awanfs-users.toml` (copied from `tests/s3tests/users.toml` with mode `0600`) | none | Multi-user and policy tests (`alt`, `tenant`) | Yes (with real keys and scoped policies) |
 | `AWANFS_ACCESS_KEY` | `AWANFSMAINKEY0000000` | none | All (`[s3 main]` in `s3tests.conf`) | No (public test credential) |
 | `AWANFS_SECRET_KEY` | `awanfs-main-secret-for-s3-tests-0000000000` | none | All (`[s3 main]` in `s3tests.conf`) | No (public test credential) |
@@ -36,5 +37,4 @@ Area issues that add new profile settings update `start_server.sh` and the **Set
 - `#118`: shortened lifecycle day (`--lifecycle-day-seconds 10`, test-only flag with startup warning)
 - `#122`: default object ownership (`D5`, ACLs enabled on new buckets for the suite)
 - `#121`: `--sse-master-key-file` and `kms_keyid` in `s3tests.conf`
-- `#140`: `--region` matching `api_name`
 - `#151`: users with `user_id`, `display_name`, and `email`
