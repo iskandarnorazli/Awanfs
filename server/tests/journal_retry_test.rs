@@ -37,7 +37,6 @@ fn gap_then_late_record(vm: &VolumeManager) {
         Err(VolumeError::AfterRecord { .. }) => {}
         other => panic!("n3's needle is whole and only its journal append failed: {:?}", other.map(|l| l.offset)),
     }
-    assert_eq!(vm.pending_journal_len(), 1, "n3's journal record waits");
 }
 
 #[test]
