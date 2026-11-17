@@ -325,8 +325,9 @@ async fn invalid_utf8_and_control_char_keys_return_400() {
         }
     }
 
-    // 3. C1 control character (e.g. U+008A from Python '\xae\x8a-' -> %C2%AE%C2%8A-) -> 400
+    // 3. C1 control character (e.g. U+008A from Python '\xae\x8a-' -> %C2%AE%C2%8A-) -> 400 InvalidURI
     for method in [reqwest::Method::GET, reqwest::Method::PUT, reqwest::Method::HEAD, reqwest::Method::DELETE] {
+        let is_head = method == reqwest::Method::HEAD;
         let resp = client
             .request(method.clone(), format!("{}/uri-bkt/%C2%AE%C2%8A-", base_url))
             .send()
@@ -338,6 +339,11 @@ async fn invalid_utf8_and_control_char_keys_return_400() {
             "expected 400 on {} for C1 control char key",
             method
         );
+        if !is_head {
+            let body = resp.text().await.unwrap();
+            assert!(body.contains("<Code>InvalidURI</Code>"), "got: {}", body);
+            assert!(body.contains("Couldn&apos;t parse the specified URI."), "got: {}", body);
+        }
     }
 
     handle.shutdown();

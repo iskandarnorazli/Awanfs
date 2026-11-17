@@ -20,7 +20,6 @@ AWANFS_LOG=off \
     --port 9000 \
     --data-dir "$DATA_DIR" \
     --auto-compaction off \
-    --region default \
     --config "$USERS_FILE" \
     </dev/null >"$LOG_FILE" 2>&1 &
 

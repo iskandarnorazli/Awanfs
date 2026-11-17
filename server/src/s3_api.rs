@@ -594,8 +594,10 @@ pub fn validate_s3_key(key: &str) -> Result<(), crate::error::S3ErrorCode> {
     if crate::names::validate_object_key(key).is_err() {
         return Err(crate::error::S3ErrorCode::KeyTooLongError);
     }
-    if key.chars().any(|c| c.is_control()) {
-        return Err(crate::error::S3ErrorCode::InvalidObjectName);
+    for b in key.bytes() {
+        if b == 0 || b < 0x20 {
+            return Err(crate::error::S3ErrorCode::InvalidObjectName);
+        }
     }
     for segment in key.split('/') {
         if segment == ".." {
