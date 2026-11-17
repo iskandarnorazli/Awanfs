@@ -1,8 +1,8 @@
-# Clustering: several nodes, one namespace (draft for #52)
+# Clustering: several nodes, one namespace (#52)
 
-**Status: draft, waiting for the owner's approval (#52).** Nothing here is built. Decision 5
-(single node) and decision 25 (no cluster code before this note is approved) stand until the
-owner approves it; the approval becomes a numbered decision in `ARCHITECTURE.md`.
+**Status: approved by the owner on 2026-11-17 (decision 64).** Nothing here is built. Cluster
+code starts after #26 (metadata segments) lands; until then AwanFS stays single node
+(decision 5). Section 10 records the owner's answers.
 
 This replaces `DISTRIBUTED_TOPOLOGY.md`, which came from awan-lang.
 
@@ -112,7 +112,7 @@ about 2x in MinIO's favour. Options:
 | A. Replicate everything, erasure-code sealed volumes later | one write path; cold data costs 1.33x eventually | bulk ingest at 3x |
 | B. Replicate small objects, erasure-code large ones when written (size threshold) | matches MinIO on ingest; small objects keep one-hop reads | two write paths; a large object's shards span K nodes |
 
-Recommendation: B, with the threshold measured (section 7).
+Owner's choice (decision 64): B, with the threshold measured (section 8).
 
 ## 5. What happens when something fails
 
@@ -166,29 +166,35 @@ works, to be replaced by section 8's benchmark.
 4. **Benchmark against the others on the same machines:** AwanFS, MinIO, RustFS, Garage and
    SeaweedFS at 3 and 6 nodes; `warp` in distributed mode; small PUT and GET at 64 and 256
    concurrency, 256 MiB PUT; P50, P99, P99.9; and each with one node killed under load.
-5. **An availability target** the owner sets (for example 99.95% of requests per month), with
-   failover and rebuild times measured against it.
+5. **The availability target: 99.999% of requests per month** (owner, decision 64). That is
+   about 26 seconds of failed requests a month, counted per request. A failover pauses writes
+   of the partitions the failed node led for about one lease, so the budget sets the lease and
+   the failover detection: with 1,000 partitions on 10 nodes, one node failure stalls about a
+   tenth of writes for one lease, and a 3-second lease uses about 0.3 s of the budget per
+   failure (inferred, not measured). Planned work (upgrades, rebalancing) hands leadership over
+   before a node stops, so it pauses nothing. The failure tests measure failover and rebuild
+   against the target.
 
 ## 9. Order of work, after approval
 
 | Step | Work | Needs |
 |---|---|---|
 | 0 | #26 metadata segments; #213 simulation; #208 | (single node) |
-| 1 | The model of section 8.1 | this note approved |
+| 1 | The model of section 8.1 | #26 |
 | 2 | The control plane: membership, partition map, leases (an existing Raft library, not our own) | 1 |
 | 3 | Log shipping and follower replay; durability modes counted in replicas | 1, 2 |
 | 4 | Forwarding, follower reads, failover | 3 |
 | 5 | Repair and rebalancing | 4 |
-| 6 | Large objects: option A or B (section 4.6), and #27 | 3; the owner's choice |
+| 6 | Large objects: erasure coding when written (option B), and #27 | 3 |
 | 7 | The failure tests and the benchmark of section 8 | 4 |
 
-Issues are filed per step once the owner approves this note; each carries a gate checked on its
+Issues are filed per step when #26 is done; each carries a gate checked on its
 pull request (`AGENTS.md`).
 
-## 10. Decisions for the owner
+## 10. The owner's decisions (2026-11-17, decision 64)
 
-1. Approve this design (log shipping with partition leaders, Raft only for membership and the
-   partition map), or choose another from section 3.
-2. Large objects: option A or B (section 4.6).
-3. The availability target (section 8.5).
-4. Failure domains to support first: racks in one site, or zones.
+1. The design is approved: log shipping with partition leaders, Raft only for membership, the
+   partition map and leases. Work starts after #26.
+2. Large objects: option B, erasure-coded when written above a measured threshold.
+3. Availability target: 99.999% of requests per month (section 8.5).
+4. Failure domains: racks in one site first; zones later.

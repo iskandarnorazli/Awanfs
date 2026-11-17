@@ -14,7 +14,7 @@ Owner decisions after the 2026-11-12 audit. The milestones Phase 1-4 on GitHub c
 | 2 | **Authentication:** bind 127.0.0.1 by default; verify SigV4 against keys from the environment; anonymous access only behind an explicit flag. IAM policies and TLS follow as separate issues. | #35, #53, #30 |
 | 3 | **Performance gates:** no absolute MiB/s targets. Layer 1: exact work counts per request type in `server/tests/work_count_test.rs` (every PR, both platforms). Layer 2: nightly AwanFS/MinIO throughput ratio on the same runner (`benchmarks/ratio_check.py`, baseline `benchmarks/ratio_baseline.json`). | #33, #34 |
 | 4 | **Order:** correctness and security first (Phase 1), then production operations (Phase 2), then scale and efficiency (Phase 3), multi-node last (Phase 4). | milestones |
-| 5 | **Topology:** single node; operators use RAID or ZFS for disk failure. Multi-node clustering is a design issue for when a production deployment needs high availability; `libs/awan-cluster` from awan-lang is an input to the design, not code to port. | #52, #27, #15 |
+| 5 | **Topology:** single node; operators use RAID or ZFS for disk failure. Multi-node clustering is a design issue for when a production deployment needs high availability; `libs/awan-cluster` from awan-lang is an input to the design, not code to port. Superseded by decision 64 once #26 lands. | #52, #27, #15 |
 | 6 | **Metadata:** keep the redb spill index; review it with the tiered metadata and Bloom filter work after Phase 1 (which reads its segments with positioned reads: decision 58). Superseded by decision 59. | #13, #26, #207 |
 | 7 | **Compression:** opt-in per bucket, in independent 64 KiB blocks so range GETs stay cheap; off by default. | #51 |
 | 8 | **Observability:** structured logs with request IDs, Prometheus `/metrics`, OpenTelemetry traces, health endpoints, a Grafana dashboard and alert rules, and an S3 access log. | #41-#46 |
@@ -46,7 +46,7 @@ Owner decisions after the 2026-11-12 unattended run (#64-#83), each the recommen
 | 22 | **Compression:** zstd level 1, enabled per bucket in the TOML config. | #51 |
 | 23 | **Metadata scale:** close #13 if the redb spill meets its gate; #26 waits as `unmeasured` until a deployment needs over 100M objects. Superseded by decision 59: #207 measured it (go, owner 2026-11-16), and #26 is built to replace the redb spill. | #13, #26, #207 |
 | 24 | **Compaction I/O:** token-bucket limit (50 MB/s, configurable); copy-on-write cloning only after a measurement. | #28 |
-| 25 | **Multi-node:** #15 closed as a duplicate of #27; the #52 design note after Phase 2; no code yet. | #15, #27, #52 |
+| 25 | **Multi-node:** #15 closed as a duplicate of #27; the #52 design note after Phase 2; no code yet. The note is approved (decision 64); cluster code starts after #26. | #15, #27, #52 |
 | 26 | **Benchmark hardware:** the owner's machine as a self-hosted runner (`benchmarks/RUNNER.md`); paid runners only for published numbers. | #58 |
 | 27 | **Invalid ranges** (`bytes=5-3`): whatever ceph s3-tests expects, once #47 runs. | #47 |
 
@@ -170,7 +170,7 @@ commit marker (option A), which changes the volume format. In the model,
 `AckedStateSurvivesRestart`. Recovery stepping over a gap without the journal, which a
 record whose journal append failed needs when it sits after a gap, is the next step of #184.
 
-**Decision 63 (Claude, 2026-11-17, #186; for the owner to confirm): recovery applies an
+**Decision 63 (owner, 2026-11-17, #186, PR #236): recovery applies an
 unversioned record of a key that already has a version history to that key's null version, as
 the live index did.** A streamed PUT stamps its version at commit (decision 51), so it can
 reserve while the bucket is unversioned and commit versioned after an unversioned write of the
@@ -186,6 +186,22 @@ record noted since its reservation, which fixes the current version only, needs 
 each record, and leaves the null version's time different. In the model,
 `fixed_versioning.cfg` passes; `versioning_replay_by_time.cfg` breaks
 `AckedStateSurvivesRestart` and `versioning_null_time.cfg` breaks `HistorySurvivesRestart`.
+
+**Decision 64 (owner, 2026-11-17, #52): AwanFS clusters by partition leaders that ship their
+log to followers, as [`CLUSTERING.md`](CLUSTERING.md) describes.** Each partition of the key space
+has a leader and two followers in different racks; followers replay the leader's log with the
+recovery code. Raft runs only membership, the partition map and leases, never the request path.
+Large objects are erasure-coded when written, above a size threshold that is measured; small
+objects are replicated (option B). The availability target is 99.999% of requests per month
+(about 26 seconds of failed requests per month), measured per request. Racks in one site come
+first; zones later. No cluster code starts before #26 (metadata segments) lands. Not chosen:
+erasure sets for every object (MinIO, RustFS), leaderless quorums (Garage).
+
+**Decision 65 (owner, 2026-11-17, #238 option A): a version keeps a display time separate from
+its ordering time.** The null version made from an object written before versioning shows that
+object's Last-Modified; its ordering time stays 0, so which version is current does not change
+and no clock reading decides it (decision 63). Not chosen: giving the null version its real time
+as its ordering time and raising the next stamp above it, which reopens the clock-step risk.
 
 **Decision 61 (owner, 2026-11-17): a sub-resource AwanFS does not implement answers 501
 `NotImplemented`; it never falls through to another operation, even when that made a test
