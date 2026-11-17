@@ -10,6 +10,7 @@ object straight after writing it (the read that redoes the mapping), for the ser
 both ways: growing (the default) and sparse (`AWAN_SPARSE_VOLUME=1`).
 """
 import argparse
+import http.client
 import os
 import platform
 import shutil
@@ -20,7 +21,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from budget_rss import create_bucket  # noqa: E402
-from large_object_check import NotMeasured, get, in_parallel, percentile, put  # noqa: E402
+from large_object_check import NotMeasured, conn_to, get, in_parallel, percentile, put  # noqa: E402
 from ratio_check import wait_port  # noqa: E402
 from run_warp_benchmark import get_free_port, get_process_peak_rss_mb, run_workload_phase  # noqa: E402
 
@@ -40,6 +41,58 @@ def volume_bytes(data_dir: str) -> int:
     return total
 
 
+def timed_get(c: http.client.HTTPConnection, path: str, want_len: int) -> float:
+    """Milliseconds from sending a GET on an open connection to its last byte."""
+    t0 = time.perf_counter()
+    c.request("GET", path)
+    r = c.getresponse()
+    got = len(r.read())
+    took = (time.perf_counter() - t0) * 1000.0
+    if r.status != 200 or got != want_len:
+        raise NotMeasured(f"GET {path}: HTTP {r.status}, {got} bytes")
+    return took
+
+
+def read_after_write_split(port: int, small: bytes, old_keys, rounds: int) -> dict:
+    """#204: where a GET straight after its PUT spends its time. Each row changes one thing:
+    connect: opening the connection alone, before the GET.
+    open_conn: the GET on a connection opened beforehand, straight after its PUT.
+    pause: the same, 100 ms after the PUT (a flush still running would be done).
+    keep_alive: PUT and GET on one connection.
+    old: a GET on a fresh open connection of an object written before the fill."""
+    rows = {k: [] for k in ("connect", "open_conn", "pause", "keep_alive", "old")}
+    for i in range(rounds):
+        key = f"/probe/split-{i}"
+        put(port, key, small)
+        c = conn_to(port)
+        t0 = time.perf_counter()
+        c.connect()
+        rows["connect"].append((time.perf_counter() - t0) * 1000.0)
+        rows["open_conn"].append(timed_get(c, key, SMALL))
+        c.close()
+        key = f"/probe/pause-{i}"
+        put(port, key, small)
+        time.sleep(0.1)
+        c = conn_to(port)
+        c.connect()
+        rows["pause"].append(timed_get(c, key, SMALL))
+        c.close()
+        key = f"/probe/ka-{i}"
+        c = conn_to(port)
+        c.request("PUT", key, body=small, headers={"Content-Length": str(len(small))})
+        r = c.getresponse()
+        r.read()
+        if r.status != 200:
+            raise NotMeasured(f"PUT {key}: HTTP {r.status}")
+        rows["keep_alive"].append(timed_get(c, key, SMALL))
+        c.close()
+        c = conn_to(port)
+        c.connect()
+        rows["old"].append(timed_get(c, old_keys[i % len(old_keys)], SMALL))
+        c.close()
+    return {k: (percentile(v, 0.50), percentile(v, 0.99)) for k, v in rows.items()}
+
+
 def measure(server_bin: str, env_extra: dict, fill_gib: float, seconds: float, rounds: int):
     data = tempfile.mkdtemp(prefix="volume_probe_")
     port = get_free_port()
@@ -50,6 +103,11 @@ def measure(server_bin: str, env_extra: dict, fill_gib: float, seconds: float, r
         if not wait_port(port, timeout=40.0):
             raise SystemExit(f"the server did not answer on port {port} with {env_extra}")
         create_bucket(port, "probe")
+        # Small objects at the start of the volume, for the "old object" row (#204).
+        small = os.urandom(SMALL)
+        old_keys = [f"/probe/old-{i}" for i in range(64)]
+        for k in old_keys:
+            put(port, k, small)
         body = memoryview(os.urandom(FILL_OBJECT))
         n = int(fill_gib * 1024 * MIB // FILL_OBJECT)
         t0 = time.perf_counter()
@@ -61,7 +119,6 @@ def measure(server_bin: str, env_extra: dict, fill_gib: float, seconds: float, r
             if m.ops_per_sec * SMALL < SMALL:
                 raise NotMeasured(f"{mode} moved nothing with {env_extra}")
             out[mode] = (m.ops_per_sec, m.p50_ms, m.p99_ms)
-        small = os.urandom(SMALL)
         lat = []
         for i in range(rounds):
             key = f"/probe/raw-{i}"
@@ -69,6 +126,7 @@ def measure(server_bin: str, env_extra: dict, fill_gib: float, seconds: float, r
             _, total = get(port, key, SMALL)
             lat.append(total * 1000.0)
         out["read_after_write"] = (percentile(lat, 0.50), percentile(lat, 0.99))
+        out["split"] = read_after_write_split(port, small, old_keys, rounds)
         # A fill object from the start of the volume is still what was written.
         import zlib
         get(port, "/probe/fill-0", FILL_OBJECT, want_crc=zlib.crc32(body))
@@ -101,6 +159,14 @@ def render(results, fill_gib, cmd):
     for mode, name in (("put", "PUT"), ("get", "GET"), ("mixed", "mixed (80% GET)")):
         row(f"{name}: ops/s (P50, P99 ms)", lambda r, m=mode: f"{r[m][0]:.0f} ({r[m][1]:.2f}, {r[m][2]:.2f})")
     row("GET straight after its PUT, 1 client: P50, P99 ms", lambda r: f"{r['read_after_write'][0]:.2f}, {r['read_after_write'][1]:.2f}")
+    for k, name in (
+        ("connect", "  of which: opening the connection, P50, P99 ms"),
+        ("open_conn", "  GET straight after its PUT, connection already open: P50, P99 ms"),
+        ("pause", "  the same, 100 ms after the PUT: P50, P99 ms"),
+        ("keep_alive", "  PUT and GET on one connection, the GET: P50, P99 ms"),
+        ("old", "  GET of an object written before the fill, connection open: P50, P99 ms"),
+    ):
+        row(name, lambda r, k=k: f"{r['split'][k][0]:.2f}, {r['split'][k][1]:.2f}")
     row("peak RSS, MiB", lambda r: f"{r['rss']:.1f}")
     lines.append("")
     return "\n".join(lines)
