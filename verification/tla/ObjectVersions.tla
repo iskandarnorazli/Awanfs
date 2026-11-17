@@ -58,17 +58,67 @@ Switches, so the same model checks the current code and the fixes:
                     yet written (VolumeManager::writers_in_flight is 0). Without it a streamed
                     PUT still receiving its body is not listed, its needle is not copied, and
                     the file it lands in is removed.
+  Versioning        the bucket's versioning can be switched on once, at any moment, without the
+                    key lock (PutBucketVersioning). A write is versioned when the bucket is at the
+                    moment it takes its stamp under the lock (s3_api.rs version_stamp), so a
+                    streamer that reserved while the bucket was unversioned can commit versioned,
+                    after an unversioned write of the same key that sits at a later offset (#186).
+                    A versioned write's time is versions.rs next_ts: the clock, raised above every
+                    version the key has. A key's history starts with its unversioned row as the
+                    null version, at time 0 (ops/object.rs null_version_of); the current version
+                    is the one with the largest time.
+  ClockStepsBack    the wall clock can go back (NTP, a VM restore).
+  NullReplay        the fix for #186: recovery applies an unversioned record of a key that already
+                    has a history to its null version, as the live index did before the history
+                    began: a PUT becomes the null version at time 0, a DELETE removes it. Without
+                    it recovery adds the record as a null version at its own creation time, which
+                    can be later than the versioned write the client saw become current.
 *)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Writers, Deleters, UseKeyLock, WriteCanFail, RecoverSkipsGaps, DeleteLogsFirst,
           Streamers, Relocate, Compactor, CompactWaitsForWriters,
-          FailLeavesRecord, IndexAfterLateFail
+          FailLeavesRecord, IndexAfterLateFail, Versioning, ClockStepsBack, NullReplay
 
 ASSUME Streamers \subseteq Writers
 
 Procs == Writers \cup Deleters
 Gone == [present |-> FALSE, val |-> "none"]
+Ts == 1..2
+Max(S) == CHOOSE m \in S : \A x \in S : x <= m
+
+\* A key's state, live or rebuilt: its unversioned row, whether it has a version history, and
+\* the history (a set of versions; at most one is the null version).
+NoRow == [present |-> FALSE, val |-> "none", ts |-> 0]
+Empty == [row |-> NoRow, hist |-> FALSE, store |-> {}]
+RowOf(r) == IF r.kind = "put" THEN [present |-> TRUE, val |-> r.val, ts |-> r.ts] ELSE NoRow
+NullOf(row) == IF row.present THEN {[val |-> row.val, ts |-> 0, null |-> TRUE, marker |-> FALSE]} ELSE {}
+VersionOf(r) == [val |-> r.val, ts |-> r.ts, null |-> FALSE, marker |-> r.kind = "tomb"]
+NonNull(s) == {v \in s : ~v.null}
+StartHist(k) == IF k.hist THEN k.store ELSE NullOf(k.row)
+
+\* What a GET shows: the row, or the history's version with the largest time.
+Visible(k) ==
+    IF ~k.hist THEN [present |-> k.row.present, val |-> k.row.val]
+    ELSE IF k.store = {} THEN Gone
+    ELSE LET top == CHOOSE v \in k.store : \A w \in k.store : w.ts <= v.ts IN
+         IF top.marker THEN Gone ELSE [present |-> TRUE, val |-> top.val]
+
+\* The live index applies a committed record. An unversioned record never meets a history live:
+\* it was stamped while the bucket was unversioned, and a history needs a versioned write.
+LiveApply(k, r) ==
+    IF r.ver THEN [row |-> k.row, hist |-> TRUE, store |-> StartHist(k) \cup {VersionOf(r)}]
+    ELSE [k EXCEPT !.row = RowOf(r)]
+
+\* Recovery applies the next record in log order.
+ReplayApply(k, r) ==
+    IF r.ver THEN [row |-> k.row, hist |-> TRUE, store |-> StartHist(k) \cup {VersionOf(r)}]
+    ELSE IF ~k.hist THEN [k EXCEPT !.row = RowOf(r)]
+    ELSE IF NullReplay
+    THEN [k EXCEPT !.store = NonNull(k.store) \cup
+                   (IF r.kind = "put" THEN {[val |-> r.val, ts |-> 0, null |-> TRUE, marker |-> FALSE]} ELSE {})]
+    ELSE [k EXCEPT !.store = NonNull(k.store) \cup
+                   {[val |-> r.val, ts |-> r.ts, null |-> TRUE, marker |-> r.kind = "tomb"]}]
 
 \* The order of a request's steps after it takes the lock.
 Steps(p) == IF p \in Deleters /\ ~DeleteLogsFirst
@@ -77,11 +127,11 @@ Steps(p) == IF p \in Deleters /\ ~DeleteLogsFirst
             THEN <<"write", "relocate", "index">>
             ELSE <<"reserve", "write", "index">>
 
-VARIABLES pc, step, off, nextOff, log, engine, lock, cpc, cut, snap
+VARIABLES pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning
 
-vars == <<pc, step, off, nextOff, log, engine, lock, cpc, cut, snap>>
+vars == <<pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning>>
 procVars == <<pc, step, off, nextOff, log, engine, lock>>
-cVars == <<cpc, cut, snap>>
+cVars == <<cpc, cut, snap, clock, versioning>>
 Dropped == cpc = "done"
 
 \* Moves p to its next step, or to release after the last one.
@@ -96,11 +146,21 @@ Replay(o, limit, acc) ==
          IF recs = {}
          THEN IF RecoverSkipsGaps THEN Replay(o + 1, limit, acc) ELSE acc
          ELSE LET r == CHOOSE x \in recs : TRUE IN
-              Replay(o + 1, limit,
-                     IF r.kind = "put" THEN [present |-> TRUE, val |-> r.val] ELSE Gone)
+              Replay(o + 1, limit, ReplayApply(acc, r))
 
 \* A removed volume is not read: replay starts at the first offset that still exists.
-Recovered == Replay(IF Dropped THEN cut ELSE 1, nextOff, Gone)
+Recovered == Replay(IF Dropped THEN cut ELSE 1, nextOff, Empty)
+
+\* A versioned write's time (versions.rs next_ts), taken under the key lock.
+Stamp == Max({clock} \cup {v.ts + 1 : v \in engine.store})
+
+\* The record a request wrote, if it is in the log.
+Own(p) == {r \in log : r.o = off[p]}
+OwnVersioned(p) == \E r \in Own(p) : r.ver
+\* The record the index applies: the request's own, or (DELETE before #39, or a write into a
+\* removed volume) the record it would have written.
+RecOf(p) == IF Own(p) # {} THEN CHOOSE r \in Own(p) : TRUE
+            ELSE [o |-> 0, kind |-> IF p \in Writers THEN "put" ELSE "tomb", val |-> p, ver |-> versioning, ts |-> clock]
 
 Init ==
     /\ pc = [p \in Procs |-> "start"]
@@ -108,11 +168,13 @@ Init ==
     /\ off = [p \in Procs |-> 0]
     /\ nextOff = 1
     /\ log = {}
-    /\ engine = Gone
+    /\ engine = Empty
     /\ lock = "free"
     /\ cpc = "idle"
     /\ cut = 0
     /\ snap = {}
+    /\ clock = 1
+    /\ versioning = FALSE
 
 \* A streamer reserves before it has the lock: the body arrives next, for as long as the
 \* client takes. Nothing is in the log yet (the header sector is written last).
@@ -145,7 +207,8 @@ Write(p) ==
     /\ pc[p] = "write"
     \* Into a removed volume file, the bytes go nowhere (the handle outlives the file).
     /\ log' = IF Dropped /\ off[p] < cut THEN log
-              ELSE log \cup {[o |-> off[p], kind |-> IF p \in Writers THEN "put" ELSE "tomb", val |-> p]}
+              ELSE log \cup {[o |-> off[p], kind |-> IF p \in Writers THEN "put" ELSE "tomb", val |-> p,
+                               ver |-> versioning, ts |-> IF versioning THEN Stamp ELSE clock]}
     /\ Advance(p)
     /\ UNCHANGED <<off, nextOff, engine, lock>>
     /\ UNCHANGED cVars
@@ -160,14 +223,16 @@ Fail(p) ==
 \* Under the lock, after the streamer's own record is in the log: a record of this key at a
 \* later offset means offset order no longer says this write is the newest, so it is written
 \* again at the end of the log. The copy can fail like any write.
-LaterRecord(p) == \E r \in log : r.o > off[p]
+\* Only an unversioned write relocates: versions are ordered by time, not offset.
+LaterRecord(p) == (\E r \in log : r.o > off[p]) /\ ~OwnVersioned(p)
+CopyOf(p) == [o |-> nextOff, kind |-> "put", val |-> p, ver |-> FALSE, ts |-> clock]
 
 RelocateStep(p) ==
     /\ pc[p] = "relocate"
     /\ IF Relocate /\ LaterRecord(p)
        THEN /\ off' = [off EXCEPT ![p] = nextOff]
             /\ nextOff' = nextOff + 1
-            /\ log' = log \cup {[o |-> nextOff, kind |-> "put", val |-> p]}
+            /\ log' = log \cup {CopyOf(p)}
        ELSE UNCHANGED <<off, nextOff, log>>
     /\ Advance(p)
     /\ UNCHANGED <<engine, lock>>
@@ -181,8 +246,6 @@ RelocateFail(p) ==
     /\ UNCHANGED <<step, off, nextOff, log, engine, lock>>
     /\ UNCHANGED cVars
 
-\* What the live index shows after a write of p takes effect.
-Applied(p) == IF p \in Writers THEN [present |-> TRUE, val |-> p] ELSE Gone
 
 \* The record is in the log (Write or RelocateStep ran), then the fsync, the journal append or
 \* the index update fails, and the request answers 500 (#184).
@@ -190,7 +253,7 @@ LateFail(p) ==
     /\ WriteCanFail /\ FailLeavesRecord
     /\ pc[p] = "index"
     /\ \E r \in log : r.o = off[p]
-    /\ engine' = IF IndexAfterLateFail THEN Applied(p) ELSE engine
+    /\ engine' = IF IndexAfterLateFail THEN LiveApply(engine, RecOf(p)) ELSE engine
     /\ pc' = [pc EXCEPT ![p] = "release"]
     /\ UNCHANGED <<step, off, nextOff, log, lock>>
     /\ UNCHANGED cVars
@@ -202,15 +265,15 @@ RelocateLateFail(p) ==
     /\ Relocate /\ LaterRecord(p)
     /\ off' = [off EXCEPT ![p] = nextOff]
     /\ nextOff' = nextOff + 1
-    /\ log' = log \cup {[o |-> nextOff, kind |-> "put", val |-> p]}
-    /\ engine' = IF IndexAfterLateFail THEN Applied(p) ELSE engine
+    /\ log' = log \cup {CopyOf(p)}
+    /\ engine' = IF IndexAfterLateFail THEN LiveApply(engine, CopyOf(p)) ELSE engine
     /\ pc' = [pc EXCEPT ![p] = "release"]
     /\ UNCHANGED <<step, lock>>
     /\ UNCHANGED cVars
 
 Index(p) ==
     /\ pc[p] = "index"
-    /\ engine' = IF p \in Writers THEN [present |-> TRUE, val |-> p] ELSE Gone
+    /\ engine' = LiveApply(engine, RecOf(p))
     /\ Advance(p)
     /\ UNCHANGED <<off, nextOff, log, lock>>
     /\ UNCHANGED cVars
@@ -225,33 +288,45 @@ Release(p) ==
 \* The compaction pass (#167).
 InFlightBelowCut == \E p \in Procs : off[p] > 0 /\ off[p] < cut /\ pc[p] \in {"body", "write"}
 \* The record the index points at: the newest record of the value the engine holds.
-Points(r) == engine.present /\ r.kind = "put" /\ r.val = engine.val
+Points(r) == Visible(engine).present /\ r.kind = "put" /\ r.val = Visible(engine).val
              /\ ~\E r2 \in log : r2.val = r.val /\ r2.o > r.o
 CSeal ==
     /\ Compactor /\ cpc = "idle"
     /\ cut' = nextOff
     /\ cpc' = "sealed"
-    /\ UNCHANGED snap /\ UNCHANGED procVars
+    /\ UNCHANGED <<snap, clock, versioning>> /\ UNCHANGED procVars
 CScan ==
     /\ cpc = "sealed"
     /\ CompactWaitsForWriters => ~InFlightBelowCut
     /\ snap' = {r \in log : r.o < cut}
     /\ cpc' = "scanned"
-    /\ UNCHANGED cut /\ UNCHANGED procVars
+    /\ UNCHANGED <<cut, clock, versioning>> /\ UNCHANGED procVars
 CCopy ==
     /\ cpc = "scanned"
     /\ UseKeyLock => lock = "free"
     /\ IF \E r \in snap : Points(r)
-       THEN /\ log' = log \cup {[o |-> nextOff, kind |-> "put", val |-> engine.val]}
+       THEN /\ log' = log \cup {[(CHOOSE r \in snap : Points(r)) EXCEPT !.o = nextOff]}
             /\ nextOff' = nextOff + 1
        ELSE UNCHANGED <<log, nextOff>>
     /\ cpc' = "copied"
-    /\ UNCHANGED <<cut, snap, pc, step, off, engine, lock>>
+    /\ UNCHANGED <<cut, snap, pc, step, off, engine, lock, clock, versioning>>
 CDrop ==
     /\ cpc = "copied"
     /\ log' = {r \in log : r.o >= cut}
     /\ cpc' = "done"
-    /\ UNCHANGED <<cut, snap, pc, step, off, nextOff, engine, lock>>
+    /\ UNCHANGED <<cut, snap, pc, step, off, nextOff, engine, lock, clock, versioning>>
+
+\* PutBucketVersioning: no key lock.
+VersionOn ==
+    /\ Versioning /\ ~versioning
+    /\ versioning' = TRUE
+    /\ UNCHANGED <<procVars, cpc, cut, snap, clock>>
+
+\* The wall clock moves; it only matters to versioned writes.
+Tick ==
+    /\ Versioning
+    /\ clock' \in (IF ClockStepsBack THEN Ts \ {clock} ELSE {c \in Ts : c > clock})
+    /\ UNCHANGED <<procVars, cpc, cut, snap, versioning>>
 
 AllDone == (\A p \in Procs : pc[p] = "done") /\ cpc \in {"idle", "done"}
 
@@ -270,15 +345,21 @@ Next ==
     \/ \E p \in Procs : Index(p)
     \/ \E p \in Procs : Release(p)
     \/ CSeal \/ CScan \/ CCopy \/ CDrop
+    \/ VersionOn \/ Tick
     \/ Finished
 
 Spec == Init /\ [][Next]_vars
 
-AckedStateSurvivesRestart == AllDone => Recovered = engine
+AckedStateSurvivesRestart == AllDone => Visible(Recovered) = Visible(engine)
+
+\* ListObjectVersions shows the same history before and after a restart.
+HistorySurvivesRestart == AllDone => Recovered.hist = engine.hist /\ Recovered.store = engine.store
 
 TypeOK ==
     /\ pc \in [Procs -> {"start", "body", "reserve", "write", "relocate", "index", "release", "done"}]
     /\ step \in [Procs -> 0..4]
     /\ nextOff \in 1..(Cardinality(Procs) + Cardinality(Streamers) + 2)
     /\ cpc \in {"idle", "sealed", "scanned", "copied", "done"}
+    /\ clock \in Ts
+    /\ versioning \in BOOLEAN
 ====

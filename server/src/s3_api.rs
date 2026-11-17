@@ -854,13 +854,23 @@ impl S3ServiceState {
                         version_store.start(b, &key, before);
                     }
                     let null = flags & crate::meta_index::FLAG_NULL_ID != 0 || flags & crate::meta_index::FLAG_VERSIONED == 0;
-                    let ev = if flags & crate::meta_index::FLAG_VERSION_DELETE != 0 {
+                    // An unversioned record of a key that already has a history was stamped
+                    // while the bucket was unversioned, so live it changed the row before the
+                    // history began; it sits later in the log because a streamed PUT reserved
+                    // first and committed versioned (#186). Apply it the way the live index
+                    // did: a PUT becomes the null version at time 0 (`null_version_of`), a
+                    // DELETE removes the null version. Its own creation time does not count.
+                    let before_history = flags & (crate::meta_index::FLAG_VERSIONED | crate::meta_index::FLAG_VERSION_DELETE) == 0;
+                    let ts = if before_history { 0 } else { n.created_at_ns };
+                    let ev = if before_history && flags & AWAN_FLAG_TOMBSTONE != 0 {
+                        crate::versions::Event::Remove(0)
+                    } else if flags & crate::meta_index::FLAG_VERSION_DELETE != 0 {
                         match vm.read_needle_bytes(vm.id(), local, crc32c) {
                             Ok(p) if p.len() == 8 => crate::versions::Event::Remove(u64::from_le_bytes(p[..8].try_into().unwrap())),
                             _ => continue,
                         }
                     } else if flags & AWAN_FLAG_TOMBSTONE != 0 {
-                        crate::versions::Event::Put(crate::versions::Version { ts: n.created_at_ns, null, marker: true, vol_offset: offset, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags })
+                        crate::versions::Event::Put(crate::versions::Version { ts, null, marker: true, vol_offset: offset, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags })
                     } else {
                         let (size, part_count) = if flags & AWAN_FLAG_MULTIPART != 0 {
                             match vm.read_needle_bytes(vm.id(), local, crc32c).ok().map(|b| decode_extents_manifest(&multipart.staging_dir, &b)) {
@@ -885,7 +895,7 @@ impl S3ServiceState {
                         } else {
                             (size, 0)
                         };
-                        crate::versions::Event::Put(crate::versions::Version { ts: n.created_at_ns, null, marker: false, vol_offset: offset, size, etag_hi, etag_lo, part_count, flags })
+                        crate::versions::Event::Put(crate::versions::Version { ts, null, marker: false, vol_offset: offset, size, etag_hi, etag_lo, part_count, flags })
                     };
                     version_store.apply(b, &key, ev);
                     match version_store.current(b, &key) {
