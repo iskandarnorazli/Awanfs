@@ -268,7 +268,7 @@ async fn update_object_tags(
         Err(e) => return internal_error_response(key, &format!("could not read the object's payload: {:?}", e)),
     };
 
-    let new_offset = match state
+    let (new_offset, late) = match state
         .store_payload_with(
             b_id,
             key,
@@ -281,8 +281,12 @@ async fn update_object_tags(
         )
         .await
     {
-        Ok(off) => off,
-        Err(e) => return internal_error_response(key, &format!("could not store updated object tags: {:?}", e)),
+        Ok(off) => (off, None),
+        // Indexed as on success, then answered 500 (#184, owner decision 4B).
+        Err(e) => match S3ServiceState::late_record(&e) {
+            Some((off, _)) => (off, Some(e)),
+            None => return internal_error_response(key, &format!("could not store updated object tags: {:?}", e)),
+        },
     };
     if new_flags & AWAN_FLAG_MULTIPART != 0 {
         state.payload_cache.remove(b_id, new_offset);
@@ -314,6 +318,9 @@ async fn update_object_tags(
         }
         None
     };
+    if let Some(e) = late {
+        return internal_error_response(key, &format!("could not store updated object tags: {:?}", e));
+    }
 
     let mut b = Response::builder().status(ok_status).header(CONTENT_LENGTH, "0");
     if let Some(vid_str) = version_id {

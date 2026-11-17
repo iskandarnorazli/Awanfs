@@ -1053,26 +1053,48 @@ impl S3ServiceState {
         self.hook("delete_start", key);
         if let Some((extra, ts)) = self.version_stamp(b_id, key) {
             let flags = AWAN_FLAG_TOMBSTONE | extra;
-            let (vm, loc, g) = self.write_to_active_at(b_id, key, &[], flags, 0, 0, Some(ts)).map_err(|e| format!("could not record the delete: {:?}", e))?;
-            self.hook("delete_marker_written", key);
-            self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-            self.make_durable(&vm, loc.seq).await.map_err(|e| format!("could not sync the delete: {:?}", e))?;
+            // A marker whole in the volume is replayed by recovery: it takes effect here too,
+            // and the request still answers an error (#184, owner decision 4B).
+            let (loc, g, late) = match self.write_to_active_at(b_id, key, &[], flags, 0, 0, Some(ts)) {
+                Ok((vm, loc, g)) => {
+                    self.hook("delete_marker_written", key);
+                    self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                    let late = self.make_durable(&vm, loc.seq).await.err().map(|e| format!("could not sync the delete: {:?}", e));
+                    (loc, g, late)
+                }
+                Err(VolumeError::AfterRecord { loc, cause, .. }) => {
+                    self.hook("delete_marker_written", key);
+                    self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                    (loc, global_offset(loc.volume_id, loc.offset), Some(format!("could not record the delete: {}", cause)))
+                }
+                Err(e) => return Err(format!("could not record the delete: {:?}", e)),
+            };
             self.needle_crc_map.write().insert((b_id, g), loc.payload_crc32c);
             self.mvcc.tombstone(b_id, key);
             let v = crate::versions::Version { ts, null: flags & crate::meta_index::FLAG_NULL_ID != 0, marker: true, vol_offset: g, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags };
             self.record_version(b_id, key, crate::versions::Event::Put(v)).map_err(|c| format!("index error {} for the delete marker", c))?;
+            if let Some(e) = late {
+                return Err(e);
+            }
             return Ok(Some(v.id_string()));
         }
         // Log the tombstone first; only a logged delete removes the row, so a failed write is
         // an error and the object stays (verification/tla, DeleteLogsFirst).
-        match self.write_to_active(b_id, key, &[], AWAN_FLAG_TOMBSTONE, 0, 0) {
+        // A tombstone whole in the volume is replayed by recovery: the row is removed here
+        // too, and the request still answers an error (#184, owner decision 4B).
+        let late = match self.write_to_active(b_id, key, &[], AWAN_FLAG_TOMBSTONE, 0, 0) {
             Ok((vm, loc, _)) => {
                 self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                 self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                self.make_durable(&vm, loc.seq).await.map_err(|e| format!("could not sync the delete: {:?}", e))?;
+                self.make_durable(&vm, loc.seq).await.err().map(|e| format!("could not sync the delete: {:?}", e))
+            }
+            Err(VolumeError::AfterRecord { loc, cause, .. }) => {
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                Some(format!("could not record the delete: {}", cause))
             }
             Err(e) => return Err(format!("could not record the delete: {:?}", e)),
-        }
+        };
         self.mvcc.tombstone(b_id, key);
         let old_info = {
             let mut engine = self.engine.write();
@@ -1089,7 +1111,10 @@ impl S3ServiceState {
                 self.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
             }
         }
-        Ok(None)
+        match late {
+            Some(e) => Err(e),
+            None => Ok(None),
+        }
     }
 
     /// `DELETE ?versionId=`: removes one version for good (#31). Returns it, or `None` when the
@@ -1113,12 +1138,26 @@ impl S3ServiceState {
             return Ok(None);
         };
         let flags = AWAN_FLAG_TOMBSTONE | crate::meta_index::FLAG_VERSION_DELETE;
-        let (vm, loc, _) = self.write_to_active(b_id, key, &id.to_le_bytes(), flags, 0, 0).map_err(|e| format!("could not record the delete: {:?}", e))?;
-        self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-        self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-        self.make_durable(&vm, loc.seq).await.map_err(|e| format!("could not sync the delete: {:?}", e))?;
+        // A record whole in the volume is replayed by recovery: the version goes here too, and
+        // the request still answers an error (#184, owner decision 4B).
+        let late = match self.write_to_active(b_id, key, &id.to_le_bytes(), flags, 0, 0) {
+            Ok((vm, loc, _)) => {
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                self.make_durable(&vm, loc.seq).await.err().map(|e| format!("could not sync the delete: {:?}", e))
+            }
+            Err(VolumeError::AfterRecord { loc, cause, .. }) => {
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                Some(format!("could not record the delete: {}", cause))
+            }
+            Err(e) => return Err(format!("could not record the delete: {:?}", e)),
+        };
         self.record_version(b_id, key, crate::versions::Event::Remove(id)).map_err(|c| format!("index error {} after deleting a version", c))?;
-        Ok(Some(target))
+        match late {
+            Some(e) => Err(e),
+            None => Ok(Some(target)),
+        }
     }
 
     /// The flags and creation time a write of `key` takes in its bucket's versioning status;
@@ -1546,10 +1585,21 @@ impl S3ServiceState {
     /// `store_payload_at` with an attributes block (#150).
     #[allow(clippy::too_many_arguments)]
     pub async fn store_payload_with(&self, b_id: u32, key: &str, attrs: &[u8], data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64, created_at: Option<u64>) -> Result<u64, VolumeError> {
-        let (vm, loc, offset) = tracing::info_span!("volume.write", bytes = data.len() as u64).in_scope(|| self.write_to_active_with(b_id, key, attrs, data, flags, etag_hi, etag_lo, created_at))?;
-        self.make_durable(&vm, loc.seq).instrument(tracing::info_span!("volume.sync")).await?;
-        self.needle_crc_map.write().insert((b_id, offset), loc.payload_crc32c);
-        self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+        let written = tracing::info_span!("volume.write", bytes = data.len() as u64).in_scope(|| self.write_to_active_with(b_id, key, attrs, data, flags, etag_hi, etag_lo, created_at));
+        let (vm, loc, offset) = match written {
+            Ok(w) => w,
+            Err(VolumeError::AfterRecord { loc, flags, cause }) => {
+                self.note_record(b_id, &loc);
+                return Err(VolumeError::AfterRecord { loc, flags, cause });
+            }
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = self.make_durable(&vm, loc.seq).instrument(tracing::info_span!("volume.sync")).await {
+            // The needle is whole in the volume; only its sync failed (#184).
+            self.note_record(b_id, &loc);
+            return Err(VolumeError::AfterRecord { loc, flags, cause: format!("could not sync the object: {:?}", e) });
+        }
+        self.note_record(b_id, &loc);
         // Cache hot payloads up to 4 MiB in dynamic auto-scaling LRU cache; the cache holds
         // object bytes, so a compressed payload is cached when it is first read. It holds the
         // request's buffer, which the per-object and total caps bound. Caching a view of the
@@ -1560,6 +1610,23 @@ impl S3ServiceState {
             self.payload_cache.insert(b_id, offset, data.clone());
         }
         Ok(offset)
+    }
+
+    /// For a write that failed after its needle was whole in the volume (#184): the needle's
+    /// global offset and flags. Recovery will replay that needle, so the caller indexes it as
+    /// on success and still answers an error (owner decision 4B, 2026-11-16).
+    pub fn late_record(e: &VolumeError) -> Option<(u64, u16)> {
+        match e {
+            VolumeError::AfterRecord { loc, flags, .. } => Some((global_offset(loc.volume_id, loc.offset), *flags)),
+            _ => None,
+        }
+    }
+
+    /// Bookkeeping for a needle now in the volume: its payload CRC, which reads verify against,
+    /// and the volume bytes it uses.
+    pub fn note_record(&self, b_id: u32, loc: &NeedleLocation) {
+        self.needle_crc_map.write().insert((b_id, global_offset(loc.volume_id, loc.offset)), loc.payload_crc32c);
+        self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
     }
 
     /// Writes a needle to the active volume. When it is full, seals it, opens the next one
@@ -1666,8 +1733,11 @@ impl S3ServiceState {
         from_vm.copy_payload(from.offset, from.payload_crc32c, |piece| writer.write(piece))?;
         let vm = Arc::clone(writer.volume());
         let g = global_offset(vm.id(), writer.offset());
-        let loc = match writer.finish(etag_hi, etag_lo) {
-            Ok(loc) => loc,
+        let (loc, late) = match writer.finish(etag_hi, etag_lo) {
+            Ok(loc) => (loc, None),
+            // The copy is whole in the volume and is the newest record of the key; only its
+            // journal append failed (#184, the model's RelocateLateFail).
+            Err(VolumeError::AfterRecord { loc, flags, cause }) => (loc, Some(VolumeError::AfterRecord { loc, flags, cause })),
             Err(e) => {
                 // The header may be on disk (see `write_to_active_at`).
                 self.streams.note_append(b_id, key, u64::MAX);
@@ -1678,7 +1748,10 @@ impl S3ServiceState {
         self.total_volume_bytes.fetch_add(from.total_len, Ordering::Relaxed);
         self.tombstone_bytes.fetch_add(from.total_len, Ordering::Relaxed);
         self.stream_relocations.fetch_add(1, Ordering::SeqCst);
-        Ok((vm, loc, g))
+        match late {
+            Some(e) => Err(e),
+            None => Ok((vm, loc, g)),
+        }
     }
 
     pub fn begin_needle_on_active(&self, b_id: u32, key: &str, attrs: &[u8], len: u64, flags: u16) -> Result<crate::volume::NeedleWriter, VolumeError> {
