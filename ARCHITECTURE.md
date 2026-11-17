@@ -203,6 +203,15 @@ object's Last-Modified; its ordering time stays 0, so which version is current d
 and no clock reading decides it (decision 63). Not chosen: giving the null version its real time
 as its ordering time and raising the next stamp above it, which reopens the clock-step risk.
 
+**Decision 66 (owner, 2026-11-17): no GPU or APU code path for now.** Erasure coding (decision
+64) is built with CPU vector instructions first and measured against the network rate. A GPU path
+on unified-memory APUs (Strix Halo, MI300A) is weighed only if CPU erasure coding cannot keep up
+with the network on a real cluster. Reason: the measured limits are the disk sync, connection
+setup (#248) and the metadata index (#26), not compute. Checksums (CRC32C) already run in
+hardware faster than a 100 Gb link, MD5 and SHA-256 are sequential per object, and offloading a
+small request adds launch time to a path under a millisecond. Not chosen: a GPU path for erasure
+coding and compression beside the CPU one, or the APU as a design target.
+
 **Decision 61 (owner, 2026-11-17): a sub-resource AwanFS does not implement answers 501
 `NotImplemented`; it never falls through to another operation, even when that made a test
 pass.** Before #148 a request such as `PUT /bucket?policy`, `?acl`, `?encryption`,
