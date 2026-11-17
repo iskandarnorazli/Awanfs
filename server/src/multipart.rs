@@ -59,6 +59,7 @@ pub struct MultipartUpload {
     pub parts: BTreeMap<u32, StagedPart>,
     pub checksum_alg: Option<crate::checksum::ChecksumAlgorithm>,
     pub checksum_type: Option<String>,
+    pub attrs: crate::attrs::Attrs,
 }
 
 #[derive(Clone, Debug)]
@@ -206,6 +207,7 @@ impl MultipartManager {
             parts: BTreeMap::new(),
             checksum_alg: None,
             checksum_type: None,
+            attrs: crate::attrs::Attrs::new(),
         };
 
         self.upload_states.write().insert(upload_id.clone(), crate::fsm::UploadState::Open);
@@ -245,6 +247,12 @@ impl MultipartManager {
         if let Some(u) = self.uploads.write().get_mut(upload_id) {
             u.checksum_alg = Some(alg);
             u.checksum_type = Some(checksum_type);
+        }
+    }
+
+    pub fn set_upload_attrs(&self, upload_id: &str, attrs: crate::attrs::Attrs) {
+        if let Some(u) = self.uploads.write().get_mut(upload_id) {
+            u.attrs = attrs;
         }
     }
 
@@ -339,16 +347,25 @@ impl MultipartManager {
         let uploads = self.uploads.read();
         let upload = uploads.get(upload_id).ok_or("NoSuchUpload")?;
 
-        // 1. Verify strictly ascending part order (InvalidPartOrder)
+        // 1. Verify non-decreasing part order (InvalidPartOrder); consecutive duplicates
+        // keep the last entry so a resent part finishing last succeeds (#111).
         for i in 1..declared_parts.len() {
-            if declared_parts[i].0 <= declared_parts[i - 1].0 {
+            if declared_parts[i].0 < declared_parts[i - 1].0 {
                 return Err("InvalidPartOrder");
+            }
+        }
+        let mut deduped: Vec<(u32, &str)> = Vec::with_capacity(declared_parts.len());
+        for (p_num, etag) in declared_parts {
+            if let Some(last) = deduped.last_mut().filter(|(n, _)| *n == *p_num) {
+                last.1 = etag.as_str();
+            } else {
+                deduped.push((*p_num, etag.as_str()));
             }
         }
 
         // 2. Verify all declared parts exist and match recorded ETag (InvalidPart)
-        let mut staged_selected = Vec::with_capacity(declared_parts.len());
-        for (p_num, declared_etag) in declared_parts {
+        let mut staged_selected = Vec::with_capacity(deduped.len());
+        for (p_num, declared_etag) in &deduped {
             let staged = upload.parts.get(p_num).ok_or("InvalidPart")?;
             let clean_declared = declared_etag.trim_matches('"');
             if staged.etag_hex != clean_declared {

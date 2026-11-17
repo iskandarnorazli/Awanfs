@@ -421,7 +421,7 @@ pub fn parse_complete_multipart(body: &str) -> Result<Vec<CompletedPart>, Refusa
                         return Err(INVALID_ARGUMENT);
                     }
                     let part_number = parsed_num as u32;
-                    if part_number <= prev_part_number {
+                    if part_number < prev_part_number {
                         return Err(INVALID_PART_ORDER);
                     }
                     prev_part_number = part_number;
@@ -728,9 +728,8 @@ mod tests {
             ("<CompleteMultipartUpload><Part><PartNumber>0</PartNumber><ETag>a</ETag></Part></CompleteMultipartUpload>", "InvalidArgument", 400),
             ("<CompleteMultipartUpload><Part><PartNumber>-1</PartNumber><ETag>a</ETag></Part></CompleteMultipartUpload>", "InvalidArgument", 400),
             ("<CompleteMultipartUpload><Part><PartNumber>10001</PartNumber><ETag>a</ETag></Part></CompleteMultipartUpload>", "InvalidArgument", 400),
-            // Not strictly ascending -> 400 InvalidPartOrder
+            // Decreasing PartNumber -> 400 InvalidPartOrder (consecutive duplicates are allowed for resent parts)
             ("<CompleteMultipartUpload><Part><PartNumber>2</PartNumber><ETag>a</ETag></Part><Part><PartNumber>1</PartNumber><ETag>b</ETag></Part></CompleteMultipartUpload>", "InvalidPartOrder", 400),
-            ("<CompleteMultipartUpload><Part><PartNumber>2</PartNumber><ETag>a</ETag></Part><Part><PartNumber>2</PartNumber><ETag>b</ETag></Part></CompleteMultipartUpload>", "InvalidPartOrder", 400),
             // Wrong root / unclosed
             ("<Other><Part><PartNumber>1</PartNumber><ETag>a</ETag></Part></Other>", "MalformedXML", 400),
             ("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>a</ETag></Part>", "MalformedXML", 400),

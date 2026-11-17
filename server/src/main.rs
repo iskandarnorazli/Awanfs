@@ -205,6 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     state.set_durability(durability);
     state.set_body_idle_timeout(body_idle_timeout);
+    state.multipart.enforce_min_part_size.store(true, std::sync::atomic::Ordering::SeqCst);
     // Compaction copies at most this many MB/s (#28, decision 24); 0 = no limit.
     state.compaction_rate.store(compaction_mb.unwrap_or(50) * 1_000_000, std::sync::atomic::Ordering::Relaxed);
     state.lifecycle_day_seconds.store(lifecycle_day_seconds, std::sync::atomic::Ordering::Relaxed);

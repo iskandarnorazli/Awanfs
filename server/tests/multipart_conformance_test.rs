@@ -487,3 +487,168 @@ async fn complete_multipart_is_idempotent_and_abort_after_complete_is_no_such_up
     handle.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+#[tokio::test]
+async fn complete_multipart_preserves_create_metadata_and_content_type() {
+    let (handle, base, dir) = start_server("mpu_meta").await;
+    let c = reqwest::Client::new();
+    assert_eq!(c.put(format!("{}/bkt", base)).send().await.unwrap().status(), StatusCode::OK);
+
+    let init = c
+        .post(format!("{}/bkt/obj?uploads", base))
+        .header("content-type", "text/bla")
+        .header("x-amz-meta-foo", "bar")
+        .header("cache-control", "max-age=60")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(init.status(), StatusCode::OK);
+    let uid = between(&init.text().await.unwrap(), "<UploadId>", "</UploadId>").unwrap().to_string();
+
+    let _e1_old = upload_part(&c, &base, "bkt", "obj", &uid, 1, b"hello".to_vec()).await;
+    let e2 = upload_part(&c, &base, "bkt", "obj", &uid, 2, b"world".to_vec()).await;
+    let e1_new = upload_part(&c, &base, "bkt", "obj", &uid, 1, b"HELLO".to_vec()).await;
+
+    let cmp = c
+        .post(format!("{}/bkt/obj?uploadId={}", base, uid))
+        .body(format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>\"{}\"</ETag></Part>\
+             <Part><PartNumber>2</PartNumber><ETag>\"{}\"</ETag></Part>\
+             </CompleteMultipartUpload>",
+            e1_new, e2
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cmp.status(), StatusCode::OK);
+
+    let get = c.get(format!("{}/bkt/obj", base)).send().await.unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(get.headers().get("content-type").and_then(|v| v.to_str().ok()), Some("text/bla"));
+    assert_eq!(get.headers().get("x-amz-meta-foo").and_then(|v| v.to_str().ok()), Some("bar"));
+    assert_eq!(get.headers().get("cache-control").and_then(|v| v.to_str().ok()), Some("max-age=60"));
+    assert_eq!(&get.bytes().await.unwrap()[..], b"HELLOworld");
+
+    // CopyObject from the completed multipart object preserves its metadata and Content-Type.
+    let copy = c
+        .put(format!("{}/bkt/dst", base))
+        .header("x-amz-copy-source", "/bkt/obj")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(copy.status(), StatusCode::OK);
+    let head = c.head(format!("{}/bkt/dst", base)).send().await.unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(head.headers().get("content-type").and_then(|v| v.to_str().ok()), Some("text/bla"));
+    assert_eq!(head.headers().get("x-amz-meta-foo").and_then(|v| v.to_str().ok()), Some("bar"));
+
+    handle.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn complete_multipart_resend_same_part_number_finishes_last() {
+    let (handle, base, dir) = start_server("mpu_resend_dup").await;
+    let c = reqwest::Client::new();
+    assert_eq!(c.put(format!("{}/bkt", base)).send().await.unwrap().status(), StatusCode::OK);
+
+    let uid = create_upload(&c, &base, "bkt", "obj").await;
+    let etag_b = upload_part(&c, &base, "bkt", "obj", &uid, 1, b"BBBB".to_vec()).await;
+    let etag_a = upload_part(&c, &base, "bkt", "obj", &uid, 1, b"AAAA".to_vec()).await;
+
+    let cmp = c
+        .post(format!("{}/bkt/obj?uploadId={}", base, uid))
+        .body(format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>\"{}\"</ETag></Part>\
+             <Part><PartNumber>1</PartNumber><ETag>\"{}\"</ETag></Part>\
+             </CompleteMultipartUpload>",
+            etag_b, etag_a
+        ))
+        .send()
+        .await
+        .unwrap();
+    let status = cmp.status();
+    let body = cmp.text().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", body);
+
+    let got = c.get(format!("{}/bkt/obj", base)).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(&got[..], b"AAAA");
+
+    handle.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn complete_multipart_versioning_return_version_id() {
+    let (handle, base, dir) = start_server("mpu_ver").await;
+    let c = reqwest::Client::new();
+
+    // 1. Unset (default): no x-amz-version-id
+    assert_eq!(c.put(format!("{}/bkt-unset", base)).send().await.unwrap().status(), StatusCode::OK);
+    let uid = create_upload(&c, &base, "bkt-unset", "k").await;
+    let e1 = upload_part(&c, &base, "bkt-unset", "k", &uid, 1, b"data".to_vec()).await;
+    let cmp = c
+        .post(format!("{}/bkt-unset/k?uploadId={}", base, uid))
+        .body(format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"{}\"</ETag></Part></CompleteMultipartUpload>", e1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cmp.status(), StatusCode::OK);
+    assert!(cmp.headers().get("x-amz-version-id").is_none(), "unset bucket must not return x-amz-version-id");
+
+    // 2. Enabled: non-empty x-amz-version-id
+    assert_eq!(c.put(format!("{}/bkt-en", base)).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        c.put(format!("{}/bkt-en?versioning", base))
+            .body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let uid = create_upload(&c, &base, "bkt-en", "k").await;
+    let e1 = upload_part(&c, &base, "bkt-en", "k", &uid, 1, b"data".to_vec()).await;
+    let cmp = c
+        .post(format!("{}/bkt-en/k?uploadId={}", base, uid))
+        .body(format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"{}\"</ETag></Part></CompleteMultipartUpload>", e1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cmp.status(), StatusCode::OK);
+    let vid = cmp.headers().get("x-amz-version-id").and_then(|v| v.to_str().ok());
+    assert!(vid.is_some_and(|s| !s.is_empty() && s != "null"), "enabled bucket must return real version id, got {:?}", vid);
+
+    // 3. Suspended: no x-amz-version-id
+    assert_eq!(c.put(format!("{}/bkt-susp", base)).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        c.put(format!("{}/bkt-susp?versioning", base))
+            .body("<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let uid = create_upload(&c, &base, "bkt-susp", "k").await;
+    let e1 = upload_part(&c, &base, "bkt-susp", "k", &uid, 1, b"data".to_vec()).await;
+    let cmp = c
+        .post(format!("{}/bkt-susp/k?uploadId={}", base, uid))
+        .body(format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"{}\"</ETag></Part></CompleteMultipartUpload>", e1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cmp.status(), StatusCode::OK);
+    assert!(
+        cmp.headers().get("x-amz-version-id").is_none(),
+        "suspended bucket must not return x-amz-version-id, got {:?}",
+        cmp.headers().get("x-amz-version-id")
+    );
+    assert_eq!(&c.get(format!("{}/bkt-susp/k", base)).send().await.unwrap().bytes().await.unwrap()[..], b"data");
+
+    handle.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
