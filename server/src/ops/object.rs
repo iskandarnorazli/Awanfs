@@ -116,15 +116,8 @@ fn request_attrs_with_checksum(
     if let Some(ct) = headers.get(CONTENT_TYPE) {
         attrs.set(crate::attrs::TAG_CONTENT_TYPE, valid_header_str(ct, key)?.as_bytes());
     }
-    if let Some(tagging) = headers.get("x-amz-tagging") {
-        let raw = tagging
-            .to_str()
-            .map_err(|_| bad_request("InvalidTag", "Invalid x-amz-tagging header.", key))?;
-        let tag_set = crate::tagging::parse_tagging_header(raw)
-            .map_err(|r| bad_request(r.code, r.why, key))?;
-        if !tag_set.tags.is_empty() {
-            attrs.set(crate::attrs::TAG_TAGGING, &crate::attrs::encode_tags(&tag_set));
-        }
+    if let Some(tag_set) = crate::ops::tagging::parse_tagging_header_from(headers, key)? {
+        attrs.set(crate::attrs::TAG_TAGGING, &crate::attrs::encode_tags(&tag_set));
     }
     if let Some((alg, cksum_type, val)) = checksum {
         attrs.set_checksum(alg, cksum_type, val);
@@ -748,23 +741,52 @@ pub async fn copy_object(
         Some(v) if v.eq_ignore_ascii_case("REPLACE") => true,
         Some(_) => return Ok(bad_request("InvalidArgument", "Unknown metadata directive.", key)),
     };
-    if src_bucket == bucket && src_key == key && src_vid.is_none() && !replace {
+    let tagging_replace = match headers.get("x-amz-tagging-directive").and_then(|v| v.to_str().ok()) {
+        None => false,
+        Some(v) if v.eq_ignore_ascii_case("COPY") => false,
+        Some(v) if v.eq_ignore_ascii_case("REPLACE") => true,
+        Some(_) => return Ok(bad_request("InvalidArgument", "Unknown tagging directive.", key)),
+    };
+    if src_bucket == bucket && src_key == key && src_vid.is_none() && !replace && !tagging_replace {
         return Ok(bad_request(
             "InvalidRequest",
             "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.",
             key,
         ));
     }
-    let copy_attrs = if replace {
-        match request_attrs(headers, key) {
+    let mut copy_attrs_obj = if replace {
+        let raw = match request_attrs(headers, key) {
             Ok(a) => a,
             Err(resp) => return Ok(resp),
-        }
+        };
+        crate::attrs::Attrs::decode(&raw).unwrap_or_default()
     } else {
-        match src_view.and_then(|a| a.encode().map_err(|_| VolumeError::CorruptIndex)) {
-            Ok(a) => a,
+        match src_view {
+            Ok(ref a) => a.clone(),
             Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source's attributes: {:?}", e))),
         }
+    };
+    if tagging_replace {
+        match crate::ops::tagging::parse_tagging_header_from(headers, key) {
+            Ok(Some(tag_set)) => {
+                copy_attrs_obj.set(crate::attrs::TAG_TAGGING, &crate::attrs::encode_tags(&tag_set));
+            }
+            Ok(None) => copy_attrs_obj.remove(crate::attrs::TAG_TAGGING),
+            Err(resp) => return Ok(resp),
+        }
+    } else if replace {
+        let src_attrs = match src_view {
+            Ok(ref a) => a,
+            Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source's attributes: {:?}", e))),
+        };
+        match src_attrs.get(crate::attrs::TAG_TAGGING) {
+            Some(raw) => copy_attrs_obj.set(crate::attrs::TAG_TAGGING, raw),
+            None => copy_attrs_obj.remove(crate::attrs::TAG_TAGGING),
+        }
+    }
+    let copy_attrs = match copy_attrs_obj.encode() {
+        Ok(a) => a,
+        Err(_) => return Ok(bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key)),
     };
     let flags = if bytes.is_empty() {
         AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE

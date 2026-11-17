@@ -403,3 +403,149 @@ async fn test_tagging_restart_persistence() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+#[tokio::test]
+async fn test_copy_object_tagging_directive() {
+    let (base_url, _state, _handle) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    assert_eq!(client.put(format!("{}/cp-bkt", base_url)).send().await.unwrap().status(), StatusCode::OK);
+
+    // Put source object with x-amz-tagging: foo (empty value) and Content-Type
+    let res = client
+        .put(format!("{}/cp-bkt/src", base_url))
+        .header(CONTENT_TYPE, "text/plain")
+        .header("x-amz-tagging", "foo")
+        .body("copy payload")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Default directive (COPY) copies source tags
+    let res = client
+        .put(format!("{}/cp-bkt/dst-copy", base_url))
+        .header("x-amz-copy-source", "/cp-bkt/src")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let tags = client.get(format!("{}/cp-bkt/dst-copy?tagging", base_url)).send().await.unwrap().text().await.unwrap();
+    assert!(tags.contains("<Key>foo</Key>"));
+    assert!(tags.contains("<Value></Value>"));
+
+    // Self-copy with x-amz-tagging-directive: REPLACE and x-amz-tagging: bar=bar
+    let res = client
+        .put(format!("{}/cp-bkt/src", base_url))
+        .header("x-amz-copy-source", "/cp-bkt/src")
+        .header("x-amz-tagging-directive", "REPLACE")
+        .header("x-amz-tagging", "bar=bar")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let tags = client.get(format!("{}/cp-bkt/src?tagging", base_url)).send().await.unwrap().text().await.unwrap();
+    assert!(tags.contains("<Key>bar</Key>") && tags.contains("<Value>bar</Value>"));
+    assert!(!tags.contains("<Key>foo</Key>"));
+    let head = client.head(format!("{}/cp-bkt/src", base_url)).send().await.unwrap();
+    assert_eq!(head.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap(), "text/plain");
+    assert_eq!(head.headers().get("x-amz-tagging-count").unwrap().to_str().unwrap(), "1");
+
+    // REPLACE without x-amz-tagging clears tags
+    let res = client
+        .put(format!("{}/cp-bkt/dst-empty", base_url))
+        .header("x-amz-copy-source", "/cp-bkt/src")
+        .header("x-amz-tagging-directive", "REPLACE")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let head = client.head(format!("{}/cp-bkt/dst-empty", base_url)).send().await.unwrap();
+    assert!(head.headers().get("x-amz-tagging-count").is_none());
+
+    // Metadata REPLACE + tagging COPY preserves source tags
+    let res = client
+        .put(format!("{}/cp-bkt/dst-meta", base_url))
+        .header("x-amz-copy-source", "/cp-bkt/src")
+        .header("x-amz-metadata-directive", "REPLACE")
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .header("x-amz-tagging-directive", "COPY")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let head = client.head(format!("{}/cp-bkt/dst-meta", base_url)).send().await.unwrap();
+    assert_eq!(head.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap(), "application/octet-stream");
+    assert_eq!(head.headers().get("x-amz-tagging-count").unwrap().to_str().unwrap(), "1");
+
+    // Invalid x-amz-tagging-directive -> 400 InvalidArgument
+    let res = client
+        .put(format!("{}/cp-bkt/dst-bad", base_url))
+        .header("x-amz-copy-source", "/cp-bkt/src")
+        .header("x-amz-tagging-directive", "BOGUS")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_multipart_upload_tagging() {
+    let (base_url, _state, _handle) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    assert_eq!(client.put(format!("{}/mp-bkt", base_url)).send().await.unwrap().status(), StatusCode::OK);
+
+    // Invalid x-amz-tagging on CreateMultipartUpload -> 400 InvalidTag
+    let res = client
+        .post(format!("{}/mp-bkt/bad?uploads", base_url))
+        .header("x-amz-tagging", "aws:reserved=1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(res.text().await.unwrap().contains("InvalidTag"));
+
+    // CreateMultipartUpload with x-amz-tagging: k1=v1&k2=v2
+    let init = client
+        .post(format!("{}/mp-bkt/obj?uploads", base_url))
+        .header("x-amz-tagging", "k1=v1&k2=v2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(init.status(), StatusCode::OK);
+    let init_xml = init.text().await.unwrap();
+    let start = init_xml.find("<UploadId>").unwrap() + "<UploadId>".len();
+    let end = init_xml.find("</UploadId>").unwrap();
+    let upload_id = &init_xml[start..end];
+
+    let part = client
+        .put(format!("{}/mp-bkt/obj?partNumber=1&uploadId={}", base_url, upload_id))
+        .body("hello multipart tagging")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(part.status(), StatusCode::OK);
+    let etag = part.headers().get("etag").unwrap().to_str().unwrap().to_string();
+
+    let complete_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etag
+    );
+    let comp = client
+        .post(format!("{}/mp-bkt/obj?uploadId={}", base_url, upload_id))
+        .body(complete_xml)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(comp.status(), StatusCode::OK);
+
+    let head = client.head(format!("{}/mp-bkt/obj", base_url)).send().await.unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(head.headers().get("x-amz-tagging-count").unwrap().to_str().unwrap(), "2");
+
+    let tags = client.get(format!("{}/mp-bkt/obj?tagging", base_url)).send().await.unwrap().text().await.unwrap();
+    assert!(tags.contains("<Key>k1</Key>") && tags.contains("<Value>v1</Value>"));
+    assert!(tags.contains("<Key>k2</Key>") && tags.contains("<Value>v2</Value>"));
+}

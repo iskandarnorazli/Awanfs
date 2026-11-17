@@ -328,3 +328,18 @@ async fn update_object_tags(
     }
     b.body(empty_body()).unwrap()
 }
+
+pub(crate) fn parse_tagging_header_from(
+    headers: &hyper::HeaderMap,
+    key: &str,
+) -> Result<Option<TagSet>, Response<ResponseBody>> {
+    let Some(tagging) = headers.get("x-amz-tagging") else {
+        return Ok(None);
+    };
+    let raw = tagging
+        .to_str()
+        .map_err(|_| bad_request("InvalidTag", "Invalid x-amz-tagging header.", key))?;
+    let tag_set = crate::tagging::parse_tagging_header(raw)
+        .map_err(|r| bad_request(r.code, r.why, key))?;
+    Ok((!tag_set.tags.is_empty()).then_some(tag_set))
+}
