@@ -62,6 +62,10 @@ pub enum VolumeError {
     VolumeFull { offset: u64, len: u64 },
     /// Written by a newer AwanFS; this one reads formats up to `supported` (#50).
     UnsupportedFormat { found: u32, supported: u32 },
+    /// The needle is whole in the volume, and a later step failed: its journal append (#184).
+    /// Recovery will replay the record, so the caller indexes it as it would on success
+    /// (owner decision 4B, 2026-11-16) and still answers an error.
+    AfterRecord { loc: NeedleLocation, flags: u16, cause: String },
 }
 
 impl std::fmt::Display for VolumeError {
@@ -261,17 +265,22 @@ impl NeedleWriter {
         self.vm.file.write_aligned_at(self.offset, &self.first)?;
         self.vm.work.disk_write(SECTOR_SIZE as u64);
         self.vm.work.payload_copy(self.payload_size);
-        self.vm.append_index(header.key_hash, self.offset, self.total_len, self.payload_size, self.flags, self.crc)?;
+        let journaled = self.vm.append_index(header.key_hash, self.offset, self.total_len, self.payload_size, self.flags, self.crc);
+        // The header is on disk: the record is whole, journaled or not, so it is no gap.
         self.vm.gaps.lock().remove(&self.offset);
         let seq = self.vm.written_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        Ok(NeedleLocation {
+        let loc = NeedleLocation {
             volume_id: self.vm.volume_id,
             offset: self.offset,
             total_len: self.total_len,
             payload_size: self.payload_size,
             payload_crc32c: self.crc,
             seq,
-        })
+        };
+        match journaled {
+            Ok(()) => Ok(loc),
+            Err(e) => Err(VolumeError::AfterRecord { loc, flags: self.flags, cause: format!("{:?}", e) }),
+        }
     }
 }
 
@@ -483,6 +492,7 @@ pub struct VolumeManager {
     fail_next_write: std::sync::atomic::AtomicBool,
     /// Tests: the next journal append fails, after the needle is on disk (#184).
     fail_next_index: std::sync::atomic::AtomicBool,
+    fail_next_sync: std::sync::atomic::AtomicBool,
     /// Writes that have reserved an offset here and not yet written their header (#167). A
     /// streamed PUT counts from `begin_needle` until its `NeedleWriter` is dropped.
     writers_in_flight: std::sync::atomic::AtomicUsize,
@@ -703,6 +713,7 @@ impl VolumeManager {
             work: Arc::new(WorkCounters::default()),
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
             fail_next_index: std::sync::atomic::AtomicBool::new(false),
+            fail_next_sync: std::sync::atomic::AtomicBool::new(false),
             writers_in_flight: std::sync::atomic::AtomicUsize::new(0),
             sealed: std::sync::atomic::AtomicBool::new(false),
             gaps: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
@@ -747,6 +758,12 @@ impl VolumeManager {
     /// a complete record in the volume that the write reports as failed (#184).
     pub fn fail_next_index(&self) {
         self.fail_next_index.store(true, Ordering::SeqCst);
+    }
+
+    /// Tests: makes the next sync of the volume fail, as a disk error would, after the needles
+    /// it covers were written (#184).
+    pub fn fail_next_sync(&self) {
+        self.fail_next_sync.store(true, Ordering::SeqCst);
     }
 
     /// Largest byte offset a needle may reach in this volume (default `MAX_VOLUME_SPAN`).
@@ -812,6 +829,9 @@ impl VolumeManager {
     /// Syncs the volume, then the journal (two counted syncs), and marks every write that had
     /// finished before the sync started as durable.
     fn sync_files(&self) -> Result<(), VolumeError> {
+        if self.fail_next_sync.swap(false, Ordering::SeqCst) {
+            return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected sync failure")));
+        }
         let target = self.written_seq.load(Ordering::SeqCst);
         self.file_sync.sync_data()?;
         self.work.disk_sync();
@@ -1096,17 +1116,20 @@ impl VolumeManager {
         }
         self.work.disk_write(total_len);
 
-        self.append_index(key_hash, offset, total_len, payload_size, flags, payload_crc32c)?;
+        let journaled = self.append_index(key_hash, offset, total_len, payload_size, flags, payload_crc32c);
         let seq = self.written_seq.fetch_add(1, Ordering::SeqCst) + 1;
-
-        Ok(NeedleLocation {
+        let loc = NeedleLocation {
             volume_id: self.volume_id,
             offset,
             total_len,
             payload_size,
             payload_crc32c,
             seq,
-        })
+        };
+        match journaled {
+            Ok(()) => Ok(loc),
+            Err(e) => Err(VolumeError::AfterRecord { loc, flags, cause: format!("{:?}", e) }),
+        }
     }
 
     /// Starts a needle whose payload arrives in pieces (#36). The space is reserved now; the

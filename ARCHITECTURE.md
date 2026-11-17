@@ -154,6 +154,22 @@ that overlap another write of the same key. Versioned keys are ordered by versio
 commit, and are never copied. Ordering recovery by a commit stamp instead was weighed and not
 chosen: it changes a recovery rule for every key and makes it depend on the clock. #154.
 
+**Decision 62 (owner, 2026-11-16, #184 option B): a write whose record is whole in the log
+takes effect in the live index even when a later step fails.** Once a needle's header is on
+disk, recovery will replay it. If the journal append, the sync, or a streamed PUT's
+relocation copy then fails, the request still answers 500 (the outcome is unknown, as S3
+allows), but the live index applies the record exactly as recovery will: a PUT, copy,
+multipart completion or tag update becomes the object, a delete removes it. So a GET before
+and after a restart agree. A failure before the header is written changes nothing. A
+streamed PUT whose record failed this way while a later record of its key exists is not
+relocated: the later record wins in both. The volume reports such a failure as
+`VolumeError::AfterRecord`, carrying the record's location. Not chosen: an abort record or a
+commit marker (option A), which changes the volume format. In the model,
+`verification/tla/ObjectVersions.tla` has `LateFail` and `RelocateLateFail`:
+`fixed_late_fail.cfg` passes, and `late_fail_not_indexed.cfg`, without the fix, breaks
+`AckedStateSurvivesRestart`. Recovery stepping over a gap without the journal, which a
+record whose journal append failed needs when it sits after a gap, is the next step of #184.
+
 **Decision 61 (owner, 2026-11-17): a sub-resource AwanFS does not implement answers 501
 `NotImplemented`; it never falls through to another operation, even when that made a test
 pass.** Before #148 a request such as `PUT /bucket?policy`, `?acl`, `?encryption`,

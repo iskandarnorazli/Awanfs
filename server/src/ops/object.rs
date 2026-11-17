@@ -64,6 +64,16 @@ fn finish_put(
     b.body(empty_body()).unwrap()
 }
 
+/// A write whose needle is whole in the volume was indexed as on success (#184, owner decision
+/// 4B): recovery will replay it, so a GET before and after a restart agree. The client is still
+/// told the write failed, since a step after it did; S3 reads a 500 as "outcome unknown".
+fn after_late_failure(key: &str, late: Option<VolumeError>, answer: Response<ResponseBody>) -> Response<ResponseBody> {
+    match late {
+        Some(e) => internal_error_response(key, &format!("could not store the object: {:?}", e)),
+        None => answer,
+    }
+}
+
 fn put_ok_response(etag_hex: &str, version_id: Option<&str>, checksum: Option<(crate::checksum::ChecksumAlgorithm, &str)>) -> Response<ResponseBody> {
     let mut b = Response::builder()
         .status(StatusCode::OK)
@@ -769,18 +779,25 @@ pub async fn copy_object(
     let stamp = state.version_stamp(b_id, key);
     let flags = flags | stamp.map_or(0, |s| s.0);
     let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
-    let (vol_offset, flags) = match state
+    let (vol_offset, flags, mut late) = match state
         .store_object(b_id, bucket, key, &copy_attrs, &bytes, flags, src_etag_hi, src_etag_lo, Some(created_ns))
         .await
     {
-        Ok(written) => written,
-        Err(e) => return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e))),
+        Ok((o, f)) => (o, f, None),
+        // Indexed as on success, then answered 500 (#184, owner decision 4B).
+        Err(e) => match S3ServiceState::late_record(&e) {
+            Some((o, f)) => (o, f, Some(e)),
+            None => return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e))),
+        },
     };
     if let Some((_, ts)) = stamp {
         let vid = match finish_version_put(&state, b_id, key, ts, flags, vol_offset, src_size, src_etag_hi, src_etag_lo, 0) {
             Ok(v) => v,
             Err(r) => return Ok(r),
         };
+        if let Some(e) = late.take() {
+            return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e)));
+        }
         let etag_hex = md5_to_etag_hex(src_etag_hi, src_etag_lo);
         let resp = Response::builder()
             .status(StatusCode::OK)
@@ -813,6 +830,9 @@ pub async fn copy_object(
         created_ns / 1_000_000,
     ) {
         return Ok(engine_error_response(code, key));
+    }
+    if let Some(e) = late {
+        return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e)));
     }
 
     let etag_hex = md5_to_etag_hex(src_etag_hi, src_etag_lo);
@@ -1047,8 +1067,11 @@ pub async fn put_object(
         writer.set_created_at(created_ns);
         let first_vm = Arc::clone(writer.volume());
         let first_offset = global_offset(first_vm.id(), writer.offset());
-        let first_loc = match writer.finish(etag_hi, etag_lo) {
-            Ok(l) => l,
+        // A failure after the header is on disk leaves a record recovery will replay, so the
+        // live index follows what a restart would show (#184, owner decision 4B).
+        let (first_loc, mut late) = match writer.finish(etag_hi, etag_lo) {
+            Ok(l) => (l, None),
+            Err(VolumeError::AfterRecord { loc, flags, cause }) => (loc, Some(VolumeError::AfterRecord { loc, flags, cause })),
             Err(e) => {
                 state.streams.note_append(b_id, key, u64::MAX);
                 return Ok(internal_error_response(key, &format!("could not store the object: {:?}", e)));
@@ -1056,33 +1079,46 @@ pub async fn put_object(
         };
         state.streams.note_append(b_id, key, first_offset);
         let (vm, loc, vol_offset) = if stamp.is_none() && ticket.appended_after(first_offset) {
+            if let Some(e) = late.take() {
+                // A later record of the key wins at a restart, and the live index shows it.
+                return Ok(internal_error_response(key, &format!("could not store the object: {:?}", e)));
+            }
             let moved = {
                 let (st, k, fvm) = (Arc::clone(&state), key.to_string(), Arc::clone(&first_vm));
                 tokio::task::spawn_blocking(move || st.relocate_needle(b_id, &k, &fvm, &first_loc, flags, etag_hi, etag_lo)).await
             };
             match moved {
                 Ok(Ok(moved)) => moved,
+                Ok(Err(VolumeError::AfterRecord { loc, flags: f, cause })) => {
+                    let g = global_offset(loc.volume_id, loc.offset);
+                    late = Some(VolumeError::AfterRecord { loc, flags: f, cause });
+                    (Arc::clone(&first_vm), loc, g)
+                }
                 Ok(Err(e)) => return Ok(internal_error_response(key, &format!("could not store the object: {:?}", e))),
                 Err(e) => return Ok(internal_error_response(key, &format!("could not store the object: {:?}", e))),
             }
         } else {
             (first_vm, first_loc, first_offset)
         };
-        if let Err(e) = state.make_durable(&vm, loc.seq).await {
-            return Ok(internal_error_response(key, &format!("could not sync the object: {:?}", e)));
+        if late.is_none() {
+            if let Err(e) = state.make_durable(&vm, loc.seq).await {
+                late = Some(VolumeError::AfterRecord { loc, flags, cause: format!("could not sync the object: {:?}", e) });
+            }
         }
         drop(ticket);
         state.needle_crc_map.write().insert((b_id, vol_offset), loc.payload_crc32c);
         state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
         state.hook("put_stored", key);
         let stream_cksum_ref = stream_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
-        if let Some((_, ts)) = stamp {
-            return Ok(match finish_version_put(&state, b_id, key, ts, flags, vol_offset, len, etag_hi, etag_lo, 0) {
+        let answer = if let Some((_, ts)) = stamp {
+            match finish_version_put(&state, b_id, key, ts, flags, vol_offset, len, etag_hi, etag_lo, 0) {
                 Ok(vid) => put_ok_response(&etag_hex, Some(&vid), stream_cksum_ref),
                 Err(r) => r,
-            });
-        }
-        return Ok(finish_put(&state, b_id, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns / 1_000_000, stream_cksum_ref));
+            }
+        } else {
+            finish_put(&state, b_id, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns / 1_000_000, stream_cksum_ref)
+        };
+        return Ok(after_late_failure(key, late, answer));
     }
     let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, expected_len.map(|n| n as u64), state.body_idle_timeout(), path).await? {
         Ok(b) => b,
@@ -1212,22 +1248,27 @@ pub async fn put_object(
     let stamp = state.version_stamp(b_id, key);
     let flags = flags | stamp.map_or(0, |s| s.0);
     let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
-    let (vol_offset, flags) = match state
+    let (vol_offset, flags, late) = match state
         .store_object(b_id, bucket, key, &buf_attrs, &decoded_bytes, flags, etag_hi, etag_lo, Some(created_ns))
         .await
     {
-        Ok(written) => written,
-        Err(e) => return Ok(internal_error_response(key, &format!("could not store the object: {:?}", e))),
+        Ok((o, f)) => (o, f, None),
+        Err(e) => match S3ServiceState::late_record(&e) {
+            Some((o, f)) => (o, f, Some(e)),
+            None => return Ok(internal_error_response(key, &format!("could not store the object: {:?}", e))),
+        },
     };
     state.hook("put_stored", key);
     let buf_cksum_ref = buf_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
-    if let Some((_, ts)) = stamp {
-        return Ok(match finish_version_put(&state, b_id, key, ts, flags, vol_offset, payload_len, etag_hi, etag_lo, 0) {
+    let answer = if let Some((_, ts)) = stamp {
+        match finish_version_put(&state, b_id, key, ts, flags, vol_offset, payload_len, etag_hi, etag_lo, 0) {
             Ok(vid) => put_ok_response(&final_etag_hex, Some(&vid), buf_cksum_ref),
             Err(r) => r,
-        });
-    }
-    Ok(finish_put(&state, b_id, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns / 1_000_000, buf_cksum_ref))
+        }
+    } else {
+        finish_put(&state, b_id, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns / 1_000_000, buf_cksum_ref)
+    };
+    Ok(after_late_failure(key, late, answer))
 }
 
 pub async fn get_or_head_object(

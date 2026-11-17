@@ -637,12 +637,19 @@ pub async fn complete_multipart_upload(
             let stamp = state.version_stamp(b_id, key);
             let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
             let mp_flags = AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART | attrs_flag | stamp.map_or(0, |s| s.0);
-            let manifest_offset = match state
+            // A manifest whole in the volume is replayed by recovery as the object, and it
+            // points at the parts: the upload is committed and indexed as on success, then the
+            // request answers 500 (#184, owner decision 4B). A retried Complete gets the
+            // recorded result.
+            let (manifest_offset, late) = match state
                 .store_payload_with(b_id, key, &attrs_bytes, &manifest, mp_flags, hi, lo, Some(created_ns))
                 .await
             {
-                Ok(off) => off,
-                Err(e) => return Ok(internal_error_response(key, &format!("could not record the multipart object: {:?}", e))),
+                Ok(off) => (off, None),
+                Err(e) => match S3ServiceState::late_record(&e) {
+                    Some((off, _)) => (off, Some(e)),
+                    None => return Ok(internal_error_response(key, &format!("could not record the multipart object: {:?}", e))),
+                },
             };
             state.payload_cache.remove(b_id, manifest_offset);
             if let Err(code) = state.multipart.commit_complete(upload_id, extents.clone()) {
@@ -688,6 +695,9 @@ pub async fn complete_multipart_upload(
                     checksum: final_cksum.clone(),
                 },
             );
+            if let Some(e) = late {
+                return Ok(internal_error_response(key, &format!("could not record the multipart object: {:?}", e)));
+            }
             let xml = complete_multipart_upload_result_xml_with_checksum(
                 bucket,
                 key,
