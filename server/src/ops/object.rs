@@ -131,13 +131,9 @@ fn request_attrs_with_checksum(
     }
     if let Some(ce) = headers.get(CONTENT_ENCODING) {
         let raw_ce = valid_header_str(ce, key)?;
-        if crate::auth::is_aws_chunked(headers) {
-            let stripped = strip_aws_chunked(raw_ce);
-            if !stripped.is_empty() {
-                attrs.set(crate::attrs::TAG_CONTENT_ENCODING, stripped.as_bytes());
-            }
-        } else if !raw_ce.is_empty() {
-            attrs.set(crate::attrs::TAG_CONTENT_ENCODING, raw_ce.as_bytes());
+        let stripped = strip_aws_chunked(raw_ce);
+        if !stripped.is_empty() {
+            attrs.set(crate::attrs::TAG_CONTENT_ENCODING, stripped.as_bytes());
         }
     }
     for (hdr, tag) in [
