@@ -99,6 +99,21 @@ jobs:
           [ -f budget_report.md ] && cat budget_report.md >> "$GITHUB_STEP_SUMMARY"
           exit $code
 
+      # #218: small objects on new keys catch a cache that pins request buffers.
+      - name: Does --memory-budget hold (4KiB unique keys)?
+        id: budget-unique-keys
+        if: always()
+        timeout-minutes: 15
+        run: |
+          set +e
+          python -u benchmarks/budget_rss.py --server-bin server/target/release/s3-server \
+            --budget 256MiB --budget-mib 256 --size 4KiB --unique-keys --concurrency 64 --duration 20 \
+            --overhead 200 --report budget_unique_keys_report.md
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          [ -f budget_unique_keys_report.md ] && cat budget_unique_keys_report.md >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -106,6 +121,7 @@ jobs:
           path: |
             ratio_report.md
             budget_report.md
+            budget_unique_keys_report.md
           if-no-files-found: ignore
 
       - name: Open or update a perf-regression issue

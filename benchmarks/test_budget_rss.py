@@ -170,6 +170,92 @@ class Cli(unittest.TestCase):
     def test_the_module_states_its_exit_codes(self):
         self.assertIn("Exit codes: 0 under the ceiling, 1 over it", br.__doc__)
 
+    def test_unique_keys_defaults_false_and_can_be_enabled(self):
+        self.assertFalse(br.build_parser().parse_args(["--server-bin", "x"]).unique_keys)
+        self.assertTrue(br.build_parser().parse_args(["--server-bin", "x", "--unique-keys"]).unique_keys)
+
+
+class UniqueKeys(unittest.TestCase):
+    """#218: --unique-keys writes a new key on every PUT instead of reusing the warm-up pool."""
+
+    def test_without_unique_keys_the_pool_repeats_as_before(self):
+        import run_warp_benchmark as rwb
+        keys = [rwb.object_key(0, i, 8, unique_keys=False) for i in range(16)]
+        self.assertEqual(keys[:8], [f"worker_0_obj_{i}.dat" for i in range(8)])
+        self.assertEqual(keys[8:], keys[:8])
+
+    def test_with_unique_keys_no_key_repeats_across_workers(self):
+        import run_warp_benchmark as rwb
+        seen = []
+        for w in range(8):
+            for i in range(50):
+                seen.append(rwb.object_key(w, i, 8, unique_keys=True))
+        self.assertEqual(len(seen), 400)
+        self.assertEqual(len(set(seen)), 400)
+
+    def test_run_workload_phase_uses_unique_keys_only_for_put(self):
+        import http.server
+        import socketserver
+        import threading
+        import run_warp_benchmark as rwb
+
+        recorded = []
+        lock = threading.Lock()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(n)
+                with lock:
+                    recorded.append(("PUT", self.path))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self):
+                with lock:
+                    recorded.append(("GET", self.path))
+                body = b"x" * 64
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+
+        srv = Server(("127.0.0.1", 0), Handler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            recorded.clear()
+            rwb.run_workload_phase("127.0.0.1", port, "budget", 64, 2, 0.25, "put", unique_keys=True)
+            puts = [p for m, p in recorded if m == "PUT"]
+            warmup_puts = puts[:16]
+            phase_puts = puts[16:]
+            self.assertGreater(len(phase_puts), 0)
+            self.assertEqual(len(phase_puts), len(set(phase_puts)), "unique-keys PUTs must not repeat")
+            self.assertTrue(set(phase_puts).isdisjoint(set(warmup_puts)))
+
+            recorded.clear()
+            rwb.run_workload_phase("127.0.0.1", port, "budget", 64, 2, 0.25, "get", unique_keys=True)
+            gets = [p for m, p in recorded if m == "GET"]
+            self.assertGreater(len(gets), 0)
+            self.assertTrue(all("_obj_" in p for p in gets), f"GETs should hit pool, got {gets[:5]}")
+
+            recorded.clear()
+            rwb.run_workload_phase("127.0.0.1", port, "budget", 64, 2, 0.25, "put", unique_keys=False)
+            puts_default = [p for m, p in recorded if m == "PUT"][16:]
+            self.assertGreater(len(puts_default), 0)
+            self.assertTrue(all("_obj_" in p for p in puts_default))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

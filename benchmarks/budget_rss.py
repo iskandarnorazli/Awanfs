@@ -151,6 +151,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--server-env", action="append", default=[], metavar="NAME=VALUE",
                     help="set NAME=VALUE in the server's environment; repeatable. For allocator experiments "
                          "(#127), e.g. MALLOC_ARENA_MAX=2 or MALLOC_MMAP_THRESHOLD_=131072")
+    ap.add_argument("--unique-keys", action="store_true",
+                    help="write a new key on every PUT instead of reusing the warm-up pool (#218)")
     return ap
 
 
@@ -230,7 +232,8 @@ def main(argv=None) -> int:
         for mode in ("put", "get"):
             with RssSplit(proc.pid) as split:
                 m = run_workload_phase("127.0.0.1", port, "budget", SIZES[a.size], a.concurrency,
-                                       a.duration, mode, server_pid=proc.pid)
+                                       a.duration, mode, server_pid=proc.pid,
+                                       unique_keys=(a.unique_keys and mode == "put"))
             peak = max(peak, get_process_peak_rss_mb(proc.pid))
             rows.append((mode, m.mib_per_sec, m.ops_per_sec, m.p99_ms, peak, split.anon, split.file, cache_mib(port)))
     finally:
@@ -239,9 +242,11 @@ def main(argv=None) -> int:
 
     ceiling = ceiling_mib(a.budget_mib, a.overhead)
     result, reasons = verdict(rows, peak, a.budget_mib, a.overhead, SIZES[a.size])
+    cmd = (f"python benchmarks/budget_rss.py --budget {a.budget} --concurrency {a.concurrency} "
+           f"--size {a.size} --duration {a.duration} --overhead {a.overhead}"
+           + (" --unique-keys" if a.unique_keys else ""))
     lines = [
-        f"Command: `python benchmarks/budget_rss.py --budget {a.budget} --concurrency {a.concurrency} "
-        f"--size {a.size} --duration {a.duration} --overhead {a.overhead}`",
+        f"Command: `{cmd}`",
         "",
         f"# Does --memory-budget {a.budget} hold? ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
         "",
