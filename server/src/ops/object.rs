@@ -216,6 +216,18 @@ pub(crate) fn with_checksum_headers(
     builder
 }
 
+fn with_part_checksum_headers(
+    mut builder: hyper::http::response::Builder,
+    attrs: &crate::attrs::Attrs,
+    part_checksum: Option<&(crate::checksum::ChecksumAlgorithm, String)>,
+) -> hyper::http::response::Builder {
+    if let Some((alg, val)) = part_checksum {
+        let cksum_type = attrs.checksum().map(|(_, ct, _)| ct).unwrap_or("COMPOSITE");
+        builder = builder.header(alg.header_name(), val.as_str()).header("x-amz-checksum-type", cksum_type);
+    }
+    builder
+}
+
 #[derive(Default)]
 struct ResponseOverrides<'a> {
     content_type: Option<&'a str>,
@@ -546,17 +558,21 @@ fn version_get_response(
                 };
                 full_body(b.slice(..(ext.part_size as usize).min(b.len())))
             };
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, view.content_type())
-                .header(ETAG, etag_val)
-                .header(ACCEPT_RANGES, "bytes")
-                .header("x-amz-mp-parts-count", parts_count.to_string())
-                .header("x-amz-version-id", v.id_string())
-                .header(CONTENT_LENGTH, ext.part_size.to_string())
-                .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts))
-                .body(body)
-                .unwrap();
+            return with_part_checksum_headers(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, view.content_type())
+                    .header(ETAG, etag_val)
+                    .header(ACCEPT_RANGES, "bytes")
+                    .header("x-amz-mp-parts-count", parts_count.to_string())
+                    .header("x-amz-version-id", v.id_string())
+                    .header(CONTENT_LENGTH, ext.part_size.to_string())
+                    .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts)),
+                &view.attrs,
+                ext.checksum.as_ref(),
+            )
+            .body(body)
+            .unwrap();
         } else if pn > 1 {
             let body = if head {
                 empty_body()
@@ -1394,16 +1410,20 @@ pub async fn get_or_head_object(
                 };
                 full_body(b.slice(..(ext.part_size as usize).min(b.len())))
             };
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, view.content_type())
-                .header(ETAG, etag_val)
-                .header(ACCEPT_RANGES, "bytes")
-                .header("x-amz-mp-parts-count", parts_count.to_string())
-                .header(CONTENT_LENGTH, ext.part_size.to_string())
-                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
-                .body(body)
-                .unwrap());
+            return Ok(with_part_checksum_headers(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, view.content_type())
+                    .header(ETAG, etag_val)
+                    .header(ACCEPT_RANGES, "bytes")
+                    .header("x-amz-mp-parts-count", parts_count.to_string())
+                    .header(CONTENT_LENGTH, ext.part_size.to_string())
+                    .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)),
+                &view.attrs,
+                ext.checksum.as_ref(),
+            )
+            .body(body)
+            .unwrap());
         } else if pn > 1 {
             let body = if is_head {
                 empty_body()

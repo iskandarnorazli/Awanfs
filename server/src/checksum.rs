@@ -72,6 +72,11 @@ const fn invalid_request(why: &'static str) -> Refusal {
 const INVALID_CHECKSUM_ALG: Refusal = invalid_request("unsupported checksum algorithm");
 const CONFLICTING_CHECKSUM_ALGS: Refusal = invalid_request("conflicting checksum algorithms");
 const INVALID_CHECKSUM_VALUE: Refusal = invalid_request("invalid checksum header value");
+const BAD_CHECKSUM_DIGEST: Refusal = Refusal {
+    code: "BadDigest",
+    status: 400,
+    why: "The checksum you specified did not match what we received.",
+};
 
 /// Supported S3 checksum algorithms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -224,10 +229,10 @@ pub fn requested_checksum(headers: &HeaderMap) -> Result<Option<(ChecksumAlgorit
             if values.next().is_some() {
                 return Err(INVALID_CHECKSUM_VALUE);
             }
-            let s = first.to_str().map_err(|_| INVALID_CHECKSUM_VALUE)?;
-            let decoded = base64_decode(s).ok_or(INVALID_CHECKSUM_VALUE)?;
+            let s = first.to_str().map_err(|_| BAD_CHECKSUM_DIGEST)?;
+            let decoded = base64_decode(s).ok_or(BAD_CHECKSUM_DIGEST)?;
             if decoded.len() != alg.digest_len() {
-                return Err(INVALID_CHECKSUM_VALUE);
+                return Err(BAD_CHECKSUM_DIGEST);
             }
             record_alg(&mut chosen, alg)?;
             expected_value = Some(s.to_owned());
@@ -492,14 +497,14 @@ mod tests {
         h.insert("x-amz-checksum-sha256", HeaderValue::from_static("bad!"));
         let err = requested_checksum(&h).unwrap_err();
         assert_eq!(err.status, 400);
-        assert_eq!(err.code, "InvalidRequest");
+        assert_eq!(err.code, "BadDigest");
 
         // Valid base64 but wrong length (4 bytes instead of 32 for SHA256)
         let mut h = HeaderMap::new();
         h.insert("x-amz-checksum-sha256", HeaderValue::from_static("y/Q5Jg=="));
         let err = requested_checksum(&h).unwrap_err();
         assert_eq!(err.status, 400);
-        assert_eq!(err.code, "InvalidRequest");
+        assert_eq!(err.code, "BadDigest");
 
         // Unknown algorithm
         let mut h = HeaderMap::new();
