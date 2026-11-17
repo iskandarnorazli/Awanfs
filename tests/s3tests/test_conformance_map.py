@@ -113,6 +113,15 @@ class Map(unittest.TestCase):
         self.assertIn("- `test_bucket_logging_flush_j` (skip): test_s3.py:10: need ceph extension", text)
 
 
+    def test_sigv2_tests_are_out_of_scope(self):
+        """Owner, 2026-11-17: SigV2 is out of scope. It must win over request-headers, which
+        claims every test_headers:: test."""
+        self.assertEqual(cm.area_of("test_headers::test_object_create_bad_md5_invalid_garbage_aws2", ["auth_aws2"])[:2], ("sigv2", "out of scope"))
+        self.assertEqual(cm.area_of("test_headers::test_bucket_create_bad_ua_empty_aws2", [])[:2], ("sigv2", "out of scope"))
+        self.assertEqual(cm.area_of("test_cors_presigned_put_object_tenant_v2", [])[0], "sigv2")
+        self.assertEqual(cm.area_of("test_bucket_listv2_maxkeys_one", ["list_objects_v2"])[0], "listing", "ListObjectsV2 is not SigV2")
+        self.assertEqual(cm.area_of("test_headers::test_object_create_bad_md5_invalid_short", ["auth_common"])[0], "request-headers")
+
     def test_headers_suite_assigned_to_request_headers(self):
         headers_suite = '''
 def test_put_obj_bad_content_length():

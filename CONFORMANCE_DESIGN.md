@@ -389,9 +389,10 @@ wave 3 (decision 45).
 |---|---|---|
 | RGW-only | 11 | `X-RGW-*` usage headers, account usage, unordered listing, torrents, tenants: ceph extensions, not S3 |
 | Storage classes and cloud tiering | 19 | Need more than one storage class or a remote tier. AwanFS has one |
+| SigV2 request signing | 25 | Owner, 2026-11-17: AwanFS accepts SigV4 only. AWS deprecated SigV2, and supporting it would add an older, weaker signing scheme to secure and keep. The 21 `test_headers.py` tests marked `auth_aws2` and the four `test_cors_presigned_*_v2` tests |
 
-The map lists them under the areas `rgw-only` and `storage-classes`, owner "out of scope", so
-they are counted apart from the work that is left.
+The map lists them under the areas `rgw-only`, `storage-classes` and `sigv2`, owner "out of
+scope", so they are counted apart from the work that is left.
 
 ## 10. Order
 

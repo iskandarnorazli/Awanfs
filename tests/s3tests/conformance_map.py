@@ -27,6 +27,8 @@ from typing import Dict, List, Optional, Tuple
 # (area, issue, design section, name regex or None, markers). First match wins, so the order
 # is part of the map: narrow areas come before the broad ones that would also match.
 AREAS: List[Tuple[str, str, str, Optional[str], frozenset]] = [
+    # SigV2 request signing: out of scope (owner, 2026-11-17; CONFORMANCE_DESIGN.md section 9).
+    ("sigv2", "out of scope", "9", r"_aws2$|^test_cors_presigned_(get|put)_object(_tenant)?_v2$", frozenset({"auth_aws2"})),
     ("request-headers", "#160", "3", r"^test_headers::", frozenset()),
     ("rgw-only", "out of scope", "9", r"^test_(head_bucket_usage|account_usage|bucket_head_extended|get_object_torrent)$|_unordered$|_tenant$", frozenset()),
     ("bucket-logging", "#153", "8.4", r"logging", frozenset({"bucket_logging", "bucket_logging_cleanup", "fails_without_logging_rollover"})),
