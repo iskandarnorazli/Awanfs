@@ -105,5 +105,21 @@ class RssCeiling(unittest.TestCase):
         self.assertEqual(len(bad), 1, "the committed ceiling must catch the measured regression")
 
 
+class AffinityTests(unittest.TestCase):
+    def test_ratio_check_pins_client_and_servers_when_pinnable(self):
+        import inspect
+        for fn in (rc.start_awanfs, rc.start_minio, rc.main):
+            self.assertIn("set_affinity_mask", inspect.getsource(fn))
+
+    def test_render_includes_pin_labels_when_provided(self):
+        rows = [("get_64k", 1.5, 1.4, "ok")]
+        md = rc.render(
+            rows, {"get_64k": [150.0]}, {"get_64k": [100.0]}, "cmd", 1,
+            pin_labels=("Cores 0..7 (Affinity Mask 0x00FF)", "Cores 8..15 (Affinity Mask 0xFF00)"),
+        )
+        self.assertIn("Cores 0..7 (Affinity Mask 0x00FF)", md)
+        self.assertIn("Cores 8..15 (Affinity Mask 0xFF00)", md)
+
+
 if __name__ == "__main__":
     unittest.main()
