@@ -33,6 +33,7 @@ or a test that is not in the file.
 | A streamed response | opening, streaming, done, aborted (read error, checksum mismatch, client gone) | wired | `server/src/fsm.rs::stream_step`, called by the reader in `server/src/stream_read.rs` | `stream_every_pair_is_decided`, `server/tests/stream_read_test.rs`, `server/tests/stream_read_disconnect_test.rs` | none: one reader per response | #155 step two |
 | Scrub of a needle | unchecked, good, bad | not built | | | none | #155 |
 | POST object form parser | preamble, part headers, part body, epilogue | not built | | | none | #119 |
+| Streamed UploadPart pipeline | filling, draining, failed, done | wired | `server/src/fsm.rs::part_pipeline_step`, called by `upload_part` in `server/src/ops/multipart.rs` | `part_pipeline_every_pair_is_decided`, `server/tests/streaming_part_test.rs` | none: one pipeline per streamed UploadPart | #57 |
 
 Not state machines, and tested as tables instead: request classification (#148) and the
 authorization decision (#151).
