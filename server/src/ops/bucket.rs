@@ -209,7 +209,7 @@ pub async fn create_bucket(
             },
             crate::fsm::BucketEvent::Create {
                 caller_id: if same_owner { 0 } else { 1 },
-                is_us_east_1: state.region == "us-east-1",
+                is_us_east_1: state.region == "us-east-1" || state.region == "default",
             },
         );
         return match step {

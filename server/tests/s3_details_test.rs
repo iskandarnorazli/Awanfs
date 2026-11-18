@@ -158,6 +158,42 @@ async fn get_bucket_location_and_create_bucket_constraint() {
     );
 
     handle.shutdown();
+
+    // 3. Region "default" (ceph s3-tests default api_name): GetBucketLocation returns "default",
+    // both empty body and <LocationConstraint>default</LocationConstraint> succeed on CreateBucket,
+    // and repeated CreateBucket by same owner is idempotent (200 OK).
+    let (base_url, _addr, _state, handle) = spawn_with_region("default", AuthConfig::open()).await;
+    let client = reqwest::Client::new();
+
+    // CreateBucket with empty body succeeds
+    let resp = client.put(format!("{}/loc-ceph-default-bkt", base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Repeated CreateBucket by same owner in "default" region returns 200 OK (idempotent)
+    let resp = client.put(format!("{}/loc-ceph-default-bkt", base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // GetBucketLocation returns <LocationConstraint>default</LocationConstraint>
+    let resp = client.get(format!("{}/loc-ceph-default-bkt?location", base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">default</LocationConstraint>"),
+        "expected default LocationConstraint, got: {}",
+        body
+    );
+
+    // CreateBucket with explicit <LocationConstraint>default</LocationConstraint> also succeeds
+    let default_xml = r#"<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LocationConstraint>default</LocationConstraint></CreateBucketConfiguration>"#;
+    let resp = client
+        .put(format!("{}/loc-ceph-explicit-bkt", base_url))
+        .body(default_xml)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    handle.shutdown();
 }
 
 #[tokio::test]
