@@ -19,6 +19,7 @@ on:
         description: "Object sizes for the full matrix (64KiB,1MiB,1GiB,10GiB). 10GiB needs about 60 GB free and adds a long time"
         default: "64KiB,1MiB,1GiB"
       rss_ceiling_mib:
+        # _rss_ceiling_source: AwanFS median peak RSS was 1210.5 MiB (1192.8..1217.2 MiB on get_10g) in run 44257320568 (3 rounds on LAPTOP-6RBIQUM5); ceiling set to 2500 MiB (~2.07x).
         description: "Fail if AwanFS median peak RSS exceeds this (MiB)"
         default: "2500"
   schedule:
