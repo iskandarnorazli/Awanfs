@@ -42,6 +42,9 @@ def _make_fake_matplotlib():
     class FakeAxes:
         def __init__(self):
             self.lines = []
+            self.images = []
+            self.bars = []
+            self.texts = []
             self._title = ""
             self._xlabel = ""
             self._ylabel = ""
@@ -49,6 +52,10 @@ def _make_fake_matplotlib():
             self._xbase = None
             self._xticks = []
             self._xticklabels = []
+            self._yticks = []
+            self._yticklabels = []
+            self._ylim = (0.0, 1.0)
+            self._ylim_set = False
 
         def plot(self, x, y, linestyle="-", marker=None, label="", **kwargs):
             line = FakeLine(x, y, linestyle=linestyle, marker=marker, label=label, **kwargs)
@@ -59,6 +66,26 @@ def _make_fake_matplotlib():
             line = FakeLine([0, 1], [y, y], linestyle=linestyle, marker=None, label=label, **kwargs)
             self.lines.append(line)
             return line
+
+        def bar(self, x, height, width=0.8, label="", **kwargs):
+            xs = list(x)
+            hs = list(height)
+            self.bars.append({"x": xs, "height": hs, "width": width, "label": label, **kwargs})
+            if label:
+                self.lines.append(FakeLine(xs, hs, label=label))
+            return [types.SimpleNamespace(get_height=lambda h=h: h) for h in hs]
+
+        def legend(self, *args, **kwargs):
+            pass
+
+        def imshow(self, data, **kwargs):
+            rows = [list(r) for r in data]
+            img = types.SimpleNamespace(data=rows, kwargs=kwargs)
+            self.images.append(img)
+            return img
+
+        def text(self, x, y, s, **kwargs):
+            self.texts.append((x, y, s))
 
         def set_title(self, t, **kwargs):
             self._title = t
@@ -88,8 +115,32 @@ def _make_fake_matplotlib():
         def set_xticks(self, ticks):
             self._xticks = list(ticks)
 
-        def set_xticklabels(self, labels):
+        def get_xticks(self):
+            return list(self._xticks)
+
+        def set_xticklabels(self, labels, **kwargs):
             self._xticklabels = list(labels)
+
+        def get_xticklabels(self):
+            return [types.SimpleNamespace(get_text=lambda s=s: s) for s in self._xticklabels]
+
+        def set_yticks(self, ticks):
+            self._yticks = list(ticks)
+
+        def get_yticks(self):
+            return list(self._yticks)
+
+        def set_yticklabels(self, labels, **kwargs):
+            self._yticklabels = list(labels)
+
+        def set_ylim(self, bottom=None, top=None):
+            if isinstance(bottom, (tuple, list)):
+                bottom, top = bottom
+            self._ylim = (float(bottom), float(top))
+            self._ylim_set = True
+
+        def get_ylim(self):
+            return self._ylim
 
         def grid(self, *args, **kwargs):
             pass
@@ -98,15 +149,22 @@ def _make_fake_matplotlib():
             return self.lines, [ln.get_label() for ln in self.lines]
 
     class FakeFigure:
-        def __init__(self, axes):
+        def __init__(self, axes, grid=None):
             self.axes = axes
+            self.grid = grid
             self._suptitle = ""
+            self.colorbars = []
 
         def suptitle(self, t, **kwargs):
             self._suptitle = t
 
         def legend(self, *args, **kwargs):
             pass
+
+        def colorbar(self, mappable, ax=None, **kwargs):
+            cb = types.SimpleNamespace(mappable=mappable, ax=ax, set_label=lambda *a, **kw: None)
+            self.colorbars.append(cb)
+            return cb
 
         def tight_layout(self, *args, **kwargs):
             pass
@@ -117,10 +175,26 @@ def _make_fake_matplotlib():
                 fh.write(b"fake-chart")
 
     def subplots(nrows=1, ncols=1, **kwargs):
+        if nrows > 1 and ncols > 1:
+            grid = [[FakeAxes() for _ in range(ncols)] for _ in range(nrows)]
+            flat = [ax for row in grid for ax in row]
+            fig = FakeFigure(flat, grid=grid)
+            created_figures.append(fig)
+            return fig, grid
         axes = [FakeAxes() for _ in range(nrows * ncols)]
         fig = FakeFigure(axes)
         created_figures.append(fig)
         return fig, axes if len(axes) > 1 else axes[0]
+
+    class FakeCmap:
+        def copy(self):
+            return FakeCmap()
+
+        def set_bad(self, *args, **kwargs):
+            pass
+
+    def get_cmap(name=None):
+        return FakeCmap()
 
     def close(fig=None):
         pass
@@ -128,6 +202,7 @@ def _make_fake_matplotlib():
     plt_mod = types.ModuleType("matplotlib.pyplot")
     plt_mod.subplots = subplots
     plt_mod.close = close
+    plt_mod.get_cmap = get_cmap
     mpl_mod = types.ModuleType("matplotlib")
     mpl_mod.use = lambda *args, **kwargs: None
     mpl_mod.pyplot = plt_mod
@@ -357,6 +432,360 @@ class ChartTests(unittest.TestCase):
             # 5th figure: ops/s per busy core
             _eff_fig, eff_axes = captured_figs[4]
             self.assertTrue(any("busy core" in ax.get_ylabel().lower() for ax in eff_axes))
+
+
+def _flatten_axes(axes):
+    if isinstance(axes, (list, tuple)):
+        out = []
+        for item in axes:
+            out.extend(_flatten_axes(item))
+        return out
+    try:
+        return list(axes.flat)
+    except AttributeError:
+        return [axes]
+
+
+def _sample_matrix_results():
+    patterns = ["seq-write", "rand-write", "seq-read", "rand-read"]
+    sizes = [4096, 1048576]
+    cores = [1, 2, 4]
+    concs = [1, 4, 16, 64, 256]
+    # results[pattern][size][srv][n_cores][conc] -> PointResult
+    results = {}
+    for p_idx, pat in enumerate(patterns):
+        results[pat] = {}
+        for s_idx, sz in enumerate(sizes):
+            results[pat][sz] = {}
+            for srv in cs.SERVERS:
+                results[pat][sz][srv] = {}
+                for n in cores:
+                    results[pat][sz][srv][n] = {}
+                    for c in concs:
+                        if srv == "RustFS":
+                            results[pat][sz][srv][n][c] = cs.PointResult(reason="rustfs binary not found")
+                        elif srv == "MinIO" and c == 256:
+                            results[pat][sz][srv][n][c] = cs.PointResult(reason="timed out at c=256")
+                        else:
+                            base = 12000.0 if srv == "AwanFS" else 5000.0
+                            if "read" in pat:
+                                base *= 1.4
+                            if "seq" in pat:
+                                base *= 1.15
+                            if sz >= 1048576:
+                                base /= 8.0
+                            ops = base * n * (1.0 + 0.3 * math.log2(c))
+                            mib = (ops * sz) / (1024.0 * 1024.0)
+                            p50 = max(0.2, 20.0 / n + 0.05 * c)
+                            p99 = p50 * 2.5
+                            cpu = min(n * 100.0, 45.0 * n + 0.2 * c)
+                            results[pat][sz][srv][n][c] = cs.PointResult(
+                                ops_per_sec=ops,
+                                mib_per_sec=mib,
+                                p50_ms=p50,
+                                p99_ms=p99,
+                                cpu_pct=cpu,
+                                ops_per_busy_core=ops / (cpu / 100.0),
+                                shares_cores=(n >= 4),
+                            )
+    return patterns, sizes, cores, concs, results
+
+
+class PatternAndSizeParsingTests(unittest.TestCase):
+    def test_parse_patterns_and_rejects_unknown(self):
+        self.assertEqual(
+            cs.parse_patterns("seq-write,rand-write,seq-read,rand-read"),
+            ["seq-write", "rand-write", "seq-read", "rand-read"],
+        )
+        with self.assertRaises(ValueError):
+            cs.parse_patterns("seq-write,bogus-op")
+
+    def test_parse_sizes_accepts_units_and_raw_bytes(self):
+        self.assertEqual(cs.parse_sizes("4KiB,1MiB"), [4096, 1048576])
+        self.assertEqual(cs.parse_sizes("4096,1048576"), [4096, 1048576])
+        self.assertEqual(cs.parse_size("64MiB"), 64 * 1024 * 1024)
+
+    def test_parse_concurrencies(self):
+        self.assertEqual(cs.parse_concurrencies("1,4,16,64,256"), [1, 4, 16, 64, 256])
+        with self.assertRaises(ValueError):
+            cs.parse_concurrencies("0,4")
+
+    def test_prefill_exceeds_stated_cache_size(self):
+        budget_bytes = cs.parse_size(cs.DEFAULT_MEMORY_BUDGET)
+        cache_bytes = cs.stated_cache_bytes(budget_bytes)
+        prefill_bytes = cs.parse_size(cs.DEFAULT_PREFILL_SIZE)
+        self.assertGreater(prefill_bytes, cache_bytes)
+        cs.validate_prefill_exceeds_cache(prefill_bytes, cache_bytes)
+        with self.assertRaises(ValueError):
+            cs.validate_prefill_exceeds_cache(cache_bytes, cache_bytes)
+        with self.assertRaises(ValueError):
+            cs.validate_prefill_exceeds_cache(cache_bytes - 1024, cache_bytes)
+
+
+class WorkloadSequenceTests(unittest.TestCase):
+    def test_sequential_write_keys_strictly_increasing_and_whole_object(self):
+        for sz in (4096, 1048576):
+            reqs = cs.generate_request_sequence(
+                pattern="seq-write",
+                size=sz,
+                count=5,
+                seed=42,
+                prefill_count=100,
+                large_obj_size=16 * 1024 * 1024,
+            )
+            self.assertEqual([r.key for r in reqs], ["seq/000000", "seq/000001", "seq/000002", "seq/000003", "seq/000004"])
+            self.assertTrue(all(r.method == "PUT" and r.range_start is None for r in reqs))
+
+    def test_sequential_read_4k_key_order_and_1m_increasing_range_offsets(self):
+        reqs_4k = cs.generate_request_sequence(
+            pattern="seq-read",
+            size=4096,
+            count=5,
+            seed=42,
+            prefill_count=3,
+            large_obj_size=16 * 1024 * 1024,
+        )
+        self.assertEqual(
+            [r.key for r in reqs_4k],
+            ["prefill_4k/000000", "prefill_4k/000001", "prefill_4k/000002", "prefill_4k/000000", "prefill_4k/000001"],
+        )
+        self.assertTrue(all(r.method == "GET" and r.range_start is None for r in reqs_4k))
+
+        large_sz = 4 * 1024 * 1024
+        reqs_1m = cs.generate_request_sequence(
+            pattern="seq-read",
+            size=1048576,
+            count=6,
+            seed=42,
+            prefill_count=3,
+            large_obj_size=large_sz,
+        )
+        self.assertEqual(len({r.key for r in reqs_1m}), 1)
+        offsets = [(r.range_start, r.range_end) for r in reqs_1m]
+        self.assertEqual(
+            offsets,
+            [
+                (0, 1048575),
+                (1048576, 2097151),
+                (2097152, 3145727),
+                (3145728, 4194303),
+                (0, 1048575),
+                (1048576, 2097151),
+            ],
+        )
+        for s, e in offsets:
+            self.assertGreaterEqual(s, 0)
+            self.assertLess(e, large_sz)
+            self.assertEqual(e - s + 1, 1048576)
+
+    def test_seeded_random_keys_repeat_and_differ_and_ranges_inside_object(self):
+        large_sz = 16 * 1024 * 1024
+        for pat, sz in [("rand-write", 4096), ("rand-write", 1048576), ("rand-read", 4096), ("rand-read", 1048576)]:
+            a = cs.generate_request_sequence(pat, sz, count=20, seed=1234, prefill_count=512, large_obj_size=large_sz)
+            b = cs.generate_request_sequence(pat, sz, count=20, seed=1234, prefill_count=512, large_obj_size=large_sz)
+            c = cs.generate_request_sequence(pat, sz, count=20, seed=5678, prefill_count=512, large_obj_size=large_sz)
+            self.assertEqual(a, b, f"{pat} {sz}: same seed must repeat")
+            self.assertNotEqual(a, c, f"{pat} {sz}: different seed must differ")
+
+        rand_1m = cs.generate_request_sequence("rand-read", 1048576, count=50, seed=99, prefill_count=512, large_obj_size=large_sz)
+        for r in rand_1m:
+            self.assertEqual(r.method, "GET")
+            self.assertIsNotNone(r.range_start)
+            self.assertIsNotNone(r.range_end)
+            self.assertGreaterEqual(r.range_start, 0)
+            self.assertLess(r.range_end, large_sz)
+            self.assertEqual(r.range_end - r.range_start + 1, 4096)
+
+    def test_deterministic_prefill_bytes_repeat_for_same_seed(self):
+        b1 = cs.deterministic_bytes(4096, seed=42)
+        b2 = cs.deterministic_bytes(4096, seed=42)
+        b3 = cs.deterministic_bytes(4096, seed=43)
+        self.assertEqual(len(b1), 4096)
+        self.assertEqual(b1, b2)
+        self.assertNotEqual(b1, b3)
+
+
+class MatrixReportTests(unittest.TestCase):
+    def test_matrix_report_command_seed_cache_prefill_and_unmeasured(self):
+        patterns, sizes, cores, concs, results = _sample_matrix_results()
+        cmd = "python benchmarks/core_scaling.py --pattern seq-write,rand-write,seq-read,rand-read --sizes 4KiB,1MiB --concurrencies 1,4,16,64,256 --seed 42"
+        md = cs.render_matrix_report(
+            cmd=cmd,
+            patterns=patterns,
+            sizes=sizes,
+            cores=cores,
+            concurrencies=concs,
+            results=results,
+            total_cores=4,
+            runs=2,
+            duration_sec=2.0,
+            seed=42,
+            memory_budget="64MiB",
+            prefill_bytes=80 * 1024 * 1024,
+            chart_paths=[],
+        )
+        self.assertTrue(md.startswith(f"Command: `{cmd}`\n"))
+        self.assertIn("seed = `42`", md)
+        self.assertIn("64 MiB", md)
+        self.assertIn("80 MiB", md)
+        self.assertIn("| Server | Pattern | Size | Cores | Concurrency | ops/s | MiB/s | P50 (ms) | P99 (ms) | CPU % |", md)
+        self.assertIn("| RustFS | seq-write | 4 KiB | 1 | 1 | not measured (rustfs binary not found) |", md)
+        self.assertIn("| MinIO | seq-write | 4 KiB | 1 | 256 | not measured (timed out at c=256) |", md)
+        self.assertNotIn("| RustFS | seq-write | 4 KiB | 1 | 1 | 0 ", md)
+
+    def test_aggregate_runs_computes_mib_per_sec_median(self):
+        agg = cs.aggregate_runs([
+            cs.PointResult(ops_per_sec=1000.0, mib_per_sec=4.0, p50_ms=2.0, p99_ms=5.0, cpu_pct=80.0),
+            cs.PointResult(ops_per_sec=2000.0, mib_per_sec=8.0, p50_ms=1.0, p99_ms=3.0, cpu_pct=120.0),
+        ])
+        self.assertAlmostEqual(agg.mib_per_sec, 6.0)
+
+
+class MatrixChartTests(unittest.TestCase):
+    def test_matrix_charts_panels_axes_shared_ylim_heatmaps_summary_and_gaps(self):
+        patterns, sizes, cores, concs, results = _sample_matrix_results()
+        try:
+            import matplotlib  # noqa: F401
+            has_mpl = True
+        except ImportError:
+            has_mpl = False
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = os.path.join(tmpdir, "report.md")
+            if has_mpl:
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+                captured_figs = []
+                orig_subplots = plt.subplots
+
+                def spy_subplots(*args, **kwargs):
+                    fig, axes = orig_subplots(*args, **kwargs)
+                    captured_figs.append((fig, _flatten_axes(axes)))
+                    return fig, axes
+
+                with mock.patch.object(plt, "subplots", side_effect=spy_subplots):
+                    written = cs.write_matrix_charts(results, patterns, sizes, cores, concs, report_path)
+            else:
+                mpl_mod, plt_mod, created_figs, _ = _make_fake_matplotlib()
+                with mock.patch.dict(sys.modules, {"matplotlib": mpl_mod, "matplotlib.pyplot": plt_mod}):
+                    written = cs.write_matrix_charts(results, patterns, sizes, cores, concs, report_path)
+                captured_figs = [(f, list(f.axes)) for f in created_figs]
+
+            # 8 core-scaling figs + 8 concurrency-sweep figs + 3 heatmap figs + 1 summary fig = 20 figures -> 40 files
+            self.assertEqual(len(captured_figs), 20)
+            self.assertEqual(len(written), 40)
+            for p in written:
+                self.assertTrue(os.path.isfile(p), f"missing chart {p}")
+                self.assertGreater(os.path.getsize(p), 0)
+
+            # 1) Core-scaling figure (first 8): 4 panels, log2 x-axis, distinct server styles, RustFS is NaN
+            core_fig, core_axes = captured_figs[0]
+            self.assertEqual(len(core_axes), 4)
+            self.assertEqual(
+                [ax.get_ylabel() for ax in core_axes],
+                ["K ops/s", "CPU usage (%)", "P50 latency (ms)", "P99 latency (ms)"],
+            )
+            for ax in core_axes:
+                self.assertEqual(ax.get_xscale(), "log")
+            rustfs_line = next(ln for ln in core_axes[0].lines if ln.get_label() == "RustFS")
+            self.assertTrue(all(math.isnan(float(y)) for y in rustfs_line.get_ydata()))
+            styles = {
+                ln.get_label(): (ln.get_linestyle(), ln.get_marker())
+                for ln in core_axes[0].lines
+                if ln.get_label() in cs.SERVERS
+            }
+            self.assertEqual(len(set(styles.values())), 3)
+
+            # 2) Concurrency sweep figure (figs 8..15): 2 rows x 3 servers, log2 x, same y scale across servers, c=256 MinIO gap
+            conc_fig, conc_axes = captured_figs[8]
+            self.assertEqual(len(conc_axes), 6)
+            for ax in conc_axes:
+                self.assertEqual(ax.get_xscale(), "log")
+            ops_ylims = [conc_axes[i].get_ylim() for i in range(3)]
+            p99_ylims = [conc_axes[i].get_ylim() for i in range(3, 6)]
+            self.assertEqual(len(set(ops_ylims)), 1, f"ops/s ylims differ across servers: {ops_ylims}")
+            self.assertEqual(len(set(p99_ylims)), 1, f"P99 ylims differ across servers: {p99_ylims}")
+            minio_ops_lines = conc_axes[1].lines
+            self.assertEqual(len(minio_ops_lines), len(cores))
+            self.assertTrue(math.isnan(float(minio_ops_lines[0].get_ydata()[-1])))
+
+            # 3) Heatmaps per server at 4 KiB (figs 16..18): 4 panels (one per pattern), MinIO c=256 is NaN
+            minio_hm_fig, minio_hm_axes = captured_figs[17]
+            self.assertEqual(len(minio_hm_axes), 4)
+            for ax in minio_hm_axes:
+                self.assertEqual(len(ax.images), 1)
+                img_data = ax.images[0].get_array() if hasattr(ax.images[0], "get_array") else ax.images[0].data
+                self.assertEqual(len(img_data), len(cores))
+                self.assertEqual(len(img_data[0]), len(concs))
+                self.assertTrue(math.isnan(float(img_data[0][-1])))
+
+            # 4) Summary figure (fig 19): grouped bars per server at 4 cores, c=64, RustFS is NaN (never 0)
+            sum_fig, sum_axes = captured_figs[19]
+            self.assertEqual(len(sum_axes), len(sizes))
+            if not has_mpl:
+                rustfs_bar = next(b for b in sum_axes[0].bars if b["label"] == "RustFS")
+                self.assertTrue(all(math.isnan(float(h)) for h in rustfs_bar["height"]))
+
+
+class MatrixExecutionTests(unittest.TestCase):
+    def test_failed_matrix_server_start_yields_not_measured_with_reason(self):
+        def broken_starter():
+            raise RuntimeError("exit code 1: address in use")
+
+        res = cs.measure_server_matrix_for_cores(
+            server_name="RustFS",
+            starter=broken_starter,
+            n_cores=1,
+            cli_cores=[1],
+            shares_cores=False,
+            patterns=["seq-write", "rand-read"],
+            sizes=[4096],
+            concurrencies=[1, 4],
+            duration_sec=0.05,
+            seed=42,
+            prefill_bytes=16384,
+        )
+        self.assertEqual(len(res), 4)
+        for pt in res.values():
+            self.assertFalse(pt.measured)
+            self.assertIn("address in use", pt.reason)
+
+    def test_live_http_prefill_and_patterns_against_stub_s3_server(self):
+        import threading
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cs.rwb.BaselineFileS3Handler.storage_root = tmpdir
+            port = cs.rwb.get_free_port()
+            httpd = cs.rwb.ThreadedHTTPServer(("127.0.0.1", port), cs.rwb.BaselineFileS3Handler)
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            os.makedirs(os.path.join(tmpdir, cs.BUCKET), exist_ok=True)
+            try:
+                prefill_bytes = 2 * cs.MIB
+                patterns = ["seq-write", "rand-write", "seq-read", "rand-read"]
+                sizes = [4 * cs.KIB, cs.MIB]
+                err = cs._prefill_server("127.0.0.1", port, cs.BUCKET, seed=42, prefill_bytes=prefill_bytes,
+                                         patterns=patterns, sizes=sizes, timeout_sec=20.0)
+                self.assertIsNone(err)
+                # Verify deterministic prefill file exists on disk
+                large_path = os.path.join(tmpdir, cs.BUCKET, "prefill_large", "seq_obj.bin")
+                self.assertTrue(os.path.isfile(large_path))
+                self.assertEqual(os.path.getsize(large_path), prefill_bytes)
+
+                for pat in patterns:
+                    for sz in sizes:
+                        pt = cs._run_pattern_phase_with_cpu(
+                            "127.0.0.1", port, cs.BUCKET, pat, sz, concurrency=2, duration_sec=0.08,
+                            seed=42, prefill_bytes=prefill_bytes, server_pid=os.getpid(), shares_cores=True,
+                        )
+                        self.assertTrue(pt.measured, f"{pat} {sz} failed: {pt.reason}")
+                        self.assertGreater(pt.ops_per_sec, 0.0)
+                        self.assertGreater(pt.mib_per_sec, 0.0)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
 
 
 if __name__ == "__main__":
