@@ -453,6 +453,67 @@ def _populate_keys(
     return ok, fail, last_err
 
 
+def _populate_keys_parallel(
+    host: str,
+    port: int,
+    bucket: str,
+    prefix: str,
+    count: int,
+    payload: bytes,
+    workers: int = 8,
+    timeout_sec: float = WARMUP_TIMEOUT_SEC,
+) -> Tuple[int, int, str]:
+    """Populates `count` keys across `workers` threads for faster DELETE batch setup."""
+    if workers <= 1 or count <= 32:
+        return _populate_keys(host, port, bucket, prefix, count, payload, timeout_sec=timeout_sec)
+
+    deadline = time.perf_counter() + timeout_sec
+    next_idx = 0
+    idx_lock = threading.Lock()
+    ok, fail, last_err = 0, 0, ""
+    headers = {"Content-Length": str(len(payload)), "Connection": "keep-alive"}
+
+    def worker() -> None:
+        nonlocal next_idx, ok, fail, last_err
+        l_ok, l_fail, l_err = 0, 0, ""
+        conn = http.client.HTTPConnection(host, port, timeout=10.0)
+        try:
+            while time.perf_counter() <= deadline:
+                with idx_lock:
+                    if next_idx >= count:
+                        break
+                    my_idx = next_idx
+                    next_idx += 1
+                path = f"/{bucket}/{prefix}_{my_idx:05d}.dat"
+                try:
+                    conn.request("PUT", path, body=payload, headers=headers)
+                    resp = conn.getresponse()
+                    resp.read()
+                    if resp.status == 200:
+                        l_ok += 1
+                    else:
+                        l_fail += 1
+                        l_err = f"HTTP {resp.status}"
+                except Exception as exc:
+                    l_fail += 1
+                    l_err = f"{type(exc).__name__}: {exc}"
+                    conn.close()
+                    conn = http.client.HTTPConnection(host, port, timeout=10.0)
+        finally:
+            conn.close()
+        with idx_lock:
+            ok += l_ok
+            fail += l_fail
+            if l_err:
+                last_err = l_err
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(workers, count))]
+    for t in threads:
+        t.start()
+    join_all(threads, f"populate_{prefix}")
+    return ok, fail, last_err
+
+
 def _build_metrics(
     latencies: List[float],
     total_bytes: int,
@@ -749,11 +810,15 @@ def run_delete_phase(
     srv_cpu_0 = get_process_cpu_times(server_pid) if server_pid else (0.0, 0.0)
     cli_cpu_0 = get_process_cpu_times(os.getpid())
     stuck_total = 0
+    effective_batch = max(batch_size, concurrency * 16) if duration_sec >= 1.0 else batch_size
+    wall_deadline = time.perf_counter() + max(duration_sec * 2.5, duration_sec + 30.0)
 
-    while active_elapsed < duration_sec:
+    while active_elapsed < duration_sec and (batch_num == 0 or time.perf_counter() < wall_deadline):
         prefix = f"del_{payload_size}_b{batch_num}"
         batch_num += 1
-        warm_ok, warm_fail, last_err = _populate_keys(host, port, bucket, prefix, batch_size, data)
+        warm_ok, warm_fail, last_err = _populate_keys_parallel(
+            host, port, bucket, prefix, effective_batch, data, workers=min(concurrency, 16)
+        )
         if warm_ok == 0:
             return BenchmarkMetrics(
                 0, 0, 0, 0, 0, 0, get_process_peak_rss_mb(server_pid) if server_pid else 0.0,
@@ -997,6 +1062,7 @@ def build_warp_command(
     concurrent: int,
     duration_sec: float,
     obj_size: str,
+    benchdata_path: Optional[str] = None,
 ) -> List[str]:
     dur = f"{max(1, int(round(duration_sec)))}s"
     cmd = [
@@ -1015,32 +1081,99 @@ def build_warp_command(
         "--duration",
         dur,
         "--noclear",
+        "--quiet",
+        "--no-color",
         "--json",
     ]
+    if benchdata_path:
+        cmd.extend(["--benchdata", benchdata_path])
     if op in ("put", "get", "mixed", "delete", "stat"):
         cmd.extend(["--obj.size", obj_size])
+    if op in ("get", "mixed"):
+        cmd.extend(["--objects", str(max(256, concurrent * 4))])
+    if op == "mixed":
+        cmd.extend(["--get-distrib", "80", "--put-distrib", "20", "--stat-distrib", "0", "--delete-distrib", "0"])
     elif op == "list":
         cmd.extend(["--objects", "1000"])
     return cmd
 
 
-def parse_warp_json(raw_text: str, server_pid: Optional[int] = None) -> BenchmarkMetrics:
-    """Parses MinIO `warp --json` output into `BenchmarkMetrics`."""
-    payload = None
-    for line in reversed(raw_text.splitlines()):
-        s = line.strip()
-        if s.startswith("{") and s.endswith("}"):
+def _extract_json_payload(raw_text: str) -> Optional[dict]:
+    """Extracts the JSON object from `warp --json` output (supports multi-line JSON)."""
+    stripped = raw_text.strip()
+    if not stripped:
+        return None
+    try:
+        obj = json.loads(stripped)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(raw_text):
+        if ch == "{":
             try:
-                payload = json.loads(s)
-                break
+                obj, _ = decoder.raw_decode(raw_text, idx)
+                if isinstance(obj, dict) and (
+                    "operations" in obj or "total" in obj or "mixed_server_stats" in obj or "error" in obj
+                ):
+                    return obj
             except json.JSONDecodeError:
                 continue
-    if payload is None:
-        try:
-            payload = json.loads(raw_text)
-        except json.JSONDecodeError as exc:
-            return BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0, measured=False, note=f"invalid warp JSON: {exc}")
+    return None
 
+
+def parse_warp_json(raw_text: str, server_pid: Optional[int] = None) -> BenchmarkMetrics:
+    """Parses MinIO `warp --json` output (`aggregate.Aggregated` or summary JSON)."""
+    payload = _extract_json_payload(raw_text)
+    if payload is None:
+        return BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0, measured=False, note="invalid warp JSON")
+
+    if payload.get("status") == "error" and isinstance(payload.get("error"), dict):
+        msg = payload["error"].get("message") or "warp error"
+        return BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0, measured=False, note=str(msg))
+
+    rss = get_process_peak_rss_mb(server_pid) if server_pid else 0.0
+
+    # Real `minio/warp` `aggregate.Aggregated` schema: `operations` + optional `mixed_server_stats`.
+    ops_list = payload.get("operations")
+    if isinstance(ops_list, list) and ops_list:
+        mixed_stats = payload.get("mixed_server_stats") if payload.get("mixed") else None
+        if isinstance(mixed_stats, dict) and mixed_stats.get("measure_duration_millis", 0) > 0:
+            dur_s = float(mixed_stats["measure_duration_millis"]) / 1000.0
+            total_bytes = float(mixed_stats.get("bytes", 0.0) or 0.0)
+            total_ops = float(mixed_stats.get("ops", 0) or 0)
+            errors = int(mixed_stats.get("errors", 0) or 0)
+        else:
+            first_tp = ops_list[0].get("throughput", {}) if isinstance(ops_list[0], dict) else {}
+            dur_s = float(first_tp.get("measure_duration_millis", 0) or 0) / 1000.0
+            total_bytes = float(first_tp.get("bytes", 0.0) or 0.0)
+            total_ops = float(first_tp.get("ops", 0) or 0)
+            errors = int(ops_list[0].get("errors", 0) or first_tp.get("errors", 0) or 0)
+
+        ops_per_sec = (total_ops / dur_s) if dur_s > 0 else 0.0
+        mib_per_sec = ((total_bytes / float(MIB)) / dur_s) if dur_s > 0 else 0.0
+
+        weight_sum = 0
+        p50_sum = p90_sum = p99_sum = 0.0
+        for op_entry in ops_list:
+            if not isinstance(op_entry, dict) or op_entry.get("skipped"):
+                continue
+            reqs = op_entry.get("single_sized_requests")
+            if isinstance(reqs, dict) and reqs.get("requests", 0) > 0:
+                w = int(reqs["requests"])
+                weight_sum += w
+                p50_sum += float(reqs.get("dur_median_millis", 0.0) or 0.0) * w
+                p90_sum += float(reqs.get("dur_90_millis", 0.0) or 0.0) * w
+                p99_sum += float(reqs.get("dur_99_millis", 0.0) or 0.0) * w
+        p50 = p50_sum / weight_sum if weight_sum > 0 else 0.0
+        p90 = p90_sum / weight_sum if weight_sum > 0 else 0.0
+        p99 = p99_sum / weight_sum if weight_sum > 0 else 0.0
+        measured = (errors == 0) and (ops_per_sec > 0 or mib_per_sec > 0)
+        note = f"{errors} warp errors" if errors > 0 else ""
+        return BenchmarkMetrics(ops_per_sec, mib_per_sec, p50, p90, p99, 0.0, rss, measured=measured, note=note)
+
+    # Legacy/simplified summary schema fallback
     total = payload.get("total", payload)
     tp = total.get("throughput", {}) if isinstance(total.get("throughput"), dict) else {}
     ops_obj = total.get("operations", {}) if isinstance(total.get("operations"), dict) else {}
@@ -1055,7 +1188,6 @@ def parse_warp_json(raw_text: str, server_pid: Optional[int] = None) -> Benchmar
     p90 = float(lat.get("p90_ms", total.get("p90_ms", 0.0)) or 0.0)
     p99 = float(lat.get("p99_ms", total.get("p99_ms", 0.0)) or 0.0)
     p999 = float(lat.get("p999_ms", total.get("p999_ms", 0.0)) or 0.0)
-    rss = get_process_peak_rss_mb(server_pid) if server_pid else 0.0
     measured = ops_per_sec > 0 or mib_per_sec > 0
     return BenchmarkMetrics(ops_per_sec, mib_per_sec, p50, p90, p99, p999, rss, measured=measured)
 
@@ -1073,13 +1205,19 @@ def run_warp_workload(
     server_pid: Optional[int] = None,
     timeout_sec: float = 300.0,
 ) -> BenchmarkMetrics:
-    """Runs MinIO `warp` writing output to a temp file (never a pipe)."""
-    cmd = build_warp_command(warp_bin, op, host_port, access_key, secret_key, bucket, concurrent, duration_sec, obj_size)
+    """Runs MinIO `warp` writing output to temp files (never a pipe)."""
     with tempfile.NamedTemporaryFile(prefix="warp_out_", suffix=".json", delete=False) as tf:
         out_path = tf.name
+    with tempfile.NamedTemporaryFile(prefix="warp_err_", suffix=".log", delete=False) as ef:
+        err_path = ef.name
+    bench_prefix = out_path[:-5] + "_data"
+    cmd = build_warp_command(
+        warp_bin, op, host_port, access_key, secret_key, bucket, concurrent, duration_sec, obj_size,
+        benchdata_path=bench_prefix,
+    )
     try:
-        with open(out_path, "wb") as sink:
-            proc = subprocess.Popen(cmd, stdout=sink, stderr=subprocess.STDOUT)
+        with open(out_path, "wb") as sink, open(err_path, "wb") as err_sink:
+            proc = subprocess.Popen(cmd, stdout=sink, stderr=err_sink)
             try:
                 rc = proc.wait(timeout=timeout_sec)
             except subprocess.TimeoutExpired:
@@ -1088,15 +1226,22 @@ def run_warp_workload(
                 return BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0, measured=False, note="warp timed out")
         with open(out_path, "r", encoding="utf-8", errors="replace") as fh:
             raw = fh.read()
+        with open(err_path, "r", encoding="utf-8", errors="replace") as fh:
+            err_raw = fh.read().strip()
         m = parse_warp_json(raw, server_pid=server_pid)
-        if rc != 0 and not m.measured:
-            m.note = m.note or f"warp exited {rc}"
+        if not m.measured:
+            err_tail = err_raw.splitlines()[-1].strip() if err_raw else ""
+            if rc != 0 and not m.note:
+                m.note = f"warp exited {rc}"
+            if err_tail:
+                m.note = f"{m.note}: {err_tail}" if m.note else err_tail
         return m
     finally:
-        try:
-            os.remove(out_path)
-        except OSError:
-            pass
+        for p in (out_path, err_path, bench_prefix + ".csv.zst", bench_prefix + ".profiles.zip"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
 def default_workloads(profile: str) -> List[Tuple[str, str]]:
@@ -1243,8 +1388,13 @@ def format_market_claims_report(
 
         if warp_results:
             for server_label, by_wl in warp_results.items():
-                w_runs = [m for m in by_wl.get(key, []) if m.measured]
+                all_w = by_wl.get(key, [])
+                if not all_w:
+                    continue
+                w_runs = [m for m in all_w if m.measured]
                 if not w_runs:
+                    note = all_w[0].note or "did not finish"
+                    lines.append(f"| **{label}** | {server_label} | `warp` | not measured ({note}) | - | - | - | - | - | - |")
                     continue
                 lines.append(
                     f"| **{label}** | {server_label} | `warp` | {format_spread([m.mib_per_sec for m in w_runs])} "
@@ -1286,6 +1436,8 @@ def run_server_suite(
     cold_bytes = max(1, cold_set_mib) * MIB
 
     def record(wl: str, m: BenchmarkMetrics, data_dir: str, hits: Optional[int] = None, misses: Optional[int] = None):
+        status = f"{m.mib_per_sec:.1f} MiB/s ({m.ops_per_sec:.0f} ops/s)" if m.measured else f"not measured ({m.note})"
+        print(f"    [{label}] {wl}: {status}", flush=True)
         out.setdefault(wl, []).append(
             RunMeasurement(metrics=m, disk_mib=dir_size_bytes(data_dir) / float(MIB), cache_hits=hits, cache_misses=misses)
         )
@@ -1296,6 +1448,8 @@ def run_server_suite(
         wm = run_warp_workload(
             warp_bin, op, f"{host}:{port}", warp_creds[0], warp_creds[1], BUCKET, w_conc, duration_sec, obj_size, server_pid=pid
         )
+        status = f"{wm.mib_per_sec:.1f} MiB/s ({wm.ops_per_sec:.0f} ops/s)" if wm.measured else f"not measured ({wm.note})"
+        print(f"    [{label}] warp:{wl}: {status}", flush=True)
         warp_out.setdefault(wl, []).append(wm)
 
     if profile == "community":

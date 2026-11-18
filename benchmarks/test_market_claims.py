@@ -181,6 +181,58 @@ class TestWarpIntegration(unittest.TestCase):
         bad = mc.parse_warp_json("not json")
         self.assertFalse(bad.measured)
 
+        # Real `minio/warp` `aggregate.Aggregated` multi-line JSON (single op and mixed)
+        real_single = "Saving benchmark data\n" + json.dumps({
+            "type": "single",
+            "mixed": False,
+            "operations": [{
+                "type": "PUT",
+                "errors": 0,
+                "n": 3000,
+                "skipped": False,
+                "throughput": {
+                    "measure_duration_millis": 10000,
+                    "bytes": 196608000.0,
+                    "objects": 3000.0,
+                    "ops": 3000,
+                    "errors": 0,
+                },
+                "single_sized_requests": {
+                    "requests": 3000,
+                    "dur_median_millis": 3.5,
+                    "dur_90_millis": 7.1,
+                    "dur_99_millis": 14.2,
+                },
+            }],
+        }, indent=2)
+        m_real = mc.parse_warp_json(real_single)
+        self.assertTrue(m_real.measured, m_real.note)
+        self.assertAlmostEqual(m_real.ops_per_sec, 300.0, places=2)
+        self.assertAlmostEqual(m_real.mib_per_sec, 18.75, places=2)
+        self.assertAlmostEqual(m_real.p50_ms, 3.5, places=2)
+        self.assertAlmostEqual(m_real.p99_ms, 14.2, places=2)
+
+        real_mixed = json.dumps({
+            "type": "mixed",
+            "mixed": True,
+            "mixed_server_stats": {
+                "measure_duration_millis": 10000,
+                "bytes": 104857600.0,
+                "ops": 1600,
+                "errors": 0,
+            },
+            "operations": [
+                {"type": "GET", "skipped": False, "single_sized_requests": {"requests": 800, "dur_median_millis": 2.0, "dur_90_millis": 4.0, "dur_99_millis": 8.0}},
+                {"type": "PUT", "skipped": False, "single_sized_requests": {"requests": 200, "dur_median_millis": 6.0, "dur_90_millis": 10.0, "dur_99_millis": 20.0}},
+            ],
+        }, indent=2)
+        m_mix = mc.parse_warp_json(real_mixed)
+        self.assertTrue(m_mix.measured, m_mix.note)
+        self.assertAlmostEqual(m_mix.mib_per_sec, 10.0, places=2)
+        self.assertAlmostEqual(m_mix.ops_per_sec, 160.0, places=2)
+        self.assertAlmostEqual(m_mix.p50_ms, 2.8, places=2)
+        self.assertAlmostEqual(m_mix.p99_ms, 10.4, places=2)
+
 
 class TestWorkloadsAgainstMockS3(unittest.TestCase):
     def setUp(self):

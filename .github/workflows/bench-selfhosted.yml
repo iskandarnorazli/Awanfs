@@ -57,26 +57,35 @@ jobs:
       - uses: actions/cache@v4
         id: tools
         with:
-          path: .tmp/minio
-          key: selfhosted-tools-Windows-${{ env.MINIO_RELEASE }}-v1
+          path: |
+            .tmp/minio
+            .tmp/warp
+          key: selfhosted-tools-Windows-${{ env.MINIO_RELEASE }}-warp-v1
       - uses: actions/setup-go@v5
         if: steps.tools.outputs.cache-hit != 'true'
         with:
           go-version: stable
           cache: false
-      - name: Build MinIO and mc from source (pinned release)
+      - name: Build MinIO, mc, and warp from source (pinned MinIO release)
         if: steps.tools.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          mkdir -p .tmp/minio
+          mkdir -p .tmp/minio .tmp/warp
           git clone -q --depth 1 --branch "$MINIO_RELEASE" https://github.com/minio/minio "$RUNNER_TEMP/minio-src"
           (cd "$RUNNER_TEMP/minio-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/minio.exe" .)
           git clone -q --depth 1 https://github.com/minio/mc "$RUNNER_TEMP/mc-src"
           (cd "$RUNNER_TEMP/mc-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/mc.exe" .)
+          git clone -q --depth 1 https://github.com/minio/warp "$RUNNER_TEMP/warp-src"
+          (cd "$RUNNER_TEMP/warp-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/warp/warp.exe" .)
       - uses: actions/upload-artifact@v4
         with:
           name: minio-windows
           path: .tmp/minio
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: warp-windows
+          path: .tmp/warp
           retention-days: 3
 
   bench:
@@ -89,6 +98,10 @@ jobs:
         with:
           name: minio-windows
           path: .tmp/minio
+      - uses: actions/download-artifact@v4
+        with:
+          name: warp-windows
+          path: .tmp/warp
       - name: MinIO and mc are here
         run: python -c "import os,sys; m=[f for f in ('minio.exe','mc.exe') if not os.path.isfile(os.path.join('.tmp','minio',f))]; print('missing:', m) if m else print('minio.exe and mc.exe are in .tmp/minio'); sys.exit(1 if m else 0)"
       - name: Machine (more than 8 cores, or this belongs on a hosted runner)
