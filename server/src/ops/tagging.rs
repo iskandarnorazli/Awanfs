@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::attrs::{encode_tags, TAG_TAGGING};
+use crate::bucket_config::ConfigKind;
 use crate::ffi_bridge::{unpack_flags, unpack_part_count, AWAN_FLAG_MULTIPART};
 use crate::meta_index::FLAG_ATTRS;
 use crate::ops::object::{find_version, no_such_version};
@@ -220,6 +221,101 @@ pub async fn delete_object_tagging(
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let vid = query_map.get("versionId").map(|s| s.as_str());
     Ok(update_object_tags(&state, b_id, key, vid, None, StatusCode::NO_CONTENT).await)
+}
+
+pub async fn put_bucket_tagging(
+    state: Arc<S3ServiceState>,
+    b_id: u32,
+    bucket: &str,
+    path: &str,
+    body: hyper::body::Incoming,
+) -> Result<Response<ResponseBody>, hyper::Error> {
+    let (body_bytes, _body_guard) =
+        match read_body_admitted(&state.body_budget, body, MAX_XML_BODY, None, state.body_idle_timeout(), path).await? {
+            Ok(b) => b,
+            Err(resp) => return Ok(resp),
+        };
+    if body_bytes.is_empty() {
+        return Ok(xml_error(
+            StatusCode::BAD_REQUEST,
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate against our published schema",
+            bucket,
+        ));
+    }
+    let res = state
+        .bucket_configs
+        .lock()
+        .put_config(b_id, ConfigKind::Tagging, &body_bytes);
+    match res {
+        Ok(()) => Ok(Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header(CONTENT_LENGTH, "0")
+            .body(empty_body())
+            .unwrap()),
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status()).unwrap_or(StatusCode::BAD_REQUEST);
+            Ok(xml_error(status, e.code(), &e.to_string(), bucket))
+        }
+    }
+}
+
+pub async fn get_bucket_tagging(
+    state: Arc<S3ServiceState>,
+    b_id: u32,
+    bucket: &str,
+) -> Result<Response<ResponseBody>, hyper::Error> {
+    let cfg = state.bucket_config_reader.load_bucket(b_id);
+    let parsed = cfg.as_ref().and_then(|c| c.get(ConfigKind::Tagging));
+    match parsed {
+        Some(p) => {
+            let mut tag_set = match p.parsed.as_ref().and_then(|a| a.downcast_ref::<TagSet>()) {
+                Some(ts) => ts.clone(),
+                None => match std::str::from_utf8(&p.raw)
+                    .ok()
+                    .and_then(|s| parse_tagging_xml(s, Scope::Bucket).ok())
+                {
+                    Some(ts) => ts,
+                    None => TagSet::default(),
+                },
+            };
+            tag_set.tags.sort_by(|a, b| a.key.cmp(&b.key));
+            let xml = tagging_xml(&tag_set);
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(full_body(Bytes::from(xml)))
+                .unwrap())
+        }
+        None => Ok(xml_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchTagSet",
+            "The TagSet does not exist",
+            bucket,
+        )),
+    }
+}
+
+pub async fn delete_bucket_tagging(
+    state: Arc<S3ServiceState>,
+    b_id: u32,
+    bucket: &str,
+) -> Result<Response<ResponseBody>, hyper::Error> {
+    let res = state
+        .bucket_configs
+        .lock()
+        .delete_config(b_id, ConfigKind::Tagging);
+    match res {
+        Ok(()) => Ok(Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header(CONTENT_LENGTH, "0")
+            .body(empty_body())
+            .unwrap()),
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            Ok(xml_error(status, e.code(), &e.to_string(), bucket))
+        }
+    }
 }
 
 async fn update_object_tags(
