@@ -65,7 +65,11 @@ async fn set_versioning(c: &reqwest::Client, url: &str, bucket: &str, status: &s
 }
 
 fn version_id(res: &reqwest::Response) -> String {
-    res.headers().get("x-amz-version-id").expect("x-amz-version-id").to_str().unwrap().to_string()
+    res.headers()
+        .get("x-amz-version-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
 }
 
 async fn put(c: &reqwest::Client, url: &str, path: &str, body: &[u8]) -> String {
@@ -279,8 +283,11 @@ async fn unversioned_and_suspended_buckets_use_the_null_version() {
     set_versioning(&c, &url, "nbkt", "Enabled").await;
     let v = put(&c, &url, "nbkt/k", b"three").await;
     set_versioning(&c, &url, "nbkt", "Suspended").await;
-    assert_eq!(put(&c, &url, "nbkt/k", b"four").await, "null");
-    assert_eq!(put(&c, &url, "nbkt/k", b"five").await, "null");
+    assert_eq!(put(&c, &url, "nbkt/k", b"four").await, "");
+    let res = c.get(format!("{}/nbkt/k", url)).send().await.unwrap();
+    assert_eq!(version_id(&res), "null");
+    assert_eq!(res.bytes().await.unwrap(), &b"four"[..]);
+    assert_eq!(put(&c, &url, "nbkt/k", b"five").await, "");
     let listed: Vec<(String, bool)> = entries(&list_versions(&c, &url, "nbkt").await).into_iter().map(|e| (e.2, e.3)).collect();
     assert_eq!(listed, vec![("null".to_string(), true), (v.clone(), false)], "one null version, the enabled-era version kept");
     assert_eq!(get_version(&c, &url, "nbkt/k", &v).await.1, b"three");

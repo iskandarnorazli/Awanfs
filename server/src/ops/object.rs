@@ -1110,9 +1110,12 @@ pub async fn put_object(
         state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
         state.hook("put_stored", key);
         let stream_cksum_ref = stream_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
-        let answer = if let Some((_, ts)) = stamp {
+        let answer = if let Some((extra, ts)) = stamp {
             match finish_version_put(&state, b_id, key, ts, flags, vol_offset, len, etag_hi, etag_lo, 0) {
-                Ok(vid) => put_ok_response(&etag_hex, Some(&vid), stream_cksum_ref),
+                Ok(vid) => {
+                    let resp_vid = (extra & crate::meta_index::FLAG_NULL_ID == 0).then_some(vid.as_str());
+                    put_ok_response(&etag_hex, resp_vid, stream_cksum_ref)
+                }
                 Err(r) => r,
             }
         } else {
@@ -1260,9 +1263,12 @@ pub async fn put_object(
     };
     state.hook("put_stored", key);
     let buf_cksum_ref = buf_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
-    let answer = if let Some((_, ts)) = stamp {
+    let answer = if let Some((extra, ts)) = stamp {
         match finish_version_put(&state, b_id, key, ts, flags, vol_offset, payload_len, etag_hi, etag_lo, 0) {
-            Ok(vid) => put_ok_response(&final_etag_hex, Some(&vid), buf_cksum_ref),
+            Ok(vid) => {
+                let resp_vid = (extra & crate::meta_index::FLAG_NULL_ID == 0).then_some(vid.as_str());
+                put_ok_response(&final_etag_hex, resp_vid, buf_cksum_ref)
+            }
             Err(r) => r,
         }
     } else {
