@@ -1120,7 +1120,7 @@ pub async fn put_object(
         };
         return Ok(after_late_failure(key, late, answer));
     }
-    let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, expected_len.map(|n| n as u64), state.body_idle_timeout(), path).await? {
+    let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, &state.work, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, expected_len.map(|n| n as u64), state.body_idle_timeout(), path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };

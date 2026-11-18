@@ -159,16 +159,17 @@ pub(crate) fn slow_down_response(resource: &str, msg: &str) -> Response<Response
         .unwrap()
 }
 
-/// Acquires against `budget` before buffering `body`, returning the `AdmissionGuard` alongside
-/// the collected bytes so the caller holds the budget until the buffer is consumed or dropped.
+/// Acquires against `budget` before buffering `body`, returning the `AdmissionGuard` and
+/// `InflightGuard` alongside the collected bytes so the caller holds both until consumed or dropped.
 pub(crate) async fn read_body_admitted(
     budget: &crate::memory::BodyBudget,
+    work: &Arc<WorkCounters>,
     body: hyper::body::Incoming,
     limit: u64,
     estimated_bytes: Option<u64>,
     idle_timeout: std::time::Duration,
     resource: &str,
-) -> Result<Result<(Bytes, crate::memory::AdmissionGuard), Response<ResponseBody>>, hyper::Error> {
+) -> Result<Result<(Bytes, (crate::memory::AdmissionGuard, crate::work::InflightGuard)), Response<ResponseBody>>, hyper::Error> {
     use hyper::body::Body as _;
     let hint = estimated_bytes
         .or_else(|| body.size_hint().exact())
@@ -183,8 +184,17 @@ pub(crate) async fn read_body_admitted(
             )));
         }
     };
+    let inflight = work.hold_inflight(guard.bytes());
     match read_body(body, limit, idle_timeout, resource).await? {
-        Ok(bytes) => Ok(Ok((bytes, guard))),
+        Ok(bytes) => {
+            let actual = if (bytes.len() as u64) != guard.bytes() {
+                drop(inflight);
+                work.hold_inflight(bytes.len() as u64)
+            } else {
+                inflight
+            };
+            Ok(Ok((bytes, (guard, actual))))
+        }
         Err(resp) => Ok(Err(resp)),
     }
 }
@@ -2072,7 +2082,7 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
     let (hits, misses) = state.payload_cache.hit_counts();
     let w = state.work.snapshot();
     let budget = crate::memory::effective();
-    let gauges: [(&str, &str, &str, u64); 23] = [
+    let gauges: [(&str, &str, &str, u64); 25] = [
         ("awanfs_volume_used_bytes", "gauge", "Bytes written into all open volumes, including dead needles.", used),
         ("awanfs_volume_free_span_bytes", "gauge", "Span left in the active volume before it rolls over.", free),
         ("awanfs_volumes_open", "gauge", "Open volumes.", state.volumes.read().len() as u64),
@@ -2086,6 +2096,8 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
         ("awanfs_disk_reads_total", "counter", "Disk read calls (not mmap page faults).", w.disk_reads),
         ("awanfs_payload_copies_total", "counter", "Copies of payload bytes into server buffers.", w.payload_copies),
         ("awanfs_payload_copy_bytes_total", "counter", "Payload bytes copied.", w.payload_copy_bytes),
+        ("awanfs_inflight_bytes", "gauge", "Bytes currently held in memory by in-flight requests.", state.work.inflight_bytes()),
+        ("awanfs_peak_inflight_bytes", "gauge", "Peak bytes held in memory concurrently by in-flight requests.", state.work.peak_inflight_bytes()),
         ("awanfs_ready", "gauge", "1 when /_awanfs/health/ready answers 200.", state.readiness().is_none() as u64),
         ("awanfs_memory_budget_bytes", "gauge", "Memory the server may hold (--memory-budget).", budget.total),
         ("awanfs_memory_budget_cache_bytes", "gauge", "The budget's half for the payload cache.", budget.cache),

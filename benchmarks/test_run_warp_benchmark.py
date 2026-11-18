@@ -312,5 +312,117 @@ class CpuSamplerTests(unittest.TestCase):
         self.assertGreaterEqual(u, 0.0)
         self.assertGreaterEqual(s, 0.0)
 
+
+class MultiRoundAndRssCeilingTests(unittest.TestCase):
+    """#133: 3-round median + min..max spread, peak inflight bytes, and RSS ceiling enforcement."""
+
+    def _m(self, mib: float, rss: float, inflight: float = None, measured: bool = True) -> BenchmarkMetrics:
+        return BenchmarkMetrics(
+            ops_per_sec=mib * 10.0,
+            mib_per_sec=mib,
+            p50_ms=1.0,
+            p90_ms=2.0,
+            p99_ms=3.0,
+            p999_ms=4.0,
+            peak_rss_mb=rss,
+            measured=measured,
+            peak_inflight_mb=inflight,
+        )
+
+    def test_aggregate_rounds_computes_median_and_min_max_spread(self):
+        from run_warp_benchmark import aggregate_rounds
+
+        rounds = [
+            {"put_10g": self._m(100.0, 410.0, inflight=12.0)},
+            {"put_10g": self._m(120.0, 390.0, inflight=8.0)},
+            {"put_10g": self._m(110.0, 450.0, inflight=10.0)},
+        ]
+        agg = aggregate_rounds(rounds)
+        m = agg["put_10g"]
+        self.assertAlmostEqual(m.mib_per_sec, 110.0)
+        self.assertAlmostEqual(m.peak_rss_mb, 410.0)
+        self.assertAlmostEqual(m.peak_rss_min_mb, 390.0)
+        self.assertAlmostEqual(m.peak_rss_max_mb, 450.0)
+        self.assertAlmostEqual(m.peak_inflight_mb, 10.0)
+
+        report = format_markdown_report(
+            "cmd --runs 3",
+            {},
+            agg,
+            minio_or_baseline=aggregate_rounds([
+                {"put_10g": self._m(90.0, 900.0)},
+                {"put_10g": self._m(95.0, 950.0)},
+                {"put_10g": self._m(92.0, 920.0)},
+            ]),
+            runs=3,
+        )
+        self.assertIn("Rounds per Server:** 3", report)
+        self.assertIn("410.0 MB (390.0..450.0)", report)
+        self.assertIn("920.0 MB (900.0..950.0)", report)
+        self.assertIn("Peak In-Flight Request Bytes (AwanFS)", report)
+        self.assertIn("| `put_10g` | 10.00 | 410.0 MB (390.0..450.0) |", report)
+
+    def test_check_rss_ceiling_passes_under_and_fails_over_ceiling(self):
+        from run_warp_benchmark import check_rss_ceiling
+
+        under = {"mpu_put_1g": self._m(500.0, 320.0), "put_10g": self._m(400.0, 480.0)}
+        peak, bad = check_rss_ceiling(under, 500.0)
+        self.assertAlmostEqual(peak, 480.0)
+        self.assertEqual(bad, [])
+
+        over = {"mpu_put_1g": self._m(500.0, 320.0), "put_10g": self._m(400.0, 610.5)}
+        peak_over, bad_over = check_rss_ceiling(over, 500.0)
+        self.assertAlmostEqual(peak_over, 610.5)
+        self.assertEqual(len(bad_over), 1)
+        self.assertIn("610.5", bad_over[0])
+        self.assertIn("500.0", bad_over[0])
+
+        _, bad_empty = check_rss_ceiling({}, 500.0)
+        self.assertEqual(len(bad_empty), 1)
+        self.assertIn("not measured", bad_empty[0])
+
+        ok_md = format_markdown_report("cmd", {}, under, minio_or_baseline={"put_10g": self._m(200.0, 900.0)}, rss_ceiling_mib=500.0)
+        self.assertIn("Peak RSS Ceiling Check", ok_md)
+        self.assertIn("| AwanFS | 480.0 | 500.0 | ok |", ok_md)
+
+        over_md = format_markdown_report("cmd", {}, over, minio_or_baseline={"put_10g": self._m(200.0, 900.0)}, rss_ceiling_mib=500.0)
+        self.assertIn("| AwanFS | 610.5 | 500.0 | OVER THE CEILING |", over_md)
+
+    def test_get_awanfs_peak_inflight_mb_reads_metrics_endpoint(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from run_warp_benchmark import get_awanfs_peak_inflight_mb
+
+        body = b"# TYPE awanfs_peak_inflight_bytes gauge\nawanfs_peak_inflight_bytes 8388608\n"
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            got = get_awanfs_peak_inflight_mb("127.0.0.1", srv.server_address[1])
+            self.assertAlmostEqual(got, 8.0)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_selfhosted_workflow_passes_runs_and_rss_ceiling(self):
+        wf_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", ".github", "workflows", "bench-selfhosted.yml")
+        )
+        with open(wf_path, encoding="utf-8") as fh:
+            wf = fh.read()
+        self.assertIn("--runs", wf)
+        self.assertIn("--rss-ceiling-mib", wf)
+
+
 if __name__ == "__main__":
     unittest.main()

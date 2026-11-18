@@ -234,7 +234,7 @@ impl MultipartManager {
         let nanos = self.clock.now_ns();
         let tmp = upload_dir.join(format!("part_{:05}.dat.partial-{}", part_number, nanos));
         let file = std::fs::File::create(&tmp)?;
-        Ok(PartWriter { file, tmp, path, buf: Vec::new(), written: 0, work: Arc::clone(&self.work), done: false })
+        Ok(PartWriter { file, tmp, path, buf: Vec::new(), written: 0, work: Arc::clone(&self.work), done: false, inflight: None })
     }
 
     pub fn get_upload(&self, upload_id: &str) -> Option<MultipartUpload> {
@@ -449,6 +449,7 @@ pub struct PartWriter {
     written: u64,
     work: Arc<crate::work::WorkCounters>,
     done: bool,
+    inflight: Option<crate::work::InflightGuard>,
 }
 
 impl PartWriter {
@@ -460,6 +461,7 @@ impl PartWriter {
     pub fn write(&mut self, mut data: &[u8]) -> std::io::Result<()> {
         if self.buf.capacity() == 0 {
             self.buf.reserve_exact(PART_CHUNK);
+            self.inflight = Some(self.work.hold_inflight(PART_CHUNK as u64));
         }
         self.written += data.len() as u64;
         while !data.is_empty() {

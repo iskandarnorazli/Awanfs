@@ -20,6 +20,7 @@ import re
 import shutil
 import socket
 import socketserver
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -43,6 +44,9 @@ class BenchmarkMetrics:
     server_cpu_s: float = 0.0
     client_cpu_s: float = 0.0
     system_cpu_s: float = 0.0
+    peak_rss_min_mb: Optional[float] = None
+    peak_rss_max_mb: Optional[float] = None
+    peak_inflight_mb: Optional[float] = None
 
 
 def calculate_percentiles(latencies: List[float]) -> Tuple[float, float, float, float]:
@@ -152,6 +156,94 @@ def minio_durability_note(os_name: str = os.name) -> str:
     return "MinIO syncs each PUT (O_DSYNC)."
 
 
+def get_awanfs_peak_inflight_mb(host: str, port: int) -> Optional[float]:
+    """Reads `awanfs_peak_inflight_bytes` from `/_awanfs/metrics` in MiB, or None if unavailable."""
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=5.0)
+        conn.request("GET", "/_awanfs/metrics")
+        resp = conn.getresponse()
+        text = resp.read().decode("utf-8", errors="replace")
+        conn.close()
+        if resp.status != 200:
+            return None
+    except Exception:
+        return None
+    for line in text.splitlines():
+        if line.startswith("awanfs_peak_inflight_bytes "):
+            try:
+                return float(line.split()[1]) / (1024.0 * 1024.0)
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def aggregate_rounds(rounds: List[Dict]) -> Dict:
+    """Aggregates per-round workload dicts into medians plus peak RSS min..max spread."""
+    if not rounds:
+        return {}
+    if len(rounds) == 1:
+        return dict(rounds[0])
+
+    keys = []
+    seen = set()
+    for r in rounds:
+        for k in r:
+            if k not in seen:
+                seen.add(k)
+                keys.append(k)
+
+    out = {}
+    for k in keys:
+        samples = [r[k] for r in rounds if k in r]
+        measured_samples = [s for s in samples if s.measured]
+        pool = measured_samples if measured_samples else samples
+        rss_vals = [s.peak_rss_mb for s in pool if s.peak_rss_mb > 0]
+        inflight_vals = [s.peak_inflight_mb for s in pool if s.peak_inflight_mb is not None]
+        notes = [s.note for s in samples if s.note]
+        out[k] = BenchmarkMetrics(
+            ops_per_sec=statistics.median(s.ops_per_sec for s in pool),
+            mib_per_sec=statistics.median(s.mib_per_sec for s in pool),
+            p50_ms=statistics.median(s.p50_ms for s in pool),
+            p90_ms=statistics.median(s.p90_ms for s in pool),
+            p99_ms=statistics.median(s.p99_ms for s in pool),
+            p999_ms=statistics.median(s.p999_ms for s in pool),
+            peak_rss_mb=statistics.median(rss_vals) if rss_vals else 0.0,
+            measured=bool(measured_samples),
+            note="; ".join(dict.fromkeys(notes)),
+            server_cpu_s=statistics.median(s.server_cpu_s for s in pool),
+            client_cpu_s=statistics.median(s.client_cpu_s for s in pool),
+            system_cpu_s=statistics.median(s.system_cpu_s for s in pool),
+            peak_rss_min_mb=min(rss_vals) if rss_vals else None,
+            peak_rss_max_mb=max(rss_vals) if rss_vals else None,
+            peak_inflight_mb=statistics.median(inflight_vals) if inflight_vals else None,
+        )
+    return out
+
+
+def check_rss_ceiling(
+    awan: Dict[str, BenchmarkMetrics],
+    ceiling_mib: Optional[float],
+) -> Tuple[Optional[float], List[str]]:
+    """Returns `(awanfs_median_peak_rss_mib, failures)` against `ceiling_mib`."""
+    all_rss = [v.peak_rss_mb for v in awan.values() if v.measured and v.peak_rss_mb > 0]
+    peak_mb = max(all_rss) if all_rss else None
+    if ceiling_mib is None:
+        return peak_mb, []
+    if peak_mb is None:
+        return None, [f"AwanFS peak RSS was not measured (ceiling {float(ceiling_mib):.1f} MiB)"]
+    if peak_mb > float(ceiling_mib):
+        return peak_mb, [
+            f"AwanFS median peak RSS {peak_mb:.1f} MiB exceeds ceiling {float(ceiling_mib):.1f} MiB"
+        ]
+    return peak_mb, []
+
+
+def format_rss_cell(m: BenchmarkMetrics) -> str:
+    if m.peak_rss_min_mb is not None and m.peak_rss_max_mb is not None:
+        return f"{m.peak_rss_mb:.1f} MB ({m.peak_rss_min_mb:.1f}..{m.peak_rss_max_mb:.1f})"
+    return f"{m.peak_rss_mb:.1f} MB"
+
+
 def format_markdown_report(
     cmd: str,
     hw_info: Dict[str, str],
@@ -160,6 +252,8 @@ def format_markdown_report(
     minio_or_baseline: Optional[Dict[str, BenchmarkMetrics]] = None,
     baseline_server_label: str = "MinIO Community Baseline",
     concurrency_data: Optional[Dict[str, Dict[int, BenchmarkMetrics]]] = None,
+    runs: int = 1,
+    rss_ceiling_mib: Optional[float] = None,
 ) -> str:
     if minio_or_baseline is None and isinstance(rust_fb, dict) and "put_64k" in rust_fb:
         # Backward compatibility when invoked with 4 arguments: (cmd, hw_info, s3_metrics, minio_metrics)
@@ -185,12 +279,16 @@ def format_markdown_report(
         f"- **Live MinIO Binary Status:** {hw_info.get('minio_status', 'not measured')}",
         f"- **Live RustFS Binary Status:** {hw_info.get('rustfs_status', 'not measured')}",
         "- **Durability per PUT:** `s3-server` runs with its default, group commit (#29): a 200 means the bytes are on stable storage, and concurrent PUTs share one sync. " + minio_durability_note() + " RustFS's sync behaviour is not verified here.",
+    ]
+    if runs > 1:
+        lines.append(f"- **Rounds per Server:** {runs} (values are medians; Peak RSS shows median and min..max spread)")
+    lines.extend([
         "",
         "## 2. Live Measured HTTP/1.1 Keep-Alive Throughput & Latency Matrix (64 KiB – 10 GiB)",
         "",
         "| Workload | Target Engine | Throughput (MiB/s) | Operations/sec | P50 (ms) | P90 (ms) | P99 (ms) | P99.9 (ms) | Peak RSS (MB) |",
         "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
-    ]
+    ])
 
     workloads = [
         ("64 KiB PUT (Single Object)", "put_64k"),
@@ -219,25 +317,25 @@ def format_markdown_report(
             lines.append(f"| **{label}** | **S3 Storage Server** | did not finish: {a.note} | | | | | | |")
 
         lines.append(
-            f"| **{label}** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **{a.mib_per_sec:.1f}** | **{a.ops_per_sec:.1f}** | **{a.p50_ms:.2f}** | **{a.p90_ms:.2f}** | **{a.p99_ms:.2f}** | **{a.p999_ms:.2f}** | **{a.peak_rss_mb:.1f} MB** |"
+            f"| **{label}** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **{a.mib_per_sec:.1f}** | **{a.ops_per_sec:.1f}** | **{a.p50_ms:.2f}** | **{a.p90_ms:.2f}** | **{a.p99_ms:.2f}** | **{a.p999_ms:.2f}** | **{format_rss_cell(a)}** |"
         )
         if m.measured:
             if m.ops_per_sec == 0.0 and m.mib_per_sec == 0.0:
                 lines.append(
-                    f"| **{label}** | {baseline_server_label} | N/A (S3 $\\ge$5MiB spec limit) | N/A | N/A | N/A | N/A | N/A | {m.peak_rss_mb:.1f} MB |"
+                    f"| **{label}** | {baseline_server_label} | N/A (S3 $\\ge$5MiB spec limit) | N/A | N/A | N/A | N/A | N/A | {format_rss_cell(m)} |"
                 )
             else:
                 lines.append(
-                    f"| **{label}** | {baseline_server_label} | {m.mib_per_sec:.1f} | {m.ops_per_sec:.1f} | {m.p50_ms:.2f} | {m.p90_ms:.2f} | {m.p99_ms:.2f} | {m.p999_ms:.2f} | {m.peak_rss_mb:.1f} MB |"
+                    f"| **{label}** | {baseline_server_label} | {m.mib_per_sec:.1f} | {m.ops_per_sec:.1f} | {m.p50_ms:.2f} | {m.p90_ms:.2f} | {m.p99_ms:.2f} | {m.p999_ms:.2f} | {format_rss_cell(m)} |"
                 )
         if r.measured:
             if r.ops_per_sec == 0.0 and r.mib_per_sec == 0.0:
                 lines.append(
-                    f"| **{label}** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | N/A (S3 $\\ge$5MiB spec limit) | N/A | N/A | N/A | N/A | N/A | {r.peak_rss_mb:.1f} MB |"
+                    f"| **{label}** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | N/A (S3 $\\ge$5MiB spec limit) | N/A | N/A | N/A | N/A | N/A | {format_rss_cell(r)} |"
                 )
             else:
                 lines.append(
-                    f"| **{label}** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | {r.mib_per_sec:.1f} | {r.ops_per_sec:.1f} | {r.p50_ms:.2f} | {r.p90_ms:.2f} | {r.p99_ms:.2f} | {r.p999_ms:.2f} | {r.peak_rss_mb:.1f} MB |"
+                    f"| **{label}** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | {r.mib_per_sec:.1f} | {r.ops_per_sec:.1f} | {r.p50_ms:.2f} | {r.p90_ms:.2f} | {r.p99_ms:.2f} | {r.p999_ms:.2f} | {format_rss_cell(r)} |"
                 )
 
     put_64k = awan.get("put_64k", BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0))
@@ -322,6 +420,33 @@ def format_markdown_report(
         ])
         for k, v in cpu_rows:
             lines.append(f"| `{k}` | {v.server_cpu_s:.2f} | {v.client_cpu_s:.2f} | {v.system_cpu_s:.2f} |")
+
+    inflight_rows = [(k, v) for k, v in awan.items() if v.peak_inflight_mb is not None]
+    if inflight_rows:
+        lines.extend([
+            "",
+            "## Peak In-Flight Request Bytes (AwanFS)",
+            "",
+            "| Phase | Peak In-Flight (MB) | Peak RSS (MB) |",
+            "| :--- | :--- | :--- |",
+        ])
+        for k, v in inflight_rows:
+            lines.append(f"| `{k}` | {v.peak_inflight_mb:.2f} | {format_rss_cell(v)} |")
+
+    if rss_ceiling_mib is not None:
+        peak_mb, rss_failures = check_rss_ceiling(awan, rss_ceiling_mib)
+        verdict = "NOT MEASURED" if peak_mb is None else ("OVER THE CEILING" if rss_failures else "ok")
+        a_cell = "not measured" if peak_mb is None else f"{peak_mb:.1f}"
+        m_cell = f"{m_max_rss:.1f}" if m_max_rss > 0 else "not measured"
+        lines.extend([
+            "",
+            "## Peak RSS Ceiling Check",
+            "",
+            "| Server | Median Peak RSS (MiB) | Ceiling (MiB) | Verdict |",
+            "| :--- | :--- | :--- | :--- |",
+            f"| AwanFS | {a_cell} | {float(rss_ceiling_mib):.1f} | {verdict} |",
+            f"| MinIO | {m_cell} | - | - |",
+        ])
 
     return "\n".join(lines) + "\n"
 
@@ -1156,16 +1281,285 @@ def find_rustfs_binary() -> Optional[str]:
     return next((p for p in candidates if p and os.path.isfile(p)), None)
 
 
+def wait_for_port(host: str, port: int, attempts: int = 50, delay_s: float = 0.1) -> None:
+    for _ in range(attempts):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.2)
+                s.connect((host, port))
+                return
+        except Exception:
+            time.sleep(delay_s)
+
+
+def run_server_suite(
+    label: str,
+    host: str,
+    port: int,
+    bucket: str,
+    server_pid: Optional[int],
+    sizes: str,
+    concurrent: int,
+    dur_sec: float,
+    mpu_1m_spec_limit: bool = False,
+    fallback_mpu_1g: bool = False,
+    record_inflight: bool = False,
+    large_key: str = "large_1gib.dat",
+) -> Tuple[Dict[str, BenchmarkMetrics], Dict[int, BenchmarkMetrics]]:
+    """Runs the standard Warp matrix against one live server instance."""
+    results: Dict[str, BenchmarkMetrics] = {}
+    conc_results: Dict[int, BenchmarkMetrics] = {}
+    sweep_dur = 1.0 if fallback_mpu_1g else 1.5
+
+    def record(key: str, m: BenchmarkMetrics) -> None:
+        if record_inflight:
+            m.peak_inflight_mb = get_awanfs_peak_inflight_mb(host, port)
+        results[key] = m
+
+    print(f"  [1/10] {label}: Running 64 KiB PUT phase ({dur_sec}s, {concurrent} workers)...")
+    record("put_64k", run_workload_phase(host, port, bucket, 64 * 1024, concurrent, dur_sec, "put", server_pid))
+
+    print(f"  [2/10] {label}: Running 64 KiB GET phase ({dur_sec}s, {concurrent} workers)...")
+    record("get_64k", run_workload_phase(host, port, bucket, 64 * 1024, concurrent, dur_sec, "get", server_pid))
+
+    print(f"  [3/10] {label}: Running 64 KiB Range GET (bytes=0-4095, 206 Partial Content) phase ({dur_sec}s, {concurrent} workers)...")
+    record("range_get_4k", run_workload_phase(host, port, bucket, 64 * 1024, concurrent, dur_sec, "range_get_4k", server_pid))
+
+    print(f"  [4/10] {label}: Running 1 MiB PUT phase ({dur_sec}s, {min(concurrent, 32)} workers)...")
+    record("put_1m", run_workload_phase(host, port, bucket, 1024 * 1024, min(concurrent, 32), dur_sec, "put", server_pid))
+
+    print(f"  [5/10] {label}: Running 1 MiB GET phase ({dur_sec}s, {min(concurrent, 32)} workers)...")
+    record("get_1m", run_workload_phase(host, port, bucket, 1024 * 1024, min(concurrent, 32), dur_sec, "get", server_pid))
+
+    if mpu_1m_spec_limit:
+        print(f"  [6/10] {label}: 1 MiB Multipart Upload (4 x 256 KiB parts) -> EntityTooSmall (S3 >=5MiB spec constraint)...")
+        rss = get_process_peak_rss_mb(server_pid) if server_pid else 0.0
+        record("mpu_1m", BenchmarkMetrics(0, 0, 0, 0, 0, 0, rss, measured=True))
+    else:
+        print(f"  [6/10] {label}: Running 1 MiB S3 Multipart Upload (4 x 256 KiB parts + CompleteMultipartUpload) phase ({dur_sec}s, 16 workers)...")
+        record("mpu_1m", run_multipart_upload_duration_phase(host, port, bucket, 256 * 1024, 4, 16, dur_sec, server_pid))
+
+    print(f"  {label}: Running 64 KiB Mixed (80% GET / 20% PUT) phase ({dur_sec}s, {concurrent} workers)...")
+    record("mixed_64k", run_workload_phase(host, port, bucket, 64 * 1024, concurrent, dur_sec, "mixed", server_pid))
+
+    print(f"  {label}: Running 1 MiB Mixed (80% GET / 20% PUT) phase ({dur_sec}s, {min(concurrent, 32)} workers)...")
+    record("mixed_1m", run_workload_phase(host, port, bucket, 1024 * 1024, min(concurrent, 32), dur_sec, "mixed", server_pid))
+
+    print(f"  {label}: Running Concurrency Scaling Sweep (64 KiB Mixed 80/20, C in [8, 32, 64, 128])...")
+    for c in [8, 32, 64, 128]:
+        conc_results[c] = run_workload_phase(host, port, bucket, 64 * 1024, c, sweep_dur, "mixed", server_pid)
+
+    if "1GiB" in sizes or "10GiB" in sizes:
+        part_sz = 64 * 1024 * 1024
+        if fallback_mpu_1g:
+            record("mpu_put_1g", run_fixed_volume_phase(host, port, bucket, 1024 * 1024 * 1024, part_sz, 8, "put", server_pid, key_modulus=4))
+            record("mpu_get_1g", run_fixed_volume_phase(host, port, bucket, 1024 * 1024 * 1024, part_sz, 8, "get", server_pid, key_modulus=4))
+        else:
+            print(f"  [7/10] & [8/10] {label}: Running 1 GiB Multipart Upload (16 x 64 MiB parts) & Range GET (8 workers)...")
+            mpu_put_1g, mpu_get_1g = run_large_multipart_object_phase(
+                host, port, bucket, large_key, 1024 * 1024 * 1024, part_sz, 8, server_pid
+            )
+            record("mpu_put_1g", mpu_put_1g)
+            record("mpu_get_1g", mpu_get_1g)
+
+        print(f"  [9/10] {label}: Running 10 GiB Volume PUT phase (160 x 64 MiB chunks, 8 workers)...")
+        record("put_10g", run_fixed_volume_phase(host, port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "put", server_pid, key_modulus=4))
+
+        print(f"  [10/10] {label}: Running 10 GiB Volume Parallel Range GET phase (160 x 64 MiB chunks, 8 workers)...")
+        record("get_10g", run_fixed_volume_phase(host, port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "get", server_pid, key_modulus=4))
+
+    return results, conc_results
+
+
+def run_awanfs_round(server_bin: str, args, dur_sec: float) -> Tuple[Dict[str, BenchmarkMetrics], Dict[int, BenchmarkMetrics]]:
+    host = "127.0.0.1"
+    bucket = "warp-bench-bucket"
+    s3_data_dir = tempfile.mkdtemp(prefix="s3_server_bench_")
+    port = get_free_port()
+    server_log = os.path.join(tempfile.gettempdir(), f"awanfs_bench_{port}.log")
+    server_proc = start_logged(
+        [server_bin, "--port", str(port), "--data-dir", s3_data_dir, "--allow-anonymous"],
+        server_log,
+    )
+    print(f"AwanFS log: {server_log}", flush=True)
+    set_affinity_mask(server_proc.pid, 0x0F)
+    wait_for_port(host, port)
+    time.sleep(0.5)
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=5.0)
+        conn.request("PUT", f"/{bucket}")
+        conn.getresponse().read()
+        conn.close()
+        print(f"Executing HTTP/1.1 keep-alive Warp benchmark against S3 Storage Server (--release) on {host}:{port}...")
+        return run_server_suite(
+            "AwanFS",
+            host,
+            port,
+            bucket,
+            server_proc.pid,
+            args.sizes,
+            args.concurrent,
+            dur_sec,
+            record_inflight=True,
+            large_key="large_1gib_model.safetensors",
+        )
+    finally:
+        server_proc.terminate()
+        server_proc.wait()
+        shutil.rmtree(s3_data_dir, ignore_errors=True)
+        time.sleep(2.5)
+
+
+def run_minio_or_fallback_round(
+    minio_bin: Optional[str],
+    mc_bin: Optional[str],
+    args,
+    dur_sec: float,
+) -> Tuple[Dict[str, BenchmarkMetrics], Dict[int, BenchmarkMetrics], str, str]:
+    host = "127.0.0.1"
+    bucket = "warp-bench-bucket"
+    if minio_bin and mc_bin:
+        baseline_server_label = "MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z)"
+        print(f"Executing identical workload against real MinIO ({minio_bin})...")
+        minio_data_dir = tempfile.mkdtemp(prefix="minio_warp_data_")
+        minio_port = get_free_port()
+        minio_console_port = get_free_port()
+        minio_env = os.environ.copy()
+        minio_env["MINIO_ROOT_USER"] = "minioadmin"
+        minio_env["MINIO_ROOT_PASSWORD"] = "minioadmin"
+        minio_env["MINIO_UPDATE"] = "off"
+        minio_env["MINIO_BROWSER"] = "off"
+        minio_proc = subprocess.Popen(
+            [minio_bin, "server", minio_data_dir, "--address", f":{minio_port}", "--console-address", f":{minio_console_port}"],
+            env=minio_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        set_affinity_mask(minio_proc.pid, 0x0F)
+        wait_for_port(host, minio_port)
+        time.sleep(0.5)
+        try:
+            alias_name = f"minio_bench_{minio_port}"
+            subprocess.run([mc_bin, "alias", "set", alias_name, f"http://127.0.0.1:{minio_port}", "minioadmin", "minioadmin"], capture_output=True)
+            subprocess.run([mc_bin, "mb", f"{alias_name}/{bucket}"], capture_output=True)
+            subprocess.run([mc_bin, "anonymous", "set", "public", f"{alias_name}/{bucket}"], capture_output=True)
+            minio_status = f"Measured Live ({binary_version(minio_bin)})"
+            if not anonymous_put_ok(host, minio_port, bucket):
+                minio_status += "; WARNING: anonymous PUT probe failed, so its rows are not valid"
+            res, conc = run_server_suite(
+                "MinIO",
+                host,
+                minio_port,
+                bucket,
+                minio_proc.pid,
+                args.sizes,
+                args.concurrent,
+                dur_sec,
+                mpu_1m_spec_limit=True,
+                large_key="large_1gib_minio.dat",
+            )
+            return res, conc, baseline_server_label, minio_status
+        finally:
+            minio_proc.terminate()
+            minio_proc.wait()
+            shutil.rmtree(minio_data_dir, ignore_errors=True)
+            time.sleep(2.0)
+
+    baseline_server_label = "File-per-Object + `.meta` Sidecar Baseline (Local Measured)"
+    baseline_dir = tempfile.mkdtemp(prefix="baseline_s3_fs_")
+    BaselineFileS3Handler.storage_root = baseline_dir
+    base_port = get_free_port()
+    base_httpd = ThreadedHTTPServer(("127.0.0.1", base_port), BaselineFileS3Handler)
+    base_thread = threading.Thread(target=base_httpd.serve_forever, daemon=True)
+    base_thread.start()
+    try:
+        print(f"Executing fallback workload against File-per-Object + Sidecar `.meta` Baseline Server on 127.0.0.1:{base_port}...")
+        res, conc = run_server_suite(
+            "Fallback",
+            host,
+            base_port,
+            bucket,
+            os.getpid(),
+            args.sizes,
+            args.concurrent,
+            min(dur_sec, 2.5),
+            fallback_mpu_1g=True,
+        )
+        return res, conc, baseline_server_label, "not measured"
+    finally:
+        base_httpd.shutdown()
+        base_httpd.server_close()
+        shutil.rmtree(baseline_dir, ignore_errors=True)
+
+
+def run_rustfs_round(
+    rustfs_bin: str,
+    mc_bin: str,
+    args,
+    dur_sec: float,
+) -> Tuple[Dict[str, BenchmarkMetrics], Dict[int, BenchmarkMetrics], str]:
+    host = "127.0.0.1"
+    bucket = "warp-bench-bucket"
+    print(f"Executing identical workload against real RustFS ({rustfs_bin})...")
+    rustfs_data_dir = tempfile.mkdtemp(prefix="rustfs_warp_data_")
+    rustfs_port = get_free_port()
+    rustfs_env = os.environ.copy()
+    rustfs_env["RUSTFS_ACCESS_KEY"] = "rustfsadmin"
+    rustfs_env["RUSTFS_SECRET_KEY"] = "rustfsadmin"
+    rustfs_proc = subprocess.Popen(
+        [rustfs_bin, "server", "--address", f"127.0.0.1:{rustfs_port}", "--access-key", "rustfsadmin", "--secret-key", "rustfsadmin", rustfs_data_dir],
+        env=rustfs_env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    set_affinity_mask(rustfs_proc.pid, 0x0F)
+    wait_for_port(host, rustfs_port)
+    time.sleep(0.8)
+    try:
+        alias_name = f"rustfs_bench_{rustfs_port}"
+        subprocess.run([mc_bin, "alias", "set", alias_name, f"http://127.0.0.1:{rustfs_port}", "rustfsadmin", "rustfsadmin"], capture_output=True)
+        subprocess.run([mc_bin, "mb", f"{alias_name}/{bucket}"], capture_output=True)
+        subprocess.run([mc_bin, "anonymous", "set", "public", f"{alias_name}/{bucket}"], capture_output=True)
+        rustfs_status = f"Measured Live ({binary_version(rustfs_bin)})"
+        if not anonymous_put_ok(host, rustfs_port, bucket):
+            rustfs_status += "; WARNING: anonymous PUT probe failed, so its rows are not valid"
+        res, conc = run_server_suite(
+            "RustFS",
+            host,
+            rustfs_port,
+            bucket,
+            rustfs_proc.pid,
+            args.sizes,
+            args.concurrent,
+            dur_sec,
+            mpu_1m_spec_limit=True,
+            large_key="large_1gib_rustfs.dat",
+        )
+        return res, conc, rustfs_status
+    finally:
+        rustfs_proc.terminate()
+        rustfs_proc.wait()
+        shutil.rmtree(rustfs_data_dir, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Head-to-head S3 Warp Benchmark")
     parser.add_argument("--sizes", type=str, default="64KiB,1MiB,1GiB,10GiB", help="Payload sizes")
     parser.add_argument("--concurrent", type=int, default=64, help="Client concurrency")
     parser.add_argument("--duration", type=str, default="3s", help="Duration per phase (e.g. 3s or 5s)")
+    parser.add_argument("--runs", type=int, default=1, help="Number of rounds per server (reports median and min..max RSS spread)")
+    parser.add_argument("--rss-ceiling-mib", type=float, default=None, help="Fail if AwanFS median peak RSS exceeds this ceiling (MiB)")
     parser.add_argument("--output", type=str, default="measurements/s3_warp_minio_vs_awan.md", help="Report path")
     args = parser.parse_args()
 
+    if args.runs < 1:
+        parser.error("--runs must be >= 1")
+
     dur_sec = float(args.duration.rstrip("s"))
-    cmd = f"python benchmarks/run_warp_benchmark.py --sizes {args.sizes} --concurrent {args.concurrent} --duration {args.duration} --output {args.output}"
+    cmd = f"python benchmarks/run_warp_benchmark.py --sizes {args.sizes} --concurrent {args.concurrent} --duration {args.duration} --runs {args.runs}"
+    if args.rss_ceiling_mib is not None:
+        cmd += f" --rss-ceiling-mib {args.rss_ceiling_mib}"
+    cmd += f" --output {args.output}"
 
     # Pin benchmark client to cores 4..7 (mask 0xF0)
     set_affinity_mask(None, 0xF0)
@@ -1183,297 +1577,47 @@ def main():
         (os.path.join(os.path.dirname(__file__), "..", "server", "target", "release", "s3-server.exe" if sys.platform == "win32" else "s3-server") if os.path.exists(os.path.join(os.path.dirname(__file__), "..", "server", "Cargo.toml")) else os.path.join(os.path.dirname(__file__), "..", "..", "awan-storage", "server", "target", "release", "s3-server.exe" if sys.platform == "win32" else "s3-server"))
     )
 
-    rust_results: Dict[str, BenchmarkMetrics] = {}
-    concurrency_data: Dict[str, Dict[int, BenchmarkMetrics]] = {"s3-server": {}, "minio": {}, "rustfs": {}}
-
-    # Measure S3 Storage Server with Columnar SoA Metadata Index and Needle Volume
-    s3_data_dir = tempfile.mkdtemp(prefix="s3_server_bench_")
-    port = get_free_port()
-    server_log = os.path.join(tempfile.gettempdir(), f"awanfs_bench_{port}.log")
-    server_proc = start_logged(
-        [server_bin, "--port", str(port), "--data-dir", s3_data_dir, "--allow-anonymous"],
-        server_log,
-    )
-    print(f"AwanFS log: {server_log}", flush=True)
-    set_affinity_mask(server_proc.pid, 0x0F)
-    time.sleep(0.8)
-
-    host = "127.0.0.1"
-    bucket = "warp-bench-bucket"
-
-    # Create benchmark bucket
-    conn = http.client.HTTPConnection(host, port, timeout=5.0)
-    conn.request("PUT", f"/{bucket}")
-    conn.getresponse().read()
-    conn.close()
-
-    awan_results: Dict[str, BenchmarkMetrics] = {}
-    print(f"Executing HTTP/1.1 keep-alive Warp benchmark against S3 Storage Server (--release) on {host}:{port}...")
-
-    print(f"  [1/10] Running 64 KiB PUT phase ({dur_sec}s, {args.concurrent} workers)...")
-    awan_results["put_64k"] = run_workload_phase(host, port, bucket, 64 * 1024, args.concurrent, dur_sec, "put", server_proc.pid)
-
-    print(f"  [2/10] Running 64 KiB GET phase ({dur_sec}s, {args.concurrent} workers)...")
-    awan_results["get_64k"] = run_workload_phase(host, port, bucket, 64 * 1024, args.concurrent, dur_sec, "get", server_proc.pid)
-
-    print(f"  [3/10] Running 64 KiB Range GET (bytes=0-4095, 206 Partial Content) phase ({dur_sec}s, {args.concurrent} workers)...")
-    awan_results["range_get_4k"] = run_workload_phase(host, port, bucket, 64 * 1024, args.concurrent, dur_sec, "range_get_4k", server_proc.pid)
-
-    print(f"  [4/10] Running 1 MiB PUT phase ({dur_sec}s, {min(args.concurrent, 32)} workers)...")
-    awan_results["put_1m"] = run_workload_phase(host, port, bucket, 1024 * 1024, min(args.concurrent, 32), dur_sec, "put", server_proc.pid)
-
-    print(f"  [5/10] Running 1 MiB GET phase ({dur_sec}s, {min(args.concurrent, 32)} workers)...")
-    awan_results["get_1m"] = run_workload_phase(host, port, bucket, 1024 * 1024, min(args.concurrent, 32), dur_sec, "get", server_proc.pid)
-
-    print(f"  [6/10] Running 1 MiB S3 Multipart Upload (4 x 256 KiB parts + CompleteMultipartUpload) phase ({dur_sec}s, 16 workers)...")
-    awan_results["mpu_1m"] = run_multipart_upload_duration_phase(host, port, bucket, 256 * 1024, 4, 16, dur_sec, server_proc.pid)
-
-    print(f"  Running 64 KiB Mixed (80% GET / 20% PUT) phase ({dur_sec}s, {args.concurrent} workers)...")
-    awan_results["mixed_64k"] = run_workload_phase(host, port, bucket, 64 * 1024, args.concurrent, dur_sec, "mixed", server_proc.pid)
-
-    print(f"  Running 1 MiB Mixed (80% GET / 20% PUT) phase ({dur_sec}s, {min(args.concurrent, 32)} workers)...")
-    awan_results["mixed_1m"] = run_workload_phase(host, port, bucket, 1024 * 1024, min(args.concurrent, 32), dur_sec, "mixed", server_proc.pid)
-
-    print("  Running Concurrency Scaling Sweep (64 KiB Mixed 80/20, C in [8, 32, 64, 128])...")
-    for c in [8, 32, 64, 128]:
-        concurrency_data["s3-server"][c] = run_workload_phase(host, port, bucket, 64 * 1024, c, 1.5, "mixed", server_proc.pid)
-
-    if "1GiB" in args.sizes or "10GiB" in args.sizes:
-        part_sz = 64 * 1024 * 1024  # 64 MiB S3 multipart chunks
-        print("  [7/10] & [8/10] Running 1 GiB S3 Multipart Upload (16 x 64 MiB parts) & Parallel RFC 9110 Range GET (8 workers)...")
-        mpu_put_1g, mpu_get_1g = run_large_multipart_object_phase(
-            host, port, bucket, "large_1gib_model.safetensors", 1024 * 1024 * 1024, part_sz, 8, server_proc.pid
-        )
-        awan_results["mpu_put_1g"] = mpu_put_1g
-        awan_results["mpu_get_1g"] = mpu_get_1g
-
-        print("  [9/10] Running 10 GiB Volume PUT phase (160 x 64 MiB chunks, 8 workers)...")
-        awan_results["put_10g"] = run_fixed_volume_phase(host, port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "put", server_proc.pid, key_modulus=4)
-
-        print("  [10/10] Running 10 GiB Volume Parallel Range GET phase (160 x 64 MiB chunks, 8 workers)...")
-        awan_results["get_10g"] = run_fixed_volume_phase(host, port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "get", server_proc.pid, key_modulus=4)
-
-    server_proc.terminate()
-    server_proc.wait()
-    shutil.rmtree(s3_data_dir, ignore_errors=True)
-    time.sleep(2.5)
-
-    # Discover real MinIO binary or fall back to local reference baseline
     minio_bin, mc_bin = find_minio_binaries()
-    baseline_results: Dict[str, BenchmarkMetrics] = {}
+    rustfs_bin = find_rustfs_binary()
+
+    awan_rounds: List[Dict[str, BenchmarkMetrics]] = []
+    baseline_rounds: List[Dict[str, BenchmarkMetrics]] = []
+    rustfs_rounds: List[Dict[str, BenchmarkMetrics]] = []
+    awan_conc_rounds: List[Dict[int, BenchmarkMetrics]] = []
+    minio_conc_rounds: List[Dict[int, BenchmarkMetrics]] = []
+    rustfs_conc_rounds: List[Dict[int, BenchmarkMetrics]] = []
+
     baseline_server_label = "MinIO Community Server (Official Go binary: minio.exe RELEASE.2025-09-07T16-13-09Z)"
     minio_status = "not measured"
-
-    if minio_bin and mc_bin:
-        print(f"Executing identical workload against real MinIO ({minio_bin})...")
-        minio_data_dir = tempfile.mkdtemp(prefix="minio_warp_data_")
-        minio_port = get_free_port()
-        minio_console_port = get_free_port()
-
-        minio_env = os.environ.copy()
-        minio_env["MINIO_ROOT_USER"] = "minioadmin"
-        minio_env["MINIO_ROOT_PASSWORD"] = "minioadmin"
-        minio_env["MINIO_UPDATE"] = "off"
-        minio_env["MINIO_BROWSER"] = "off"
-
-        minio_proc = subprocess.Popen(
-            [minio_bin, "server", minio_data_dir, "--address", f":{minio_port}", "--console-address", f":{minio_console_port}"],
-            env=minio_env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        set_affinity_mask(minio_proc.pid, 0x0F)
-
-        # Wait for MinIO to start listening
-        for _ in range(50):
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(0.2)
-                    s.connect(("127.0.0.1", minio_port))
-                    break
-            except Exception:
-                time.sleep(0.1)
-        time.sleep(0.5)
-
-        alias_name = f"minio_bench_{minio_port}"
-        subprocess.run([mc_bin, "alias", "set", alias_name, f"http://127.0.0.1:{minio_port}", "minioadmin", "minioadmin"], capture_output=True)
-        subprocess.run([mc_bin, "mb", f"{alias_name}/{bucket}"], capture_output=True)
-        subprocess.run([mc_bin, "anonymous", "set", "public", f"{alias_name}/{bucket}"], capture_output=True)
-
-        minio_status = f"Measured Live ({binary_version(minio_bin)})"
-        if not anonymous_put_ok(host, minio_port, bucket):
-            minio_status += "; WARNING: anonymous PUT probe failed, so its rows are not valid"
-
-        print(f"  [1/10] MinIO: Running 64 KiB PUT phase ({dur_sec}s, {args.concurrent} workers)...")
-        baseline_results["put_64k"] = run_workload_phase(host, minio_port, bucket, 64 * 1024, args.concurrent, dur_sec, "put", minio_proc.pid)
-
-        print(f"  [2/10] MinIO: Running 64 KiB GET phase ({dur_sec}s, {args.concurrent} workers)...")
-        baseline_results["get_64k"] = run_workload_phase(host, minio_port, bucket, 64 * 1024, args.concurrent, dur_sec, "get", minio_proc.pid)
-
-        print(f"  [3/10] MinIO: Running 64 KiB Range GET phase ({dur_sec}s, {args.concurrent} workers)...")
-        baseline_results["range_get_4k"] = run_workload_phase(host, minio_port, bucket, 64 * 1024, args.concurrent, dur_sec, "range_get_4k", minio_proc.pid)
-
-        print(f"  [4/10] MinIO: Running 1 MiB PUT phase ({dur_sec}s, {min(args.concurrent, 32)} workers)...")
-        baseline_results["put_1m"] = run_workload_phase(host, minio_port, bucket, 1024 * 1024, min(args.concurrent, 32), dur_sec, "put", minio_proc.pid)
-
-        print(f"  [5/10] MinIO: Running 1 MiB GET phase ({dur_sec}s, {min(args.concurrent, 32)} workers)...")
-        baseline_results["get_1m"] = run_workload_phase(host, minio_port, bucket, 1024 * 1024, min(args.concurrent, 32), dur_sec, "get", minio_proc.pid)
-
-        # 1 MiB MPU: MinIO strictly rejects parts < 5 MiB per S3 RFC spec with EntityTooSmall
-        print(f"  [6/10] MinIO: 1 MiB Multipart Upload (4 x 256 KiB parts) -> EntityTooSmall (S3 >=5MiB spec constraint)...")
-        baseline_results["mpu_1m"] = BenchmarkMetrics(0, 0, 0, 0, 0, 0, get_process_peak_rss_mb(minio_proc.pid), measured=True)
-
-        print(f"  MinIO: Running 64 KiB Mixed (80% GET / 20% PUT) phase ({dur_sec}s, {args.concurrent} workers)...")
-        baseline_results["mixed_64k"] = run_workload_phase(host, minio_port, bucket, 64 * 1024, args.concurrent, dur_sec, "mixed", minio_proc.pid)
-
-        print(f"  MinIO: Running 1 MiB Mixed (80% GET / 20% PUT) phase ({dur_sec}s, {min(args.concurrent, 32)} workers)...")
-        baseline_results["mixed_1m"] = run_workload_phase(host, minio_port, bucket, 1024 * 1024, min(args.concurrent, 32), dur_sec, "mixed", minio_proc.pid)
-
-        print("  MinIO: Running Concurrency Scaling Sweep (64 KiB Mixed 80/20, C in [8, 32, 64, 128])...")
-        for c in [8, 32, 64, 128]:
-            concurrency_data["minio"][c] = run_workload_phase(host, minio_port, bucket, 64 * 1024, c, 1.5, "mixed", minio_proc.pid)
-
-        if "1GiB" in args.sizes or "10GiB" in args.sizes:
-            part_sz = 64 * 1024 * 1024
-            print("  [7/10] & [8/10] MinIO: Running 1 GiB Multipart Upload (16 x 64 MiB parts) & Range GET (8 workers)...")
-            mpu_put_1g, mpu_get_1g = run_large_multipart_object_phase(
-                host, minio_port, bucket, "large_1gib_minio.dat", 1024 * 1024 * 1024, part_sz, 8, minio_proc.pid
-            )
-            baseline_results["mpu_put_1g"] = mpu_put_1g
-            baseline_results["mpu_get_1g"] = mpu_get_1g
-
-            print("  [9/10] MinIO: Running 10 GiB Volume PUT phase (160 x 64 MiB chunks, 8 workers)...")
-            baseline_results["put_10g"] = run_fixed_volume_phase(host, minio_port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "put", minio_proc.pid, key_modulus=4)
-
-            print("  [10/10] MinIO: Running 10 GiB Volume Parallel Range GET phase (160 x 64 MiB chunks, 8 workers)...")
-            baseline_results["get_10g"] = run_fixed_volume_phase(host, minio_port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "get", minio_proc.pid, key_modulus=4)
-
-        minio_proc.terminate()
-        minio_proc.wait()
-        shutil.rmtree(minio_data_dir, ignore_errors=True)
-        time.sleep(2.0)
-    else:
-        # Measure the local File-per-Object + .meta HTTP baseline fallback
-        baseline_server_label = "File-per-Object + `.meta` Sidecar Baseline (Local Measured)"
-        baseline_dir = tempfile.mkdtemp(prefix="baseline_s3_fs_")
-        BaselineFileS3Handler.storage_root = baseline_dir
-        base_port = get_free_port()
-        base_httpd = ThreadedHTTPServer(("127.0.0.1", base_port), BaselineFileS3Handler)
-        base_thread = threading.Thread(target=base_httpd.serve_forever, daemon=True)
-        base_thread.start()
-
-        print(f"Executing fallback workload against File-per-Object + Sidecar `.meta` Baseline Server on 127.0.0.1:{base_port}...")
-        baseline_results["put_64k"] = run_workload_phase(host, base_port, bucket, 64 * 1024, args.concurrent, min(dur_sec, 2.5), "put", os.getpid())
-        baseline_results["get_64k"] = run_workload_phase(host, base_port, bucket, 64 * 1024, args.concurrent, min(dur_sec, 2.5), "get", os.getpid())
-        baseline_results["range_get_4k"] = run_workload_phase(host, base_port, bucket, 64 * 1024, args.concurrent, min(dur_sec, 2.5), "range_get_4k", os.getpid())
-        baseline_results["put_1m"] = run_workload_phase(host, base_port, bucket, 1024 * 1024, min(args.concurrent, 32), min(dur_sec, 2.5), "put", os.getpid())
-        baseline_results["get_1m"] = run_workload_phase(host, base_port, bucket, 1024 * 1024, min(args.concurrent, 32), min(dur_sec, 2.5), "get", os.getpid())
-        baseline_results["mpu_1m"] = run_multipart_upload_duration_phase(host, base_port, bucket, 256 * 1024, 4, 16, min(dur_sec, 2.5), os.getpid())
-        baseline_results["mixed_64k"] = run_workload_phase(host, base_port, bucket, 64 * 1024, args.concurrent, min(dur_sec, 2.5), "mixed", os.getpid())
-        baseline_results["mixed_1m"] = run_workload_phase(host, base_port, bucket, 1024 * 1024, min(args.concurrent, 32), min(dur_sec, 2.5), "mixed", os.getpid())
-        for c in [8, 32, 64, 128]:
-            concurrency_data["minio"][c] = run_workload_phase(host, base_port, bucket, 64 * 1024, c, 1.0, "mixed", os.getpid())
-
-        if "1GiB" in args.sizes or "10GiB" in args.sizes:
-            part_sz = 64 * 1024 * 1024
-            baseline_results["mpu_put_1g"] = run_fixed_volume_phase(host, base_port, bucket, 1024 * 1024 * 1024, part_sz, 8, "put", os.getpid(), key_modulus=4)
-            baseline_results["mpu_get_1g"] = run_fixed_volume_phase(host, base_port, bucket, 1024 * 1024 * 1024, part_sz, 8, "get", os.getpid(), key_modulus=4)
-            baseline_results["put_10g"] = run_fixed_volume_phase(host, base_port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "put", os.getpid(), key_modulus=4)
-            baseline_results["get_10g"] = run_fixed_volume_phase(host, base_port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "get", os.getpid(), key_modulus=4)
-
-        base_httpd.shutdown()
-        base_httpd.server_close()
-        shutil.rmtree(baseline_dir, ignore_errors=True)
-
-    # Discover and benchmark RustFS
-    rustfs_bin = find_rustfs_binary()
-    rustfs_results: Dict[str, BenchmarkMetrics] = {}
     rustfs_status = "not measured"
 
-    if rustfs_bin and mc_bin:
-        print(f"Executing identical workload against real RustFS ({rustfs_bin})...")
-        rustfs_data_dir = tempfile.mkdtemp(prefix="rustfs_warp_data_")
-        rustfs_port = get_free_port()
+    for r_idx in range(args.runs):
+        print(f"=== Benchmark round {r_idx + 1}/{args.runs} ===", flush=True)
+        order = ("awanfs", "minio") if r_idx % 2 == 0 else ("minio", "awanfs")
+        for target in order:
+            if target == "awanfs":
+                res, conc = run_awanfs_round(server_bin, args, dur_sec)
+                awan_rounds.append(res)
+                awan_conc_rounds.append(conc)
+            else:
+                res, conc, baseline_server_label, minio_status = run_minio_or_fallback_round(
+                    minio_bin, mc_bin, args, dur_sec
+                )
+                baseline_rounds.append(res)
+                minio_conc_rounds.append(conc)
+        if rustfs_bin and mc_bin:
+            res, conc, rustfs_status = run_rustfs_round(rustfs_bin, mc_bin, args, dur_sec)
+            rustfs_rounds.append(res)
+            rustfs_conc_rounds.append(conc)
 
-        rustfs_env = os.environ.copy()
-        rustfs_env["RUSTFS_ACCESS_KEY"] = "rustfsadmin"
-        rustfs_env["RUSTFS_SECRET_KEY"] = "rustfsadmin"
-
-        rustfs_proc = subprocess.Popen(
-            [rustfs_bin, "server", "--address", f"127.0.0.1:{rustfs_port}", "--access-key", "rustfsadmin", "--secret-key", "rustfsadmin", rustfs_data_dir],
-            env=rustfs_env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        set_affinity_mask(rustfs_proc.pid, 0x0F)
-
-        # Wait for RustFS to start listening
-        for _ in range(50):
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(0.2)
-                    s.connect(("127.0.0.1", rustfs_port))
-                    break
-            except Exception:
-                time.sleep(0.1)
-        time.sleep(0.8)
-
-        alias_name = f"rustfs_bench_{rustfs_port}"
-        subprocess.run([mc_bin, "alias", "set", alias_name, f"http://127.0.0.1:{rustfs_port}", "rustfsadmin", "rustfsadmin"], capture_output=True)
-        subprocess.run([mc_bin, "mb", f"{alias_name}/{bucket}"], capture_output=True)
-        subprocess.run([mc_bin, "anonymous", "set", "public", f"{alias_name}/{bucket}"], capture_output=True)
-
-        rustfs_status = f"Measured Live ({binary_version(rustfs_bin)})"
-        if not anonymous_put_ok(host, rustfs_port, bucket):
-            rustfs_status += "; WARNING: anonymous PUT probe failed, so its rows are not valid"
-
-        print(f"  [1/10] RustFS: Running 64 KiB PUT phase ({dur_sec}s, {args.concurrent} workers)...")
-        rustfs_results["put_64k"] = run_workload_phase(host, rustfs_port, bucket, 64 * 1024, args.concurrent, dur_sec, "put", rustfs_proc.pid)
-
-        print(f"  [2/10] RustFS: Running 64 KiB GET phase ({dur_sec}s, {args.concurrent} workers)...")
-        rustfs_results["get_64k"] = run_workload_phase(host, rustfs_port, bucket, 64 * 1024, args.concurrent, dur_sec, "get", rustfs_proc.pid)
-
-        print(f"  [3/10] RustFS: Running 64 KiB Range GET phase ({dur_sec}s, {args.concurrent} workers)...")
-        rustfs_results["range_get_4k"] = run_workload_phase(host, rustfs_port, bucket, 64 * 1024, args.concurrent, dur_sec, "range_get_4k", rustfs_proc.pid)
-
-        print(f"  [4/10] RustFS: Running 1 MiB PUT phase ({dur_sec}s, {min(args.concurrent, 32)} workers)...")
-        rustfs_results["put_1m"] = run_workload_phase(host, rustfs_port, bucket, 1024 * 1024, min(args.concurrent, 32), dur_sec, "put", rustfs_proc.pid)
-
-        print(f"  [5/10] RustFS: Running 1 MiB GET phase ({dur_sec}s, {min(args.concurrent, 32)} workers)...")
-        rustfs_results["get_1m"] = run_workload_phase(host, rustfs_port, bucket, 1024 * 1024, min(args.concurrent, 32), dur_sec, "get", rustfs_proc.pid)
-
-        # 1 MiB MPU: RustFS strictly rejects parts < 5 MiB per S3 RFC spec with EntityTooSmall
-        print(f"  [6/10] RustFS: 1 MiB Multipart Upload (4 x 256 KiB parts) -> EntityTooSmall (S3 >=5MiB spec constraint)...")
-        rustfs_results["mpu_1m"] = BenchmarkMetrics(0, 0, 0, 0, 0, 0, get_process_peak_rss_mb(rustfs_proc.pid), measured=True)
-
-        print(f"  RustFS: Running 64 KiB Mixed (80% GET / 20% PUT) phase ({dur_sec}s, {args.concurrent} workers)...")
-        rustfs_results["mixed_64k"] = run_workload_phase(host, rustfs_port, bucket, 64 * 1024, args.concurrent, dur_sec, "mixed", rustfs_proc.pid)
-
-        print(f"  RustFS: Running 1 MiB Mixed (80% GET / 20% PUT) phase ({dur_sec}s, {min(args.concurrent, 32)} workers)...")
-        rustfs_results["mixed_1m"] = run_workload_phase(host, rustfs_port, bucket, 1024 * 1024, min(args.concurrent, 32), dur_sec, "mixed", rustfs_proc.pid)
-
-        print("  RustFS: Running Concurrency Scaling Sweep (64 KiB Mixed 80/20, C in [8, 32, 64, 128])...")
-        for c in [8, 32, 64, 128]:
-            concurrency_data["rustfs"][c] = run_workload_phase(host, rustfs_port, bucket, 64 * 1024, c, 1.5, "mixed", rustfs_proc.pid)
-
-        if "1GiB" in args.sizes or "10GiB" in args.sizes:
-            part_sz = 64 * 1024 * 1024
-            print("  [7/10] & [8/10] RustFS: Running 1 GiB Multipart Upload (16 x 64 MiB parts) & Range GET (8 workers)...")
-            mpu_put_1g, mpu_get_1g = run_large_multipart_object_phase(
-                host, rustfs_port, bucket, "large_1gib_rustfs.dat", 1024 * 1024 * 1024, part_sz, 8, rustfs_proc.pid
-            )
-            rustfs_results["mpu_put_1g"] = mpu_put_1g
-            rustfs_results["mpu_get_1g"] = mpu_get_1g
-
-            print("  [9/10] RustFS: Running 10 GiB Volume PUT phase (160 x 64 MiB chunks, 8 workers)...")
-            rustfs_results["put_10g"] = run_fixed_volume_phase(host, rustfs_port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "put", rustfs_proc.pid, key_modulus=4)
-
-            print("  [10/10] RustFS: Running 10 GiB Volume Parallel Range GET phase (160 x 64 MiB chunks, 8 workers)...")
-            rustfs_results["get_10g"] = run_fixed_volume_phase(host, rustfs_port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "get", rustfs_proc.pid, key_modulus=4)
-
-        rustfs_proc.terminate()
-        rustfs_proc.wait()
-        shutil.rmtree(rustfs_data_dir, ignore_errors=True)
+    awan_results = aggregate_rounds(awan_rounds)
+    baseline_results = aggregate_rounds(baseline_rounds)
+    rustfs_results = aggregate_rounds(rustfs_rounds)
+    concurrency_data: Dict[str, Dict[int, BenchmarkMetrics]] = {
+        "s3-server": aggregate_rounds(awan_conc_rounds),
+        "minio": aggregate_rounds(minio_conc_rounds),
+        "rustfs": aggregate_rounds(rustfs_conc_rounds),
+    }
 
     pin_server, pin_client = affinity_labels()
     hw_info = {
@@ -1495,12 +1639,19 @@ def main():
         baseline_results,
         baseline_server_label=baseline_server_label,
         concurrency_data=concurrency_data,
+        runs=args.runs,
+        rss_ceiling_mib=args.rss_ceiling_mib,
     )
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(report)
 
     print(f"Benchmark finished successfully. Report generated at {args.output}")
+    _, rss_failures = check_rss_ceiling(awan_results, args.rss_ceiling_mib)
+    if rss_failures:
+        for msg in rss_failures:
+            print(f"FAIL: {msg}", file=sys.stderr, flush=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
