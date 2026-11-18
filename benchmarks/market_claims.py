@@ -1115,7 +1115,11 @@ def _extract_json_payload(raw_text: str) -> Optional[dict]:
             try:
                 obj, _ = decoder.raw_decode(raw_text, idx)
                 if isinstance(obj, dict) and (
-                    "operations" in obj or "total" in obj or "mixed_server_stats" in obj or "error" in obj
+                    "operations" in obj
+                    or "total" in obj
+                    or "mixed_server_stats" in obj
+                    or "by_op_type" in obj
+                    or "error" in obj
                 ):
                     return obj
             except json.JSONDecodeError:
@@ -1124,18 +1128,67 @@ def _extract_json_payload(raw_text: str) -> Optional[dict]:
 
 
 def parse_warp_json(raw_text: str, server_pid: Optional[int] = None) -> BenchmarkMetrics:
-    """Parses MinIO `warp --json` output (`aggregate.Aggregated` or summary JSON)."""
+    """Parses MinIO `warp --json` output (`v: 2` Realtime, `Aggregated`, or summary JSON)."""
     payload = _extract_json_payload(raw_text)
     if payload is None:
         return BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0, measured=False, note="invalid warp JSON")
 
     if payload.get("status") == "error" and isinstance(payload.get("error"), dict):
         msg = payload["error"].get("message") or "warp error"
+        cause = payload["error"].get("cause", {})
+        if isinstance(cause, dict) and cause.get("message"):
+            msg = f"{msg}: {cause['message']}"
         return BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0, measured=False, note=str(msg))
 
     rss = get_process_peak_rss_mb(server_pid) if server_pid else 0.0
 
-    # Real `minio/warp` `aggregate.Aggregated` schema: `operations` + optional `mixed_server_stats`.
+    # Real `minio/warp --json` (`v: 2` `aggregate.Realtime`): `total.throughput_by_host` + `requests_by_client`.
+    total_v2 = payload.get("total")
+    if isinstance(total_v2, dict) and (
+        "throughput_by_host" in total_v2 or "throughput_by_client" in total_v2 or "total_requests" in total_v2
+    ):
+        by_host = total_v2.get("throughput_by_host") or total_v2.get("throughput_by_client") or {}
+        dur_ms_vals = [
+            float(v.get("measure_duration_millis", 0) or 0)
+            for v in by_host.values()
+            if isinstance(v, dict)
+        ]
+        dur_s = (max(dur_ms_vals) / 1000.0) if dur_ms_vals and max(dur_ms_vals) > 0 else 0.0
+        total_bytes = sum(float(v.get("bytes", 0.0) or 0.0) for v in by_host.values() if isinstance(v, dict))
+        total_ops = sum(float(v.get("ops", 0) or 0) for v in by_host.values() if isinstance(v, dict))
+        errors = int(total_v2.get("total_errors", 0) or 0)
+        if total_ops == 0 and total_v2.get("total_requests", 0):
+            total_ops = float(total_v2.get("total_requests", 0) or 0)
+            total_bytes = float(total_v2.get("total_bytes", 0.0) or 0.0)
+
+        ops_per_sec = (total_ops / dur_s) if dur_s > 0 else 0.0
+        mib_per_sec = ((total_bytes / float(MIB)) / dur_s) if dur_s > 0 else 0.0
+
+        weight_sum = 0
+        p50_sum = p90_sum = p99_sum = 0.0
+        req_by_cli = total_v2.get("requests_by_client") or {}
+        if isinstance(req_by_cli, dict):
+            for entries in req_by_cli.values():
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    reqs = entry.get("single_sized_requests")
+                    if isinstance(reqs, dict) and reqs.get("requests", 0) > 0:
+                        w = int(reqs["requests"])
+                        weight_sum += w
+                        p50_sum += float(reqs.get("dur_median_millis", 0.0) or 0.0) * w
+                        p90_sum += float(reqs.get("dur_90_millis", 0.0) or 0.0) * w
+                        p99_sum += float(reqs.get("dur_99_millis", 0.0) or 0.0) * w
+        p50 = p50_sum / weight_sum if weight_sum > 0 else 0.0
+        p90 = p90_sum / weight_sum if weight_sum > 0 else 0.0
+        p99 = p99_sum / weight_sum if weight_sum > 0 else 0.0
+        measured = (errors == 0) and (ops_per_sec > 0 or mib_per_sec > 0)
+        note = f"{errors} warp errors" if errors > 0 else ""
+        return BenchmarkMetrics(ops_per_sec, mib_per_sec, p50, p90, p99, 0.0, rss, measured=measured, note=note)
+
+    # `minio/warp` `aggregate.Aggregated` schema: `operations` + optional `mixed_server_stats`.
     ops_list = payload.get("operations")
     if isinstance(ops_list, list) and ops_list:
         mixed_stats = payload.get("mixed_server_stats") if payload.get("mixed") else None

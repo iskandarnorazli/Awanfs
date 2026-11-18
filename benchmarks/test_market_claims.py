@@ -233,6 +233,42 @@ class TestWarpIntegration(unittest.TestCase):
         self.assertAlmostEqual(m_mix.p50_ms, 2.8, places=2)
         self.assertAlmostEqual(m_mix.p99_ms, 10.4, places=2)
 
+        # Real `minio/warp --json` v2 (`aggregate.Realtime`) JSON output
+        real_v2 = json.dumps({
+            "v": 2,
+            "final": True,
+            "total": {
+                "total_requests": 2000,
+                "total_errors": 0,
+                "total_bytes": 131072000,
+                "throughput": {"measure_duration_millis": 0, "bytes": 0, "ops": 0},
+                "throughput_by_host": {
+                    "http://127.0.0.1:9000": {
+                        "measure_duration_millis": 2000,
+                        "bytes": 131072000,
+                        "ops": 2000,
+                        "errors": 0,
+                    }
+                },
+                "requests_by_client": {
+                    "host-1": [{
+                        "single_sized_requests": {
+                            "dur_median_millis": 2.17,
+                            "dur_90_millis": 10.19,
+                            "dur_99_millis": 14.12,
+                            "requests": 2000,
+                        }
+                    }]
+                },
+            },
+        }, indent=2)
+        m_v2 = mc.parse_warp_json(real_v2)
+        self.assertTrue(m_v2.measured, m_v2.note)
+        self.assertAlmostEqual(m_v2.ops_per_sec, 1000.0, places=2)
+        self.assertAlmostEqual(m_v2.mib_per_sec, 62.5, places=2)
+        self.assertAlmostEqual(m_v2.p50_ms, 2.17, places=2)
+        self.assertAlmostEqual(m_v2.p99_ms, 14.12, places=2)
+
 
 class TestWorkloadsAgainstMockS3(unittest.TestCase):
     def setUp(self):
