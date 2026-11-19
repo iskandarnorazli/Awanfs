@@ -42,6 +42,11 @@ impl<F: VolFile> SegmentSet<F> {
         self.segs.len()
     }
 
+    /// The counters this set's block reads go to.
+    pub fn work(&self) -> Arc<WorkCounters> {
+        Arc::clone(&self.work)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.segs.is_empty()
     }

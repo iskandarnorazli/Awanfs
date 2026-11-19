@@ -21,8 +21,11 @@ trap 'rm -rf "$meta"' EXIT
 status=0
 for cfg in *.cfg; do
   name="${cfg%.cfg}"
-  out="$(java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -config "$cfg" -workers 1 -metadir "$meta/$name" ObjectVersions.tla 2>&1 || true)"
-  if [[ "$name" == fixed* ]]; then
+  # A configuration named manifest_* checks Manifest.tla (#26 stage 4); the others ObjectVersions.tla.
+  module=ObjectVersions; base="$name"
+  if [[ "$name" == manifest_* ]]; then module=Manifest; base="${name#manifest_}"; fi
+  out="$(java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -config "$cfg" -workers 1 -metadir "$meta/$name" "$module.tla" 2>&1 || true)"
+  if [[ "$base" == fixed* ]]; then
     if grep -q "No error has been found" <<<"$out"; then echo "ok    $name: the rule holds"; else echo "FAIL  $name: expected no error"; echo "$out" | tail -40; status=1; fi
   else
     inv="$(sed -n '1s/.*Must fail: \([A-Za-z]*\).*/\1/p' "$cfg")"
