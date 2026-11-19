@@ -14,7 +14,8 @@ on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
 
 jobs:
   s3tests:
@@ -63,6 +64,7 @@ jobs:
           python3 -m venv /tmp/venv
           /tmp/venv/bin/pip install -q -r /tmp/s3-tests/requirements.txt pytest-timeout
       - name: Run
+        id: run
         if: steps.changes.outputs.run == 'true'
         run: |
           cd /tmp/s3-tests
@@ -73,13 +75,16 @@ jobs:
             -p no:cacheprovider -q --timeout=60 --junitxml=/tmp/s3tests-headers-results.xml -o junit_family=xunit1 || true
           test -s /tmp/s3tests-headers-results.xml
       - name: Ratchet
+        id: ratchet
         if: steps.changes.outputs.run == 'true'
         run: python3 tests/s3tests/ratchet.py /tmp/s3tests-results.xml /tmp/s3tests-headers-results.xml tests/s3tests/passing.txt --report /tmp/s3tests-report.md
       - name: Conformance map (every test has an owner; CONFORMANCE_DESIGN.md)
+        id: map
         if: always() && steps.changes.outputs.run == 'true'
         run: |
           python3 tests/s3tests/test_conformance_map.py
           python3 tests/s3tests/test_ratchet.py
+          python3 tests/s3tests/test_nightly_map_pr.py
           python3 tests/s3tests/conformance_map.py /tmp/s3-tests/s3tests/functional/test_s3.py /tmp/s3-tests/s3tests/functional/test_headers.py tests/s3tests/passing.txt \
             --junit /tmp/s3tests-results.xml --junit /tmp/s3tests-headers-results.xml \
             --suite-ref "ceph/s3-tests $(git -C /tmp/s3-tests rev-parse --short HEAD), run $GITHUB_RUN_ID" \
@@ -106,3 +111,74 @@ jobs:
             /tmp/s3tests-report.md
             /tmp/CONFORMANCE_MAP.md
             /tmp/TRIAGE.md
+      - name: Compare conformance map counts
+        id: map_diff
+        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.changes.outputs.run == 'true' && steps.run.outcome == 'success' && steps.ratchet.outcome == 'success' && steps.map.outcome == 'success'
+        run: python3 tests/s3tests/nightly_map_diff.py tests/s3tests/CONFORMANCE_MAP.md /tmp/CONFORMANCE_MAP.md --github-output "$GITHUB_OUTPUT"
+      - name: Open or update conformance map PR
+        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.changes.outputs.run == 'true' && steps.run.outcome == 'success' && steps.ratchet.outcome == 'success' && steps.map.outcome == 'success' && steps.map_diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BRANCH="bot/conformance-map"
+          BASE="main"
+          if [ "$BRANCH" = "$BASE" ]; then
+            echo "Refusing to push to $BASE" >&2
+            exit 1
+          fi
+
+          git config user.name "Iskandar Norazli"
+          git config user.email "111472977+iskandarnorazli@users.noreply.github.com"
+
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            git fetch --unshallow --no-tags origin
+          fi
+          git fetch --no-tags origin "$BASE:refs/remotes/origin/$BASE"
+
+          git show "origin/$BASE:tests/s3tests/CONFORMANCE_MAP.md" > /tmp/main-CONFORMANCE_MAP.md
+          MAIN_DIFF="$(python3 tests/s3tests/nightly_map_diff.py /tmp/main-CONFORMANCE_MAP.md /tmp/CONFORMANCE_MAP.md)"
+          if printf '%s\n' "$MAIN_DIFF" | grep -q '^changed=false$'; then
+            echo "CONFORMANCE_MAP.md counts match origin/$BASE; no PR needed."
+            exit 0
+          fi
+
+          OPEN_PR="$(gh pr list --base "$BASE" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch --no-tags origin "$BRANCH:refs/remotes/origin/$BRANCH"
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+            if [ -n "$OPEN_PR" ]; then
+              BRANCH_DIFF="$(python3 tests/s3tests/nightly_map_diff.py tests/s3tests/CONFORMANCE_MAP.md /tmp/CONFORMANCE_MAP.md)"
+              if printf '%s\n' "$BRANCH_DIFF" | grep -q '^changed=false$'; then
+                echo "Open PR #$OPEN_PR on $BRANCH already has matching counts; no new commit needed."
+                exit 0
+              fi
+            fi
+            git merge --no-edit -X theirs "origin/$BASE"
+          else
+            git checkout -B "$BRANCH" "origin/$BASE"
+          fi
+
+          cp /tmp/CONFORMANCE_MAP.md tests/s3tests/CONFORMANCE_MAP.md
+
+          if ! git diff --quiet -- tests/s3tests/CONFORMANCE_MAP.md; then
+            git add -- tests/s3tests/CONFORMANCE_MAP.md
+            git commit -m "s3-tests: refresh CONFORMANCE_MAP.md (run $GITHUB_RUN_ID)"
+          fi
+
+          # Never force-push and never push to main.
+          git push origin "HEAD:refs/heads/$BRANCH"
+
+          BODY=$(printf "Updates \`tests/s3tests/CONFORMANCE_MAP.md\` from ceph s3-tests run %s.\n\n%s\n" \
+            "$GITHUB_RUN_ID" \
+            "$(sed -n '3,6p' /tmp/CONFORMANCE_MAP.md)")
+
+          if [ -n "$OPEN_PR" ]; then
+            gh pr edit "$OPEN_PR" --body "$BODY"
+            echo "Updated PR #$OPEN_PR on $BRANCH (run $GITHUB_RUN_ID)."
+          else
+            gh pr create --base "$BASE" --head "$BRANCH" \
+              --title "s3-tests: refresh CONFORMANCE_MAP.md (run $GITHUB_RUN_ID)" \
+              --body "$BODY"
+          fi
