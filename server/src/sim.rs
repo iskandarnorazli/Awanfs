@@ -7,7 +7,7 @@
 //!
 //! Used by tests only; the server binary never constructs it.
 
-use crate::vfile::{VolFile, VolFs};
+use crate::vfile::{FileKind, VolFile, VolFs};
 use memmap2::Mmap;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -193,6 +193,14 @@ impl VolFile for SimFile {
         Ok(())
     }
 
+    fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        self.write_aligned_at(offset, buf)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.read_aligned_at(offset, buf)
+    }
+
     fn len(&self) -> io::Result<u64> {
         Ok(self.state.lock().current.len() as u64)
     }
@@ -253,7 +261,7 @@ impl SimFs {
 impl VolFs for SimFs {
     type File = SimFile;
 
-    fn open(&self, path: &Path, create: bool) -> io::Result<Arc<SimFile>> {
+    fn open(&self, path: &Path, _kind: FileKind, create: bool) -> io::Result<Arc<SimFile>> {
         let mut files = self.files.lock();
         if let Some(f) = files.get(path) {
             return Ok(Arc::clone(f));
@@ -387,15 +395,15 @@ mod tests {
     #[test]
     fn a_crashed_fs_is_independent_of_the_old_handles() {
         let fs = SimFs::new();
-        let a = fs.open(Path::new("v/volume_0001.dat"), true).unwrap();
+        let a = fs.open(Path::new("v/volume_0001.dat"), FileKind::Data, true).unwrap();
         a.write_aligned_at(0, &sector(1)).unwrap();
         a.sync_data().unwrap();
         let after = fs.crashed(CrashMode::DropUnsynced, &mut SimRng::new(3));
         a.write_aligned_at(S as u64, &sector(2)).unwrap();
         a.sync_data().unwrap();
-        let b = after.open(Path::new("v/volume_0001.dat"), false).unwrap();
+        let b = after.open(Path::new("v/volume_0001.dat"), FileKind::Data, false).unwrap();
         assert_eq!(b.contents(), sector(1), "writes to the old handle do not reach the crashed copy");
-        assert!(after.open(Path::new("v/missing"), false).is_err());
+        assert!(after.open(Path::new("v/missing"), FileKind::Data, false).is_err());
         assert!(after.exists(Path::new("v/volume_0001.dat")));
     }
 }

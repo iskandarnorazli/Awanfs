@@ -205,9 +205,11 @@ as its ordering time and raising the next stamp above it, which reopens the cloc
 
 **Decision 67 (Claude, 2026-11-19, #213 and #26): a volume reaches its files only through a
 file seam, so a seeded simulation can crash and fail them.** `server/src/vfile.rs` defines
-`VolFile` (positioned write and read, length, resize, `sync_data`, sparse, and the read mapping
-where there is one) and `VolFs` (open, exists, remove). Production uses `AlignedFile` and `DiskFs`,
-unchanged in what they do. `server/src/sim.rs` implements both in memory: a `SimFile` keeps the
+`VolFile` (aligned and unaligned positioned writes and reads, length, resize, `sync_data`, sparse,
+and the read mapping where there is one) and `VolFs` (open a data file or a journal, exists,
+remove). Production uses `DiskFile` and `DiskFs`, which keep today's three handles per file: the
+write handle, a second open used only to sync (a Windows sync through the write handle stalls
+every writer), and a read-only handle for page-cache reads (#155). `server/src/sim.rs` implements both in memory: a `SimFile` keeps the
 bytes made durable by `sync_data` apart from the writes since, so a crash drops them, keeps a
 seeded prefix in write order, or tears the next one; faults (`EIO`, `ENOSPC`) are armed by name
 per operation. The volume code becomes generic over `VolFs` with `DiskFs` as the default (stage 1b),
