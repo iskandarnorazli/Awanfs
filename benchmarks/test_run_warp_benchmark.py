@@ -381,5 +381,248 @@ class AffinitySplittingTests(unittest.TestCase):
             self.assertEqual(cli16, "Cores 8..15 (Affinity Mask 0xFF00)")
 
 
+class LargeFixedVolumePhaseTests(unittest.TestCase):
+    """#261: fixed-volume phases must bound idle stalls, not total transfer time, and never swallow errors."""
+
+    def test_fixed_volume_phase_completes_when_total_exceeds_join_timeout_while_making_progress(self):
+        import threading
+        import time
+        from http.server import BaseHTTPRequestHandler
+        from unittest import mock
+        import run_warp_benchmark as r
+
+        class SlowPartHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_PUT(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(n)
+                time.sleep(0.25)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        srv = r.ThreadedHTTPServer(("127.0.0.1", 0), SlowPartHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            # 8 parts * 0.25s = ~2.0s total (> 0.8s join timeout), while each part completes in 0.25s (< 0.8s stall).
+            with mock.patch.object(r, "PHASE_JOIN_TIMEOUT_SEC", 0.8), \
+                 mock.patch.object(r.join_all, "__defaults__", (0.8,)):
+                m = r.run_fixed_volume_phase(
+                    "127.0.0.1", srv.server_address[1], "warp-bench-bucket",
+                    8192, 1024, 1, "put", server_pid=None, key_modulus=2,
+                )
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        self.assertTrue(m.measured, f"phase making steady progress should complete, got note={m.note!r}")
+        self.assertGreater(m.ops_per_sec, 0.0)
+        self.assertGreater(m.mib_per_sec, 0.0)
+
+    def test_fixed_volume_phase_records_errors_instead_of_swallowing(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler
+        import run_warp_benchmark as r
+
+        count_lock = threading.Lock()
+        seen = {"n": 0}
+
+        class FlakyHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_PUT(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(n)
+                with count_lock:
+                    seen["n"] += 1
+                    cur = seen["n"]
+                status = 500 if cur == 2 else 200
+                body = b"<Error/>" if status != 200 else b""
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+
+        srv = r.ThreadedHTTPServer(("127.0.0.1", 0), FlakyHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            m = r.run_fixed_volume_phase(
+                "127.0.0.1", srv.server_address[1], "warp-bench-bucket",
+                4096, 1024, 2, "put", server_pid=None, key_modulus=2,
+            )
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        self.assertFalse(m.measured, "a phase with HTTP 500 responses must not report measured=True")
+        self.assertIn("500", m.note, m.note)
+
+    def test_fixed_volume_phase_records_connection_exceptions_instead_of_swallowing(self):
+        import socket
+        import threading
+        from http.server import BaseHTTPRequestHandler
+        import run_warp_benchmark as r
+
+        count_lock = threading.Lock()
+        seen = {"n": 0}
+
+        class DropSecondHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_PUT(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(n)
+                with count_lock:
+                    seen["n"] += 1
+                    cur = seen["n"]
+                if cur == 2:
+                    self.close_connection = True
+                    try:
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    self.connection.close()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        srv = r.ThreadedHTTPServer(("127.0.0.1", 0), DropSecondHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            m = r.run_fixed_volume_phase(
+                "127.0.0.1", srv.server_address[1], "warp-bench-bucket",
+                4096, 1024, 2, "put", server_pid=None, key_modulus=2,
+            )
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        self.assertFalse(m.measured, "a phase with dropped connections must not report measured=True")
+        self.assertTrue(m.note, "expected error details in note")
+
+    def test_fixed_volume_phase_stops_when_stalled_with_no_progress(self):
+        import socket
+        import threading
+        import time
+        from unittest import mock
+        import run_warp_benchmark as r
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(16)
+        port = listener.getsockname()[1]
+        held = []
+        stop = threading.Event()
+
+        def accept_and_ignore():
+            listener.settimeout(0.1)
+            while not stop.is_set():
+                try:
+                    c, _ = listener.accept()
+                    held.append(c)
+                except OSError:
+                    pass
+
+        threading.Thread(target=accept_and_ignore, daemon=True).start()
+        try:
+            t0 = time.perf_counter()
+            req_patch = (
+                mock.patch.object(r, "LARGE_PART_REQUEST_TIMEOUT_SEC", 0.5)
+                if hasattr(r, "LARGE_PART_REQUEST_TIMEOUT_SEC")
+                else mock.MagicMock()
+            )
+            with mock.patch.object(r, "PHASE_JOIN_TIMEOUT_SEC", 0.4), \
+                 mock.patch.object(r.join_all, "__defaults__", (0.4,)), \
+                 req_patch:
+                m = r.run_fixed_volume_phase(
+                    "127.0.0.1", port, "warp-bench-bucket",
+                    4096, 1024, 2, "put", server_pid=None, key_modulus=2,
+                )
+            elapsed = time.perf_counter() - t0
+        finally:
+            stop.set()
+            for c in held:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+            listener.close()
+
+        self.assertFalse(m.measured)
+        self.assertLess(elapsed, 10.0, f"stalled fixed-volume phase took too long: {elapsed:.2f}s")
+
+    def test_large_part_request_timeout_exceeds_30s(self):
+        import inspect
+        import run_warp_benchmark as r
+        self.assertGreaterEqual(r.LARGE_PART_REQUEST_TIMEOUT_SEC, 120.0)
+        self.assertNotIn("timeout=30.0", inspect.getsource(r.run_fixed_volume_phase))
+        self.assertNotIn("timeout=30.0", inspect.getsource(r.run_large_multipart_object_phase))
+
+    def test_large_multipart_object_phase_records_errors_without_crashing(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler
+        import run_warp_benchmark as r
+
+        class FailPartHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                if n > 0:
+                    self.rfile.read(n)
+                if "?uploads" in self.path:
+                    xml = b"<InitiateMultipartUploadResult><UploadId>u1</UploadId></InitiateMultipartUploadResult>"
+                else:
+                    xml = b'<CompleteMultipartUploadResult><ETag>"abc-2"</ETag></CompleteMultipartUploadResult>'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(xml)))
+                self.end_headers()
+                self.wfile.write(xml)
+
+            def do_PUT(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(n)
+                self.send_response(500)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self):
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        srv = r.ThreadedHTTPServer(("127.0.0.1", 0), FailPartHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            put_m, get_m = r.run_large_multipart_object_phase(
+                "127.0.0.1", srv.server_address[1], "warp-bench-bucket",
+                "obj.bin", 2048, 1024, 2, server_pid=None,
+            )
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        self.assertFalse(put_m.measured)
+        self.assertIn("500", put_m.note, put_m.note)
+        self.assertFalse(get_m.measured)
+        self.assertIn("404", get_m.note, get_m.note)
+
+
 if __name__ == "__main__":
     unittest.main()
