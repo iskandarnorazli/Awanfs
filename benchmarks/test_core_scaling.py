@@ -604,6 +604,31 @@ class WorkloadSequenceTests(unittest.TestCase):
         self.assertEqual(b1, b2)
         self.assertNotEqual(b1, b3)
 
+    def test_small_read_specs_use_size_specific_prefill_prefix(self):
+        small_sizes = (1024, 4096, 8192, 65536)
+        for pat in ("seq-read", "rand-read"):
+            prefixes = set()
+            for sz in small_sizes:
+                reqs = cs.generate_request_sequence(
+                    pattern=pat,
+                    size=sz,
+                    count=8,
+                    seed=42,
+                    prefill_count=16,
+                    large_obj_size=16 * cs.MIB,
+                )
+                expected_prefix = f"prefill_{sz // cs.KIB}k"
+                for r in reqs:
+                    self.assertEqual(r.method, "GET")
+                    self.assertIsNone(r.range_start)
+                    self.assertIsNone(r.range_end)
+                    self.assertTrue(
+                        r.key.startswith(f"{expected_prefix}/"),
+                        f"{pat} size={sz} read unexpected key {r.key!r}, expected prefix {expected_prefix}/",
+                    )
+                prefixes.add(reqs[0].key.split("/")[0])
+            self.assertEqual(len(prefixes), len(small_sizes))
+
 
 class MatrixReportTests(unittest.TestCase):
     def test_matrix_report_command_seed_cache_prefill_and_unmeasured(self):
@@ -639,6 +664,48 @@ class MatrixReportTests(unittest.TestCase):
             cs.PointResult(ops_per_sec=2000.0, mib_per_sec=8.0, p50_ms=1.0, p99_ms=3.0, cpu_pct=120.0),
         ])
         self.assertAlmostEqual(agg.mib_per_sec, 6.0)
+
+    def test_large_rand_read_row_labels_range_length(self):
+        patterns, sizes, cores, concs, results = _sample_matrix_results()
+        md = cs.render_matrix_report(
+            cmd="python benchmarks/core_scaling.py --matrix",
+            patterns=patterns,
+            sizes=sizes,
+            cores=cores,
+            concurrencies=concs,
+            results=results,
+            total_cores=4,
+            runs=2,
+            duration_sec=2.0,
+            seed=42,
+            memory_budget="32MiB",
+            prefill_bytes=48 * cs.MIB,
+            chart_paths=[],
+        )
+        self.assertIn("| AwanFS | rand-read | 1 MiB (4 KiB range) | 1 | 1 |", md)
+        self.assertNotIn("| AwanFS | rand-read | 1 MiB | 1 | 1 |", md)
+        self.assertIn("| AwanFS | seq-read | 1 MiB | 1 | 1 |", md)
+        self.assertIn("| AwanFS | rand-read | 4 KiB | 1 | 1 |", md)
+
+        small_md = cs.render_matrix_report(
+            cmd="python benchmarks/core_scaling.py --matrix --pattern rand-read --sizes 1KiB,8KiB,64KiB",
+            patterns=["rand-read"],
+            sizes=[1024, 8192, 65536],
+            cores=[1],
+            concurrencies=[1],
+            results={"rand-read": {sz: {"AwanFS": {1: {1: cs.PointResult(ops_per_sec=100.0, mib_per_sec=100.0 * sz / cs.MIB, p50_ms=1.0, p99_ms=2.0, cpu_pct=10.0)}}, "MinIO": {1: {1: cs.PointResult(reason="missing")}}, "RustFS": {1: {1: cs.PointResult(reason="missing")}}} for sz in (1024, 8192, 65536)}},
+            total_cores=4,
+            runs=1,
+            duration_sec=1.0,
+            seed=42,
+            memory_budget="32MiB",
+            prefill_bytes=48 * cs.MIB,
+            chart_paths=[],
+        )
+        self.assertIn("49,152 x 1 KiB", small_md)
+        self.assertIn("6,144 x 8 KiB", small_md)
+        self.assertIn("768 x 64 KiB", small_md)
+        self.assertNotIn(" 4 KiB objects", small_md)
 
 
 class MatrixChartTests(unittest.TestCase):
@@ -783,6 +850,101 @@ class MatrixExecutionTests(unittest.TestCase):
                         self.assertTrue(pt.measured, f"{pat} {sz} failed: {pt.reason}")
                         self.assertGreater(pt.ops_per_sec, 0.0)
                         self.assertGreater(pt.mib_per_sec, 0.0)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+    def test_prefill_writes_one_read_set_per_small_size_and_reads_match_size(self):
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cs.rwb.BaselineFileS3Handler.storage_root = tmpdir
+            port = cs.rwb.get_free_port()
+            httpd = cs.rwb.ThreadedHTTPServer(("127.0.0.1", port), cs.rwb.BaselineFileS3Handler)
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            os.makedirs(os.path.join(tmpdir, cs.BUCKET), exist_ok=True)
+            try:
+                prefill_bytes = 256 * cs.KIB
+                patterns = ["seq-read", "rand-read"]
+                sizes = [1024, 8192, 65536]
+                err = cs._prefill_server(
+                    "127.0.0.1",
+                    port,
+                    cs.BUCKET,
+                    seed=42,
+                    prefill_bytes=prefill_bytes,
+                    patterns=patterns,
+                    sizes=sizes,
+                    timeout_sec=20.0,
+                )
+                self.assertIsNone(err)
+                self.assertFalse(os.path.exists(os.path.join(tmpdir, cs.BUCKET, "prefill_4k")))
+                for sz in sizes:
+                    prefix = f"prefill_{sz // cs.KIB}k"
+                    set_dir = os.path.join(tmpdir, cs.BUCKET, prefix)
+                    self.assertTrue(os.path.isdir(set_dir), f"missing prefill read set dir {set_dir}")
+                    files = sorted(f for f in os.listdir(set_dir) if not f.endswith(".meta"))
+                    expected_count = prefill_bytes // sz
+                    self.assertEqual(len(files), expected_count, f"expected {expected_count} objects for {sz} B")
+                    self.assertEqual(os.path.getsize(os.path.join(set_dir, files[0])), sz)
+                    self.assertEqual(os.path.getsize(os.path.join(set_dir, files[-1])), sz)
+
+                for pat in patterns:
+                    for sz in sizes:
+                        pt = cs._run_pattern_phase_with_cpu(
+                            "127.0.0.1",
+                            port,
+                            cs.BUCKET,
+                            pat,
+                            sz,
+                            concurrency=2,
+                            duration_sec=0.12,
+                            seed=42,
+                            prefill_bytes=prefill_bytes,
+                            server_pid=os.getpid(),
+                            shares_cores=True,
+                        )
+                        self.assertTrue(pt.measured, f"{pat} {sz} failed: {pt.reason}")
+                        expected_mib = (pt.ops_per_sec * sz) / float(cs.MIB)
+                        rel_err = abs(pt.mib_per_sec - expected_mib) / expected_mib
+                        self.assertLessEqual(
+                            rel_err,
+                            0.01,
+                            f"{pat} {sz}: MiB/s={pt.mib_per_sec:.4f} vs ops*size={expected_mib:.4f}",
+                        )
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+    def test_whole_object_read_size_mismatch_fails_loudly(self):
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cs.rwb.BaselineFileS3Handler.storage_root = tmpdir
+            port = cs.rwb.get_free_port()
+            httpd = cs.rwb.ThreadedHTTPServer(("127.0.0.1", port), cs.rwb.BaselineFileS3Handler)
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            os.makedirs(os.path.join(tmpdir, cs.BUCKET, "prefill_64k"), exist_ok=True)
+            with open(os.path.join(tmpdir, cs.BUCKET, "prefill_64k", "000000"), "wb") as fh:
+                fh.write(b"x" * (4 * cs.KIB))
+            try:
+                pt = cs._run_pattern_phase_with_cpu(
+                    "127.0.0.1",
+                    port,
+                    cs.BUCKET,
+                    "seq-read",
+                    65536,
+                    concurrency=1,
+                    duration_sec=0.05,
+                    seed=42,
+                    prefill_bytes=65536,
+                    server_pid=os.getpid(),
+                    shares_cores=True,
+                )
+                self.assertFalse(pt.measured)
+                self.assertIn("4096/65536", pt.reason)
             finally:
                 httpd.shutdown()
                 httpd.server_close()

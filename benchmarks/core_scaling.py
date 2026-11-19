@@ -42,6 +42,7 @@ DEFAULT_CONCURRENCIES = "1,4,16,64,256"
 DEFAULT_SEED = 42
 DEFAULT_MEMORY_BUDGET = "32MiB"
 DEFAULT_PREFILL_SIZE = "48MiB"
+RAND_READ_LARGE_RANGE_BYTES = 4 * KIB
 
 # (key, display label, mode, payload_size)
 WORKLOADS: List[Tuple[str, str, str, int]] = [
@@ -204,6 +205,38 @@ def rand_write_key_space_for(size: int) -> int:
     return 16 if size >= MIB else 256
 
 
+def prefill_prefix_for(size: int) -> str:
+    """Object key prefix for prefilled read sets below 1 MiB, distinct per size."""
+    if size % KIB == 0:
+        return f"prefill_{size // KIB}k"
+    return f"prefill_{size}b"
+
+
+def prefill_count_for(prefill_bytes: int, size: int) -> int:
+    """Number of `size`-byte objects needed to cover `prefill_bytes`."""
+    return max(1, prefill_bytes // max(1, size))
+
+
+def row_size_label(pattern: str, size: int) -> str:
+    """Display size label; marks `rand-read` at >= 1 MiB with the range length it reads."""
+    if pattern == "rand-read" and size >= MIB:
+        return f"{format_size(size)} ({format_size(RAND_READ_LARGE_RANGE_BYTES)} range)"
+    return format_size(size)
+
+
+def describe_prefill_sets(prefill_bytes: int, patterns: Sequence[str], sizes: Sequence[int]) -> str:
+    """Human-readable summary of read sets written during prefill."""
+    if not any(p in ("seq-read", "rand-read") for p in patterns):
+        return "none (write-only patterns)"
+    parts = [
+        f"{prefill_count_for(prefill_bytes, sz):,} x {format_size(sz)} objects"
+        for sz in sorted({s for s in sizes if s < MIB})
+    ]
+    if any(s >= MIB for s in sizes):
+        parts.append(f"1 x {format_size(prefill_bytes)} large object for range GETs")
+    return " + ".join(parts) if parts else "none"
+
+
 def build_request_spec(
     pattern: str,
     size: int,
@@ -222,7 +255,7 @@ def build_request_spec(
     if pattern == "seq-read":
         if size < MIB:
             idx = step_idx % max(1, prefill_count)
-            return RequestSpec("GET", f"prefill_4k/{idx:06d}")
+            return RequestSpec("GET", f"{prefill_prefix_for(size)}/{idx:06d}")
         chunks = max(1, large_obj_size // size)
         start = (step_idx % chunks) * size
         end = min(large_obj_size - 1, start + size - 1)
@@ -230,8 +263,8 @@ def build_request_spec(
     if pattern == "rand-read":
         if size < MIB:
             idx = rng.randrange(max(1, prefill_count))
-            return RequestSpec("GET", f"prefill_4k/{idx:06d}")
-        range_len = 4 * KIB
+            return RequestSpec("GET", f"{prefill_prefix_for(size)}/{idx:06d}")
+        range_len = RAND_READ_LARGE_RANGE_BYTES
         blocks = max(1, large_obj_size // range_len)
         start = rng.randrange(blocks) * range_len
         end = min(large_obj_size - 1, start + range_len - 1)
@@ -971,6 +1004,65 @@ def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
 
 
+def _prefill_small_set(
+    host: str,
+    port: int,
+    bucket: str,
+    size: int,
+    prefill_count: int,
+    seed: int,
+    deadline: float,
+) -> Optional[str]:
+    """Uploads `prefill_count` deterministic `size`-byte objects for one read size."""
+    prefix = prefill_prefix_for(size)
+    size_label = format_size(size)
+    payload = deterministic_bytes(size, seed)
+    workers = min(16, prefill_count)
+    next_idx = 0
+    idx_lock = threading.Lock()
+    errors: List[str] = []
+
+    def prefill_worker() -> None:
+        nonlocal next_idx
+        conn = http.client.HTTPConnection(host, port, timeout=15.0)
+        headers = {"Content-Length": str(len(payload)), "Connection": "keep-alive"}
+        try:
+            while time.perf_counter() < deadline:
+                with idx_lock:
+                    if errors or next_idx >= prefill_count:
+                        return
+                    i = next_idx
+                    next_idx += 1
+                try:
+                    conn.request("PUT", f"/{bucket}/{prefix}/{i:06d}", body=payload, headers=headers)
+                    resp = conn.getresponse()
+                    resp.read()
+                    if resp.status != 200:
+                        with idx_lock:
+                            errors.append(f"prefill {size_label} HTTP {resp.status}")
+                        return
+                except Exception as e:
+                    with idx_lock:
+                        errors.append(f"prefill {size_label} {type(e).__name__}: {e}")
+                    return
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    threads = [threading.Thread(target=prefill_worker, daemon=True) for _ in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=max(1.0, deadline - time.perf_counter()))
+    if errors:
+        return errors[0]
+    if next_idx < prefill_count:
+        return f"prefill {size_label} timed out ({next_idx}/{prefill_count})"
+    return None
+
+
 def _prefill_server(
     host: str,
     port: int,
@@ -979,60 +1071,33 @@ def _prefill_server(
     prefill_bytes: int,
     patterns: Sequence[str],
     sizes: Sequence[int],
-    timeout_sec: float = 120.0,
+    timeout_sec: Optional[float] = None,
 ) -> Optional[str]:
     """Writes identical deterministic prefill data before timing read/overwrite phases."""
-    need_4k = any(p in ("seq-read", "rand-read") for p in patterns) and any(s < MIB for s in sizes)
-    need_large = any(p in ("seq-read", "rand-read") for p in patterns) and any(s >= MIB for s in sizes)
+    need_reads = any(p in ("seq-read", "rand-read") for p in patterns)
+    small_sizes = sorted({s for s in sizes if s < MIB}) if need_reads else []
+    need_large = need_reads and any(s >= MIB for s in sizes)
     need_rand_write = "rand-write" in patterns
+    if timeout_sec is None:
+        total_small_objects = sum(prefill_count_for(prefill_bytes, sz) for sz in small_sizes)
+        timeout_sec = max(
+            120.0,
+            total_small_objects * 0.015 + (120.0 if need_large else 0.0) + (60.0 if need_rand_write else 0.0),
+        )
     deadline = time.perf_counter() + timeout_sec
 
-    if need_4k:
-        prefill_count = max(1, prefill_bytes // (4 * KIB))
-        payload_4k = deterministic_bytes(4 * KIB, seed)
-        workers = min(16, prefill_count)
-        next_idx = 0
-        idx_lock = threading.Lock()
-        errors: List[str] = []
-
-        def prefill_worker():
-            nonlocal next_idx
-            conn = http.client.HTTPConnection(host, port, timeout=15.0)
-            headers = {"Content-Length": str(len(payload_4k)), "Connection": "keep-alive"}
-            try:
-                while time.perf_counter() < deadline:
-                    with idx_lock:
-                        if errors or next_idx >= prefill_count:
-                            return
-                        i = next_idx
-                        next_idx += 1
-                    try:
-                        conn.request("PUT", f"/{bucket}/prefill_4k/{i:06d}", body=payload_4k, headers=headers)
-                        resp = conn.getresponse()
-                        resp.read()
-                        if resp.status != 200:
-                            with idx_lock:
-                                errors.append(f"prefill 4 KiB HTTP {resp.status}")
-                            return
-                    except Exception as e:
-                        with idx_lock:
-                            errors.append(f"prefill 4 KiB {type(e).__name__}: {e}")
-                        return
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-        threads = [threading.Thread(target=prefill_worker, daemon=True) for _ in range(workers)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=max(1.0, deadline - time.perf_counter()))
-        if errors:
-            return errors[0]
-        if next_idx < prefill_count:
-            return f"prefill 4 KiB timed out ({next_idx}/{prefill_count})"
+    for sz in small_sizes:
+        err = _prefill_small_set(
+            host=host,
+            port=port,
+            bucket=bucket,
+            size=sz,
+            prefill_count=prefill_count_for(prefill_bytes, sz),
+            seed=seed,
+            deadline=deadline,
+        )
+        if err:
+            return err
 
     if need_large:
         large_payload = deterministic_bytes(prefill_bytes, seed + 1)
@@ -1090,7 +1155,7 @@ def _run_pattern_phase_with_cpu(
     shares_cores: bool,
 ) -> PointResult:
     """Runs one `(pattern, size, concurrency)` phase and measures server CPU % over its timed window."""
-    prefill_count = max(1, prefill_bytes // (4 * KIB))
+    prefill_count = prefill_count_for(prefill_bytes, size)
     source = PatternRequestSource(
         pattern=pattern,
         size=size,
@@ -1156,10 +1221,15 @@ def _run_pattern_phase_with_cpu(
                     conn.request("GET", path, headers=get_headers)
                     resp = conn.getresponse()
                     data = resp.read()
-                    ok = resp.status == 200
-                    if ok:
+                    if resp.status == 200 and len(data) == size:
+                        ok = True
                         local_bytes += len(data)
+                    elif resp.status == 200:
+                        ok = False
+                        msg = f"GET size mismatch ({len(data)}/{size})"
+                        local_errs[msg] = local_errs.get(msg, 0) + 1
                     else:
+                        ok = False
                         msg = f"HTTP {resp.status}"
                         local_errs[msg] = local_errs.get(msg, 0) + 1
                 t1 = time.perf_counter()
@@ -1249,7 +1319,7 @@ def measure_server_matrix_for_cores(
     out: Dict[Tuple[str, int, int], PointResult] = {}
     try:
         pin_process(os.getpid(), cli_cores)
-        print(f"    {server_name} N={n_cores}: prefilling {format_size(prefill_bytes)}...", flush=True)
+        print(f"    {server_name} N={n_cores}: prefilling ({describe_prefill_sets(prefill_bytes, patterns, sizes)})...", flush=True)
         prefill_err = _prefill_server("127.0.0.1", port, BUCKET, seed, prefill_bytes, patterns, sizes)
         if prefill_err:
             print(f"    {server_name} N={n_cores}: prefill failed: {prefill_err}", flush=True)
@@ -1359,7 +1429,7 @@ def write_matrix_charts(
 
             handles, labels = axes[0].get_legend_handles_labels()
             fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False, bbox_to_anchor=(0.5, 0.99))
-            fig.suptitle(f"{pat} ({sz_lbl}) — Core Scaling (concurrency = {fixed_conc})", y=1.06)
+            fig.suptitle(f"{pat} ({row_size_label(pat, sz)}) — Core Scaling (concurrency = {fixed_conc})", y=1.06)
             fig.tight_layout(rect=[0, 0, 1, 0.92])
             _save_both(fig, f"cores_{_slug(pat)}_{_slug(sz_lbl)}")
 
@@ -1412,7 +1482,7 @@ def write_matrix_charts(
 
             handles, labels = axes[0][0].get_legend_handles_labels()
             fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False, bbox_to_anchor=(0.5, 0.99))
-            fig.suptitle(f"{pat} ({sz_lbl}) — Concurrency Sweep across Core Counts", y=1.03)
+            fig.suptitle(f"{pat} ({row_size_label(pat, sz)}) — Concurrency Sweep across Core Counts", y=1.03)
             fig.tight_layout(rect=[0, 0, 1, 0.94])
             _save_both(fig, f"conc_{_slug(pat)}_{_slug(sz_lbl)}")
 
@@ -1548,7 +1618,7 @@ def render_matrix_report(
         "",
         f"- **Machine:** {platform.node()} ({platform.platform()}, {total_cores} logical cores, {rwb.host_ram_gb()} GB RAM, CPU: {rwb.cpu_model()})",
         f"- **Methodology:** `patterns = {', '.join(patterns)}`, `sizes = {', '.join(format_size(s) for s in sizes)}`, `cores = {', '.join(str(n) for n in cores)}`, `concurrencies = {', '.join(str(c) for c in concurrencies)}`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase, seed = `{seed}`.",
-        f"- **Cache & Prefill:** AwanFS `--memory-budget {format_size(budget_bytes)}` (stated cache half = {format_size(cache_bytes)}). Read prefill size = {format_size(prefill_bytes)} ({prefill_bytes // (4 * KIB):,} x 4 KiB objects + 1 x {format_size(prefill_bytes)} large object for range GETs), identical deterministic bytes for every server, written before timing.",
+        f"- **Cache & Prefill:** AwanFS `--memory-budget {format_size(budget_bytes)}` (stated cache half = {format_size(cache_bytes)}). Read prefill size = {format_size(prefill_bytes)} ({describe_prefill_sets(prefill_bytes, patterns, sizes)}), identical deterministic bytes for every server, written before timing.",
         f"- **Core pinning:** {sharing_note}",
         f"- **Durability:** AwanFS group commit (#29). {rwb.minio_durability_note()}",
         "",
@@ -1561,7 +1631,7 @@ def render_matrix_report(
     for srv in SERVERS:
         for pat in patterns:
             for sz in sizes:
-                sz_lbl = format_size(sz)
+                sz_lbl = row_size_label(pat, sz)
                 for n in cores:
                     for c in concurrencies:
                         pt = results.get(pat, {}).get(sz, {}).get(srv, {}).get(n, {}).get(c)
