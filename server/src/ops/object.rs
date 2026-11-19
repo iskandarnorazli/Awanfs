@@ -895,6 +895,24 @@ pub async fn put_object(
 
     let expected_len = headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok());
     let is_chunked = crate::auth::is_aws_chunked(headers);
+    let has_te_chunked = headers
+        .get_all(hyper::header::TRANSFER_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("chunked")));
+    if expected_len.is_none() && !is_chunked && !has_te_chunked {
+        let xml = s3_error_xml(
+            "MissingContentLength",
+            "You must provide the Content-Length HTTP header.",
+            key,
+            "req-put-len",
+        );
+        return Ok(Response::builder()
+            .status(StatusCode::LENGTH_REQUIRED)
+            .header(CONTENT_TYPE, "application/xml")
+            .body(full_body(Bytes::from(xml)))
+            .unwrap());
+    }
     let content_md5_hdr = headers.get("content-md5").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
     if let Some(ref content_md5) = content_md5_hdr {
         if !crate::bucket_config::base64_decode(content_md5).is_ok_and(|b| b.len() == 16) {
