@@ -219,6 +219,20 @@ the mapped read path (`SimFile` has no mapping, so simulated reads use positione
 path keeps its own tests). Not chosen: a whole-server simulation, and `loom` or `shuttle` for
 interleavings (owner, 2026-11-16, option B).
 
+**Decision 68 (Claude, 2026-11-19, #26 stage 5): the metadata segments are leveled.** Flushes
+write level-0 segments, which may overlap; each deeper level holds non-overlapping segments and is
+about ten times larger than the one above (LevelDB's layout). A lookup reads the level-0 segments
+and then at most one segment per level, each behind its key range and Bloom filter, so the cost
+of an absent key stays near zero as the store grows, and a prefix scan reads one cursor per
+level. Compaction streams: it reads its inputs block by block and writes segments of at most
+64 MiB as it goes, so its memory does not grow with the segments. The manifest (format 2,
+`FORMAT.md`) records each segment's level; `verification/tla/Levels.tla` checks the three rules
+(level 0 compacts whole, every overlapping segment below is taken, tombstones drop only at the
+bottom). The design replaces stage 4's `merge` of two named segments, which gave its output a
+sequence number above newer segments it had not merged, so an older row could win (nothing in
+the server used it). Not chosen: size-tiered runs (fewer rewrites, but more segments for a
+lookup to check and larger scans' merges).
+
 **Decision 66 (owner, 2026-11-17): no GPU or APU code path for now.** Erasure coding (decision
 64) is built with CPU vector instructions first and measured against the network rate. A GPU path
 on unified-memory APUs (Strix Halo, MI300A) is weighed only if CPU erasure coding cannot keep up
