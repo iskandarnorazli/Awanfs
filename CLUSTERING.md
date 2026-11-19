@@ -114,6 +114,10 @@ about 2x in MinIO's favour. Options:
 
 Owner's choice (decision 64): B, with the threshold measured (section 8).
 
+Erasure coding runs on the CPU with vector instructions first (decision 66). A GPU or APU path
+(Strix Halo, MI300A) is weighed only if the failure tests and benchmark of section 8 show CPU
+erasure coding cannot keep up with the network on a real cluster.
+
 ## 5. What happens when something fails
 
 | Failure | Reads | Writes | Data |

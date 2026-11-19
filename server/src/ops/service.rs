@@ -1,22 +1,75 @@
 use bytes::Bytes;
 use hyper::header::CONTENT_TYPE;
 use hyper::{Response, StatusCode};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::s3_api::{full_body, ResponseBody, S3ServiceState};
+use super::bucket::{decode_hex_token, encode_hex_token};
+use crate::s3_api::{bad_request, full_body, ResponseBody, S3ServiceState};
 use crate::xml::list_buckets_xml;
 
-pub async fn list_buckets(state: Arc<S3ServiceState>) -> Result<Response<ResponseBody>, hyper::Error> {
+pub async fn list_buckets(
+    state: Arc<S3ServiceState>,
+    query_map: &HashMap<String, String>,
+) -> Result<Response<ResponseBody>, hyper::Error> {
+    let max_buckets = match query_map.get("max-buckets") {
+        Some(s) => match s.parse::<i32>() {
+            Ok(n) if n >= 1 => (n as usize).min(10_000),
+            _ => {
+                return Ok(bad_request(
+                    "InvalidArgument",
+                    "Argument max-buckets must be an integer between 1 and 10000",
+                    "/",
+                ));
+            }
+        },
+        None => 10_000,
+    };
+
+    let after = match query_map.get("continuation-token") {
+        Some(t) => match decode_hex_token(t).and_then(|b| String::from_utf8(b).ok()) {
+            Some(s) => Some(s),
+            None => {
+                return Ok(bad_request(
+                    "InvalidArgument",
+                    "The continuation token provided is incorrect",
+                    "/",
+                ));
+            }
+        },
+        None => None,
+    };
+
+    let prefix = query_map.get("prefix").map(|s| s.as_str());
+
     let engine = state.engine.read();
     let created_map = state.bucket_created_ns.read();
-    let mut entries: Vec<(&str, String)> = Vec::new();
+    let mut entries: Vec<(String, String)> = Vec::new();
     for (name, &b_id) in &engine.bucket_names {
+        if let Some(pfx) = prefix {
+            if !name.starts_with(pfx) {
+                continue;
+            }
+        }
+        if let Some(ref marker) = after {
+            if name.as_str() <= marker.as_str() {
+                continue;
+            }
+        }
         let ts = created_map.get(&b_id).copied().filter(|&t| t != 0).unwrap_or(state.started_at_ns);
-        entries.push((name.as_str(), crate::versions::iso8601(ts)));
+        entries.push((name.clone(), crate::versions::iso8601(ts)));
     }
-    entries.sort_by_key(|(n, _)| *n);
-    let b_list: Vec<(&str, &str)> = entries.iter().map(|(n, d)| (*n, d.as_str())).collect();
-    let xml = list_buckets_xml(&b_list, "req-list-buckets");
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let next_token = if entries.len() > max_buckets {
+        entries.truncate(max_buckets);
+        entries.last().map(|(n, _)| encode_hex_token(n.as_bytes()))
+    } else {
+        None
+    };
+
+    let b_list: Vec<(&str, &str)> = entries.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
+    let xml = list_buckets_xml(&b_list, prefix, next_token.as_deref(), "req-list-buckets");
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/xml")

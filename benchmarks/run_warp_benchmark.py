@@ -43,6 +43,9 @@ class BenchmarkMetrics:
     server_cpu_s: float = 0.0
     client_cpu_s: float = 0.0
     system_cpu_s: float = 0.0
+    server_cpu_pct: float = 0.0
+    client_cpu_pct: float = 0.0
+    system_cpu_pct: float = 0.0
 
 
 def calculate_percentiles(latencies: List[float]) -> Tuple[float, float, float, float]:
@@ -77,19 +80,24 @@ def get_process_peak_rss_mb(pid: int) -> float:
 
         PROCESS_QUERY_INFORMATION = 0x0400
         PROCESS_VM_READ = 0x0010
-        handle = ctypes.windll.kernel32.OpenProcess(
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.OpenProcess(
             PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid
         )
         if handle:
             try:
                 counters = PROCESS_MEMORY_COUNTERS()
                 counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
-                if ctypes.windll.psapi.GetProcessMemoryInfo(
+                psapi = ctypes.windll.psapi
+                psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+                if psapi.GetProcessMemoryInfo(
                     handle, ctypes.byref(counters), counters.cb
                 ):
                     return counters.PeakWorkingSetSize / (1024.0 * 1024.0)
             finally:
-                ctypes.windll.kernel32.CloseHandle(handle)
+                kernel32.CloseHandle(handle)
     else:
         try:
             with open(f"/proc/{pid}/status", "r") as f:
@@ -116,18 +124,24 @@ def get_process_cpu_times(pid: int) -> Tuple[float, float]:
             _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
 
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if handle:
             try:
                 ct, et, kt, ut = FILETIME(), FILETIME(), FILETIME(), FILETIME()
-                if ctypes.windll.kernel32.GetProcessTimes(
+                if kernel32.GetProcessTimes(
                     handle, ctypes.byref(ct), ctypes.byref(et), ctypes.byref(kt), ctypes.byref(ut)
                 ):
                     def ft_to_s(ft: FILETIME) -> float:
                         return ((ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 1e7
                     return ft_to_s(ut), ft_to_s(kt)
             finally:
-                ctypes.windll.kernel32.CloseHandle(handle)
+                kernel32.CloseHandle(handle)
     else:
         try:
             with open(f"/proc/{pid}/stat", "r") as f:
@@ -139,6 +153,129 @@ def get_process_cpu_times(pid: int) -> Tuple[float, float]:
         except Exception:
             pass
     return 0.0, 0.0
+
+
+def get_system_cpu_times() -> Tuple[float, float]:
+    """Returns `(busy_seconds, total_seconds)` across all CPUs using psutil or OS APIs."""
+    try:
+        import psutil  # type: ignore
+        ct = psutil.cpu_times()
+        idle = float(getattr(ct, "idle", 0.0)) + float(getattr(ct, "iowait", 0.0))
+        total = sum(float(v) for v in ct)
+        return max(0.0, total - idle), max(0.0, total)
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        class FILETIME(ctypes.Structure):
+            _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+        it, kt, ut = FILETIME(), FILETIME(), FILETIME()
+        if ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(it), ctypes.byref(kt), ctypes.byref(ut)):
+            def ft_to_s(ft: FILETIME) -> float:
+                return ((ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 1e7
+            idle = ft_to_s(it)
+            kernel = ft_to_s(kt)  # Windows kernel time includes idle time
+            user = ft_to_s(ut)
+            total = kernel + user
+            busy = max(0.0, total - idle)
+            return busy, total
+    else:
+        try:
+            with open("/proc/stat", "r") as f:
+                first = f.readline().split()
+            if first and first[0] == "cpu":
+                vals = [int(v) for v in first[1:]]
+                hz = float(os.sysconf("SC_CLK_TCK"))
+                idle = (vals[3] + (vals[4] if len(vals) > 4 else 0)) / hz
+                total = sum(vals) / hz
+                return max(0.0, total - idle), max(0.0, total)
+        except Exception:
+            pass
+    return 0.0, 0.0
+
+
+class CpuSampler:
+    """Samples server, client, and system CPU utilisation while a workload phase runs (#175)."""
+
+    def __init__(self, server_pid: Optional[int], every: float = 0.2):
+        self.server_pid = server_pid
+        self.client_pid = os.getpid()
+        self.every = every
+        self.server_cpu_s = 0.0
+        self.client_cpu_s = 0.0
+        self.system_cpu_s = 0.0
+        self.server_cpu_pct = 0.0
+        self.client_cpu_pct = 0.0
+        self.system_cpu_pct = 0.0
+        self._samples_srv: List[float] = []
+        self._samples_cli: List[float] = []
+        self._samples_sys: List[float] = []
+        self._stop: Optional[threading.Event] = None
+        self._thread: Optional[threading.Thread] = None
+        self._t0 = 0.0
+        self._srv0 = (0.0, 0.0)
+        self._cli0 = (0.0, 0.0)
+        self._sys0 = (0.0, 0.0)
+
+    def _take(self) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float], float]:
+        srv = get_process_cpu_times(self.server_pid) if self.server_pid else (0.0, 0.0)
+        cli = get_process_cpu_times(self.client_pid)
+        sys_t = get_system_cpu_times()
+        return srv, cli, sys_t, time.perf_counter()
+
+    def __enter__(self):
+        self._srv0, self._cli0, self._sys0, self._t0 = self._take()
+        prev_srv, prev_cli, prev_sys, prev_t = self._srv0, self._cli0, self._sys0, self._t0
+        self._stop = threading.Event()
+
+        def loop():
+            nonlocal prev_srv, prev_cli, prev_sys, prev_t
+            while not self._stop.wait(self.every):
+                cur_srv, cur_cli, cur_sys, cur_t = self._take()
+                dt = cur_t - prev_t
+                if dt > 0:
+                    if self.server_pid:
+                        dsrv = max(0.0, (cur_srv[0] - prev_srv[0]) + (cur_srv[1] - prev_srv[1]))
+                        self._samples_srv.append(100.0 * dsrv / dt)
+                    dcli = max(0.0, (cur_cli[0] - prev_cli[0]) + (cur_cli[1] - prev_cli[1]))
+                    self._samples_cli.append(100.0 * dcli / dt)
+                    dtot = cur_sys[1] - prev_sys[1]
+                    if dtot > 0:
+                        dbsy = max(0.0, cur_sys[0] - prev_sys[0])
+                        self._samples_sys.append(min(100.0, 100.0 * dbsy / dtot))
+                prev_srv, prev_cli, prev_sys, prev_t = cur_srv, cur_cli, cur_sys, cur_t
+
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        srv1, cli1, sys1, t1 = self._take()
+        dt = max(1e-9, t1 - self._t0)
+        self.server_cpu_s = max(0.0, (srv1[0] - self._srv0[0]) + (srv1[1] - self._srv0[1])) if self.server_pid else 0.0
+        self.client_cpu_s = max(0.0, (cli1[0] - self._cli0[0]) + (cli1[1] - self._cli0[1]))
+        self.system_cpu_s = (
+            (max(0.0, srv1[1] - self._srv0[1]) if self.server_pid else 0.0)
+            + max(0.0, cli1[1] - self._cli0[1])
+        )
+        self.server_cpu_pct = (
+            sum(self._samples_srv) / len(self._samples_srv)
+            if self._samples_srv else (100.0 * self.server_cpu_s / dt if self.server_pid else 0.0)
+        )
+        self.client_cpu_pct = (
+            sum(self._samples_cli) / len(self._samples_cli)
+            if self._samples_cli else (100.0 * self.client_cpu_s / dt)
+        )
+        sys_tot = sys1[1] - self._sys0[1]
+        self.system_cpu_pct = (
+            sum(self._samples_sys) / len(self._samples_sys)
+            if self._samples_sys else (min(100.0, 100.0 * max(0.0, sys1[0] - self._sys0[0]) / sys_tot) if sys_tot > 0 else 0.0)
+        )
+        return False
 
 
 def minio_durability_note(os_name: str = os.name) -> str:
@@ -311,17 +448,23 @@ def format_markdown_report(
         "| **License** | **Permissive (Workspace / MIT / Apache-2.0)** | AGPLv3 (Active Community OSS) | Apache 2.0 (Active Rust OSS) |",
     ])
 
-    cpu_rows = [(k, v) for k, v in awan.items() if v.server_cpu_s > 0 or v.client_cpu_s > 0]
+    cpu_rows = [
+        (k, v) for k, v in awan.items()
+        if v.server_cpu_s > 0 or v.client_cpu_s > 0 or v.server_cpu_pct > 0 or v.client_cpu_pct > 0
+    ]
     if cpu_rows:
         lines.extend([
             "",
             "## CPU Breakdown (per process, AwanFS phases)",
             "",
-            "| Phase | Server CPU (s) | Client CPU (s) | System/Kernel CPU (s) |",
-            "| :--- | :--- | :--- | :--- |",
+            "| Phase | Server CPU (s) | Client CPU (s) | System/Kernel CPU (s) | Server CPU % | Client CPU % | System CPU % |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
         ])
         for k, v in cpu_rows:
-            lines.append(f"| `{k}` | {v.server_cpu_s:.2f} | {v.client_cpu_s:.2f} | {v.system_cpu_s:.2f} |")
+            lines.append(
+                f"| `{k}` | {v.server_cpu_s:.2f} | {v.client_cpu_s:.2f} | {v.system_cpu_s:.2f} | "
+                f"{v.server_cpu_pct:.1f}% | {v.client_cpu_pct:.1f}% | {v.system_cpu_pct:.1f}% |"
+            )
 
     return "\n".join(lines) + "\n"
 
@@ -348,11 +491,22 @@ def get_free_port() -> int:
         return s.getsockname()[1]
 
 
-PIN_MIN_CPUS = 8  # the server gets cores 0..3 and the client cores 4..7
+PIN_MIN_CPUS = 8  # server gets first half of cores, client gets second half
 
 
-def can_pin() -> bool:
-    return (os.cpu_count() or 0) >= PIN_MIN_CPUS and (sys.platform == "win32" or hasattr(os, "sched_setaffinity"))
+def can_pin(cpu_count: Optional[int] = None) -> bool:
+    n = (os.cpu_count() or 0) if cpu_count is None else cpu_count
+    return n >= PIN_MIN_CPUS and (sys.platform == "win32" or hasattr(os, "sched_setaffinity"))
+
+
+def affinity_masks(cpu_count: Optional[int] = None) -> Tuple[int, int]:
+    """Returns `(server_mask, client_mask)` splitting logical cores into two disjoint halves."""
+    n = (os.cpu_count() or 0) if cpu_count is None else cpu_count
+    usable = max(2, min(n, 64))
+    half = usable // 2
+    server_mask = (1 << half) - 1
+    client_mask = ((1 << (usable - half)) - 1) << half
+    return server_mask, client_mask
 
 
 def set_affinity_mask(pid_or_current: Optional[int], mask: int) -> None:
@@ -361,17 +515,22 @@ def set_affinity_mask(pid_or_current: Optional[int], mask: int) -> None:
         return
     if sys.platform == "win32":
         try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
             if pid_or_current is None:
-                handle = ctypes.windll.kernel32.GetCurrentProcess()
-                ctypes.windll.kernel32.SetProcessAffinityMask(handle, mask)
+                handle = kernel32.GetCurrentProcess()
+                kernel32.SetProcessAffinityMask(handle, mask)
             else:
                 PROCESS_SET_INFORMATION = 0x0200
-                handle = ctypes.windll.kernel32.OpenProcess(
+                handle = kernel32.OpenProcess(
                     PROCESS_SET_INFORMATION, False, pid_or_current
                 )
                 if handle:
-                    ctypes.windll.kernel32.SetProcessAffinityMask(handle, mask)
-                    ctypes.windll.kernel32.CloseHandle(handle)
+                    kernel32.SetProcessAffinityMask(handle, mask)
+                    kernel32.CloseHandle(handle)
         except Exception:
             pass
     else:
@@ -381,10 +540,17 @@ def set_affinity_mask(pid_or_current: Optional[int], mask: int) -> None:
             pass
 
 
-def affinity_labels() -> Tuple[str, str]:
-    if can_pin():
-        return "Cores 0..3 (Affinity Mask 0x0F)", "Cores 4..7 (Affinity Mask 0xF0)"
-    n = os.cpu_count() or 0
+def affinity_labels(cpu_count: Optional[int] = None) -> Tuple[str, str]:
+    n = (os.cpu_count() or 0) if cpu_count is None else cpu_count
+    if can_pin(n):
+        usable = min(n, 64)
+        half = usable // 2
+        srv_mask, cli_mask = affinity_masks(n)
+        width = max(2, (usable + 3) // 4)
+        return (
+            f"Cores 0..{half - 1} (Affinity Mask 0x{srv_mask:0{width}X})",
+            f"Cores {half}..{usable - 1} (Affinity Mask 0x{cli_mask:0{width}X})",
+        )
     return (f"not pinned ({n} logical cores; pinning needs {PIN_MIN_CPUS})",) * 2
 
 
@@ -714,22 +880,16 @@ def run_workload_phase(
                 error_statuses[st] = error_statuses.get(st, 0) + n
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(concurrency)]
-    srv_cpu_0 = get_process_cpu_times(server_pid) if server_pid else (0.0, 0.0)
-    cli_cpu_0 = get_process_cpu_times(os.getpid())
-    t_start = time.perf_counter()
-    for t in threads:
-        t.start()
+    with CpuSampler(server_pid) as cpu_sampler:
+        t_start = time.perf_counter()
+        for t in threads:
+            t.start()
 
-    time.sleep(duration_sec)
-    stop_event.set()
+        time.sleep(duration_sec)
+        stop_event.set()
 
-    stuck = join_all(threads, phase_label)
-    t_total = time.perf_counter() - t_start
-    srv_cpu_1 = get_process_cpu_times(server_pid) if server_pid else (0.0, 0.0)
-    cli_cpu_1 = get_process_cpu_times(os.getpid())
-    srv_cpu_s = max(0.0, (srv_cpu_1[0] - srv_cpu_0[0]) + (srv_cpu_1[1] - srv_cpu_0[1])) if server_pid else 0.0
-    cli_cpu_s = max(0.0, (cli_cpu_1[0] - cli_cpu_0[0]) + (cli_cpu_1[1] - cli_cpu_0[1]))
-    sys_cpu_s = max(0.0, (srv_cpu_1[1] - srv_cpu_0[1]) if server_pid else 0.0) + max(0.0, cli_cpu_1[1] - cli_cpu_0[1])
+        stuck = join_all(threads, phase_label)
+        t_total = time.perf_counter() - t_start
 
     ops = len(latencies)
     ops_per_sec = ops / t_total if t_total > 0 else 0.0
@@ -745,9 +905,12 @@ def run_workload_phase(
         p99_ms=p99,
         p999_ms=p999,
         peak_rss_mb=peak_rss,
-        server_cpu_s=srv_cpu_s,
-        client_cpu_s=cli_cpu_s,
-        system_cpu_s=sys_cpu_s,
+        server_cpu_s=cpu_sampler.server_cpu_s,
+        client_cpu_s=cpu_sampler.client_cpu_s,
+        system_cpu_s=cpu_sampler.system_cpu_s,
+        server_cpu_pct=cpu_sampler.server_cpu_pct,
+        client_cpu_pct=cpu_sampler.client_cpu_pct,
+        system_cpu_pct=cpu_sampler.system_cpu_pct,
         measured=not stuck and not warm_short and warm_fail == 0 and errors == 0,
         note=", ".join(
             x for x in (
@@ -1168,8 +1331,9 @@ def main():
     size_set = {s.strip() for s in args.sizes.split(",") if s.strip()}
     cmd = f"python benchmarks/run_warp_benchmark.py --sizes {args.sizes} --concurrent {args.concurrent} --duration {args.duration} --output {args.output}"
 
-    # Pin benchmark client to cores 4..7 (mask 0xF0)
-    set_affinity_mask(None, 0xF0)
+    # Pin benchmark client to second half of cores, server to first half (when cpu_count >= 8)
+    srv_mask, cli_mask = affinity_masks()
+    set_affinity_mask(None, cli_mask)
 
     manifest = os.path.abspath(
         (os.path.join(os.path.dirname(__file__), "..", "server", "Cargo.toml") if os.path.exists(os.path.join(os.path.dirname(__file__), "..", "server", "Cargo.toml")) else os.path.join(os.path.dirname(__file__), "..", "..", "awan-storage", "server", "Cargo.toml"))
@@ -1196,7 +1360,7 @@ def main():
         server_log,
     )
     print(f"AwanFS log: {server_log}", flush=True)
-    set_affinity_mask(server_proc.pid, 0x0F)
+    set_affinity_mask(server_proc.pid, srv_mask)
     time.sleep(0.8)
 
     host = "127.0.0.1"
@@ -1285,7 +1449,7 @@ def main():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        set_affinity_mask(minio_proc.pid, 0x0F)
+        set_affinity_mask(minio_proc.pid, srv_mask)
 
         # Wait for MinIO to start listening
         for _ in range(50):
@@ -1412,7 +1576,7 @@ def main():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        set_affinity_mask(rustfs_proc.pid, 0x0F)
+        set_affinity_mask(rustfs_proc.pid, srv_mask)
 
         # Wait for RustFS to start listening
         for _ in range(50):
