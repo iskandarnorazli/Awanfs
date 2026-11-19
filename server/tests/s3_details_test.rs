@@ -382,6 +382,10 @@ async fn invalid_utf8_and_control_char_keys_return_400() {
         }
     }
 
+    handle.shutdown();
+}
+
+
 /// #160: PUT object without Content-Length (and without chunked transfer) returns 411 MissingContentLength.
 #[tokio::test]
 async fn put_object_without_content_length_returns_411() {
