@@ -7,6 +7,7 @@
 
 use crate::meta_index::ObjectMeta;
 use crate::vfile::{FileKind, VolFile, VolFs};
+use crate::work::WorkCounters;
 use std::path::Path;
 use std::sync::Arc;
 use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
@@ -260,6 +261,8 @@ pub struct Segment<F: VolFile> {
     data_blocks: u64,
     fences: Vec<Vec<u8>>,
     bloom: Bloom,
+    /// Counts each block read, when the segment belongs to a server's index (stage 3).
+    work: Option<Arc<WorkCounters>>,
 }
 
 fn corrupt(what: impl Into<String>) -> SegmentError {
@@ -339,12 +342,21 @@ impl<F: VolFile> Segment<F> {
             }
             blocks.push(b);
         }
-        Ok(Segment { file, seq, created_at_ns, entry_count, data_blocks, fences, bloom: Bloom { blocks } })
+        Ok(Segment { file, seq, created_at_ns, entry_count, data_blocks, fences, bloom: Bloom { blocks }, work: None })
+    }
+
+    /// Counts this segment's block reads in `work` from now on.
+    pub fn with_work(mut self, work: Arc<WorkCounters>) -> Self {
+        self.work = Some(work);
+        self
     }
 
     fn read_block(&self, i: u64) -> Result<Vec<SegEntry>, SegmentError> {
         let mut b = vec![0u8; BLOCK];
         self.file.read_at((1 + i) * BLOCK as u64, &mut b)?;
+        if let Some(w) = &self.work {
+            w.disk_read();
+        }
         if crc32c::crc32c(&b[..BLOCK_PAYLOAD]) != u32::from_le_bytes(b[BLOCK_PAYLOAD..].try_into().unwrap()) {
             return Err(corrupt(format!("data block {} CRC", i)));
         }
@@ -383,6 +395,13 @@ impl<F: VolFile> Segment<F> {
         Ok(block.into_iter().find(|e| e.key == key).map(|e| e.entry))
     }
 
+    /// A cursor over the entries with a key at or after `start`, reading each block only when
+    /// the scan reaches it.
+    pub fn scan_from(&self, start: &[u8]) -> Cursor<'_, F> {
+        let first = self.fences.partition_point(|f| f.as_slice() <= start).saturating_sub(1) as u64;
+        Cursor { seg: self, block: first, buf: Vec::new(), pos: 0, start: start.to_vec(), loaded: false }
+    }
+
     /// Every entry, in sort-key order (compaction and tests).
     pub fn entries(&self) -> Result<Vec<SegEntry>, SegmentError> {
         let mut out = Vec::with_capacity(self.entry_count as usize);
@@ -393,6 +412,41 @@ impl<F: VolFile> Segment<F> {
             return Err(corrupt("entry count"));
         }
         Ok(out)
+    }
+}
+
+/// Walks one segment's entries in sort-key order from a start key (`Segment::scan_from`).
+pub struct Cursor<'a, F: VolFile> {
+    seg: &'a Segment<F>,
+    block: u64,
+    buf: Vec<SegEntry>,
+    pos: usize,
+    start: Vec<u8>,
+    loaded: bool,
+}
+
+impl<F: VolFile> Cursor<'_, F> {
+    /// The next entry at or after the start key, or `None` at the end of the segment.
+    pub fn next_entry(&mut self) -> Result<Option<SegEntry>, SegmentError> {
+        loop {
+            if !self.loaded {
+                if self.block >= self.seg.data_blocks {
+                    return Ok(None);
+                }
+                self.buf = self.seg.read_block(self.block)?;
+                self.pos = 0;
+                self.loaded = true;
+            }
+            while self.pos < self.buf.len() {
+                let e = &self.buf[self.pos];
+                self.pos += 1;
+                if e.key.as_slice() >= self.start.as_slice() {
+                    return Ok(Some(e.clone()));
+                }
+            }
+            self.block += 1;
+            self.loaded = false;
+        }
     }
 }
 
