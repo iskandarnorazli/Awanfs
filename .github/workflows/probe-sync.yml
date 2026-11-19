@@ -22,6 +22,9 @@ on:
 permissions:
   contents: read
 
+env:
+  MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+
 jobs:
   probe:
     strategy:
@@ -29,9 +32,9 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    # The large-volume step stores 10 GiB twice; with a sparse volume on Windows that alone
-    # took over 9 minutes (run 43628997538 was cancelled at the old 15-minute limit).
-    timeout-minutes: 60
+    # The large-volume step stores 10 GiB twice; with a sparse volume on Windows the job took
+    # 50 minutes (run 44091117402). Allow 90 minutes so building MinIO on a cache miss fits.
+    timeout-minutes: 90
     steps:
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
@@ -59,6 +62,43 @@ jobs:
           workspaces: server
       - name: Build s3-server
         run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+
+      - uses: actions/cache@v4
+        id: minio-cache
+        with:
+          path: .tmp/minio
+          key: minio-${{ env.MINIO_RELEASE }}-mc-v1-${{ runner.os }}
+      - uses: actions/setup-go@v5
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        with:
+          go-version: stable
+          cache: false
+      - name: Fetch MinIO and mc
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          exe=""; [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
+          mkdir -p .tmp/minio
+          from_image() { # image, path in image, output
+            [ "$RUNNER_OS" = "Linux" ] || return 1
+            docker pull "$1" >/dev/null 2>&1 || return 1
+            id=$(docker create "$1") && docker cp "$id:$2" "$3" && docker rm "$id" >/dev/null
+          }
+          if ! from_image "quay.io/minio/minio:${MINIO_RELEASE}" /usr/bin/minio ".tmp/minio/minio$exe"; then
+            git clone -q --depth 1 --branch "${MINIO_RELEASE}" https://github.com/minio/minio "$RUNNER_TEMP/minio-src"
+            (cd "$RUNNER_TEMP/minio-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/minio$exe" .)
+          fi
+          if ! from_image quay.io/minio/mc:latest /usr/bin/mc ".tmp/minio/mc$exe"; then
+            git clone -q --depth 1 https://github.com/minio/mc "$RUNNER_TEMP/mc-src"
+            (cd "$RUNNER_TEMP/mc-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/mc$exe" .)
+          fi
+          chmod +x ".tmp/minio/minio$exe" ".tmp/minio/mc$exe" || true
+      - name: MinIO versions
+        shell: bash
+        run: |
+          exe=""; [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
+          ".tmp/minio/minio$exe" --version && ".tmp/minio/mc$exe" --version
+
       - name: Where a PUT's time goes
         shell: bash
         env:
@@ -81,6 +121,21 @@ jobs:
           grep -E '^(Data under|\|)' commit_cost.txt >> "$GITHUB_STEP_SUMMARY"
       - name: Probe self-tests
         run: python benchmarks/test_large_volume_probe.py
+      # #248: loopback connect cost on AwanFS vs MinIO on the same runner.
+      - name: Loopback connect cost, AwanFS against MinIO
+        shell: bash
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          bin=server/target/release/s3-server
+          exe=""
+          if [ -f "$bin.exe" ]; then bin="$bin.exe"; exe=".exe"; fi
+          python -u benchmarks/large_volume_probe.py --server-bin "$bin" \
+            --minio-bin ".tmp/minio/minio$exe" --mc-bin ".tmp/minio/mc$exe" \
+            --connect-only --report connect_probe.md
+          cat connect_probe.md >> "$GITHUB_STEP_SUMMARY"
       # Decision 52: new volumes grow. Does that cost anything once the volume is large?
       - name: A large volume, growing against sparse
         shell: bash
@@ -94,3 +149,13 @@ jobs:
           [ -f "$bin.exe" ] && bin="$bin.exe"
           python -u benchmarks/large_volume_probe.py --server-bin "$bin" --fill-gib "$FILL_GIB" --report large_volume_probe.md
           cat large_volume_probe.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-reports-${{ matrix.os }}
+          path: |
+            sync_probe.md
+            put_path_probe.md
+            connect_probe.md
+            large_volume_probe.md
+          if-no-files-found: ignore

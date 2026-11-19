@@ -14,6 +14,7 @@ import http.client
 import os
 import platform
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -65,44 +66,250 @@ def read_after_write_split(port: int, small: bytes, old_keys, rounds: int) -> di
         key = f"/probe/split-{i}"
         put(port, key, small)
         c = conn_to(port)
-        t0 = time.perf_counter()
-        c.connect()
-        rows["connect"].append((time.perf_counter() - t0) * 1000.0)
-        rows["open_conn"].append(timed_get(c, key, SMALL))
-        c.close()
+        try:
+            t0 = time.perf_counter()
+            c.connect()
+            rows["connect"].append((time.perf_counter() - t0) * 1000.0)
+            rows["open_conn"].append(timed_get(c, key, SMALL))
+        finally:
+            c.close()
         key = f"/probe/pause-{i}"
         put(port, key, small)
         time.sleep(0.1)
         c = conn_to(port)
-        c.connect()
-        rows["pause"].append(timed_get(c, key, SMALL))
-        c.close()
+        try:
+            c.connect()
+            rows["pause"].append(timed_get(c, key, SMALL))
+        finally:
+            c.close()
         key = f"/probe/ka-{i}"
         c = conn_to(port)
-        c.request("PUT", key, body=small, headers={"Content-Length": str(len(small))})
-        r = c.getresponse()
-        r.read()
-        if r.status != 200:
-            raise NotMeasured(f"PUT {key}: HTTP {r.status}")
-        rows["keep_alive"].append(timed_get(c, key, SMALL))
-        c.close()
+        try:
+            c.request("PUT", key, body=small, headers={"Content-Length": str(len(small))})
+            r = c.getresponse()
+            r.read()
+            if r.status != 200:
+                raise NotMeasured(f"PUT {key}: HTTP {r.status}")
+            rows["keep_alive"].append(timed_get(c, key, SMALL))
+        finally:
+            c.close()
         c = conn_to(port)
-        c.connect()
-        rows["old"].append(timed_get(c, old_keys[i % len(old_keys)], SMALL))
-        c.close()
+        try:
+            c.connect()
+            rows["old"].append(timed_get(c, old_keys[i % len(old_keys)], SMALL))
+        finally:
+            c.close()
     return {k: (percentile(v, 0.50), percentile(v, 0.99)) for k, v in rows.items()}
 
 
-def measure(server_bin: str, env_extra: dict, fill_gib: float, seconds: float, rounds: int):
+def _read_log_tail(log_path: str, limit: int = 2000) -> str:
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()[-limit:]
+    except OSError:
+        return ""
+
+
+def stop_server(proc: subprocess.Popen, data: str) -> None:
+    proc.kill()
+    proc.wait()
+    shutil.rmtree(data, ignore_errors=True)
+
+
+def start_awanfs(server_bin: str, env_extra: dict = None):
     data = tempfile.mkdtemp(prefix="volume_probe_")
     port = get_free_port()
-    with open(os.path.join(data, "server.log"), "ab") as log:
-        proc = subprocess.Popen([server_bin, "--port", str(port), "--data-dir", data, "--allow-anonymous", "--auto-compaction", "off"],
-                                stdout=log, stderr=subprocess.STDOUT, env=dict(os.environ, **env_extra))
+    log_path = os.path.join(data, "server.log")
+    with open(log_path, "ab") as log:
+        proc = subprocess.Popen(
+            [server_bin, "--port", str(port), "--data-dir", data, "--allow-anonymous", "--auto-compaction", "off"],
+            stdout=log, stderr=subprocess.STDOUT, env=dict(os.environ, **(env_extra or {})),
+        )
+    if not wait_port(port, timeout=40.0):
+        proc.kill()
+        proc.wait()
+        tail = _read_log_tail(log_path)
+        shutil.rmtree(data, ignore_errors=True)
+        raise SystemExit(f"the server did not answer on port {port} with {env_extra}\n{tail}")
     try:
-        if not wait_port(port, timeout=40.0):
-            raise SystemExit(f"the server did not answer on port {port} with {env_extra}")
         create_bucket(port, "probe")
+    except BaseException:
+        stop_server(proc, data)
+        raise
+    return proc, port, data
+
+
+def start_minio(minio_bin: str, mc_bin: str):
+    if not mc_bin:
+        raise SystemExit("--mc-bin is required alongside --minio-bin (mc not found)")
+    data = tempfile.mkdtemp(prefix="minio_probe_")
+    port, console = get_free_port(), get_free_port()
+    env = dict(os.environ, MINIO_ROOT_USER="minioadmin", MINIO_ROOT_PASSWORD="minioadmin",
+               MINIO_UPDATE="off", MINIO_BROWSER="off")
+    log_path = os.path.join(data, "minio.log")
+    with open(log_path, "ab") as log:
+        proc = subprocess.Popen(
+            [minio_bin, "server", data, "--address", f"127.0.0.1:{port}", "--console-address", f"127.0.0.1:{console}"],
+            env=env, stdout=log, stderr=subprocess.STDOUT,
+        )
+    if not wait_port(port, timeout=40.0):
+        proc.kill()
+        proc.wait()
+        tail = _read_log_tail(log_path)
+        shutil.rmtree(data, ignore_errors=True)
+        raise SystemExit(f"minio did not answer on port {port}\n{tail}")
+    alias = f"probe{port}"
+    for args in (["alias", "set", alias, f"http://127.0.0.1:{port}", "minioadmin", "minioadmin"],
+                 ["mb", f"{alias}/probe"],
+                 ["anonymous", "set", "public", f"{alias}/probe"]):
+        last = None
+        for _ in range(20):
+            res = subprocess.run([mc_bin, *args], capture_output=True, text=True)
+            if res.returncode == 0:
+                break
+            last = res.stderr or res.stdout
+            time.sleep(0.5)
+        else:
+            proc.kill()
+            proc.wait()
+            tail = _read_log_tail(log_path)
+            shutil.rmtree(data, ignore_errors=True)
+            raise SystemExit(f"mc {args[0]} failed: {last}\n{tail}")
+    return proc, port, data
+
+
+def measure_connect(port: int, rounds: int, bucket: str = "probe") -> dict:
+    """Measure fresh loopback connection setup (`c.connect()`) followed by a 64 KiB GET."""
+    small = os.urandom(SMALL)
+    key = f"/{bucket}/connect-probe"
+    put(port, key, small)
+    connect_ms = []
+    open_get_ms = []
+    for _ in range(rounds):
+        c = conn_to(port)
+        try:
+            t0 = time.perf_counter()
+            c.connect()
+            connect_ms.append((time.perf_counter() - t0) * 1000.0)
+            open_get_ms.append(timed_get(c, key, SMALL))
+        finally:
+            c.close()
+    return {
+        "connect": (percentile(connect_ms, 0.50), percentile(connect_ms, 0.99)),
+        "open_conn": (percentile(open_get_ms, 0.50), percentile(open_get_ms, 0.99)),
+    }
+
+
+def resolve_mc_bin(minio_bin: str, mc_bin: str) -> str:
+    if mc_bin:
+        return mc_bin
+    if not minio_bin:
+        return ""
+    exe = ".exe" if minio_bin.lower().endswith(".exe") else ""
+    sibling = os.path.join(os.path.dirname(os.path.abspath(minio_bin)), "mc" + exe)
+    return sibling if os.path.isfile(sibling) else ""
+
+
+def run_connect_comparison(server_bin: str, minio_bin: str, mc_bin: str, rounds: int) -> list:
+    starters = [("AwanFS", lambda: start_awanfs(server_bin))]
+    if minio_bin:
+        mc = resolve_mc_bin(minio_bin, mc_bin)
+        starters.append(("MinIO", lambda m=mc: start_minio(minio_bin, m)))
+    results = []
+    for round_no, order in enumerate((starters, list(reversed(starters))), 1):
+        for name, start in order:
+            print(f"connect round {round_no}: {name} ...", flush=True)
+            proc, port, data = start()
+            try:
+                results.append((name, round_no, measure_connect(port, rounds)))
+            finally:
+                stop_server(proc, data)
+    return results
+
+
+def summarize_connect(results) -> dict:
+    by_server = {}
+    for server, _round_no, m in results:
+        by_server.setdefault(server, []).append(m)
+    summary = {}
+    for server in ("AwanFS", "MinIO"):
+        entries = by_server.get(server)
+        if not entries:
+            summary[server] = None
+            continue
+        summary[server] = {
+            "connect_p50_ms": statistics.median(e["connect"][0] for e in entries),
+            "connect_p99_ms": statistics.median(e["connect"][1] for e in entries),
+            "open_conn_p50_ms": statistics.median(e["open_conn"][0] for e in entries),
+            "open_conn_p99_ms": statistics.median(e["open_conn"][1] for e in entries),
+        }
+    a = summary.get("AwanFS")
+    b = summary.get("MinIO")
+    summary["ratio"] = (a["connect_p50_ms"] / b["connect_p50_ms"]) if (a and b and b["connect_p50_ms"] > 0) else None
+    return summary
+
+
+def render_connect(results, rounds: int, cmd: str) -> str:
+    lines = [
+        f"Command: `{cmd}`",
+        "",
+        f"# Loopback connect cost: AwanFS against MinIO ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
+        "",
+        f"Machine: {platform.node()} ({platform.platform()}, {os.cpu_count()} CPUs). Data under {tempfile.gettempdir()}. "
+        f"{rounds} fresh connections per round, alternating order.",
+        "",
+        "| | " + " | ".join(f"{srv}, round {rnd}" for srv, rnd, _ in results) + " |",
+        "|---|" + "---|" * len(results),
+        "| opening the connection (connect), P50, P99 ms | "
+        + " | ".join(f"{m['connect'][0]:.2f}, {m['connect'][1]:.2f}" for _, _, m in results) + " |",
+        "| GET on the open connection (64 KiB), P50, P99 ms | "
+        + " | ".join(f"{m['open_conn'][0]:.2f}, {m['open_conn'][1]:.2f}" for _, _, m in results) + " |",
+        "",
+        "| server | connect P50 ms (median) | connect P99 ms (median) | open-conn GET P50 ms (median) |",
+        "|---|---|---|---|",
+    ]
+    summary = summarize_connect(results)
+    for server in ("AwanFS", "MinIO"):
+        s = summary.get(server)
+        if s is None:
+            lines.append(f"| {server} | not measured | not measured | not measured |")
+        else:
+            lines.append(
+                f"| {server} | {s['connect_p50_ms']:.2f} | {s['connect_p99_ms']:.2f} | {s['open_conn_p50_ms']:.2f} |"
+            )
+    ratio = summary.get("ratio")
+    lines.append("")
+    lines.append(
+        f"AwanFS / MinIO connect P50 ratio: {ratio:.2f}x"
+        if ratio is not None else "AwanFS / MinIO connect P50 ratio: not measured"
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def parse_connect_summary(text: str) -> dict:
+    """Parse the summary table and ratio line from render_connect output."""
+    out = {"AwanFS": None, "MinIO": None, "ratio": None}
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("| AwanFS |") or s.startswith("| MinIO |"):
+            parts = [p.strip() for p in s.strip("|").split("|")]
+            if len(parts) >= 4 and parts[1] != "not measured":
+                out[parts[0]] = {
+                    "connect_p50_ms": float(parts[1]),
+                    "connect_p99_ms": float(parts[2]),
+                    "open_conn_p50_ms": float(parts[3]),
+                }
+        elif s.startswith("AwanFS / MinIO connect P50 ratio:"):
+            val = s.split(":", 1)[1].strip()
+            if val != "not measured" and val.endswith("x"):
+                out["ratio"] = float(val[:-1])
+    return out
+
+
+def measure(server_bin: str, env_extra: dict, fill_gib: float, seconds: float, rounds: int):
+    proc, port, data = start_awanfs(server_bin, env_extra)
+    try:
         # Small objects at the start of the volume, for the "old object" row (#204).
         small = os.urandom(SMALL)
         old_keys = [f"/probe/old-{i}" for i in range(64)]
@@ -133,9 +340,7 @@ def measure(server_bin: str, env_extra: dict, fill_gib: float, seconds: float, r
         out["rss"] = get_process_peak_rss_mb(proc.pid)
         return out
     finally:
-        proc.kill()
-        proc.wait()
-        shutil.rmtree(data, ignore_errors=True)
+        stop_server(proc, data)
 
 
 def render(results, fill_gib, cmd):
@@ -175,15 +380,31 @@ def render(results, fill_gib, cmd):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--server-bin", required=True)
+    ap.add_argument("--minio-bin", default="")
+    ap.add_argument("--mc-bin", default="")
+    ap.add_argument("--connect-only", action="store_true")
     ap.add_argument("--fill-gib", type=float, default=10.0)
     ap.add_argument("--seconds", type=float, default=5.0)
     ap.add_argument("--rounds", type=int, default=300)
     ap.add_argument("--report", default="")
     a = ap.parse_args(argv)
+    cmd = "python benchmarks/large_volume_probe.py " + " ".join(argv if argv is not None else sys.argv[1:])
+    if a.connect_only:
+        connect_results = run_connect_comparison(a.server_bin, a.minio_bin, a.mc_bin, a.rounds)
+        text = render_connect(connect_results, a.rounds, cmd)
+        print(text)
+        if a.report:
+            with open(a.report, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        return 0
     free_gib = shutil.disk_usage(tempfile.gettempdir()).free / (1024 * MIB)
     fill = min(a.fill_gib, max(1.0, free_gib - 4.0))
     if fill < a.fill_gib:
         print(f"{free_gib:.1f} GiB free under {tempfile.gettempdir()}: filling {fill:.1f} GiB, not {a.fill_gib:g}", flush=True)
+    sections = []
+    if a.minio_bin:
+        connect_results = run_connect_comparison(a.server_bin, a.minio_bin, a.mc_bin, a.rounds)
+        sections.append(render_connect(connect_results, a.rounds, cmd))
     results = []
     # Twice, in opposite orders: one pass cannot tell a difference from the runner's drift.
     for round_no, order in enumerate((CONFIGS, list(reversed(CONFIGS))), 1):
@@ -191,8 +412,9 @@ def main(argv=None):
             print(f"round {round_no}: {label} ...", flush=True)
             results.append((f"{label}, round {round_no}", measure(a.server_bin, env, fill, a.seconds, a.rounds)))
             print(render(results[-1:], fill, "(partial)"), flush=True)
-    cmd = "python benchmarks/large_volume_probe.py " + " ".join(argv if argv is not None else sys.argv[1:])
     text = render(results, fill, cmd)
+    if sections:
+        text = "\n".join(sections) + "\n" + text
     print(text)
     if a.report:
         with open(a.report, "w", encoding="utf-8") as fh:
