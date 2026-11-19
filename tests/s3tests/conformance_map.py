@@ -36,6 +36,9 @@ AREAS: List[Tuple[str, str, str, Optional[str], frozenset]] = [
     ("rgw-only", "out of scope", "9", r"^test_(head_bucket_usage|account_usage|bucket_head_extended|get_object_torrent)$|_unordered$|_tenant$", frozenset()),
     # An anonymous DELETE is refused before the bucket is looked up: authorization, #122 (owner, 2026-11-18; #140).
     ("anonymous-bucket-gone", "#122", "5", r"^test_object_delete_key_bucket_gone$", frozenset()),
+    # Unsigned GETs on a public-read bucket: the 403 is authorization, #122; CORS's matching is
+    # covered by server/tests/cors_test.rs (owner, 2026-11-19; #116).
+    ("anonymous-cors", "#122", "5", r"^test_cors_origin_(response|wildcard)$", frozenset()),
     ("bucket-logging", "#153", "8.4", r"logging", frozenset({"bucket_logging", "bucket_logging_cleanup", "fails_without_logging_rollover"})),
     ("storage-classes", "out of scope", "9", r"transition|cloud|restore|storage_class", frozenset({"lifecycle_transition", "cloud_transition", "cloud_restore"})),
     ("encryption", "#121", "8.2", r"sse|encrypt|kms", frozenset({"encryption", "sse_s3", "bucket_encryption"})),

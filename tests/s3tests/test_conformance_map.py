@@ -130,6 +130,14 @@ class Map(unittest.TestCase):
         self.assertEqual(cm.area_of("test_object_delete_key_bucket_gone", [])[:2], ("anonymous-bucket-gone", "#122"))
         self.assertEqual(cm.area_of("test_object_read_not_exist", [])[0], "object-basics")
 
+    def test_owner_decision_2026_11_19_cors(self):
+        """#116: the two CORS tests that read a public-read bucket anonymously belong to #122;
+        the other CORS tests stay with #116, and the SigV2 ones stay out of scope."""
+        self.assertEqual(cm.area_of("test_cors_origin_response", [])[:2], ("anonymous-cors", "#122"))
+        self.assertEqual(cm.area_of("test_cors_origin_wildcard", [])[:2], ("anonymous-cors", "#122"))
+        self.assertEqual(cm.area_of("test_cors_header_option", [])[:2], ("cors", "#116"))
+        self.assertEqual(cm.area_of("test_cors_presigned_get_object_v2", [])[0], "sigv2")
+
     def test_headers_suite_assigned_to_request_headers(self):
         headers_suite = '''
 def test_put_obj_bad_content_length():
