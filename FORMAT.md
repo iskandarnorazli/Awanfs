@@ -21,7 +21,86 @@ All integers are little-endian. Sectors are 4096 bytes.
 | `volume_NNNN.idx` | The volume's journal: one 42-byte record per needle. |
 | `buckets.manifest` | One line per bucket event: `+<id>:<name>` created, `-<id>:<name>` deleted. |
 | `metadata.db` | redb spill index (rebuilt from the volumes if lost). To be replaced by metadata segment files and their manifest (#26, decision 59), documented here before they are written. |
+| `meta/seg_<seq>.seg` | A metadata segment (#26, decision 59): sorted rows of the metadata index, immutable once written. `<seq>` is 16 lowercase hex digits; a higher sequence number is newer. Below. Not read by the server until #26 stage 6 switches from redb; the manifest that names the live segments comes in stage 4. |
 | `.staging/upload-<hex>/part_NNNNN.dat` | Multipart part files; the parts of completed objects stay here. |
+
+## Metadata segment (`meta/seg_<seq>.seg`, #26 stage 2)
+
+A segment is an immutable, sorted run of index entries, written once and synced, then only
+read: with positioned reads through the page cache, never a mapping (decision 58). Every
+number is little-endian except the bucket id inside a sort key. The file is 4096-byte blocks:
+the header block, the data blocks, the index blocks, and the trailer block. At most 64 MiB.
+
+**Sort key.** `bucket id (u32, big-endian) || object key bytes`. Big-endian puts one bucket's
+keys together and in bucket order, so byte order on the sort key is (bucket, key) order, and
+listing a bucket is one range. An object key is at most 1024 bytes.
+
+### Header (block 0)
+
+| Bytes | Field |
+|---|---|
+| 0..4 | magic `0x47535741` ("AWSG") |
+| 4..6 | segment format version, 1 |
+| 6..8 | flags, 0 |
+| 8..16 | sequence number (the `<seq>` of the file name) |
+| 16..24 | creation time, ns since the Unix epoch |
+| 24..32 | entry count |
+| 32..40 | data block count `D` |
+| 40..44 | CRC32C of bytes 0..40 |
+| 44..4096 | zero |
+
+### Data block (blocks 1..=D)
+
+| Bytes | Field |
+|---|---|
+| 0..2 | entry count in this block |
+| 2.. | entries, packed, in strictly increasing sort-key order across all blocks |
+| ..4092 | zero |
+| 4092..4096 | CRC32C of bytes 0..4092 |
+
+An entry never spans two blocks. Entry:
+
+| Bytes | Field |
+|---|---|
+| 0 | kind: 1 = row, 2 = tombstone (the key is deleted; it hides older segments) |
+| 1..3 | sort-key length `K` (u16) |
+| 3..3+K | sort key |
+| 3+K..67+K | row (kind 1 only): the 64-byte `ObjectMeta`, little-endian, in its field order: `key_hash`, `bucket_flags`, `vol_offset`, `size`, `etag_hi`, `etag_lo`, `created_at`, `key_slice`. `key_slice` is written 0: it points into the in-memory key arena, and on disk the key is the sort key. |
+
+### Index blocks (after the data blocks)
+
+The fence keys, then the Bloom filter, padded with zeros to a block boundary:
+- **Fences:** for each data block in order, its first entry's sort key as `u16 length || bytes`.
+- **Bloom filter:** `B` blocks of 64 bytes (512 bits each). A sort key sets `P` bits, all in one
+  block: `h = xxh3_64(sort key)`, block `h % B`, and `P` bit positions in it from a second hash,
+  `xxh3_64_with_seed(sort key, 0x5345474D454E5453)` (`bloom_probes` in `server/src/segment.rs`). Rows and tombstones are both in the filter.
+
+### Trailer (last block)
+
+| Bytes | Field |
+|---|---|
+| 0..4 | magic `0x46535741` ("AWSF") |
+| 4..12 | first index block |
+| 12..20 | fence region length in bytes |
+| 20..28 | fence count (equals `D`) |
+| 28..36 | Bloom byte offset from the first index block |
+| 36..44 | Bloom block count `B` |
+| 44..48 | probes per key `P` |
+| 48..52 | CRC32C of the index region (fences and Bloom, unpadded) |
+| 52..56 | CRC32C of bytes 0..52 |
+| 56..4096 | zero |
+
+### Reading and the rules
+- **Open** reads the header, the trailer and the index region, and checks all three CRCs. A
+  mismatch, a wrong magic, a newer segment format, or a length that does not fit the file is an
+  error: the segment is not used, never read past.
+- **Lookup:** the Bloom filter (a miss costs no read), then the fence to find the one data block,
+  one 4096-byte read, its CRC, then a scan of its entries. A block whose CRC fails is an error,
+  never "not found".
+- **Several segments:** the entry from the segment with the higher sequence number wins; a
+  tombstone hides every older entry of its key.
+- Written in full, then `sync_data`, then (stage 4) named in the manifest. A segment the
+  manifest does not name is ignored, so a crash mid-write leaves nothing visible.
 
 ## Superblock (sector 0 of a volume)
 
