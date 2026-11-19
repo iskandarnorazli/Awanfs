@@ -232,13 +232,13 @@ mod tests {
         let newest = maps.last().unwrap().iter().find(|(_, e)| matches!(e, Entry::Row(_))).unwrap().0.clone();
         let before = work.snapshot();
         assert!(s.get(&newest).unwrap().is_some());
-        assert_eq!(work.since(&before).disk_reads, 1);
+        assert_eq!(work.snapshot().since(&before).disk_reads, 1);
         // 10,000 absent keys across 10 segments: only Bloom false positives read.
         let before = work.snapshot();
         for i in 0..10_000u32 {
             assert_eq!(s.get(&sort_key(2, format!("absent-{}", i).as_bytes())).unwrap(), None);
         }
-        let reads = work.since(&before).disk_reads;
+        let reads = work.snapshot().since(&before).disk_reads;
         assert!(reads < 3_000, "reads for 10,000 absent keys over 10 segments: {}", reads);
     }
 
