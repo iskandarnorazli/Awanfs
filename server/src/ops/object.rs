@@ -308,6 +308,7 @@ impl MetadataHeadersExt for hyper::http::response::Builder {
 pub(crate) fn null_version_of(m: &crate::meta_index::ObjectMeta) -> crate::versions::Version {
     crate::versions::Version {
         ts: 0,
+        modified: m.created_at.saturating_mul(1_000_000),
         null: true,
         marker: false,
         vol_offset: m.vol_offset,
@@ -357,6 +358,7 @@ pub(crate) fn finish_version_put(
 ) -> Result<String, Response<ResponseBody>> {
     let v = crate::versions::Version {
         ts,
+        modified: ts,
         null: flags & crate::meta_index::FLAG_NULL_ID != 0,
         marker: false,
         vol_offset,
@@ -505,7 +507,7 @@ fn version_get_response(
             .unwrap();
     }
     let etag_val = version_etag(&v);
-    let lm_secs = last_modified_secs_from_ns(v.ts);
+    let lm_secs = last_modified_secs_from_ns(v.modified);
     let facts = ObjectFacts {
         etag: etag_val.clone(),
         last_modified_secs: lm_secs,
@@ -556,7 +558,7 @@ fn version_get_response(
                     .header("x-amz-mp-parts-count", parts_count.to_string())
                     .header("x-amz-version-id", v.id_string())
                     .header(CONTENT_LENGTH, ext.part_size.to_string())
-                    .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts)),
+                    .header(LAST_MODIFIED, crate::clock::format_http_date(v.modified)),
                 &view.attrs,
                 ext.checksum.as_ref(),
             )
@@ -591,7 +593,7 @@ fn version_get_response(
             .header(ETAG, etag_val)
             .header(ACCEPT_RANGES, "bytes")
             .header("x-amz-version-id", v.id_string())
-            .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts)),
+            .header(LAST_MODIFIED, crate::clock::format_http_date(v.modified)),
         tag_count,
     );
     if let Some(h) = range {
@@ -716,7 +718,7 @@ pub async fn copy_object(
             }
             let src_facts = ObjectFacts {
                 etag: version_etag(&v),
-                last_modified_secs: last_modified_secs_from_ns(v.ts),
+                last_modified_secs: last_modified_secs_from_ns(v.modified),
             };
             if precondition(headers, Some(&src_facts), true) != PreconditionOutcome::Proceed {
                 return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
@@ -1828,7 +1830,7 @@ pub async fn get_object_attributes(
                 .body(full_body(Bytes::from(xml)))
                 .unwrap());
         }
-        (v.vol_offset, v.flags, v.size, v.etag_hi, v.etag_lo, v.part_count, crate::clock::format_http_date(v.ts), Some(v.id_string()))
+        (v.vol_offset, v.flags, v.size, v.etag_hi, v.etag_lo, v.part_count, crate::clock::format_http_date(v.modified), Some(v.id_string()))
     } else {
         let meta = {
             let engine = state.engine.read();

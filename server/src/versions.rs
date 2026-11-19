@@ -49,6 +49,10 @@ impl Versioning {
 pub struct Version {
     /// Needle creation time (ns): the order of versions, and the id unless `null`.
     pub ts: u64,
+    /// Last-Modified (ns). Equal to `ts`, except for the null version made from an object
+    /// written before the key had a history: its `ts` is 0, so any versioned write orders
+    /// after it, while this keeps the object's own write time (decision 65, #238).
+    pub modified: u64,
     pub null: bool,
     pub marker: bool,
     pub vol_offset: u64,
@@ -226,7 +230,7 @@ mod tests {
     use super::*;
 
     fn v(ts: u64) -> Version {
-        Version { ts, null: false, marker: false, vol_offset: ts * 4096, size: 1, etag_hi: 0, etag_lo: 0, part_count: 0, flags: 0 }
+        Version { ts, modified: ts, null: false, marker: false, vol_offset: ts * 4096, size: 1, etag_hi: 0, etag_lo: 0, part_count: 0, flags: 0 }
     }
 
     fn ids(s: &VersionStore) -> Vec<String> {

@@ -683,7 +683,7 @@ pub async fn list_object_versions(
                 version_id: vid.clone(),
                 latest: orig_idx == 0,
                 marker: v.marker,
-                last_modified: crate::versions::iso8601(v.ts),
+                last_modified: crate::versions::iso8601(v.modified),
                 etag: version_etag(v).trim_matches('"').to_string(),
                 size: v.size,
             });

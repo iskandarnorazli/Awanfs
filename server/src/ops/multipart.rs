@@ -883,7 +883,7 @@ pub async fn upload_part_copy(
             }
             let facts = ObjectFacts {
                 etag: version_etag(&v),
-                last_modified_secs: last_modified_secs_from_ns(v.ts),
+                last_modified_secs: last_modified_secs_from_ns(v.modified),
             };
             let vid_str = v.id_string();
             (v.size, facts, Some(vid_str), Some(v))

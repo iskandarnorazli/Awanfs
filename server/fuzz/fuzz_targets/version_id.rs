@@ -15,6 +15,7 @@ fuzz_target!(|data: &[u8]| {
         let id = u64::from_le_bytes(data[..8].try_into().unwrap());
         let v = Version {
             ts: id,
+            modified: id,
             null: id == 0,
             marker: false,
             vol_offset: 0,
