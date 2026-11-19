@@ -35,6 +35,10 @@ pub trait VolFile: Send + Sync + 'static {
     fn set_len(&self, len: u64) -> io::Result<()>;
     /// The data and the length are durable when this returns.
     fn sync_data(&self) -> io::Result<()>;
+    /// As `sync_data`, and the file's metadata too (used after recovery cuts a torn tail).
+    fn sync_all(&self) -> io::Result<()> {
+        self.sync_data()
+    }
     /// Marks the file sparse where the platform needs it (Windows); a no-op elsewhere.
     fn make_sparse(&self) -> io::Result<()>;
     /// The read mapping over the whole file, where there is one. `None` makes reads use
@@ -82,14 +86,24 @@ impl DiskFile {
     pub fn main(&self) -> &AlignedFile {
         &self.main
     }
+
+    /// The same as the trait's, callable without importing `VolFile`: code that held the
+    /// volume's `AlignedFile` before the seam (tests among it) keeps working unchanged.
+    pub fn write_aligned_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        self.main.write_aligned_at(offset, buf)
+    }
+
+    pub fn read_aligned_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.main.read_aligned_at(offset, buf)
+    }
 }
 
 impl VolFile for DiskFile {
     fn write_aligned_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
-        self.main.write_aligned_at(offset, buf)
+        DiskFile::write_aligned_at(self, offset, buf)
     }
     fn read_aligned_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        self.main.read_aligned_at(offset, buf)
+        DiskFile::read_aligned_at(self, offset, buf)
     }
     fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
         crate::direct_io::write_all_at(self.main.file(), offset, buf)
@@ -105,6 +119,9 @@ impl VolFile for DiskFile {
     }
     fn sync_data(&self) -> io::Result<()> {
         self.sync.sync_data()
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        self.main.sync_all()
     }
     fn make_sparse(&self) -> io::Result<()> {
         self.main.make_sparse()
