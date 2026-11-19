@@ -7,6 +7,8 @@ busy core scale with N pinned server cores (1, 2, 4, ...). Writes a markdown rep
 its command and SeaStore-style 4-panel PNG and SVG charts next to the report.
 """
 import argparse
+import ctypes
+import hashlib
 import http.client
 import math
 import os
@@ -21,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -42,6 +45,37 @@ DEFAULT_CONCURRENCIES = "1,4,16,64,256"
 DEFAULT_SEED = 42
 DEFAULT_MEMORY_BUDGET = "32MiB"
 DEFAULT_PREFILL_SIZE = "48MiB"
+DURABILITIES: Tuple[str, ...] = ("group", "fast", "strict")
+DEFAULT_PROFILE_THREAD_CORES: Tuple[int, ...] = (4, 8)
+
+MINIO_RELEASE = "RELEASE.2025-09-07T16-13-09Z"
+MC_RELEASE = "RELEASE.2025-08-13T08-35-41Z"
+MINIO_ASSETS: Dict[Tuple[str, str], Dict[str, Tuple[str, str, str]]] = {
+    ("win32", "x86_64"): {
+        "minio": (
+            "minio.exe",
+            f"https://github.com/minio/minio/releases/download/{MINIO_RELEASE}/minio.windows-amd64.{MINIO_RELEASE}.exe",
+            "af709e6ba68488404e85acdd22a3030d0f5e56a108d4b27d744f18ceb50861b4",
+        ),
+        "mc": (
+            "mc.exe",
+            f"https://github.com/minio/mc/releases/download/{MC_RELEASE}/mc.windows-amd64.{MC_RELEASE}.exe",
+            "c8db13ebeda31497f354c0e950809db0ae9b2a2a69b8afee68c128c37300c157",
+        ),
+    },
+    ("linux", "x86_64"): {
+        "minio": (
+            "minio",
+            f"https://github.com/minio/minio/releases/download/{MINIO_RELEASE}/minio.linux-amd64.{MINIO_RELEASE}",
+            "7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f",
+        ),
+        "mc": (
+            "mc",
+            f"https://github.com/minio/mc/releases/download/{MC_RELEASE}/mc.linux-amd64.{MC_RELEASE}",
+            "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891",
+        ),
+    },
+}
 
 # (key, display label, mode, payload_size)
 WORKLOADS: List[Tuple[str, str, str, int]] = [
@@ -67,6 +101,18 @@ CORE_STYLES: Tuple[Dict[str, str], ...] = (
 )
 
 
+@dataclass(frozen=True)
+class ThreadCpuSample:
+    tid: int
+    name: str
+    user_s: float
+    system_s: float
+
+    @property
+    def total_s(self) -> float:
+        return self.user_s + self.system_s
+
+
 @dataclass
 class PointResult:
     ops_per_sec: Optional[float] = None
@@ -77,6 +123,8 @@ class PointResult:
     reason: str = ""
     shares_cores: bool = False
     mib_per_sec: Optional[float] = None
+    thread_cpu: Optional[Tuple[ThreadCpuSample, ...]] = None
+    wall_sec: Optional[float] = None
 
     @property
     def measured(self) -> bool:
@@ -396,6 +444,265 @@ def client_cores_for(n_cores: int, total_cores: int) -> Tuple[List[int], bool]:
     return list(range(total)), True
 
 
+def should_auto_profile_put(total_cores: int, cores: Sequence[int]) -> bool:
+    """True on 16+ core split-client machines (e.g. self-hosted) when 4 or 8 cores are tested."""
+    if total_cores < 16 or not cores:
+        return False
+    if not any(c in DEFAULT_PROFILE_THREAD_CORES for c in cores):
+        return False
+    return all(c <= total_cores and not client_cores_for(c, total_cores)[1] for c in cores)
+
+
+def _platform_asset_key(platform_name: str = sys.platform, machine: Optional[str] = None) -> Tuple[str, str]:
+    plat = "win32" if platform_name == "win32" else "linux" if platform_name.startswith("linux") else platform_name
+    arch_raw = (machine if machine is not None else platform.machine()).lower()
+    arch = "x86_64" if arch_raw in ("amd64", "x86_64", "x64") else arch_raw
+    return plat, arch
+
+
+def fetch_verified_binary(url: str, expected_sha256: str, dest_path: str, timeout: float = 120.0) -> str:
+    """Downloads `url` to `dest_path` atomically, verifying SHA-256 before committing."""
+    os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
+    last_err: Optional[Exception] = None
+    for attempt in range(2):
+        fd, tmp_path = tempfile.mkstemp(prefix=".dl_", dir=os.path.dirname(os.path.abspath(dest_path)))
+        os.close(fd)
+        try:
+            digest = hashlib.sha256()
+            with urllib.request.urlopen(url, timeout=timeout) as resp, open(tmp_path, "wb") as out:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    out.write(chunk)
+            got = digest.hexdigest().lower()
+            if got != expected_sha256.lower():
+                raise RuntimeError(f"SHA-256 mismatch for {url}: expected {expected_sha256}, got {got}")
+            if sys.platform != "win32":
+                os.chmod(tmp_path, 0o755)
+            os.replace(tmp_path, dest_path)
+            return dest_path
+        except RuntimeError:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+        except Exception as e:
+            last_err = e
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            if attempt == 0:
+                time.sleep(1.0)
+    raise RuntimeError(f"download failed for {url}: {last_err}")
+
+
+def ensure_minio_binaries(
+    minio_bin: Optional[str],
+    mc_bin: Optional[str],
+    auto_fetch: bool = True,
+    dest_dir: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Returns `(minio_bin, mc_bin)`, fetching pinned GitHub release binaries when missing."""
+    if minio_bin and os.path.isfile(minio_bin) and mc_bin and os.path.isfile(mc_bin):
+        return minio_bin, mc_bin
+    if not auto_fetch:
+        return minio_bin, mc_bin
+
+    assets = MINIO_ASSETS.get(_platform_asset_key())
+    if not assets:
+        return minio_bin, mc_bin
+
+    target_dir = dest_dir or os.path.join(REPO_ROOT, ".tmp", "minio")
+    for kind, current in (("minio", minio_bin), ("mc", mc_bin)):
+        if current and os.path.isfile(current):
+            continue
+        fname, url, sha = assets[kind]
+        candidate = os.path.join(target_dir, fname)
+        if os.path.isfile(candidate):
+            if kind == "minio":
+                minio_bin = candidate
+            else:
+                mc_bin = candidate
+            continue
+        try:
+            print(f"Fetching {kind} ({fname}) from pinned GitHub release...", flush=True)
+            fetched = fetch_verified_binary(url, sha, candidate)
+            if kind == "minio":
+                minio_bin = fetched
+            else:
+                mc_bin = fetched
+        except Exception as e:
+            print(f"warning: could not fetch {kind} binary: {e}", file=sys.stderr)
+    return minio_bin, mc_bin
+
+
+def get_thread_name(
+    pid: int,
+    tid: int,
+    platform_name: str = sys.platform,
+    psutil_thread: Optional[object] = None,
+    proc_root: str = "/proc",
+) -> str:
+    """Returns OS-reported thread name for `(pid, tid)`, or empty string if unavailable."""
+    if psutil_thread is not None:
+        ps_name = getattr(psutil_thread, "name", None)
+        if isinstance(ps_name, str) and ps_name.strip():
+            return ps_name.strip()
+
+    if platform_name.startswith("linux"):
+        comm_path = os.path.join(proc_root, str(pid), "task", str(tid), "comm")
+        try:
+            with open(comm_path, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+
+    if platform_name == "win32":
+        from ctypes import wintypes
+
+        THREAD_QUERY_LIMITED_INFORMATION = 0x0800
+        try:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenThread.restype = wintypes.HANDLE
+            k32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.GetThreadDescription.restype = ctypes.c_long
+            k32.GetThreadDescription.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_void_p)]
+            k32.LocalFree.restype = ctypes.c_void_p
+            k32.LocalFree.argtypes = [ctypes.c_void_p]
+            k32.CloseHandle.restype = wintypes.BOOL
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        except Exception:
+            return ""
+
+        handle = k32.OpenThread(THREAD_QUERY_LIMITED_INFORMATION, False, int(tid))
+        if not handle:
+            return ""
+        desc_ptr = ctypes.c_void_p()
+        try:
+            hr = k32.GetThreadDescription(handle, ctypes.byref(desc_ptr))
+            if hr >= 0 and desc_ptr.value:
+                return ctypes.wstring_at(desc_ptr.value).strip()
+            return ""
+        except Exception:
+            return ""
+        finally:
+            if desc_ptr.value:
+                k32.LocalFree(desc_ptr)
+            k32.CloseHandle(handle)
+
+    return ""
+
+
+def snapshot_process_threads(
+    pid: int,
+    known_names: Optional[Dict[int, str]] = None,
+) -> Dict[int, Tuple[float, float, str]]:
+    """Returns `{tid: (user_s, system_s, name)}` for all live threads of `pid`."""
+    try:
+        import psutil  # type: ignore
+        threads = psutil.Process(pid).threads()
+    except Exception:
+        return {}
+
+    snap: Dict[int, Tuple[float, float, str]] = {}
+    for thr in threads:
+        tid = int(thr.id)
+        name = known_names.get(tid, "") if known_names is not None else ""
+        if not name:
+            name = get_thread_name(pid, tid, psutil_thread=thr)
+            if known_names is not None and name:
+                known_names[tid] = name
+        snap[tid] = (float(thr.user_time), float(thr.system_time), name)
+    return snap
+
+
+def _collect_thread_samples(
+    before: Dict[int, Tuple[float, float, str]],
+    last_seen: Dict[int, Tuple[float, float]],
+    after: Dict[int, Tuple[float, float, str]],
+    names: Dict[int, str],
+) -> Tuple[ThreadCpuSample, ...]:
+    """Combines start, polled, and end thread snapshots into sorted `ThreadCpuSample` entries."""
+    tids = set(before) | set(last_seen) | set(after)
+    out: List[ThreadCpuSample] = []
+    for tid in tids:
+        u0, s0, name0 = before.get(tid, (0.0, 0.0, ""))
+        if tid in after:
+            u1, s1, name1 = after[tid]
+        elif tid in last_seen:
+            u1, s1 = last_seen[tid]
+            name1 = ""
+        else:
+            u1, s1, name1 = u0, s0, name0
+        name = names.get(tid) or name1 or name0
+        out.append(
+            ThreadCpuSample(
+                tid=tid,
+                name=name,
+                user_s=max(0.0, u1 - u0),
+                system_s=max(0.0, s1 - s0),
+            )
+        )
+    out.sort(key=lambda s: (-s.total_s, s.tid))
+    return tuple(out)
+
+
+class ThreadCpuSampler:
+    """Samples per-thread CPU times and OS thread names for `pid` over a timed phase."""
+
+    def __init__(self, pid: int, every: float = 0.25):
+        self.pid = pid
+        self.every = every
+        self._names: Dict[int, str] = {}
+        self._before: Optional[Dict[int, Tuple[float, float, str]]] = None
+        self._last_seen: Dict[int, Tuple[float, float]] = {}
+        self._after: Optional[Dict[int, Tuple[float, float, str]]] = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def record_snapshot(self, snap: Dict[int, Tuple[float, float, str]]) -> None:
+        with self._lock:
+            if self._before is None:
+                self._before = snap
+            for tid, (u, s, name) in snap.items():
+                self._last_seen[tid] = (u, s)
+                if name and not self._names.get(tid):
+                    self._names[tid] = name
+            self._after = snap
+
+    def poll_once(self) -> None:
+        self.record_snapshot(snapshot_process_threads(self.pid, self._names))
+
+    def __enter__(self):
+        self.poll_once()
+
+        def poll_loop():
+            while not self._stop.wait(self.every):
+                self.poll_once()
+
+        self._thread = threading.Thread(target=poll_loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+        self.poll_once()
+        return False
+
+    def samples(self) -> Optional[Tuple[ThreadCpuSample, ...]]:
+        with self._lock:
+            if self._before is None or self._after is None:
+                return None
+            return _collect_thread_samples(self._before, self._last_seen, self._after, self._names)
+
+
 def process_cpu_times_total(pid: int) -> Tuple[float, float]:
     """Returns `(user_s, system_s)` for `pid` including recursive children via psutil."""
     try:
@@ -454,6 +761,15 @@ def aggregate_runs(run_points: Sequence[PointResult]) -> PointResult:
     cpu_med = statistics.median(cpu_vals) if cpu_vals else None
     eff_vals = [p.ops_per_busy_core for p in measured if p.ops_per_busy_core is not None]
     eff_med = statistics.median(eff_vals) if eff_vals else ops_per_busy_core(ops_med, cpu_med)
+
+    thread_candidates = [p for p in measured if p.thread_cpu]
+    rep = min(
+        thread_candidates,
+        key=lambda p: abs((p.ops_per_sec or 0.0) - ops_med),
+    ) if thread_candidates else None
+    wall_vals = [p.wall_sec for p in measured if p.wall_sec is not None]
+    wall_rep = rep.wall_sec if rep is not None else (statistics.median(wall_vals) if wall_vals else None)
+
     return PointResult(
         ops_per_sec=ops_med,
         mib_per_sec=mib_med,
@@ -462,6 +778,8 @@ def aggregate_runs(run_points: Sequence[PointResult]) -> PointResult:
         cpu_pct=cpu_med,
         ops_per_busy_core=eff_med,
         shares_cores=any(p.shares_cores for p in measured),
+        thread_cpu=rep.thread_cpu if rep is not None else None,
+        wall_sec=wall_rep,
     )
 
 
@@ -553,13 +871,22 @@ def _start_awanfs(
     n_cores: int,
     data_root: str,
     memory_budget: Optional[str] = None,
+    durability: str = "group",
 ) -> Tuple[subprocess.Popen, int, str, str]:
+    if durability not in DURABILITIES:
+        raise ValueError(f"invalid durability {durability!r}; expected one of {', '.join(DURABILITIES)}")
     if not server_bin or not os.path.isfile(server_bin):
         raise RuntimeError("s3-server binary not found")
     data = tempfile.mkdtemp(prefix="scaling_awanfs_", dir=data_root)
     port = rwb.get_free_port()
     log_path = os.path.join(data_root, f"scaling_awanfs_{port}.log")
-    argv = [server_bin, "--port", str(port), "--data-dir", data, "--allow-anonymous"]
+    argv = [
+        server_bin,
+        "--port", str(port),
+        "--data-dir", data,
+        "--allow-anonymous",
+        "--durability", durability,
+    ]
     if memory_budget:
         argv.extend(["--memory-budget", memory_budget])
     proc = _spawn_pinned(argv, n_cores, log_path)
@@ -664,15 +991,19 @@ def _run_phase_with_cpu(
     mode: str,
     server_pid: int,
     shares_cores: bool,
+    profile_threads: bool = False,
 ) -> PointResult:
     """Runs `run_workload_phase` and measures server CPU time (children included) over its timed window."""
     samples: List[Tuple[float, Tuple[float, float]]] = []
+    thread_sampler = ThreadCpuSampler(server_pid) if profile_threads else None
     orig_cpu_fn = rwb.get_process_cpu_times
 
     def hooked_cpu(pid: int) -> Tuple[float, float]:
         if pid == server_pid:
             ct = process_cpu_times_total(pid)
             samples.append((time.perf_counter(), ct))
+            if thread_sampler is not None:
+                thread_sampler.poll_once()
             return ct
         return orig_cpu_fn(pid)
 
@@ -688,9 +1019,13 @@ def _run_phase_with_cpu(
     if len(samples) >= 2:
         t0, cpu0 = samples[0]
         t1, cpu1 = samples[-1]
-        pct = cpu_percent(cpu0, cpu1, t1 - t0)
+        wall_sec = t1 - t0
+        pct = cpu_percent(cpu0, cpu1, wall_sec)
     else:
+        wall_sec = duration_sec if duration_sec > 0 else None
         pct = (metrics.server_cpu_s / duration_sec) * 100.0 if duration_sec > 0 else None
+
+    thread_cpu = thread_sampler.samples() if thread_sampler is not None else None
 
     eff = ops_per_busy_core(metrics.ops_per_sec, pct)
     return PointResult(
@@ -700,7 +1035,24 @@ def _run_phase_with_cpu(
         cpu_pct=pct,
         ops_per_busy_core=eff,
         shares_cores=shares_cores,
+        thread_cpu=thread_cpu,
+        wall_sec=wall_sec,
     )
+
+
+def _log_thread_samples(
+    server_name: str,
+    n_cores: int,
+    concurrency: int,
+    samples: Sequence[ThreadCpuSample],
+    wall_sec: Optional[float],
+) -> None:
+    total = sum(s.total_s for s in samples)
+    wall_s = f"{wall_sec:.2f}s" if wall_sec is not None else "?"
+    print(f"      {server_name} N={n_cores} c={concurrency} threads (wall={wall_s}, sum={total:.3f}s):", flush=True)
+    for s in samples[:12]:
+        label = s.name or "(unnamed)"
+        print(f"        tid={s.tid} ({label}): {s.total_s:.3f}s (user={s.user_s:.3f}s, sys={s.system_s:.3f}s)", flush=True)
 
 
 def measure_server_for_cores(
@@ -711,6 +1063,8 @@ def measure_server_for_cores(
     shares_cores: bool,
     duration_sec: float,
     workloads: Sequence[Tuple[str, str, str, int]] = WORKLOADS,
+    profile_threads: bool = False,
+    profile_workload: str = "put_4k",
 ) -> Dict[str, PointResult]:
     """Starts one server, pins the load generator to `cli_cores`, runs all workloads, cleans up."""
     try:
@@ -725,9 +1079,14 @@ def measure_server_for_cores(
         pin_process(os.getpid(), cli_cores)
         for wkey, label, mode, size in workloads:
             print(f"    {server_name} N={n_cores} (c={concurrency}): {label}...", flush=True)
-            out[wkey] = _run_phase_with_cpu(
-                "127.0.0.1", port, BUCKET, size, concurrency, duration_sec, mode, proc.pid, shares_cores
+            sample_here = profile_threads and wkey == profile_workload
+            pt = _run_phase_with_cpu(
+                "127.0.0.1", port, BUCKET, size, concurrency, duration_sec, mode, proc.pid, shares_cores,
+                profile_threads=sample_here,
             )
+            out[wkey] = pt
+            if sample_here and pt.thread_cpu:
+                _log_thread_samples(server_name, n_cores, concurrency, pt.thread_cpu, pt.wall_sec)
     finally:
         _stop_proc(proc)
         shutil.rmtree(data_dir, ignore_errors=True)
@@ -868,6 +1227,41 @@ def write_charts(
     return written
 
 
+def _render_thread_breakdown_lines(
+    entries: Sequence[Tuple[str, int, int, PointResult]],
+) -> List[str]:
+    rows: List[str] = []
+    for durability, n_cores, concurrency, pt in entries:
+        if not pt or not pt.measured or not pt.thread_cpu:
+            continue
+        total_cpu_s = sum(s.total_s for s in pt.thread_cpu)
+        wall_s = f"{pt.wall_sec:.2f}" if pt.wall_sec is not None else "-"
+        for s in pt.thread_cpu:
+            label = s.name or "(unnamed)"
+            share = f"{(s.total_s / total_cpu_s) * 100.0:.1f}%" if total_cpu_s > 0 else "-"
+            rows.append(
+                f"| {durability} | {n_cores} | {s.tid} | {label} | {s.user_s:.3f} | {s.system_s:.3f} | {s.total_s:.3f} | {share} | {concurrency} | {wall_s} |"
+            )
+    if not rows:
+        return []
+    return [
+        "",
+        "## Per-Thread CPU Breakdown (AwanFS PUT 4 KiB)",
+        "",
+        "| Durability | Cores | Thread ID | Thread Name | User (s) | System (s) | Total CPU (s) | Share | Concurrency | Wall (s) |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+        *rows,
+    ]
+
+
+def _durability_label(durability: str) -> str:
+    if durability == "fast":
+        return "AwanFS `--durability fast` (no sync on PUT; background flusher every 1s)"
+    if durability == "strict":
+        return "AwanFS `--durability strict` (sync per PUT)"
+    return "AwanFS group commit (#29)"
+
+
 def render_report(
     cmd: str,
     cores: Sequence[int],
@@ -877,6 +1271,8 @@ def render_report(
     duration_sec: float,
     max_put_ops: Optional[Dict[int, Optional[float]]] = None,
     chart_paths: Optional[Sequence[str]] = None,
+    fast_results: Optional[Dict[int, PointResult]] = None,
+    durability: str = "group",
 ) -> str:
     max_n = max(cores)
     shared_ns = [n for n in cores if n >= total_cores]
@@ -909,7 +1305,7 @@ def render_report(
         f"- **Machine:** {platform.node()} ({platform.platform()}, {total_cores} logical cores, {rwb.host_ram_gb()} GB RAM, CPU: {rwb.cpu_model()})",
         f"- **Methodology:** `cores = {', '.join(str(n) for n in cores)}`, `concurrency = 16 × N`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase.",
         f"- **Core pinning:** {sharing_note}",
-        f"- **Durability:** AwanFS group commit (#29). {rwb.minio_durability_note()} {probe_note}",
+        f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()} {probe_note}",
         "",
         "## Throughput and Latency (`ops/s (P50, P99 ms)`)",
         "",
@@ -919,21 +1315,26 @@ def render_report(
     lines.append("| Workload | Size | Server | " + " | ".join(core_headers) + f" | Scaling ({max_n}/1) |")
     lines.append("|---|---|---|" + "|".join(["---"] * (len(core_headers) + 1)) + "|")
 
+    def _throughput_row(wlabel: str, size_label: str, srv_label: str, pts: Dict[int, PointResult]) -> str:
+        cells = []
+        for n in cores:
+            pt = pts.get(n)
+            if pt and pt.measured:
+                cells.append(f"{pt.ops_per_sec:,.0f} ops/s ({pt.p50_ms:.2f}, {pt.p99_ms:.2f} ms)")
+            else:
+                reason = pt.reason if pt and pt.reason else "not measured"
+                cells.append(f"not measured ({reason})")
+        sc = compute_scaling(pts, cores)
+        sc_str = f"{sc:.2f}x" if sc is not None else "-"
+        return f"| {wlabel} | {size_label} | {srv_label} | " + " | ".join(cells) + f" | {sc_str} |"
+
     for wkey, wlabel, _mode, size in WORKLOADS:
         size_label = f"{size // KIB} KiB"
         for srv in SERVERS:
             pts = results.get(wkey, {}).get(srv, {})
-            cells = []
-            for n in cores:
-                pt = pts.get(n)
-                if pt and pt.measured:
-                    cells.append(f"{pt.ops_per_sec:,.0f} ops/s ({pt.p50_ms:.2f}, {pt.p99_ms:.2f} ms)")
-                else:
-                    reason = pt.reason if pt and pt.reason else "not measured"
-                    cells.append(f"not measured ({reason})")
-            sc = compute_scaling(pts, cores)
-            sc_str = f"{sc:.2f}x" if sc is not None else "-"
-            lines.append(f"| {wlabel} | {size_label} | {srv} | " + " | ".join(cells) + f" | {sc_str} |")
+            lines.append(_throughput_row(wlabel, size_label, srv, pts))
+            if wkey == "put_4k" and srv == "AwanFS" and fast_results is not None:
+                lines.append(_throughput_row(wlabel, size_label, "AwanFS (--durability fast)", fast_results))
 
     lines.extend([
         "",
@@ -942,21 +1343,40 @@ def render_report(
         "| Workload | Size | Server | " + " | ".join(core_headers) + " |",
         "|---|---|---|" + "|".join(["---"] * len(core_headers)) + "|",
     ])
+
+    def _cpu_row(wlabel: str, size_label: str, srv_label: str, pts: Dict[int, PointResult]) -> str:
+        cells = []
+        for n in cores:
+            pt = pts.get(n)
+            if pt and pt.measured:
+                cpu_s = f"{pt.cpu_pct:.1f}%" if pt.cpu_pct is not None else "-"
+                eff_s = f"{pt.ops_per_busy_core:,.0f} ops/s/core" if pt.ops_per_busy_core is not None else "-"
+                cells.append(f"{cpu_s} ({eff_s})")
+            else:
+                reason = pt.reason if pt and pt.reason else "not measured"
+                cells.append(f"not measured ({reason})")
+        return f"| {wlabel} | {size_label} | {srv_label} | " + " | ".join(cells) + " |"
+
     for wkey, wlabel, _mode, size in WORKLOADS:
         size_label = f"{size // KIB} KiB"
         for srv in SERVERS:
             pts = results.get(wkey, {}).get(srv, {})
-            cells = []
-            for n in cores:
-                pt = pts.get(n)
-                if pt and pt.measured:
-                    cpu_s = f"{pt.cpu_pct:.1f}%" if pt.cpu_pct is not None else "-"
-                    eff_s = f"{pt.ops_per_busy_core:,.0f} ops/s/core" if pt.ops_per_busy_core is not None else "-"
-                    cells.append(f"{cpu_s} ({eff_s})")
-                else:
-                    reason = pt.reason if pt and pt.reason else "not measured"
-                    cells.append(f"not measured ({reason})")
-            lines.append(f"| {wlabel} | {size_label} | {srv} | " + " | ".join(cells) + " |")
+            lines.append(_cpu_row(wlabel, size_label, srv, pts))
+            if wkey == "put_4k" and srv == "AwanFS" and fast_results is not None:
+                lines.append(_cpu_row(wlabel, size_label, "AwanFS (--durability fast)", fast_results))
+
+    thread_entries: List[Tuple[str, int, int, PointResult]] = []
+    awan_put4k = results.get("put_4k", {}).get("AwanFS", {})
+    for n in cores:
+        pt = awan_put4k.get(n)
+        if pt and pt.measured and pt.thread_cpu:
+            thread_entries.append((durability, n, 16 * n, pt))
+    if fast_results is not None:
+        for n in cores:
+            pt = fast_results.get(n)
+            if pt and pt.measured and pt.thread_cpu:
+                thread_entries.append(("fast", n, 16 * n, pt))
+    lines.extend(_render_thread_breakdown_lines(thread_entries))
 
     if chart_paths:
         lines.extend(["", "## Charts", ""])
@@ -1088,6 +1508,7 @@ def _run_pattern_phase_with_cpu(
     prefill_bytes: int,
     server_pid: int,
     shares_cores: bool,
+    profile_threads: bool = False,
 ) -> PointResult:
     """Runs one `(pattern, size, concurrency)` phase and measures server CPU % over its timed window."""
     prefill_count = max(1, prefill_bytes // (4 * KIB))
@@ -1188,6 +1609,9 @@ def _run_pattern_phase_with_cpu(
                 error_notes[m] = error_notes.get(m, 0) + cnt
 
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(concurrency)]
+    thread_sampler = ThreadCpuSampler(server_pid) if profile_threads else None
+    if thread_sampler is not None:
+        thread_sampler.__enter__()
     cpu_0 = process_cpu_times_total(server_pid)
     t_start = time.perf_counter()
     for t in threads:
@@ -1197,6 +1621,8 @@ def _run_pattern_phase_with_cpu(
     stuck = rwb.join_all(threads, f"{pattern} {format_size(size)} c={concurrency}", timeout_sec=max(20.0, duration_sec * 10.0))
     t_total = time.perf_counter() - t_start
     cpu_1 = process_cpu_times_total(server_pid)
+    if thread_sampler is not None:
+        thread_sampler.__exit__(None, None, None)
 
     if stuck or errors > 0 or not latencies or t_total <= 0:
         reasons = []
@@ -1222,6 +1648,8 @@ def _run_pattern_phase_with_cpu(
         cpu_pct=pct,
         ops_per_busy_core=eff,
         shares_cores=shares_cores,
+        thread_cpu=thread_sampler.samples() if thread_sampler is not None else None,
+        wall_sec=t_total,
     )
 
 
@@ -1237,6 +1665,7 @@ def measure_server_matrix_for_cores(
     duration_sec: float,
     seed: int,
     prefill_bytes: int,
+    profile_threads_points: Optional[Sequence[Tuple[str, int, int]]] = None,
 ) -> Dict[Tuple[str, int, int], PointResult]:
     """Starts one server, prefills reads once, runs the `(pattern, size, concurrency)` sweep, cleans up."""
     all_keys = [(pat, sz, c) for pat in patterns for sz in sizes for c in concurrencies]
@@ -1246,6 +1675,7 @@ def measure_server_matrix_for_cores(
         reason = str(e).strip() or f"{server_name} failed to start"
         return {k: PointResult(reason=reason, shares_cores=shares_cores) for k in all_keys}
 
+    profile_set = set(profile_threads_points or ())
     out: Dict[Tuple[str, int, int], PointResult] = {}
     try:
         pin_process(os.getpid(), cli_cores)
@@ -1261,7 +1691,8 @@ def measure_server_matrix_for_cores(
             for sz in sizes:
                 for c in concurrencies:
                     print(f"    {server_name} N={n_cores} {pat} {format_size(sz)} c={c}...", flush=True)
-                    out[(pat, sz, c)] = _run_pattern_phase_with_cpu(
+                    sample_here = (pat, sz, c) in profile_set
+                    pt = _run_pattern_phase_with_cpu(
                         "127.0.0.1",
                         port,
                         BUCKET,
@@ -1273,7 +1704,11 @@ def measure_server_matrix_for_cores(
                         prefill_bytes,
                         proc.pid,
                         shares_cores,
+                        profile_threads=sample_here,
                     )
+                    out[(pat, sz, c)] = pt
+                    if sample_here and pt.thread_cpu:
+                        _log_thread_samples(server_name, n_cores, c, pt.thread_cpu, pt.wall_sec)
     finally:
         _stop_proc(proc)
         shutil.rmtree(data_dir, ignore_errors=True)
@@ -1526,6 +1961,8 @@ def render_matrix_report(
     memory_budget: str,
     prefill_bytes: int,
     chart_paths: Optional[Sequence[str]] = None,
+    fast_results: Optional[Dict[int, Dict[int, PointResult]]] = None,
+    durability: str = "group",
 ) -> str:
     budget_bytes = parse_size(memory_budget)
     cache_bytes = stated_cache_bytes(budget_bytes)
@@ -1550,7 +1987,7 @@ def render_matrix_report(
         f"- **Methodology:** `patterns = {', '.join(patterns)}`, `sizes = {', '.join(format_size(s) for s in sizes)}`, `cores = {', '.join(str(n) for n in cores)}`, `concurrencies = {', '.join(str(c) for c in concurrencies)}`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase, seed = `{seed}`.",
         f"- **Cache & Prefill:** AwanFS `--memory-budget {format_size(budget_bytes)}` (stated cache half = {format_size(cache_bytes)}). Read prefill size = {format_size(prefill_bytes)} ({prefill_bytes // (4 * KIB):,} x 4 KiB objects + 1 x {format_size(prefill_bytes)} large object for range GETs), identical deterministic bytes for every server, written before timing.",
         f"- **Core pinning:** {sharing_note}",
-        f"- **Durability:** AwanFS group commit (#29). {rwb.minio_durability_note()}",
+        f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()}",
         "",
         "## All Measured Points",
         "",
@@ -1558,6 +1995,15 @@ def render_matrix_report(
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
 
+    def _matrix_row(srv_label: str, pat: str, sz_lbl: str, n: int, c: int, pt: Optional[PointResult]) -> str:
+        if pt and pt.measured:
+            mib_s = f"{pt.mib_per_sec:.2f}" if pt.mib_per_sec is not None else "-"
+            cpu_s = f"{pt.cpu_pct:.1f}%" if pt.cpu_pct is not None else "-"
+            return f"| {srv_label} | {pat} | {sz_lbl} | {n} | {c} | {pt.ops_per_sec:,.0f} | {mib_s} | {pt.p50_ms:.2f} | {pt.p99_ms:.2f} | {cpu_s} |"
+        reason = pt.reason if pt and pt.reason else "unknown"
+        return f"| {srv_label} | {pat} | {sz_lbl} | {n} | {c} | not measured ({reason}) | - | - | - | - |"
+
+    put_pat = "seq-write" if "seq-write" in patterns else ("rand-write" if "rand-write" in patterns else patterns[0])
     for srv in SERVERS:
         for pat in patterns:
             for sz in sizes:
@@ -1565,17 +2011,27 @@ def render_matrix_report(
                 for n in cores:
                     for c in concurrencies:
                         pt = results.get(pat, {}).get(sz, {}).get(srv, {}).get(n, {}).get(c)
-                        if pt and pt.measured:
-                            mib_s = f"{pt.mib_per_sec:.2f}" if pt.mib_per_sec is not None else "-"
-                            cpu_s = f"{pt.cpu_pct:.1f}%" if pt.cpu_pct is not None else "-"
-                            lines.append(
-                                f"| {srv} | {pat} | {sz_lbl} | {n} | {c} | {pt.ops_per_sec:,.0f} | {mib_s} | {pt.p50_ms:.2f} | {pt.p99_ms:.2f} | {cpu_s} |"
-                            )
-                        else:
-                            reason = pt.reason if pt and pt.reason else "unknown"
-                            lines.append(
-                                f"| {srv} | {pat} | {sz_lbl} | {n} | {c} | not measured ({reason}) | - | - | - | - |"
-                            )
+                        lines.append(_matrix_row(srv, pat, sz_lbl, n, c, pt))
+        if srv == "AwanFS" and fast_results is not None and (4 * KIB) in sizes:
+            for n in cores:
+                for c in sorted(fast_results.get(n, {})):
+                    lines.append(_matrix_row("AwanFS (--durability fast)", put_pat, "4 KiB", n, c, fast_results[n][c]))
+
+    thread_entries: List[Tuple[str, int, int, PointResult]] = []
+    if (4 * KIB) in sizes:
+        for n in cores:
+            c_map = results.get(put_pat, {}).get(4 * KIB, {}).get("AwanFS", {}).get(n, {})
+            for c in concurrencies:
+                pt = c_map.get(c)
+                if pt and pt.measured and pt.thread_cpu:
+                    thread_entries.append((durability, n, c, pt))
+    if fast_results is not None:
+        for n in cores:
+            for c in sorted(fast_results.get(n, {})):
+                pt = fast_results[n][c]
+                if pt and pt.measured and pt.thread_cpu:
+                    thread_entries.append(("fast", n, c, pt))
+    lines.extend(_render_thread_breakdown_lines(thread_entries))
 
     if chart_paths:
         lines.extend(["", "## Charts", ""])
@@ -1590,6 +2046,25 @@ def _default_awanfs_bin() -> Optional[str]:
     exe = ".exe" if sys.platform == "win32" else ""
     p = os.path.join(REPO_ROOT, "server", "target", "release", f"s3-server{exe}")
     return p if os.path.isfile(p) else None
+
+
+def _resolve_profile_config(
+    a: argparse.Namespace,
+    cores: Sequence[int],
+    total_cores: int,
+) -> Tuple[str, set, bool]:
+    durability = getattr(a, "durability", "group")
+    if durability not in DURABILITIES:
+        raise ValueError(f"invalid durability {durability!r}; expected one of {', '.join(DURABILITIES)}")
+    auto = should_auto_profile_put(total_cores, cores)
+    prof_spec = getattr(a, "profile_threads_cores", "") or ""
+    if prof_spec.strip():
+        profile_cores = set(parse_cores(prof_spec, total_cores))
+    else:
+        profile_cores = set(DEFAULT_PROFILE_THREAD_CORES) if auto else set()
+    cmp_flag = getattr(a, "compare_fast", None)
+    compare_fast = (cmp_flag if cmp_flag is not None else auto) and (durability != "fast")
+    return durability, profile_cores, compare_fast
 
 
 def _run_matrix_mode(
@@ -1610,6 +2085,8 @@ def _run_matrix_mode(
     cache_bytes = stated_cache_bytes(budget_bytes)
     prefill_bytes = parse_size(a.prefill_size)
     validate_prefill_exceeds_cache(prefill_bytes, cache_bytes)
+    durability, profile_cores, compare_fast = _resolve_profile_config(a, cores, total_cores)
+    put_pat = "seq-write" if "seq-write" in patterns else ("rand-write" if "rand-write" in patterns else None)
 
     orig_affinity = get_process_affinity(os.getpid())
     raw_runs: Dict[str, Dict[int, Dict[str, Dict[int, Dict[int, List[PointResult]]]]]] = {
@@ -1623,6 +2100,15 @@ def _run_matrix_mode(
         for pat in patterns
     }
 
+    fast_raw: Optional[Dict[int, Dict[int, List[PointResult]]]] = None
+    fast_concs_by_core: Dict[int, List[int]] = {}
+    if compare_fast and put_pat is not None and (4 * KIB) in sizes:
+        fast_raw = {}
+        for n in cores:
+            targets = sorted({_pick_target(concurrencies, 64), _pick_target(concurrencies, 16 * n)})
+            fast_concs_by_core[n] = targets
+            fast_raw[n] = {c: [] for c in targets}
+
     try:
         for n in cores:
             if n > total_cores:
@@ -1632,9 +2118,19 @@ def _run_matrix_mode(
                         for srv in SERVERS:
                             for c in concurrencies:
                                 raw_runs[pat][sz][srv][n][c].append(PointResult(reason=reason))
+                if fast_raw is not None:
+                    for c in fast_concs_by_core[n]:
+                        fast_raw[n][c].append(PointResult(reason=reason))
                 continue
 
             cli_cores, shares = client_cores_for(n, total_cores)
+            prof_points: Optional[List[Tuple[str, int, int]]] = None
+            if n in profile_cores and put_pat is not None and (4 * KIB) in sizes:
+                prof_points = [
+                    (put_pat, 4 * KIB, c)
+                    for c in sorted({_pick_target(concurrencies, 64), _pick_target(concurrencies, 16 * n)})
+                ]
+
             for run_idx in range(a.runs):
                 order = server_order_for_run(run_idx, SERVERS)
                 for srv in order:
@@ -1644,11 +2140,16 @@ def _run_matrix_mode(
                         flush=True,
                     )
                     if srv == "AwanFS":
-                        starter = lambda n=n: _start_awanfs(awanfs_bin, n, data_root, memory_budget=a.memory_budget)
+                        starter = lambda n=n: _start_awanfs(
+                            awanfs_bin, n, data_root, memory_budget=a.memory_budget, durability=durability
+                        )
+                        srv_prof = prof_points
                     elif srv == "MinIO":
                         starter = lambda n=n: _start_minio(minio_bin, mc_bin, n, data_root)
+                        srv_prof = None
                     else:
                         starter = lambda n=n: _start_rustfs(rustfs_bin, mc_bin, n, data_root)
+                        srv_prof = None
 
                     phase_map = measure_server_matrix_for_cores(
                         server_name=srv,
@@ -1662,9 +2163,38 @@ def _run_matrix_mode(
                         duration_sec=a.duration,
                         seed=a.seed,
                         prefill_bytes=prefill_bytes,
+                        profile_threads_points=srv_prof,
                     )
                     for (pat, sz, c), pt in phase_map.items():
                         raw_runs[pat][sz][srv][n][c].append(pt)
+
+            if fast_raw is not None and put_pat is not None:
+                targets = fast_concs_by_core[n]
+                fast_prof = [(put_pat, 4 * KIB, c) for c in targets] if n in profile_cores else None
+                for run_idx in range(a.runs):
+                    print(
+                        f"[N={n}, run {run_idx + 1}/{a.runs}] Starting AwanFS (--durability fast) "
+                        f"(client cores={cli_cores}, shares={shares})...",
+                        flush=True,
+                    )
+                    fast_map = measure_server_matrix_for_cores(
+                        server_name="AwanFS (--durability fast)",
+                        starter=lambda n=n: _start_awanfs(
+                            awanfs_bin, n, data_root, memory_budget=a.memory_budget, durability="fast"
+                        ),
+                        n_cores=n,
+                        cli_cores=cli_cores,
+                        shares_cores=shares,
+                        patterns=[put_pat],
+                        sizes=[4 * KIB],
+                        concurrencies=targets,
+                        duration_sec=a.duration,
+                        seed=a.seed,
+                        prefill_bytes=prefill_bytes,
+                        profile_threads_points=fast_prof,
+                    )
+                    for (_pat, _sz, c), pt in fast_map.items():
+                        fast_raw[n][c].append(pt)
     finally:
         if orig_affinity:
             pin_process(os.getpid(), orig_affinity)
@@ -1682,6 +2212,12 @@ def _run_matrix_mode(
         }
         for pat in patterns
     }
+    fast_results: Optional[Dict[int, Dict[int, PointResult]]] = None
+    if fast_raw is not None:
+        fast_results = {
+            n: {c: aggregate_runs(fast_raw[n][c]) for c in fast_concs_by_core[n]}
+            for n in cores
+        }
 
     try:
         chart_paths = write_matrix_charts(results, patterns, sizes, cores, concurrencies, a.output)
@@ -1703,6 +2239,8 @@ def _run_matrix_mode(
         memory_budget=a.memory_budget,
         prefill_bytes=prefill_bytes,
         chart_paths=chart_paths,
+        fast_results=fast_results,
+        durability=durability,
     )
     out_abs = os.path.abspath(a.output)
     os.makedirs(os.path.dirname(out_abs), exist_ok=True)
@@ -1725,6 +2263,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED, help=f"RNG seed for random patterns and prefill (default: {DEFAULT_SEED})")
     ap.add_argument("--memory-budget", default=DEFAULT_MEMORY_BUDGET, help=f"AwanFS --memory-budget (default: {DEFAULT_MEMORY_BUDGET})")
     ap.add_argument("--prefill-size", default=DEFAULT_PREFILL_SIZE, help=f"Total prefill size per read set, > cache (default: {DEFAULT_PREFILL_SIZE})")
+    ap.add_argument("--durability", default="group", choices=DURABILITIES, help="AwanFS --durability mode (default: group)")
+    ap.add_argument("--compare-fast", dest="compare_fast", action="store_true", default=None,
+                    help="Also measure AwanFS --durability fast on PUT 4 KiB")
+    ap.add_argument("--no-compare-fast", dest="compare_fast", action="store_false",
+                    help="Disable automatic --durability fast comparison on 16+ core machines")
+    ap.add_argument("--profile-threads-cores", default="",
+                    help="Comma-separated core counts where AwanFS per-thread CPU is sampled during PUT 4 KiB (default: 4,8 on 16+ core split-client runs)")
+    ap.add_argument("--no-fetch-minio", action="store_true", help="Do not auto-fetch missing MinIO/mc binaries from GitHub Releases")
     ap.add_argument("--server-bin", default="", help="Path to AwanFS release s3-server binary")
     ap.add_argument("--minio-bin", default="", help="Path to MinIO binary")
     ap.add_argument("--mc-bin", default="", help="Path to MinIO mc binary")
@@ -1747,6 +2293,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     auto_minio, auto_mc = rwb.find_minio_binaries()
     minio_bin = a.minio_bin or auto_minio
     mc_bin = a.mc_bin or auto_mc
+    if not a.no_fetch_minio and (not minio_bin or not mc_bin):
+        minio_bin, mc_bin = ensure_minio_binaries(minio_bin, mc_bin, auto_fetch=True)
     rustfs_bin = a.rustfs_bin or rwb.find_rustfs_binary()
 
     if a.matrix or a.pattern or a.sizes or a.concurrencies:
@@ -1762,6 +2310,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             rustfs_bin=rustfs_bin,
         )
 
+    durability, profile_cores, compare_fast = _resolve_profile_config(a, cores, total_cores)
     orig_affinity = get_process_affinity(os.getpid())
 
     if a.skip_sync_probe:
@@ -1775,6 +2324,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         wkey: {srv: {n: [] for n in cores} for srv in SERVERS}
         for wkey, *_ in WORKLOADS
     }
+    raw_fast_runs: Optional[Dict[int, List[PointResult]]] = {n: [] for n in cores} if compare_fast else None
 
     try:
         for n in cores:
@@ -1783,6 +2333,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 for wkey, *_ in WORKLOADS:
                     for srv in SERVERS:
                         raw_runs[wkey][srv][n].append(PointResult(reason=reason))
+                if raw_fast_runs is not None:
+                    raw_fast_runs[n].append(PointResult(reason=reason))
                 continue
 
             cli_cores, shares = client_cores_for(n, total_cores)
@@ -1791,15 +2343,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 for srv in order:
                     print(f"[N={n}, run {run_idx + 1}/{a.runs}] Starting {srv} (client cores={cli_cores}, shares={shares})...", flush=True)
                     if srv == "AwanFS":
-                        starter = lambda n=n: _start_awanfs(awanfs_bin, n, data_root)
+                        starter = lambda n=n: _start_awanfs(awanfs_bin, n, data_root, durability=durability)
+                        sample_srv_threads = n in profile_cores
                     elif srv == "MinIO":
                         starter = lambda n=n: _start_minio(minio_bin, mc_bin, n, data_root)
+                        sample_srv_threads = False
                     else:
                         starter = lambda n=n: _start_rustfs(rustfs_bin, mc_bin, n, data_root)
+                        sample_srv_threads = False
 
-                    phase_map = measure_server_for_cores(srv, starter, n, cli_cores, shares, a.duration)
+                    phase_map = measure_server_for_cores(
+                        srv, starter, n, cli_cores, shares, a.duration,
+                        profile_threads=sample_srv_threads,
+                    )
                     for wkey, pt in phase_map.items():
                         raw_runs[wkey][srv][n].append(pt)
+
+            if raw_fast_runs is not None:
+                for run_idx in range(a.runs):
+                    print(f"[N={n}, run {run_idx + 1}/{a.runs}] Starting AwanFS (--durability fast) (client cores={cli_cores}, shares={shares})...", flush=True)
+                    fast_map = measure_server_for_cores(
+                        "AwanFS (--durability fast)",
+                        lambda n=n: _start_awanfs(awanfs_bin, n, data_root, durability="fast"),
+                        n,
+                        cli_cores,
+                        shares,
+                        a.duration,
+                        workloads=[WORKLOADS[0]],
+                        profile_threads=(n in profile_cores),
+                    )
+                    raw_fast_runs[n].append(fast_map["put_4k"])
     finally:
         if orig_affinity:
             pin_process(os.getpid(), orig_affinity)
@@ -1811,6 +2384,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         }
         for wkey, *_ in WORKLOADS
     }
+    fast_results: Optional[Dict[int, PointResult]] = (
+        {n: aggregate_runs(raw_fast_runs[n]) for n in cores} if raw_fast_runs is not None else None
+    )
 
     try:
         chart_paths = write_charts(results, cores, a.output, max_put_ops=max_put_ops)
@@ -1827,6 +2403,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         duration_sec=a.duration,
         max_put_ops=max_put_ops,
         chart_paths=chart_paths,
+        fast_results=fast_results,
+        durability=durability,
     )
     out_abs = os.path.abspath(a.output)
     os.makedirs(os.path.dirname(out_abs), exist_ok=True)
