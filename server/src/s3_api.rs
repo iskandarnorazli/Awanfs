@@ -433,42 +433,55 @@ pub fn parse_range_header(header: &str, object_size: u64) -> Result<Option<ByteR
     Err(())
 }
 
+fn vhost_bucket(host_header: Option<&str>) -> Option<&str> {
+    let host_no_port = host_header?.split(':').next()?;
+    for base in &["s3.localhost", "localhost", "s3.internal", "s3.amazonaws.com", "127.0.0.1"] {
+        if let Some(prefix) = host_no_port.strip_suffix(base).and_then(|p| p.strip_suffix('.')) {
+            if !prefix.is_empty() && !prefix.contains('.') && !prefix.contains('/') {
+                return Some(prefix);
+            }
+        }
+    }
+    None
+}
+
+fn split_path_style(trimmed_path: &str) -> (&str, Option<&str>) {
+    let mut parts = trimmed_path.splitn(2, '/');
+    let bucket = parts.next().unwrap_or("");
+    // Path-style bucket URIs like `/bucket/` end in a slash with an empty tail; treat as bucket, not key `""`.
+    let raw_key = parts.next().filter(|k| !k.is_empty());
+    (bucket, raw_key)
+}
+
 pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarget {
     let raw_path = uri_path.split('?').next().unwrap_or(uri_path);
     let trimmed_path = raw_path.trim_start_matches('/');
 
-    if let Some(host) = host_header {
-        let host_no_port = host.split(':').next().unwrap_or(host);
-        for base in &["s3.localhost", "localhost", "s3.internal", "s3.amazonaws.com", "127.0.0.1"] {
-            if let Some(prefix) = host_no_port.strip_suffix(base).and_then(|p| p.strip_suffix('.')) {
-                if !prefix.is_empty() && !prefix.contains('.') && !prefix.contains('/') {
-                    let bucket = prefix.to_string();
-                    if trimmed_path.is_empty() {
-                        return ParsedTarget::Bucket { bucket };
-                    } else {
-                        return ParsedTarget::Object {
-                            bucket,
-                            key: percent_decode_path(trimmed_path),
-                        };
-                    }
-                }
+    if let Some(bucket) = vhost_bucket(host_header) {
+        let bucket = bucket.to_string();
+        return if trimmed_path.is_empty() {
+            ParsedTarget::Bucket { bucket }
+        } else {
+            ParsedTarget::Object {
+                bucket,
+                key: percent_decode_path(trimmed_path),
             }
-        }
+        };
     }
 
     if trimmed_path.is_empty() {
         return ParsedTarget::Service;
     }
 
-    let mut parts = trimmed_path.splitn(2, '/');
-    let bucket = parts.next().unwrap_or("").to_string();
-    if let Some(key) = parts.next() {
-        ParsedTarget::Object {
-            bucket,
+    let (bucket, raw_key) = split_path_style(trimmed_path);
+    match raw_key {
+        Some(key) => ParsedTarget::Object {
+            bucket: bucket.to_string(),
             key: percent_decode_path(key),
-        }
-    } else {
-        ParsedTarget::Bucket { bucket }
+        },
+        None => ParsedTarget::Bucket {
+            bucket: bucket.to_string(),
+        },
     }
 }
 
@@ -479,22 +492,13 @@ pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarge
 pub fn raw_s3_key<'a>(uri_path: &'a str, host_header: Option<&str>) -> Option<&'a str> {
     let raw_path = uri_path.split('?').next().unwrap_or(uri_path);
     let trimmed_path = raw_path.trim_start_matches('/');
-    if let Some(host) = host_header {
-        let host_no_port = host.split(':').next().unwrap_or(host);
-        for base in &["s3.localhost", "localhost", "s3.internal", "s3.amazonaws.com", "127.0.0.1"] {
-            if let Some(prefix) = host_no_port.strip_suffix(base).and_then(|p| p.strip_suffix('.')) {
-                if !prefix.is_empty() && !prefix.contains('.') && !prefix.contains('/') {
-                    return if trimmed_path.is_empty() { None } else { Some(trimmed_path) };
-                }
-            }
-        }
+    if vhost_bucket(host_header).is_some() {
+        return if trimmed_path.is_empty() { None } else { Some(trimmed_path) };
     }
     if trimmed_path.is_empty() {
         return None;
     }
-    let mut parts = trimmed_path.splitn(2, '/');
-    let _bucket = parts.next();
-    parts.next()
+    split_path_style(trimmed_path).1
 }
 
 /// Decodes `%XX` in a URL path into raw bytes. Unlike query decoding, `+` stays `+`.
