@@ -257,5 +257,78 @@ class UniqueKeys(unittest.TestCase):
             srv.server_close()
 
 
+class WithoutProcTests(unittest.TestCase):
+    """Experiment 5 (#175): budget_rss.py runs cleanly when /proc/<pid>/status is absent (Windows)."""
+
+    def test_main_runs_cleanly_when_proc_files_are_absent(self):
+        import tempfile
+        import shutil
+        from unittest import mock
+        import http.server
+        import socketserver
+        import threading
+        import subprocess
+
+        class FakeServerHandler(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(n)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self):
+                if self.path == "/_awanfs/metrics":
+                    body = b"awanfs_payload_cache_bytes 1048576\n"
+                else:
+                    body = b"x" * 65536
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+
+        srv = Server(("127.0.0.1", 0), FakeServerHandler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        d = tempfile.mkdtemp(prefix="budget_noproc_")
+        report = os.path.join(d, "report.md")
+        try:
+            class NoProcSplit(br.RssSplit):
+                def __init__(self, pid, every=0.05):
+                    super().__init__(pid, every=every)
+                    self.path = os.path.join(d, "nonexistent_proc_status")
+
+            with mock.patch.object(br, "start_server", return_value=(proc, port)), \
+                 mock.patch.object(br, "RssSplit", NoProcSplit), \
+                 mock.patch.object(br, "process_env", return_value=None):
+                rc = br.main([
+                    "--server-bin", "dummy",
+                    "--budget", "256MiB", "--budget-mib", "256",
+                    "--concurrency", "2", "--size", "64KiB", "--duration", "0.25",
+                    "--overhead", "200", "--data-dir", d,
+                    "--server-env", "MALLOC_ARENA_MAX=2",
+                    "--report", report,
+                ])
+            self.assertEqual(rc, 0)
+            with open(report, encoding="utf-8") as fh:
+                text = fh.read()
+            self.assertIn("not measured", text)
+            self.assertIn("**ok**", text)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            srv.shutdown()
+            srv.server_close()
+            shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
