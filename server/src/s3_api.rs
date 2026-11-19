@@ -821,13 +821,15 @@ impl S3ServiceState {
             MultipartManager::with_staging_dir(dir.join(".staging")).with_work_counters(Arc::clone(&work)).with_clock(Arc::clone(&clock)),
         );
         let mut engine = AwanStorageEngine::new(100_000, 4_194_304, 65536);
-        let db_path = dir.join("metadata.db");
+        // The redb spill index of servers before #26 stage 6: rebuilt from the volumes at every
+        // boot, so nothing in it is needed (decision 59). The segments under meta/ replace it.
+        let _ = std::fs::remove_file(dir.join("metadata.db"));
         let spill_cache_bytes = crate::memory::split_cache(crate::memory::effective().cache).0.min(usize::MAX as u64) as usize;
-        if let Ok(spill) = crate::spill::SpillIndex::open_with_cache_size(&db_path, spill_cache_bytes) {
-            // Rebuilt from the volume replay below: its commits are not durable (#13).
-            let _ = spill.clear();
-            engine.attach_spill_index(spill);
-        }
+        let spill = crate::spill::SpillIndex::open_with_cache_size(dir, spill_cache_bytes).map_err(|e| format!("metadata segments: {}", e))?;
+        // Rebuilt from the volume replay below, as before (#13); booting from the manifest's
+        // checkpoint comes next in #26.
+        spill.clear().map_err(|e| format!("metadata segments: {}", e))?;
+        engine.attach_spill_index(spill);
         let needle_crc_map = Arc::new(RwLock::new(HashMap::new()));
         let mut initial_vol_offset = 4096;
 
@@ -2120,7 +2122,7 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
         ("awanfs_ready", "gauge", "1 when /_awanfs/health/ready answers 200.", state.readiness().is_none() as u64),
         ("awanfs_memory_budget_bytes", "gauge", "Memory the server may hold (--memory-budget).", budget.total),
         ("awanfs_memory_budget_cache_bytes", "gauge", "The budget's half for the payload cache.", budget.cache),
-        ("awanfs_memory_budget_spill_bytes", "gauge", "The redb spill index page cache, carved out of the cache half.", crate::memory::split_cache(budget.cache).0),
+        ("awanfs_memory_budget_spill_bytes", "gauge", "The spill index's memtable and segment filters, carved out of the cache half.", crate::memory::split_cache(budget.cache).0),
         ("awanfs_memory_budget_bodies_bytes", "gauge", "The budget's half for in-flight request bodies.", budget.bodies),
         ("awanfs_memory_bodies_in_use_bytes", "gauge", "Bytes currently held by admitted in-flight request bodies.", state.body_budget.in_use()),
         ("awanfs_memory_bodies_rejected_total", "counter", "Requests rejected with 503 SlowDown because the body memory budget was exhausted.", state.body_budget.rejected()),

@@ -1,8 +1,9 @@
-//! #207, decision 59: the metadata index at N keys, redb as AwanFS uses it (`spill::SpillIndex`)
-//! against a minimal segment prototype. A measurement, not server code.
+//! #207, decision 59: the metadata index at N keys, redb as AwanFS used it before #26 stage 6
+//! (`redb_spill` below), a minimal segment prototype, and the production segments
+//! (`spill::SpillIndex`, `prod`). A measurement, not server code.
 //!
-//!   meta_index_bench build --store redb|seg --dir DIR --keys N
-//!   meta_index_bench query --store redb|seg --dir DIR --keys N [--gets 1000000] [--scans 1000]
+//!   meta_index_bench build --store redb|seg|prod --dir DIR --keys N
+//!   meta_index_bench query --store redb|seg|prod --dir DIR --keys N [--gets 1000000] [--scans 1000]
 //!
 //! Each run prints one JSON line. `build` inserts N keys in a scrambled order, as PUTs arrive.
 //! `query` opens what `build` left (its time is the open time), gets present and absent keys,
@@ -18,7 +19,6 @@
 //! live segments, so open reads footers and nothing else. There is no compaction.
 
 use s3_server::meta_index::ObjectMeta;
-use s3_server::spill::SpillIndex;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -114,7 +114,7 @@ trait Store {
     fn finish(&mut self);
 }
 
-struct Redb(SpillIndex);
+struct Redb(redb_spill::RedbSpill);
 
 impl Store for Redb {
     fn put(&mut self, key: &[u8], row: &ObjectMeta) {
@@ -127,6 +127,25 @@ impl Store for Redb {
         self.0.scan_prefix(BUCKET, prefix, None, limit).expect("redb scan")
     }
     fn finish(&mut self) {}
+}
+
+/// The server's spill index since #26 stage 6: a memtable and leveled segments.
+struct Prod(s3_server::spill::SpillIndex);
+
+impl Store for Prod {
+    fn put(&mut self, key: &[u8], row: &ObjectMeta) {
+        self.0.put(BUCKET, key, row).expect("prod put");
+    }
+    fn get(&mut self, key: &[u8]) -> Option<ObjectMeta> {
+        self.0.get(BUCKET, key).expect("prod get")
+    }
+    fn scan(&mut self, prefix: &[u8], limit: usize) -> Vec<(Vec<u8>, ObjectMeta)> {
+        self.0.scan_prefix(BUCKET, prefix, None, limit).expect("prod scan")
+    }
+    fn finish(&mut self) {
+        // The build ends with the memtable written, so the query run's open finds every row.
+        self.0.flush().expect("prod flush");
+    }
 }
 
 /// A blocked bloom filter: each key sets `BLOOM_PROBES` bits in one 512-bit block.
@@ -469,9 +488,15 @@ fn peak_rss_mib() -> Option<f64> {
     }
 }
 
+/// Bytes of every file under `dir` (the production store keeps its files in `dir/meta`).
 fn dir_bytes(dir: &Path) -> u64 {
     std::fs::read_dir(dir)
-        .map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum())
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.metadata().ok().map(|m| (e.path(), m)))
+                .map(|(p, m)| if m.is_dir() { dir_bytes(&p) } else { m.len() })
+                .sum()
+        })
         .unwrap_or(0)
 }
 
@@ -488,9 +513,10 @@ fn percentile(sorted: &[u64], p: f64) -> f64 {
 
 fn open_store(kind: &str, dir: &Path) -> Box<dyn Store> {
     match kind {
-        "redb" => Box::new(Redb(SpillIndex::open(&dir.join("metadata.db")).expect("open redb"))),
+        "redb" => Box::new(Redb(redb_spill::RedbSpill::open(&dir.join("metadata.db")).expect("open redb"))),
         "seg" => Box::new(Seg::open(dir)),
-        other => panic!("--store redb|seg, not {}", other),
+        "prod" => Box::new(Prod(s3_server::spill::SpillIndex::open(dir).expect("open prod"))),
+        other => panic!("--store redb|seg|prod, not {}", other),
     }
 }
 
@@ -602,5 +628,201 @@ fn main() {
             assert_eq!(wrong, 0, "{} gave {} wrong answers", kind, wrong);
         }
         _ => panic!("first argument: build or query"),
+    }
+}
+
+/// redb as the server used it before #26 stage 6 (`spill.rs` at that commit), kept here so
+/// the benchmark still compares against it.
+#[allow(dead_code)]
+mod redb_spill {
+    use redb::{Database, Durability, TableDefinition};
+    use s3_server::meta_index::ObjectMeta;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    const META_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("object_metadata");
+
+    /// Page cache of the spill database (#13).
+    const SPILL_CACHE_BYTES: usize = 64 << 20;
+
+    /// One commit in this many is durable (#13).
+    const DURABLE_EVERY: u64 = 4096;
+
+    #[derive(Clone)]
+    pub struct RedbSpill {
+        db: Arc<Database>,
+        commits: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    fn make_db_key(bucket_id: u32, key: &[u8]) -> Vec<u8> {
+        let mut k = Vec::with_capacity(4 + key.len());
+        k.extend_from_slice(&bucket_id.to_be_bytes());
+        k.extend_from_slice(key);
+        k
+    }
+
+    fn encode_meta(meta: &ObjectMeta) -> [u8; 64] {
+        let mut buf = [0u8; 64];
+        buf[0..8].copy_from_slice(&meta.key_hash.to_le_bytes());
+        buf[8..16].copy_from_slice(&meta.bucket_flags.to_le_bytes());
+        buf[16..24].copy_from_slice(&meta.vol_offset.to_le_bytes());
+        buf[24..32].copy_from_slice(&meta.size.to_le_bytes());
+        buf[32..40].copy_from_slice(&meta.etag_hi.to_le_bytes());
+        buf[40..48].copy_from_slice(&meta.etag_lo.to_le_bytes());
+        buf[48..56].copy_from_slice(&meta.created_at.to_le_bytes());
+        buf[56..64].copy_from_slice(&meta.key_slice.to_le_bytes());
+        buf
+    }
+
+    fn decode_meta(buf: &[u8]) -> Option<ObjectMeta> {
+        if buf.len() < 64 {
+            return None;
+        }
+        Some(ObjectMeta {
+            key_hash: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            bucket_flags: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            vol_offset: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            size: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+            etag_hi: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
+            etag_lo: u64::from_le_bytes(buf[40..48].try_into().unwrap()),
+            created_at: u64::from_le_bytes(buf[48..56].try_into().unwrap()),
+            key_slice: u64::from_le_bytes(buf[56..64].try_into().unwrap()),
+        })
+    }
+
+    impl RedbSpill {
+        pub fn open(path: &Path) -> Result<Self, redb::Error> {
+            Self::open_with_cache_size(path, SPILL_CACHE_BYTES)
+        }
+
+        pub fn open_with_cache_size(path: &Path, cache_bytes: usize) -> Result<Self, redb::Error> {
+            // A bounded page cache: the spill exists to keep memory bounded (#13). redb's default
+            // is about 1 GiB.
+            let db = Database::builder().set_cache_size(cache_bytes).create(path)?;
+
+            // Initialize table if needed
+            let write_txn = db.begin_write()?;
+            {
+                let _ = write_txn.open_table(META_TABLE)?;
+            }
+            write_txn.commit()?;
+
+            Ok(Self { db: Arc::new(db), commits: Arc::new(std::sync::atomic::AtomicU64::new(0)) })
+        }
+
+        /// Empties the index. The server does this at boot and rebuilds it from the volume
+        /// replay, so its non-durable commits never decide what exists.
+        pub fn clear(&self) -> Result<(), redb::Error> {
+            let mut write_txn = self.db.begin_write()?;
+            write_txn.set_durability(Durability::None);
+            write_txn.delete_table(META_TABLE)?;
+            {
+                let _ = write_txn.open_table(META_TABLE)?;
+            }
+            write_txn.commit()?;
+            Ok(())
+        }
+
+        fn next_durability(&self) -> Durability {
+            let n = self.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n % DURABLE_EVERY == 0 {
+                Durability::Immediate
+            } else {
+                Durability::None
+            }
+        }
+
+        pub fn put(&self, bucket_id: u32, key: &[u8], meta: &ObjectMeta) -> Result<(), redb::Error> {
+            let db_key = make_db_key(bucket_id, key);
+            let encoded = encode_meta(meta);
+            let mut write_txn = self.db.begin_write()?;
+            // Not fsynced: the volumes are the record, and boot rebuilds this index from them.
+            // Every DURABLE_EVERY-th commit is durable, so redb can reuse the pages earlier
+            // non-durable commits freed (it only reclaims them at a durable commit).
+            write_txn.set_durability(self.next_durability());
+            {
+                let mut table = write_txn.open_table(META_TABLE)?;
+                table.insert(&db_key[..], &encoded[..])?;
+            }
+            write_txn.commit()?;
+            Ok(())
+        }
+
+        pub fn get(&self, bucket_id: u32, key: &[u8]) -> Result<Option<ObjectMeta>, redb::Error> {
+            let db_key = make_db_key(bucket_id, key);
+            let read_txn = self.db.begin_read()?;
+            let table = read_txn.open_table(META_TABLE)?;
+            let val_opt = table.get(&db_key[..])?;
+            match val_opt {
+                Some(v) => Ok(decode_meta(v.value())),
+                None => Ok(None),
+            }
+        }
+
+        pub fn delete(&self, bucket_id: u32, key: &[u8]) -> Result<bool, redb::Error> {
+            let db_key = make_db_key(bucket_id, key);
+            let mut write_txn = self.db.begin_write()?;
+            write_txn.set_durability(self.next_durability());
+            let existed = {
+                let mut table = write_txn.open_table(META_TABLE)?;
+                let rem = table.remove(&db_key[..])?;
+                rem.is_some()
+            };
+            write_txn.commit()?;
+            Ok(existed)
+        }
+
+        pub fn scan_prefix(
+            &self,
+            bucket_id: u32,
+            prefix: &[u8],
+            start_after: Option<&[u8]>,
+            limit: usize,
+        ) -> Result<Vec<(Vec<u8>, ObjectMeta)>, redb::Error> {
+            let prefix_key = make_db_key(bucket_id, prefix);
+            let start_key = if let Some(sa) = start_after {
+                make_db_key(bucket_id, sa)
+            } else {
+                prefix_key.clone()
+            };
+
+            let read_txn = self.db.begin_read()?;
+            let table = read_txn.open_table(META_TABLE)?;
+
+            let mut results = Vec::new();
+            let b_id_prefix = bucket_id.to_be_bytes();
+
+            use std::ops::Bound;
+            let start_bound = if start_after.is_some() {
+                Bound::Excluded(&start_key[..])
+            } else {
+                Bound::Included(&start_key[..])
+            };
+
+            let range = table.range::<&[u8]>((start_bound, Bound::Unbounded))?;
+            for entry in range {
+                if results.len() >= limit {
+                    break;
+                }
+                let (k, v) = entry?;
+                let k_bytes = k.value();
+                if k_bytes.len() < 4 || &k_bytes[0..4] != &b_id_prefix[..] {
+                    // Beyond this bucket's range
+                    break;
+                }
+                let user_key = &k_bytes[4..];
+                if !prefix.is_empty() && !user_key.starts_with(prefix) {
+                    if user_key > prefix {
+                        break;
+                    }
+                    continue;
+                }
+                if let Some(meta) = decode_meta(v.value()) {
+                    results.push((user_key.to_vec(), meta));
+                }
+            }
+
+            Ok(results)
+        }
     }
 }

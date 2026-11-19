@@ -1,8 +1,8 @@
 name: Metadata index (experiment)
 
-# #207, decision 59: the metadata index at 10M keys, redb as AwanFS uses it (spill::SpillIndex)
-# against a segment prototype (server/examples/meta_index_bench.rs). An experiment with no
-# baseline: it fails only when the two stores did not answer alike or a phase did not run.
+# #207, decision 59, and #26 stage 6: the metadata index at 10M keys, redb as AwanFS used it,
+# a segment prototype and the production segments (server/examples/meta_index_bench.rs). No
+# baseline: it fails only when the stores did not answer alike or a phase did not run.
 
 on:
   # A new workflow can be dispatched only once it is on the default branch; until then a push
@@ -63,7 +63,7 @@ jobs:
           [ -f "$bin.exe" ] && bin="$bin.exe"
           out=results.jsonl
           : > "$out"
-          for s in redb seg; do
+          for s in redb seg prod; do
             "$bin" build --store "$s" --dir "$DATA/$s" --keys "$KEYS" | tee -a "$out"
             if [ "$RUNNER_OS" = "Linux" ]; then
               # A cold open: nothing of the index in the page cache.

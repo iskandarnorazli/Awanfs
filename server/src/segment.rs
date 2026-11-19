@@ -5,7 +5,7 @@
 //! `SegmentWriter` writes a segment as a stream, block by block (stage 5's compaction), so a
 //! segment is never held in memory whole.
 //!
-//! Nothing in the server reads segments yet: stage 6 switches from redb.
+//! The server's spill index (`spill.rs`) keeps its rows in segments since #26 stage 6.
 
 use crate::meta_index::ObjectMeta;
 use crate::vfile::{FileKind, VolFile, VolFs};

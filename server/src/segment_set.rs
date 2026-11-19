@@ -8,7 +8,7 @@
 //! in sort-key order with the same rule, opening one cursor per level. Each block read counts in
 //! the server's work counters.
 //!
-//! Nothing in the server uses this yet: stage 6 switches from redb.
+//! The spill index (`spill.rs`) reads through this since #26 stage 6.
 
 use crate::meta_index::ObjectMeta;
 use crate::segment::{Cursor, Entry, SegEntry, Segment, SegmentError};

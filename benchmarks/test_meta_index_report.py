@@ -42,6 +42,18 @@ class Report(unittest.TestCase):
         code, text = report(load(FULL), "t")
         self.assertIn("not measured", text)
 
+    def test_three_stores_must_all_agree(self):
+        prod = [rec("prod", p) for p in ("build", "query")]
+        code, text = report(load(FULL + prod), "t")
+        self.assertEqual(code, 0, text)
+        self.assertIn("production", text)
+        code, text = report(load(FULL + prod[:1] + [rec("prod", "query", answers="cd")]), "t")
+        self.assertEqual(code, 1)
+
+    def test_redb_is_required(self):
+        lines = [rec(s, p) for s in ("seg", "prod") for p in ("build", "query")]
+        self.assertEqual(report(load(lines), "t")[0], 2)
+
     def test_non_json_lines_are_ignored(self):
         self.assertEqual(report(load(["Compiling...", *FULL]), "t")[0], 0)
 
