@@ -1,11 +1,14 @@
-//! Lookups across several metadata segments (#26 stage 3, decision 59).
+//! Lookups across the metadata segments (#26 stages 3 and 5, decisions 59 and 68).
 //!
-//! Segments are ordered by sequence number, newest first. For one key, the newest segment that
-//! has an entry decides: a row is the answer, a tombstone means the key is absent. A range scan
-//! merges every segment's entries in sort-key order with the same rule. Each block read counts
-//! in the server's work counters.
+//! The segments are in levels. Level 0 holds flushes, which may overlap: the higher sequence
+//! number is newer. Each deeper level holds segments whose key ranges do not overlap, and a
+//! shallower level is newer than a deeper one. A lookup takes the level-0 segments newest
+//! first, then in each deeper level the one segment whose range holds the key; the first entry
+//! it finds decides (a tombstone means the key is absent). A range scan merges the same sources
+//! in sort-key order with the same rule, opening one cursor per level. Each block read counts in
+//! the server's work counters.
 //!
-//! Nothing in the server uses this yet: stage 4 adds the manifest, stage 6 the switch from redb.
+//! Nothing in the server uses this yet: stage 6 switches from redb.
 
 use crate::meta_index::ObjectMeta;
 use crate::segment::{Cursor, Entry, SegEntry, Segment, SegmentError};
@@ -15,31 +18,92 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
+/// The deepest level.
+pub const MAX_LEVEL: u8 = 7;
+
+/// What compaction planning needs to know about one segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegInfo {
+    pub seq: u64,
+    /// First and last sort keys; `None` for a segment with no entries.
+    pub range: Option<(Vec<u8>, Vec<u8>)>,
+    pub bytes: u64,
+}
+
 pub struct SegmentSet<F: VolFile> {
-    /// Newest (highest sequence number) first.
-    segs: Vec<Segment<F>>,
+    /// Level 0, newest (highest sequence number) first.
+    l0: Vec<Segment<F>>,
+    /// `levels[i - 1]` is level `i`, by first key; no two overlap and none is empty.
+    levels: Vec<Vec<Segment<F>>>,
     work: Arc<WorkCounters>,
+}
+
+fn first_key<F: VolFile>(s: &Segment<F>) -> &[u8] {
+    s.key_range().map(|r| r.0).unwrap_or(&[])
+}
+
+fn last_key<F: VolFile>(s: &Segment<F>) -> &[u8] {
+    s.key_range().map(|r| r.1).unwrap_or(&[])
 }
 
 impl<F: VolFile> SegmentSet<F> {
     pub fn new(work: Arc<WorkCounters>) -> Self {
-        SegmentSet { segs: Vec::new(), work }
+        SegmentSet { l0: Vec::new(), levels: (0..MAX_LEVEL).map(|_| Vec::new()).collect(), work }
     }
 
-    /// Adds an open segment. Two segments with one sequence number would make "newest wins"
-    /// ambiguous, so the second is refused.
-    pub fn add(&mut self, seg: Segment<F>) -> Result<(), SegmentError> {
-        if self.segs.iter().any(|s| s.seq == seg.seq) {
+    fn all(&self) -> impl Iterator<Item = &Segment<F>> {
+        self.l0.iter().chain(self.levels.iter().flatten())
+    }
+
+    /// Adds an open segment at `level`. Refused: a second segment with one sequence number
+    /// (which entry wins would be ambiguous), a level above `MAX_LEVEL`, and below level 0 an
+    /// empty segment or one that overlaps a segment of its level. A manifest asking for any of
+    /// these is corrupt.
+    pub fn add(&mut self, seg: Segment<F>, level: u8) -> Result<(), SegmentError> {
+        if self.all().any(|s| s.seq == seg.seq) {
             return Err(SegmentError::Corrupt(format!("two segments with sequence number {}", seg.seq)));
         }
+        if level > MAX_LEVEL {
+            return Err(SegmentError::Corrupt(format!("level {} is deeper than {}", level, MAX_LEVEL)));
+        }
         let seg = seg.with_work(Arc::clone(&self.work));
-        let at = self.segs.partition_point(|s| s.seq > seg.seq);
-        self.segs.insert(at, seg);
+        if level == 0 {
+            let at = self.l0.partition_point(|s| s.seq > seg.seq);
+            self.l0.insert(at, seg);
+            return Ok(());
+        }
+        let Some((lo, hi)) = seg.key_range().map(|(a, b)| (a.to_vec(), b.to_vec())) else {
+            return Err(SegmentError::Corrupt(format!("empty segment {} at level {}", seg.seq, level)));
+        };
+        let lvl = &mut self.levels[level as usize - 1];
+        let at = lvl.partition_point(|s| first_key(s) < lo.as_slice());
+        let clash = (at > 0 && last_key(&lvl[at - 1]) >= lo.as_slice()) || (at < lvl.len() && first_key(&lvl[at]) <= hi.as_slice());
+        if clash {
+            return Err(SegmentError::Corrupt(format!("segment {} overlaps another at level {}", seg.seq, level)));
+        }
+        lvl.insert(at, seg);
         Ok(())
     }
 
+    /// Takes the segment with sequence number `seq` out of the set.
+    pub fn remove(&mut self, seq: u64) -> Option<Segment<F>> {
+        if let Some(i) = self.l0.iter().position(|s| s.seq == seq) {
+            return Some(self.l0.remove(i));
+        }
+        for lvl in &mut self.levels {
+            if let Some(i) = lvl.iter().position(|s| s.seq == seq) {
+                return Some(lvl.remove(i));
+            }
+        }
+        None
+    }
+
     pub fn len(&self) -> usize {
-        self.segs.len()
+        self.all().count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// The counters this set's block reads go to.
@@ -47,13 +111,26 @@ impl<F: VolFile> SegmentSet<F> {
         Arc::clone(&self.work)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.segs.is_empty()
+    /// Every level's segments, level 0 first (newest first), deeper levels by key.
+    pub fn levels(&self) -> Vec<Vec<SegInfo>> {
+        let info = |s: &Segment<F>| SegInfo { seq: s.seq, range: s.key_range().map(|(a, b)| (a.to_vec(), b.to_vec())), bytes: s.len_bytes() };
+        std::iter::once(self.l0.iter().map(info).collect::<Vec<_>>()).chain(self.levels.iter().map(|l| l.iter().map(info).collect::<Vec<_>>())).collect()
     }
 
-    /// The row for `key`, or `None` if no segment has it or the newest entry is a tombstone.
+    fn find(&self, seq: u64) -> Option<&Segment<F>> {
+        self.all().find(|s| s.seq == seq)
+    }
+
+    /// The row for `key`, or `None` if no segment has it or the first entry found is a tombstone.
     pub fn get(&self, key: &[u8]) -> Result<Option<ObjectMeta>, SegmentError> {
-        for s in &self.segs {
+        let level_pick = self.levels.iter().filter_map(|lvl| {
+            let i = lvl.partition_point(|s| first_key(s) <= key);
+            (i > 0).then(|| &lvl[i - 1])
+        });
+        for s in self.l0.iter().chain(level_pick) {
+            if !s.spans(key) {
+                continue;
+            }
             match s.get(key)? {
                 Some(Entry::Row(m)) => return Ok(Some(m)),
                 Some(Entry::Tombstone) => return Ok(None),
@@ -70,46 +147,130 @@ impl<F: VolFile> SegmentSet<F> {
         if limit == 0 {
             return Ok(out);
         }
-        let mut cursors: Vec<Cursor<'_, F>> = self.segs.iter().map(|s| s.scan_from(start)).collect();
-        // Min-heap on (key, rank): rank 0 is the newest segment, so on equal keys it comes first.
-        let mut heap: BinaryHeap<Reverse<(Vec<u8>, usize)>> = BinaryHeap::new();
-        let mut heads: Vec<Option<SegEntry>> = Vec::with_capacity(cursors.len());
-        for (rank, c) in cursors.iter_mut().enumerate() {
-            let e = c.next_entry()?;
-            if let Some(e) = &e {
-                heap.push(Reverse((e.key.clone(), rank)));
+        let mut srcs: Vec<Src<'_, F>> = Vec::new();
+        for s in &self.l0 {
+            if let Some((lo, hi)) = s.key_range() {
+                if hi >= start && end.is_none_or(|e| lo < e) {
+                    srcs.push(Src::One(s.scan_from(start)));
+                }
             }
-            heads.push(e);
         }
-        while let Some(Reverse((key, rank))) = heap.pop() {
-            if end.is_some_and(|end| key.as_slice() >= end) {
+        for lvl in &self.levels {
+            if !lvl.is_empty() {
+                srcs.push(Src::level(lvl.iter().collect(), start, end));
+            }
+        }
+        let mut m = Merge::new(srcs)?;
+        while let Some(e) = m.next_entry()? {
+            if end.is_some_and(|end| e.key.as_slice() >= end) {
                 break;
             }
-            let winner = heads[rank].take().expect("a heap entry has its head");
-            // Older segments' entries for the same key are hidden: advance past them.
-            while let Some(Reverse((k, r))) = heap.peek() {
-                if *k != key {
-                    break;
-                }
-                let r = *r;
-                heap.pop();
-                heads[r] = cursors[r].next_entry()?;
-                if let Some(e) = &heads[r] {
-                    heap.push(Reverse((e.key.clone(), r)));
-                }
-            }
-            heads[rank] = cursors[rank].next_entry()?;
-            if let Some(e) = &heads[rank] {
-                heap.push(Reverse((e.key.clone(), rank)));
-            }
-            if let Entry::Row(m) = winner.entry {
-                out.push((winner.key, m));
+            if let Entry::Row(r) = e.entry {
+                out.push((e.key, r));
                 if out.len() == limit {
                     break;
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Every entry of the named segments, tombstones included, merged in sort-key order. Each
+    /// group is one source, in precedence order: a group of one segment, or the segments of one
+    /// deeper level (disjoint, read in key order). Compaction reads its inputs through this.
+    pub fn merge_of(&self, groups: &[Vec<u64>]) -> Result<Merge<'_, F>, SegmentError> {
+        let mut srcs = Vec::new();
+        for g in groups {
+            let mut segs = Vec::with_capacity(g.len());
+            for &seq in g {
+                segs.push(self.find(seq).ok_or_else(|| SegmentError::Corrupt(format!("no segment {}", seq)))?);
+            }
+            segs.sort_by(|a, b| first_key(a).cmp(first_key(b)));
+            srcs.push(Src::level(segs, &[], None));
+        }
+        Merge::new(srcs)
+    }
+}
+
+/// One source of a merge: one segment's cursor, or a level's segments one after another.
+enum Src<'a, F: VolFile> {
+    One(Cursor<'a, F>),
+    Level { segs: Vec<&'a Segment<F>>, next: usize, cur: Option<Cursor<'a, F>>, start: Vec<u8>, end: Option<Vec<u8>> },
+}
+
+impl<'a, F: VolFile> Src<'a, F> {
+    fn level(segs: Vec<&'a Segment<F>>, start: &[u8], end: Option<&[u8]>) -> Self {
+        // Skip the segments that end before the start: they hold nothing the scan wants.
+        let next = segs.partition_point(|s| last_key(s) < start);
+        Src::Level { segs, next, cur: None, start: start.to_vec(), end: end.map(|e| e.to_vec()) }
+    }
+
+    fn next_entry(&mut self) -> Result<Option<SegEntry>, SegmentError> {
+        match self {
+            Src::One(c) => c.next_entry(),
+            Src::Level { segs, next, cur, start, end } => loop {
+                if let Some(c) = cur {
+                    if let Some(e) = c.next_entry()? {
+                        return Ok(Some(e));
+                    }
+                    *cur = None;
+                }
+                let Some(&s) = segs.get(*next) else { return Ok(None) };
+                if end.as_ref().is_some_and(|e| first_key(s) >= e.as_slice()) {
+                    return Ok(None);
+                }
+                *cur = Some(s.scan_from(start));
+                *next += 1;
+            },
+        }
+    }
+}
+
+/// A k-way merge of sources in sort-key order: for each key, the entry of the first source (in
+/// precedence order) that has it; the others' entries for that key are skipped.
+pub struct Merge<'a, F: VolFile> {
+    srcs: Vec<Src<'a, F>>,
+    heads: Vec<Option<SegEntry>>,
+    /// Min-heap on (key, rank): rank 0 is the newest source, so on equal keys it comes first.
+    heap: BinaryHeap<Reverse<(Vec<u8>, usize)>>,
+}
+
+impl<'a, F: VolFile> Merge<'a, F> {
+    fn new(mut srcs: Vec<Src<'a, F>>) -> Result<Self, SegmentError> {
+        let mut heap = BinaryHeap::new();
+        let mut heads = Vec::with_capacity(srcs.len());
+        for (rank, s) in srcs.iter_mut().enumerate() {
+            let e = s.next_entry()?;
+            if let Some(e) = &e {
+                heap.push(Reverse((e.key.clone(), rank)));
+            }
+            heads.push(e);
+        }
+        Ok(Merge { srcs, heads, heap })
+    }
+
+    fn advance(&mut self, rank: usize) -> Result<(), SegmentError> {
+        self.heads[rank] = self.srcs[rank].next_entry()?;
+        if let Some(e) = &self.heads[rank] {
+            self.heap.push(Reverse((e.key.clone(), rank)));
+        }
+        Ok(())
+    }
+
+    /// The next winning entry, a tombstone included.
+    pub fn next_entry(&mut self) -> Result<Option<SegEntry>, SegmentError> {
+        let Some(Reverse((key, rank))) = self.heap.pop() else { return Ok(None) };
+        let winner = self.heads[rank].take().expect("a heap entry has its head");
+        while let Some(Reverse((k, r))) = self.heap.peek() {
+            if *k != key {
+                break;
+            }
+            let r = *r;
+            self.heap.pop();
+            self.advance(r)?;
+        }
+        self.advance(rank)?;
+        Ok(Some(winner))
     }
 }
 
@@ -136,7 +297,7 @@ mod tests {
             let seq = i as u64 + 1;
             let es: Vec<SegEntry> = m.iter().map(|(k, e)| SegEntry { key: k.clone(), entry: *e }).collect();
             write_segment(fs, &path(seq), seq, 0, &es).unwrap();
-            set.add(Segment::open(fs, &path(seq)).unwrap()).unwrap();
+            set.add(Segment::open(fs, &path(seq)).unwrap(), 0).unwrap();
         }
         set
     }
@@ -252,8 +413,8 @@ mod tests {
         let fs = SimFs::new();
         write_segment(&fs, &path(5), 5, 0, &[]).unwrap();
         let mut s = SegmentSet::new(Arc::new(WorkCounters::default()));
-        s.add(Segment::open(&fs, &path(5)).unwrap()).unwrap();
-        assert!(s.add(Segment::open(&fs, &path(5)).unwrap()).is_err());
+        s.add(Segment::open(&fs, &path(5)).unwrap(), 0).unwrap();
+        assert!(s.add(Segment::open(&fs, &path(5)).unwrap(), 0).is_err());
         assert_eq!(s.len(), 1);
     }
 
@@ -269,5 +430,39 @@ mod tests {
         let first_key = maps[1].keys().next().unwrap().clone();
         assert!(s.get(&first_key).is_err(), "never a wrong or missing row");
         assert!(s.range(&sort_key(0, b""), None, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn a_level_refuses_overlapping_and_empty_segments_and_finds_each_key_in_one() {
+        let fs = SimFs::new();
+        let seg = |seq: u64, keys: &[&str]| {
+            let es: Vec<SegEntry> = keys.iter().map(|k| SegEntry { key: sort_key(1, k.as_bytes()), entry: Entry::Row(row(seq)) }).collect();
+            write_segment(&fs, &path(seq), seq, 0, &es).unwrap();
+            Segment::open(&fs, &path(seq)).unwrap()
+        };
+        let work = Arc::new(WorkCounters::default());
+        let mut s = SegmentSet::new(Arc::clone(&work));
+        s.add(seg(1, &["a", "c"]), 1).unwrap();
+        s.add(seg(2, &["m", "p"]), 1).unwrap();
+        assert!(s.add(seg(3, &["b", "d"]), 1).is_err(), "overlaps segment 1");
+        assert!(s.add(seg(4, &["p", "q"]), 1).is_err(), "shares a key with segment 2");
+        assert!(s.add(seg(5, &[]), 2).is_err(), "an empty segment below level 0");
+        assert!(s.add(seg(6, &["x"]), MAX_LEVEL + 1).is_err());
+        s.add(seg(7, &["d", "k"]), 1).unwrap();
+        s.add(seg(8, &["c"]), 0).unwrap();
+        // Level 0 wins over level 1; in level 1 one segment is read per key.
+        let before = work.snapshot();
+        assert_eq!(s.get(&sort_key(1, b"c")).unwrap(), Some(row(8)));
+        assert_eq!(s.get(&sort_key(1, b"k")).unwrap(), Some(row(7)));
+        assert_eq!(s.get(&sort_key(1, b"p")).unwrap(), Some(row(2)));
+        assert_eq!(s.get(&sort_key(1, b"e")).unwrap(), None);
+        assert_eq!(s.get(&sort_key(1, b"z")).unwrap(), None);
+        assert!(work.snapshot().since(&before).disk_reads <= 5, "at most one read a lookup here");
+        let keys: Vec<_> = s.range(&sort_key(1, b""), None, 100).unwrap().into_iter().map(|(k, m)| (k[4..].to_vec(), m.key_hash)).collect();
+        assert_eq!(keys, vec![(b"a".to_vec(), 1), (b"c".to_vec(), 8), (b"d".to_vec(), 7), (b"k".to_vec(), 7), (b"m".to_vec(), 2), (b"p".to_vec(), 2)]);
+        assert_eq!(s.range(&sort_key(1, b"e"), Some(&sort_key(1, b"n")), 100).unwrap().len(), 2, "k and m");
+        assert!(s.remove(7).is_some() && s.remove(7).is_none());
+        assert_eq!(s.get(&sort_key(1, b"k")).unwrap(), None);
+        assert_eq!(s.levels()[1].iter().map(|i| i.seq).collect::<Vec<_>>(), vec![1, 2]);
     }
 }

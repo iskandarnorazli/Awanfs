@@ -24,6 +24,7 @@ pub mod lifecycle;
 pub mod lifecycle_config;
 pub mod manifest;
 pub mod memory;
+pub mod meta_compaction;
 pub mod meta_index;
 pub mod metrics;
 pub mod multipart;
