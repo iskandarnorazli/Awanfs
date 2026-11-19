@@ -760,7 +760,7 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
     let key = c.key.as_deref().unwrap_or("");
 
     match c.op {
-        Operation::ListBuckets => service::list_buckets(state).await,
+        Operation::ListBuckets => service::list_buckets(state, &c.query_map).await,
         Operation::CreateBucket => bucket::create_bucket(state, bucket, &path, &principal, c.body).await,
         Operation::DeleteBucket => bucket::delete_bucket(state, b_id.unwrap(), bucket).await,
         Operation::HeadBucket => bucket::head_bucket().await,
