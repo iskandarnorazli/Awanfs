@@ -86,14 +86,24 @@ impl DiskFile {
     pub fn main(&self) -> &AlignedFile {
         &self.main
     }
+
+    /// The same as the trait's, callable without importing `VolFile`: code that held the
+    /// volume's `AlignedFile` before the seam (tests among it) keeps working unchanged.
+    pub fn write_aligned_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        self.main.write_aligned_at(offset, buf)
+    }
+
+    pub fn read_aligned_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.main.read_aligned_at(offset, buf)
+    }
 }
 
 impl VolFile for DiskFile {
     fn write_aligned_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
-        self.main.write_aligned_at(offset, buf)
+        DiskFile::write_aligned_at(self, offset, buf)
     }
     fn read_aligned_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        self.main.read_aligned_at(offset, buf)
+        DiskFile::read_aligned_at(self, offset, buf)
     }
     fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
         crate::direct_io::write_all_at(self.main.file(), offset, buf)
