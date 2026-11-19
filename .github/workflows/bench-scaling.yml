@@ -12,10 +12,26 @@ on:
         default: ""
       duration:
         description: "Seconds per workload phase"
-        default: "3"
+        default: "2"
       runs:
         description: "Alternating rounds per core count"
         default: "2"
+      matrix:
+        description: "Run pattern x size x concurrency x cores matrix (#251)"
+        type: boolean
+        default: true
+      patterns:
+        description: "Comma-separated patterns (seq-write,rand-write,seq-read,rand-read)"
+        default: "seq-write,rand-write,seq-read,rand-read"
+      sizes:
+        description: "Comma-separated payload sizes (e.g. 4KiB,1MiB)"
+        default: "4KiB,1MiB"
+      concurrencies:
+        description: "Comma-separated concurrencies (e.g. 1,4,16,64,256)"
+        default: "1,4,16,64,256"
+      seed:
+        description: "RNG seed for random patterns and prefill"
+        default: "42"
       include_self_hosted:
         description: "Also run on the self-hosted bench runner"
         type: boolean
@@ -108,7 +124,7 @@ jobs:
         run: python benchmarks/test_core_scaling.py
 
       - name: Run core scaling benchmark
-        timeout-minutes: 60
+        timeout-minutes: 75
         env:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
@@ -117,12 +133,23 @@ jobs:
           mkdir -p "$RUNNER_TEMP/core_scaling"
           cores_arg="${{ inputs.cores }}"
           if [ -z "$cores_arg" ]; then cores_arg="1,2,4"; fi
+          extra_args=()
+          if [ "${{ github.event_name }}" = "pull_request" ] || [ "${{ inputs.matrix }}" = "true" ]; then
+            extra_args+=(
+              --matrix
+              --pattern "${{ inputs.patterns || 'seq-write,rand-write,seq-read,rand-read' }}"
+              --sizes "${{ inputs.sizes || '4KiB,1MiB' }}"
+              --concurrencies "${{ inputs.concurrencies || '1,4,16,64,256' }}"
+              --seed "${{ inputs.seed || '42' }}"
+            )
+          fi
           python -u benchmarks/core_scaling.py \
             --cores "$cores_arg" \
             --runs "${{ inputs.runs || '2' }}" \
-            --duration "${{ inputs.duration || '3' }}" \
+            --duration "${{ inputs.duration || '2' }}" \
             --data-dir "$RUNNER_TEMP" \
-            --output $RUNNER_TEMP/core_scaling/report.md
+            --output $RUNNER_TEMP/core_scaling/report.md \
+            "${extra_args[@]}"
 
       - name: Report to the job summary
         if: always()
@@ -166,13 +193,21 @@ jobs:
           cmd = [
               sys.executable, "-u", "benchmarks/core_scaling.py",
               "--runs", "${{ inputs.runs || '2' }}",
-              "--duration", "${{ inputs.duration || '3' }}",
+              "--duration", "${{ inputs.duration || '2' }}",
               "--data-dir", os.environ["RUNNER_TEMP"],
               "--output", os.path.join(out_dir, "report.md"),
           ]
           cores = "${{ inputs.cores }}".strip()
           if cores:
               cmd.extend(["--cores", cores])
+          if "${{ inputs.matrix }}" == "true":
+              cmd.extend([
+                  "--matrix",
+                  "--pattern", "${{ inputs.patterns || 'seq-write,rand-write,seq-read,rand-read' }}",
+                  "--sizes", "${{ inputs.sizes || '4KiB,1MiB' }}",
+                  "--concurrencies", "${{ inputs.concurrencies || '1,4,16,64,256' }}",
+                  "--seed", "${{ inputs.seed || '42' }}",
+              ])
           subprocess.run(cmd, check=True)
       - name: Report to the job summary
         if: always()
