@@ -890,6 +890,9 @@ impl S3ServiceState {
                     // DELETE removes the null version. Its own creation time does not count.
                     let before_history = flags & (crate::meta_index::FLAG_VERSIONED | crate::meta_index::FLAG_VERSION_DELETE) == 0;
                     let ts = if before_history { 0 } else { n.created_at_ns };
+                    // Last-Modified: the record's own time, in the row's milliseconds for a
+                    // pre-history record, as `null_version_of` gives it live (#238).
+                    let modified = if before_history { created_at_ms.saturating_mul(1_000_000) } else { n.created_at_ns };
                     let ev = if before_history && flags & AWAN_FLAG_TOMBSTONE != 0 {
                         crate::versions::Event::Remove(0)
                     } else if flags & crate::meta_index::FLAG_VERSION_DELETE != 0 {
@@ -898,7 +901,7 @@ impl S3ServiceState {
                             _ => continue,
                         }
                     } else if flags & AWAN_FLAG_TOMBSTONE != 0 {
-                        crate::versions::Event::Put(crate::versions::Version { ts, null, marker: true, vol_offset: offset, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags })
+                        crate::versions::Event::Put(crate::versions::Version { ts, modified, null, marker: true, vol_offset: offset, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags })
                     } else {
                         let (size, part_count) = if flags & AWAN_FLAG_MULTIPART != 0 {
                             match vm.read_needle_bytes(vm.id(), local, crc32c).ok().map(|b| decode_extents_manifest(&multipart.staging_dir, &b)) {
@@ -923,7 +926,7 @@ impl S3ServiceState {
                         } else {
                             (size, 0)
                         };
-                        crate::versions::Event::Put(crate::versions::Version { ts, null, marker: false, vol_offset: offset, size, etag_hi, etag_lo, part_count, flags })
+                        crate::versions::Event::Put(crate::versions::Version { ts, modified, null, marker: false, vol_offset: offset, size, etag_hi, etag_lo, part_count, flags })
                     };
                     version_store.apply(b, &key, ev);
                     match version_store.current(b, &key) {
@@ -1109,7 +1112,7 @@ impl S3ServiceState {
             };
             self.needle_crc_map.write().insert((b_id, g), loc.payload_crc32c);
             self.mvcc.tombstone(b_id, key);
-            let v = crate::versions::Version { ts, null: flags & crate::meta_index::FLAG_NULL_ID != 0, marker: true, vol_offset: g, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags };
+            let v = crate::versions::Version { ts, modified: ts, null: flags & crate::meta_index::FLAG_NULL_ID != 0, marker: true, vol_offset: g, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags };
             self.record_version(b_id, key, crate::versions::Event::Put(v)).map_err(|c| format!("index error {} for the delete marker", c))?;
             if let Some(e) = late {
                 return Err(e);
