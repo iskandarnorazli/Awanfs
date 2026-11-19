@@ -1,6 +1,6 @@
 //! The spill index: object rows past the in-memory hot set (#13), kept in metadata segments
 //! (#26 stage 6, decision 59) in place of redb. Writes go to a memtable; when it holds
-//! `cache_bytes / 2` it is flushed to a level-0 segment and compacted (decision 68). Lookups
+//! `cache_bytes / 4` it is flushed to a level-0 segment and compacted (decision 68). Lookups
 //! read the memtable, then the segments (`segment_set.rs`): a key the Bloom filters reject costs
 //! no read, a present one about one 4 KiB read.
 //!
@@ -68,8 +68,8 @@ impl SpillIndex {
         Self::open_with_cache_size(dir, SPILL_CACHE_BYTES)
     }
 
-    /// As `open`, with `cache_bytes` of heap for the memtable (half of it) and the segments'
-    /// filters and fences.
+    /// As `open`, with `cache_bytes` of heap for the memtable (a quarter of it) and the
+    /// segments' filters and fences.
     pub fn open_with_cache_size(dir: &Path, cache_bytes: usize) -> Result<Self, SpillError> {
         Self::open_with(dir, cache_bytes, Policy::default())
     }
@@ -81,8 +81,11 @@ impl SpillIndex {
         Ok(SpillIndex {
             state: Arc::new(RwLock::new(State { mem: BTreeMap::new(), mem_bytes: 0, store: Some(store) })),
             dir: dir.to_path_buf(),
+            // A quarter, not half (run 44522807804, 10M keys): at half, building peaked at 73 MiB
+            // RSS on Linux against redb's 66; at a quarter, 56 MiB (Windows 59 against 87), with
+            // 236,000 inserts/s on Linux and 119,000 on Windows against 2,121 and 1,231 for redb.
             // At most 32 MiB, so a flush always fits one segment.
-            mem_limit: (cache_bytes / 2).clamp(64 << 10, 32 << 20),
+            mem_limit: (cache_bytes / 4).clamp(64 << 10, 32 << 20),
             policy,
             work,
         })

@@ -43,7 +43,7 @@ fn a_hundred_thousand_spilled_keys_take_a_bounded_heap() {
     static N: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!("awanfs_spill_heap_{}_{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&dir);
-    // 2 MiB for the spill index: a memtable of 1 MiB.
+    // 2 MiB for the spill index: a memtable of 512 KiB.
     let spill = SpillIndex::open_with_cache_size(&dir, 2 << 20).unwrap();
     let mut engine = StorageEngine::new(1_000, 1 << 20, 65536);
     engine.attach_spill_index(spill);
@@ -65,7 +65,7 @@ fn a_hundred_thousand_spilled_keys_take_a_bounded_heap() {
     assert!(engine.get_object(b, b"obj-0050000").is_err());
     assert!(engine.delete_object(b, b"obj-0050000").is_err(), "deleting it again finds nothing");
     println!("heap grew by {} bytes for 100,000 spilled keys", grown);
-    // A set of 100,000 owned keys alone is about 7 MB; the memtable is 1 MiB of entries.
+    // A set of 100,000 owned keys alone is about 7 MB; the memtable is 512 KiB of entries.
     assert!(grown < 3 << 20, "heap grew by {} bytes for 100,000 spilled keys", grown);
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
