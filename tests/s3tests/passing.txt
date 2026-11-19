@@ -283,6 +283,7 @@ test_s3::test_put_excess_val_tags
 test_s3::test_put_max_kvsize_tags
 test_s3::test_put_max_tags
 test_s3::test_put_modify_tags
+test_s3::test_put_obj_with_tags
 test_s3::test_put_object_ifmatch_good
 test_s3::test_put_object_ifmatch_overwrite_existed_good
 test_s3::test_put_object_ifnonmatch_good
@@ -294,7 +295,9 @@ test_s3::test_ranged_request_invalid_range
 test_s3::test_ranged_request_response_code
 test_s3::test_ranged_request_return_trailing_bytes_response_code
 test_s3::test_ranged_request_skip_leading_bytes_response_code
+test_s3::test_set_bucket_tagging
 test_s3::test_set_cors
+test_s3::test_set_multipart_tagging
 test_s3::test_sse_kms_multipart_invalid_chunks_1
 test_s3::test_sse_kms_multipart_invalid_chunks_2
 test_s3::test_sse_kms_present

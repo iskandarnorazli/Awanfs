@@ -219,7 +219,9 @@ pass.** Before #148 a request such as `PUT /bucket?policy`, `?acl`, `?encryption
 a client was told a security setting was applied when it was ignored. 32 ceph s3-tests passed
 that way; commit dde3ca2 removed them from `tests/s3tests/passing.txt` when #148 made them 501.
 The removals stand: the 26 that still fail return with their features (#122 policy and ACLs,
-#121 encryption, #120 object lock, #119 POST object); the other 6 pass again since #115. A test
+#121 encryption, #120 object lock, #119 POST object); the other 6 pass again since #115
+(including `test_set_bucket_tagging`, which #115 implements via `PutBucketTagging`,
+`GetBucketTagging` and `DeleteBucketTagging` on `BucketConfigStore`: owner, 2026-11-18). A test
 leaves `passing.txt` only with a recorded reason and the owner's decision (#220 makes CI check
 it). Restoring the old answers was weighed and refused: it fakes security settings.
 
