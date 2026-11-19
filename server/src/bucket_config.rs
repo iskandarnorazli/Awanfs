@@ -234,6 +234,27 @@ impl ValidatorRegistry {
                 ))
             }),
         );
+        reg.register(
+            ConfigKind::Tagging,
+            Arc::new(|bytes: &[u8]| {
+                let xml_str = std::str::from_utf8(bytes).map_err(|_| ConfigError::Rejected {
+                    status: 400,
+                    code: "MalformedXML",
+                    message: "Tagging configuration is not valid UTF-8".to_string(),
+                })?;
+                let tag_set = crate::tagging::parse_tagging_xml(xml_str, crate::tagging::Scope::Bucket).map_err(|r| {
+                    ConfigError::Rejected {
+                        status: r.status,
+                        code: r.code,
+                        message: r.why.to_string(),
+                    }
+                })?;
+                Ok(ParsedConfig::with_parsed(
+                    Bytes::copy_from_slice(bytes),
+                    Arc::new(tag_set),
+                ))
+            }),
+        );
         reg
     }
 

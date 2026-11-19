@@ -122,6 +122,22 @@ class Map(unittest.TestCase):
         self.assertEqual(cm.area_of("test_bucket_listv2_maxkeys_one", ["list_objects_v2"])[0], "listing", "ListObjectsV2 is not SigV2")
         self.assertEqual(cm.area_of("test_headers::test_object_create_bad_md5_invalid_short", ["auth_common"])[0], "request-headers")
 
+    def test_owner_decisions_of_2026_11_18(self):
+        """#160: the request no client can send is out of scope; #140: the anonymous DELETE on a
+        gone bucket belongs to #122. Neighbours keep their areas."""
+        self.assertEqual(cm.area_of("test_headers::test_object_create_bad_contentlength_none", [])[:2], ("request-headers-unsendable", "out of scope"))
+        self.assertEqual(cm.area_of("test_headers::test_object_create_bad_contentlength_empty", [])[0], "request-headers")
+        self.assertEqual(cm.area_of("test_object_delete_key_bucket_gone", [])[:2], ("anonymous-bucket-gone", "#122"))
+        self.assertEqual(cm.area_of("test_object_read_not_exist", [])[0], "object-basics")
+
+    def test_owner_decision_2026_11_19_cors(self):
+        """#116: the two CORS tests that read a public-read bucket anonymously belong to #122;
+        the other CORS tests stay with #116, and the SigV2 ones stay out of scope."""
+        self.assertEqual(cm.area_of("test_cors_origin_response", [])[:2], ("anonymous-cors", "#122"))
+        self.assertEqual(cm.area_of("test_cors_origin_wildcard", [])[:2], ("anonymous-cors", "#122"))
+        self.assertEqual(cm.area_of("test_cors_header_option", [])[:2], ("cors", "#116"))
+        self.assertEqual(cm.area_of("test_cors_presigned_get_object_v2", [])[0], "sigv2")
+
     def test_headers_suite_assigned_to_request_headers(self):
         headers_suite = '''
 def test_put_obj_bad_content_length():

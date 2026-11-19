@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crate::iam::{Iam, Principal};
 use crate::s3_api::{
     body_limit_for, empty_body, entity_too_large, full_body, parse_s3_target, percent_decode,
-    percent_decode_path, validate_s3_key, ParsedTarget, ResponseBody, S3ServiceState,
+    percent_decode_path, percent_decode_path_bytes, raw_s3_key, validate_s3_key, ParsedTarget, ResponseBody, S3ServiceState,
 };
 use crate::xml::s3_error_xml;
 
@@ -38,6 +38,9 @@ pub enum Operation {
     GetBucketCors,
     PutBucketCors,
     DeleteBucketCors,
+    GetBucketTagging,
+    PutBucketTagging,
+    DeleteBucketTagging,
     CorsPreflight,
     ListMultipartUploads,
     DeleteObjects,
@@ -207,6 +210,30 @@ pub const OPS: &[OpSpec] = &[
     OpSpec {
         op: Operation::DeleteBucketCors,
         name: "DeleteBucketCors",
+        iam_action: Some("s3:DeleteBucket"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::GetBucketTagging,
+        name: "GetBucketTagging",
+        iam_action: Some("s3:ListBucket"),
+        acl_permission: AclPermission::Read,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::PutBucketTagging,
+        name: "PutBucketTagging",
+        iam_action: Some("s3:CreateBucket"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::DeleteBucketTagging,
+        name: "DeleteBucketTagging",
         iam_action: Some("s3:DeleteBucket"),
         acl_permission: AclPermission::Write,
         target: TargetKind::Bucket,
@@ -468,6 +495,9 @@ pub fn classify(
             (&Method::PUT, ["cors"]) => Ok(Operation::PutBucketCors),
             (&Method::GET, ["cors"]) => Ok(Operation::GetBucketCors),
             (&Method::DELETE, ["cors"]) => Ok(Operation::DeleteBucketCors),
+            (&Method::PUT, ["tagging"]) => Ok(Operation::PutBucketTagging),
+            (&Method::GET, ["tagging"]) => Ok(Operation::GetBucketTagging),
+            (&Method::DELETE, ["tagging"]) => Ok(Operation::DeleteBucketTagging),
             (&Method::OPTIONS, []) => Ok(Operation::CorsPreflight),
             (&Method::GET, ["location"]) => Ok(Operation::GetBucketLocation),
             (&Method::GET, ["uploads"]) => Ok(Operation::ListMultipartUploads),
@@ -716,6 +746,18 @@ pub fn authorize(r: Resolved) -> Result<Authorized, Response<ResponseBody>> {
 pub fn validate(a: Authorized) -> Result<Validated, Response<ResponseBody>> {
     let c = &a.resolved.auth.classified;
     if let Some(ref key) = c.key {
+        let host_hdr = c.parts.headers.get(HOST).and_then(|v| v.to_str().ok());
+        let invalid_utf8 = raw_s3_key(c.parts.uri.path(), host_hdr)
+            .is_some_and(|raw_key| std::str::from_utf8(&percent_decode_path_bytes(raw_key)).is_err());
+        let has_c1_or_del = key.chars().any(|ch| matches!(ch, '\u{007f}' | '\u{0080}'..='\u{009f}'));
+        if invalid_utf8 || has_c1_or_del {
+            let xml = s3_error_xml("InvalidURI", "Couldn't parse the specified URI.", c.parts.uri.path(), "req-val-uri");
+            return Err(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(full_body(Bytes::from(xml)))
+                .unwrap());
+        }
         if let Err(err_code) = validate_s3_key(key) {
             let xml = s3_error_xml(err_code.as_str(), err_code.description(), key, "req-val-key");
             return Err(Response::builder()
@@ -760,7 +802,7 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
     let key = c.key.as_deref().unwrap_or("");
 
     match c.op {
-        Operation::ListBuckets => service::list_buckets(state).await,
+        Operation::ListBuckets => service::list_buckets(state, &c.query_map).await,
         Operation::CreateBucket => bucket::create_bucket(state, bucket, &path, &principal, c.body).await,
         Operation::DeleteBucket => bucket::delete_bucket(state, b_id.unwrap(), bucket).await,
         Operation::HeadBucket => bucket::head_bucket().await,
@@ -776,6 +818,9 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         Operation::GetBucketCors => cors::get_bucket_cors(state, b_id.unwrap(), bucket).await,
         Operation::PutBucketCors => cors::put_bucket_cors(state, b_id.unwrap(), bucket, &path, c.body).await,
         Operation::DeleteBucketCors => cors::delete_bucket_cors(state, b_id.unwrap(), bucket).await,
+        Operation::GetBucketTagging => tagging::get_bucket_tagging(state, b_id.unwrap(), bucket).await,
+        Operation::PutBucketTagging => tagging::put_bucket_tagging(state, b_id.unwrap(), bucket, &path, c.body).await,
+        Operation::DeleteBucketTagging => tagging::delete_bucket_tagging(state, b_id.unwrap(), bucket).await,
         Operation::CorsPreflight => cors::preflight(state, b_id.unwrap(), &path, &c.parts.headers).await,
         Operation::ListMultipartUploads => multipart::list_multipart_uploads(state, bucket, &c.query_map).await,
         Operation::DeleteObjects => {
@@ -842,6 +887,9 @@ mod tests {
             (Operation::GetBucketCors, Method::GET, Some("bkt"), None, "cors", None),
             (Operation::PutBucketCors, Method::PUT, Some("bkt"), None, "cors", None),
             (Operation::DeleteBucketCors, Method::DELETE, Some("bkt"), None, "cors", None),
+            (Operation::GetBucketTagging, Method::GET, Some("bkt"), None, "tagging", None),
+            (Operation::PutBucketTagging, Method::PUT, Some("bkt"), None, "tagging", None),
+            (Operation::DeleteBucketTagging, Method::DELETE, Some("bkt"), None, "tagging", None),
             (Operation::CorsPreflight, Method::OPTIONS, Some("bkt"), None, "", None),
             (Operation::ListMultipartUploads, Method::GET, Some("bkt"), None, "uploads", None),
             (Operation::DeleteObjects, Method::POST, Some("bkt"), None, "delete", None),

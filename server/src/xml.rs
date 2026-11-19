@@ -64,7 +64,12 @@ pub fn s3_error_xml(code: &str, message: &str, resource: &str, request_id: &str)
     )
 }
 
-pub fn list_buckets_xml(buckets: &[(&str, &str)], request_id: &str) -> String {
+pub fn list_buckets_xml(
+    buckets: &[(&str, &str)],
+    prefix: Option<&str>,
+    continuation_token: Option<&str>,
+    request_id: &str,
+) -> String {
     let mut out = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
         <ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  \
@@ -80,7 +85,14 @@ pub fn list_buckets_xml(buckets: &[(&str, &str)], request_id: &str) -> String {
         out.push_str(&format!("      <CreationDate>{}</CreationDate>\n", created_at));
         out.push_str("    </Bucket>\n");
     }
-    out.push_str("  </Buckets>\n</ListAllMyBucketsResult>");
+    out.push_str("  </Buckets>\n");
+    if let Some(token) = continuation_token {
+        out.push_str(&format!("  <ContinuationToken>{}</ContinuationToken>\n", xml_escape(token)));
+    }
+    if let Some(pfx) = prefix {
+        out.push_str(&format!("  <Prefix>{}</Prefix>\n", xml_escape(pfx)));
+    }
+    out.push_str("</ListAllMyBucketsResult>");
     let _ = request_id;
     out
 }

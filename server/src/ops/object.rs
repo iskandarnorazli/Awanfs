@@ -116,28 +116,17 @@ fn request_attrs_with_checksum(
     if let Some(ct) = headers.get(CONTENT_TYPE) {
         attrs.set(crate::attrs::TAG_CONTENT_TYPE, valid_header_str(ct, key)?.as_bytes());
     }
-    if let Some(tagging) = headers.get("x-amz-tagging") {
-        let raw = tagging
-            .to_str()
-            .map_err(|_| bad_request("InvalidTag", "Invalid x-amz-tagging header.", key))?;
-        let tag_set = crate::tagging::parse_tagging_header(raw)
-            .map_err(|r| bad_request(r.code, r.why, key))?;
-        if !tag_set.tags.is_empty() {
-            attrs.set(crate::attrs::TAG_TAGGING, &crate::attrs::encode_tags(&tag_set));
-        }
+    if let Some(tag_set) = crate::ops::tagging::parse_tagging_header_from(headers, key)? {
+        attrs.set(crate::attrs::TAG_TAGGING, &crate::attrs::encode_tags(&tag_set));
     }
     if let Some((alg, cksum_type, val)) = checksum {
         attrs.set_checksum(alg, cksum_type, val);
     }
     if let Some(ce) = headers.get(CONTENT_ENCODING) {
         let raw_ce = valid_header_str(ce, key)?;
-        if crate::auth::is_aws_chunked(headers) {
-            let stripped = strip_aws_chunked(raw_ce);
-            if !stripped.is_empty() {
-                attrs.set(crate::attrs::TAG_CONTENT_ENCODING, stripped.as_bytes());
-            }
-        } else if !raw_ce.is_empty() {
-            attrs.set(crate::attrs::TAG_CONTENT_ENCODING, raw_ce.as_bytes());
+        let stripped = strip_aws_chunked(raw_ce);
+        if !stripped.is_empty() {
+            attrs.set(crate::attrs::TAG_CONTENT_ENCODING, stripped.as_bytes());
         }
     }
     for (hdr, tag) in [
@@ -212,6 +201,18 @@ pub(crate) fn with_checksum_headers(
         if let Some((alg, cksum_type, val)) = attrs.checksum() {
             builder = builder.header(alg.header_name(), val).header("x-amz-checksum-type", cksum_type);
         }
+    }
+    builder
+}
+
+fn with_part_checksum_headers(
+    mut builder: hyper::http::response::Builder,
+    attrs: &crate::attrs::Attrs,
+    part_checksum: Option<&(crate::checksum::ChecksumAlgorithm, String)>,
+) -> hyper::http::response::Builder {
+    if let Some((alg, val)) = part_checksum {
+        let cksum_type = attrs.checksum().map(|(_, ct, _)| ct).unwrap_or("COMPOSITE");
+        builder = builder.header(alg.header_name(), val.as_str()).header("x-amz-checksum-type", cksum_type);
     }
     builder
 }
@@ -546,17 +547,21 @@ fn version_get_response(
                 };
                 full_body(b.slice(..(ext.part_size as usize).min(b.len())))
             };
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, view.content_type())
-                .header(ETAG, etag_val)
-                .header(ACCEPT_RANGES, "bytes")
-                .header("x-amz-mp-parts-count", parts_count.to_string())
-                .header("x-amz-version-id", v.id_string())
-                .header(CONTENT_LENGTH, ext.part_size.to_string())
-                .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts))
-                .body(body)
-                .unwrap();
+            return with_part_checksum_headers(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, view.content_type())
+                    .header(ETAG, etag_val)
+                    .header(ACCEPT_RANGES, "bytes")
+                    .header("x-amz-mp-parts-count", parts_count.to_string())
+                    .header("x-amz-version-id", v.id_string())
+                    .header(CONTENT_LENGTH, ext.part_size.to_string())
+                    .header(LAST_MODIFIED, crate::clock::format_http_date(v.ts)),
+                &view.attrs,
+                ext.checksum.as_ref(),
+            )
+            .body(body)
+            .unwrap();
         } else if pn > 1 {
             let body = if head {
                 empty_body()
@@ -748,23 +753,52 @@ pub async fn copy_object(
         Some(v) if v.eq_ignore_ascii_case("REPLACE") => true,
         Some(_) => return Ok(bad_request("InvalidArgument", "Unknown metadata directive.", key)),
     };
-    if src_bucket == bucket && src_key == key && src_vid.is_none() && !replace {
+    let tagging_replace = match headers.get("x-amz-tagging-directive").and_then(|v| v.to_str().ok()) {
+        None => false,
+        Some(v) if v.eq_ignore_ascii_case("COPY") => false,
+        Some(v) if v.eq_ignore_ascii_case("REPLACE") => true,
+        Some(_) => return Ok(bad_request("InvalidArgument", "Unknown tagging directive.", key)),
+    };
+    if src_bucket == bucket && src_key == key && src_vid.is_none() && !replace && !tagging_replace {
         return Ok(bad_request(
             "InvalidRequest",
             "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.",
             key,
         ));
     }
-    let copy_attrs = if replace {
-        match request_attrs(headers, key) {
+    let mut copy_attrs_obj = if replace {
+        let raw = match request_attrs(headers, key) {
             Ok(a) => a,
             Err(resp) => return Ok(resp),
-        }
+        };
+        crate::attrs::Attrs::decode(&raw).unwrap_or_default()
     } else {
-        match src_view.and_then(|a| a.encode().map_err(|_| VolumeError::CorruptIndex)) {
-            Ok(a) => a,
+        match src_view {
+            Ok(ref a) => a.clone(),
             Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source's attributes: {:?}", e))),
         }
+    };
+    if tagging_replace {
+        match crate::ops::tagging::parse_tagging_header_from(headers, key) {
+            Ok(Some(tag_set)) => {
+                copy_attrs_obj.set(crate::attrs::TAG_TAGGING, &crate::attrs::encode_tags(&tag_set));
+            }
+            Ok(None) => copy_attrs_obj.remove(crate::attrs::TAG_TAGGING),
+            Err(resp) => return Ok(resp),
+        }
+    } else if replace {
+        let src_attrs = match src_view {
+            Ok(ref a) => a,
+            Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source's attributes: {:?}", e))),
+        };
+        match src_attrs.get(crate::attrs::TAG_TAGGING) {
+            Some(raw) => copy_attrs_obj.set(crate::attrs::TAG_TAGGING, raw),
+            None => copy_attrs_obj.remove(crate::attrs::TAG_TAGGING),
+        }
+    }
+    let copy_attrs = match copy_attrs_obj.encode() {
+        Ok(a) => a,
+        Err(_) => return Ok(bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key)),
     };
     let flags = if bytes.is_empty() {
         AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE
@@ -877,6 +911,24 @@ pub async fn put_object(
 
     let expected_len = headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok());
     let is_chunked = crate::auth::is_aws_chunked(headers);
+    let has_te_chunked = headers
+        .get_all(hyper::header::TRANSFER_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("chunked")));
+    if expected_len.is_none() && !is_chunked && !has_te_chunked {
+        let xml = s3_error_xml(
+            "MissingContentLength",
+            "You must provide the Content-Length HTTP header.",
+            key,
+            "req-put-len",
+        );
+        return Ok(Response::builder()
+            .status(StatusCode::LENGTH_REQUIRED)
+            .header(CONTENT_TYPE, "application/xml")
+            .body(full_body(Bytes::from(xml)))
+            .unwrap());
+    }
     let content_md5_hdr = headers.get("content-md5").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
     if let Some(ref content_md5) = content_md5_hdr {
         if !crate::bucket_config::base64_decode(content_md5).is_ok_and(|b| b.len() == 16) {
@@ -1243,9 +1295,12 @@ pub async fn put_object(
         state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
         state.hook("put_stored", key);
         let stream_cksum_ref = stream_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
-        let answer = if let Some((_, ts)) = stamp {
+        let answer = if let Some((extra, ts)) = stamp {
             match finish_version_put(&state, b_id, key, ts, flags, vol_offset, len, etag_hi, etag_lo, 0) {
-                Ok(vid) => put_ok_response(&etag_hex, Some(&vid), stream_cksum_ref),
+                Ok(vid) => {
+                    let resp_vid = (extra & crate::meta_index::FLAG_NULL_ID == 0).then_some(vid.as_str());
+                    put_ok_response(&etag_hex, resp_vid, stream_cksum_ref)
+                }
                 Err(r) => r,
             }
         } else {
@@ -1393,9 +1448,12 @@ pub async fn put_object(
     };
     state.hook("put_stored", key);
     let buf_cksum_ref = buf_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
-    let answer = if let Some((_, ts)) = stamp {
+    let answer = if let Some((extra, ts)) = stamp {
         match finish_version_put(&state, b_id, key, ts, flags, vol_offset, payload_len, etag_hi, etag_lo, 0) {
-            Ok(vid) => put_ok_response(&final_etag_hex, Some(&vid), buf_cksum_ref),
+            Ok(vid) => {
+                let resp_vid = (extra & crate::meta_index::FLAG_NULL_ID == 0).then_some(vid.as_str());
+                put_ok_response(&final_etag_hex, resp_vid, buf_cksum_ref)
+            }
             Err(r) => r,
         }
     } else {
@@ -1527,16 +1585,20 @@ pub async fn get_or_head_object(
                 };
                 full_body(b.slice(..(ext.part_size as usize).min(b.len())))
             };
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, view.content_type())
-                .header(ETAG, etag_val)
-                .header(ACCEPT_RANGES, "bytes")
-                .header("x-amz-mp-parts-count", parts_count.to_string())
-                .header(CONTENT_LENGTH, ext.part_size.to_string())
-                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at))
-                .body(body)
-                .unwrap());
+            return Ok(with_part_checksum_headers(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, view.content_type())
+                    .header(ETAG, etag_val)
+                    .header(ACCEPT_RANGES, "bytes")
+                    .header("x-amz-mp-parts-count", parts_count.to_string())
+                    .header(CONTENT_LENGTH, ext.part_size.to_string())
+                    .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)),
+                &view.attrs,
+                ext.checksum.as_ref(),
+            )
+            .body(body)
+            .unwrap());
         } else if pn > 1 {
             let body = if is_head {
                 empty_body()
