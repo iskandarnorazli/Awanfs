@@ -19,6 +19,8 @@ use std::sync::Arc;
 pub enum FileKind {
     Data,
     Journal,
+    /// A metadata segment (#26): written once, then read with positioned reads.
+    Segment,
 }
 
 /// One file of a volume.
@@ -74,7 +76,7 @@ impl DiskFile {
         }
         let main = match kind {
             FileKind::Data => AlignedFile::open_direct(path, false)?,
-            FileKind::Journal => AlignedFile::open_buffered(path)?,
+            FileKind::Journal | FileKind::Segment => AlignedFile::open_buffered(path)?,
         };
         // Second opens, not `try_clone`: a clone shares the handle (see `sync` above).
         let sync = OpenOptions::new().write(true).open(path)?;

@@ -1,0 +1,552 @@
+//! Metadata segments (#26 stage 2, decision 59): an immutable, sorted run of index entries in
+//! one file, read with positioned reads, never a mapping (decision 58). The byte layout is in
+//! `FORMAT.md` ("Metadata segment"); this file follows it and nothing else.
+//!
+//! Nothing in the server reads segments yet: stage 3 adds lookups over several segments, stage 4
+//! the manifest, stage 6 the switch from redb.
+
+use crate::meta_index::ObjectMeta;
+use crate::vfile::{FileKind, VolFile, VolFs};
+use std::path::Path;
+use std::sync::Arc;
+use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
+
+pub const BLOCK: usize = 4096;
+pub const SEGMENT_MAGIC: u32 = 0x4753_5741; // "AWSG"
+pub const TRAILER_MAGIC: u32 = 0x4653_5741; // "AWSF"
+pub const SEGMENT_FORMAT: u16 = 1;
+/// A segment's largest size (#26).
+pub const MAX_SEGMENT_BYTES: u64 = 64 << 20;
+/// S3's longest object key.
+pub const MAX_KEY_BYTES: usize = 1024;
+const BLOCK_PAYLOAD: usize = BLOCK - 4;
+const ROW_BYTES: usize = 64;
+const BLOOM_BLOCK_BITS: u64 = 512;
+const BLOOM_BITS_PER_KEY: u64 = 10;
+const BLOOM_PROBES: u32 = 7;
+const BLOOM_SEED: u64 = 0x5345_474D_454E_5453; // "SEGMENTS"
+const KIND_ROW: u8 = 1;
+const KIND_TOMBSTONE: u8 = 2;
+
+#[derive(Debug)]
+pub enum SegmentError {
+    Io(std::io::Error),
+    /// The file does not hold a segment as `FORMAT.md` describes: a magic, a CRC or a length
+    /// is wrong. Never treated as "not found".
+    Corrupt(String),
+    /// Written by a newer AwanFS.
+    NewerFormat(u16),
+    /// The entries given to the writer are not in strictly increasing sort-key order.
+    Unsorted,
+    KeyTooLong(usize),
+    TooLarge(u64),
+}
+
+impl From<std::io::Error> for SegmentError {
+    fn from(e: std::io::Error) -> Self {
+        SegmentError::Io(e)
+    }
+}
+
+impl std::fmt::Display for SegmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+/// `bucket id (big-endian) || key`: byte order is (bucket, key) order.
+pub fn sort_key(bucket_id: u32, key: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(4 + key.len());
+    k.extend_from_slice(&bucket_id.to_be_bytes());
+    k.extend_from_slice(key);
+    k
+}
+
+/// What a segment says about one key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entry {
+    Row(ObjectMeta),
+    /// The key is deleted: it hides every older segment's entry for it.
+    Tombstone,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegEntry {
+    pub key: Vec<u8>,
+    pub entry: Entry,
+}
+
+fn encode_row(m: &ObjectMeta, out: &mut Vec<u8>) {
+    for v in [m.key_hash, m.bucket_flags, m.vol_offset, m.size, m.etag_hi, m.etag_lo, m.created_at, 0u64] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+fn decode_row(b: &[u8]) -> ObjectMeta {
+    let u = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+    ObjectMeta {
+        key_hash: u(0),
+        bucket_flags: u(1),
+        vol_offset: u(2),
+        size: u(3),
+        etag_hi: u(4),
+        etag_lo: u(5),
+        created_at: u(6),
+        key_slice: 0,
+    }
+}
+
+fn entry_len(e: &SegEntry) -> usize {
+    3 + e.key.len() + if matches!(e.entry, Entry::Row(_)) { ROW_BYTES } else { 0 }
+}
+
+/// A blocked Bloom filter: a key sets `BLOOM_PROBES` bits, all in one 512-bit block, so a
+/// lookup touches one cache line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bloom {
+    blocks: Vec<[u64; 8]>,
+}
+
+/// The bits a key sets: its block and `BLOOM_PROBES` bit positions in it (FORMAT.md names this).
+pub fn bloom_probes(key: &[u8], nblocks: usize) -> (usize, [u32; BLOOM_PROBES as usize]) {
+    let h = xxh3_64(key);
+    let block = (h % nblocks.max(1) as u64) as usize;
+    // The bits come from a second, independent hash, so keys that share a block do not share
+    // their bit pattern.
+    let g = xxh3_64_with_seed(key, BLOOM_SEED);
+    let mut bits = [0u32; BLOOM_PROBES as usize];
+    let (h1, h2) = (g >> 32, (g & 0xFFFF_FFFF) | 1);
+    for (i, b) in bits.iter_mut().enumerate() {
+        *b = ((h1.wrapping_add((i as u64).wrapping_mul(h2))) % BLOOM_BLOCK_BITS) as u32;
+    }
+    (block, bits)
+}
+
+impl Bloom {
+    fn with_keys(n: usize) -> Self {
+        let nblocks = ((n as u64 * BLOOM_BITS_PER_KEY).div_ceil(BLOOM_BLOCK_BITS)).max(1) as usize;
+        Bloom { blocks: vec![[0u64; 8]; nblocks] }
+    }
+    fn insert(&mut self, key: &[u8]) {
+        let (block, bits) = bloom_probes(key, self.blocks.len());
+        for bit in bits {
+            self.blocks[block][(bit / 64) as usize] |= 1u64 << (bit % 64);
+        }
+    }
+    pub fn may_contain(&self, key: &[u8]) -> bool {
+        let (block, bits) = bloom_probes(key, self.blocks.len());
+        bits.iter().all(|&bit| self.blocks[block][(bit / 64) as usize] & (1u64 << (bit % 64)) != 0)
+    }
+}
+
+/// Builds the bytes of a segment holding `entries`, which must be in strictly increasing
+/// sort-key order. Deterministic: the same entries give the same bytes.
+pub fn encode_segment(seq: u64, created_at_ns: u64, entries: &[SegEntry]) -> Result<Vec<u8>, SegmentError> {
+    for e in entries {
+        if e.key.len() > 4 + MAX_KEY_BYTES {
+            return Err(SegmentError::KeyTooLong(e.key.len()));
+        }
+    }
+    if entries.windows(2).any(|w| w[0].key >= w[1].key) {
+        return Err(SegmentError::Unsorted);
+    }
+
+    let mut out = vec![0u8; BLOCK];
+    let mut fences: Vec<&[u8]> = Vec::new();
+    let mut bloom = Bloom::with_keys(entries.len());
+    let mut block: Vec<u8> = Vec::with_capacity(BLOCK);
+    let mut count: u16 = 0;
+    let flush = |out: &mut Vec<u8>, block: &mut Vec<u8>, count: &mut u16| {
+        let mut b = vec![0u8; BLOCK];
+        b[0..2].copy_from_slice(&count.to_le_bytes());
+        b[2..2 + block.len()].copy_from_slice(block);
+        let crc = crc32c::crc32c(&b[..BLOCK_PAYLOAD]);
+        b[BLOCK_PAYLOAD..].copy_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&b);
+        block.clear();
+        *count = 0;
+    };
+    for e in entries {
+        if 2 + block.len() + entry_len(e) > BLOCK_PAYLOAD {
+            flush(&mut out, &mut block, &mut count);
+        }
+        if count == 0 {
+            fences.push(&e.key);
+        }
+        match e.entry {
+            Entry::Row(m) => {
+                block.push(KIND_ROW);
+                block.extend_from_slice(&(e.key.len() as u16).to_le_bytes());
+                block.extend_from_slice(&e.key);
+                encode_row(&m, &mut block);
+            }
+            Entry::Tombstone => {
+                block.push(KIND_TOMBSTONE);
+                block.extend_from_slice(&(e.key.len() as u16).to_le_bytes());
+                block.extend_from_slice(&e.key);
+            }
+        }
+        count += 1;
+        bloom.insert(&e.key);
+    }
+    if count > 0 {
+        flush(&mut out, &mut block, &mut count);
+    }
+    let data_blocks = (out.len() / BLOCK - 1) as u64;
+
+    let index_start = out.len();
+    for f in &fences {
+        out.extend_from_slice(&(f.len() as u16).to_le_bytes());
+        out.extend_from_slice(f);
+    }
+    let fence_len = (out.len() - index_start) as u64;
+    for b in &bloom.blocks {
+        for w in b {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+    let index_crc = crc32c::crc32c(&out[index_start..]);
+    let bloom_offset = fence_len;
+    while out.len() % BLOCK != 0 {
+        out.push(0);
+    }
+
+    let mut t = vec![0u8; BLOCK];
+    t[0..4].copy_from_slice(&TRAILER_MAGIC.to_le_bytes());
+    t[4..12].copy_from_slice(&((index_start / BLOCK) as u64).to_le_bytes());
+    t[12..20].copy_from_slice(&fence_len.to_le_bytes());
+    t[20..28].copy_from_slice(&(fences.len() as u64).to_le_bytes());
+    t[28..36].copy_from_slice(&bloom_offset.to_le_bytes());
+    t[36..44].copy_from_slice(&(bloom.blocks.len() as u64).to_le_bytes());
+    t[44..48].copy_from_slice(&BLOOM_PROBES.to_le_bytes());
+    t[48..52].copy_from_slice(&index_crc.to_le_bytes());
+    let tcrc = crc32c::crc32c(&t[0..52]);
+    t[52..56].copy_from_slice(&tcrc.to_le_bytes());
+    out.extend_from_slice(&t);
+
+    let h = &mut out[0..BLOCK];
+    h[0..4].copy_from_slice(&SEGMENT_MAGIC.to_le_bytes());
+    h[4..6].copy_from_slice(&SEGMENT_FORMAT.to_le_bytes());
+    h[8..16].copy_from_slice(&seq.to_le_bytes());
+    h[16..24].copy_from_slice(&created_at_ns.to_le_bytes());
+    h[24..32].copy_from_slice(&(entries.len() as u64).to_le_bytes());
+    h[32..40].copy_from_slice(&data_blocks.to_le_bytes());
+    let hcrc = crc32c::crc32c(&h[0..40]);
+    h[40..44].copy_from_slice(&hcrc.to_le_bytes());
+
+    if out.len() as u64 > MAX_SEGMENT_BYTES {
+        return Err(SegmentError::TooLarge(out.len() as u64));
+    }
+    Ok(out)
+}
+
+/// Writes a segment to `path` in `fs` and syncs it. The caller names it in the manifest only
+/// after this returns (stage 4).
+pub fn write_segment<Fs: VolFs>(fs: &Fs, path: &Path, seq: u64, created_at_ns: u64, entries: &[SegEntry]) -> Result<(), SegmentError> {
+    let bytes = encode_segment(seq, created_at_ns, entries)?;
+    let f = fs.open(path, FileKind::Segment, true)?;
+    f.set_len(0)?;
+    f.write_at(0, &bytes)?;
+    f.sync_data()?;
+    Ok(())
+}
+
+/// An open segment: its header facts, fences and Bloom filter in memory; rows on disk.
+pub struct Segment<F: VolFile> {
+    file: Arc<F>,
+    pub seq: u64,
+    pub created_at_ns: u64,
+    pub entry_count: u64,
+    data_blocks: u64,
+    fences: Vec<Vec<u8>>,
+    bloom: Bloom,
+}
+
+fn corrupt(what: impl Into<String>) -> SegmentError {
+    SegmentError::Corrupt(what.into())
+}
+
+impl<F: VolFile> Segment<F> {
+    /// Opens and checks a segment: header, trailer and index region, each against its CRC.
+    pub fn open<Fs: VolFs<File = F>>(fs: &Fs, path: &Path) -> Result<Self, SegmentError> {
+        let file = fs.open(path, FileKind::Segment, false)?;
+        let len = file.len()?;
+        if len < 2 * BLOCK as u64 || len % BLOCK as u64 != 0 || len > MAX_SEGMENT_BYTES {
+            return Err(corrupt(format!("length {} is not a whole segment", len)));
+        }
+        let mut h = vec![0u8; BLOCK];
+        file.read_at(0, &mut h)?;
+        let u64at = |b: &[u8], i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        let u32at = |b: &[u8], i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+        if u32at(&h, 0) != SEGMENT_MAGIC {
+            return Err(corrupt("header magic"));
+        }
+        if crc32c::crc32c(&h[0..40]) != u32at(&h, 40) {
+            return Err(corrupt("header CRC"));
+        }
+        let format = u16::from_le_bytes(h[4..6].try_into().unwrap());
+        if format > SEGMENT_FORMAT {
+            return Err(SegmentError::NewerFormat(format));
+        }
+        let (seq, created_at_ns, entry_count, data_blocks) = (u64at(&h, 8), u64at(&h, 16), u64at(&h, 24), u64at(&h, 32));
+
+        let mut t = vec![0u8; BLOCK];
+        file.read_at(len - BLOCK as u64, &mut t)?;
+        if u32at(&t, 0) != TRAILER_MAGIC {
+            return Err(corrupt("trailer magic"));
+        }
+        if crc32c::crc32c(&t[0..52]) != u32at(&t, 52) {
+            return Err(corrupt("trailer CRC"));
+        }
+        let (index_block, fence_len, nfences, bloom_offset, bloom_blocks) =
+            (u64at(&t, 4), u64at(&t, 12), u64at(&t, 20), u64at(&t, 28), u64at(&t, 36));
+        let probes = u32at(&t, 44);
+        let index_start = index_block.checked_mul(BLOCK as u64).ok_or_else(|| corrupt("index offset"))?;
+        let index_len = bloom_blocks.checked_mul(64).and_then(|b| b.checked_add(fence_len)).ok_or_else(|| corrupt("index length"))?;
+        if index_block != 1 + data_blocks || nfences != data_blocks || bloom_offset != fence_len || probes != BLOOM_PROBES || bloom_blocks == 0 {
+            return Err(corrupt("trailer fields disagree with the header"));
+        }
+        if index_start + index_len > len - BLOCK as u64 {
+            return Err(corrupt("index region past the trailer"));
+        }
+        let mut idx = vec![0u8; index_len as usize];
+        file.read_at(index_start, &mut idx)?;
+        if crc32c::crc32c(&idx) != u32at(&t, 48) {
+            return Err(corrupt("index CRC"));
+        }
+        let mut fences = Vec::with_capacity(nfences as usize);
+        let mut p = 0usize;
+        for _ in 0..nfences {
+            if p + 2 > fence_len as usize {
+                return Err(corrupt("fence region"));
+            }
+            let l = u16::from_le_bytes(idx[p..p + 2].try_into().unwrap()) as usize;
+            if p + 2 + l > fence_len as usize {
+                return Err(corrupt("fence region"));
+            }
+            fences.push(idx[p + 2..p + 2 + l].to_vec());
+            p += 2 + l;
+        }
+        if p != fence_len as usize {
+            return Err(corrupt("fence region length"));
+        }
+        let mut blocks = Vec::with_capacity(bloom_blocks as usize);
+        for i in 0..bloom_blocks as usize {
+            let mut b = [0u64; 8];
+            for (w, slot) in b.iter_mut().enumerate() {
+                let at = fence_len as usize + i * 64 + w * 8;
+                *slot = u64::from_le_bytes(idx[at..at + 8].try_into().unwrap());
+            }
+            blocks.push(b);
+        }
+        Ok(Segment { file, seq, created_at_ns, entry_count, data_blocks, fences, bloom: Bloom { blocks } })
+    }
+
+    fn read_block(&self, i: u64) -> Result<Vec<SegEntry>, SegmentError> {
+        let mut b = vec![0u8; BLOCK];
+        self.file.read_at((1 + i) * BLOCK as u64, &mut b)?;
+        if crc32c::crc32c(&b[..BLOCK_PAYLOAD]) != u32::from_le_bytes(b[BLOCK_PAYLOAD..].try_into().unwrap()) {
+            return Err(corrupt(format!("data block {} CRC", i)));
+        }
+        let n = u16::from_le_bytes(b[0..2].try_into().unwrap());
+        let mut out = Vec::with_capacity(n as usize);
+        let mut p = 2usize;
+        for _ in 0..n {
+            if p + 3 > BLOCK_PAYLOAD {
+                return Err(corrupt(format!("data block {} entry", i)));
+            }
+            let kind = b[p];
+            let k = u16::from_le_bytes(b[p + 1..p + 3].try_into().unwrap()) as usize;
+            let key_end = p + 3 + k;
+            let (entry, end) = match kind {
+                KIND_ROW if key_end + ROW_BYTES <= BLOCK_PAYLOAD => (Entry::Row(decode_row(&b[key_end..key_end + ROW_BYTES])), key_end + ROW_BYTES),
+                KIND_TOMBSTONE if key_end <= BLOCK_PAYLOAD => (Entry::Tombstone, key_end),
+                _ => return Err(corrupt(format!("data block {} entry", i))),
+            };
+            out.push(SegEntry { key: b[p + 3..key_end].to_vec(), entry });
+            p = end;
+        }
+        Ok(out)
+    }
+
+    /// The entry for `key`, if this segment has one. A Bloom filter miss costs no read; a hit
+    /// costs one block read. A damaged block is an error, never `None`.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Entry>, SegmentError> {
+        if self.data_blocks == 0 || !self.bloom.may_contain(key) {
+            return Ok(None);
+        }
+        let i = self.fences.partition_point(|f| f.as_slice() <= key);
+        if i == 0 {
+            return Ok(None);
+        }
+        let block = self.read_block(i as u64 - 1)?;
+        Ok(block.into_iter().find(|e| e.key == key).map(|e| e.entry))
+    }
+
+    /// Every entry, in sort-key order (compaction and tests).
+    pub fn entries(&self) -> Result<Vec<SegEntry>, SegmentError> {
+        let mut out = Vec::with_capacity(self.entry_count as usize);
+        for i in 0..self.data_blocks {
+            out.extend(self.read_block(i)?);
+        }
+        if out.len() as u64 != self.entry_count {
+            return Err(corrupt("entry count"));
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::{SimFs, SimOp, SimRng};
+    use std::collections::BTreeMap;
+
+    fn path() -> &'static Path {
+        Path::new("meta/seg_0000000000000001.seg")
+    }
+
+    fn row(i: u64) -> ObjectMeta {
+        ObjectMeta { key_hash: i, bucket_flags: i << 3, vol_offset: i * 4096, size: i * 7 + 1, etag_hi: !i, etag_lo: i ^ 0xABCD, created_at: 1_700_000_000_000 + i, key_slice: 0 }
+    }
+
+    /// `n` entries over three buckets, keys of 1 to 200 bytes, about 1 in 10 a tombstone.
+    fn entries(seed: u64, n: usize) -> Vec<SegEntry> {
+        let mut rng = SimRng::new(seed);
+        let mut m = BTreeMap::new();
+        while m.len() < n {
+            let bucket = rng.below(3) as u32 + 1;
+            let len = rng.below(200) as usize + 1;
+            let key: Vec<u8> = (0..len).map(|_| b"abcdefghij/0123456789-_. "[rng.below(25) as usize]).collect();
+            let i = m.len() as u64;
+            let entry = if rng.below(10) == 0 { Entry::Tombstone } else { Entry::Row(row(i)) };
+            m.insert(sort_key(bucket, &key), entry);
+        }
+        m.into_iter().map(|(key, entry)| SegEntry { key, entry }).collect()
+    }
+
+    fn written(es: &[SegEntry]) -> SimFs {
+        let fs = SimFs::new();
+        write_segment(&fs, path(), 1, 42, es).unwrap();
+        fs
+    }
+
+    #[test]
+    fn every_entry_reads_back_and_absent_keys_are_none() {
+        let es = entries(1, 5000);
+        let fs = written(&es);
+        let s = Segment::open(&fs, path()).unwrap();
+        assert_eq!((s.seq, s.created_at_ns, s.entry_count), (1, 42, 5000));
+        for e in &es {
+            assert_eq!(s.get(&e.key).unwrap(), Some(e.entry), "key {:?}", e.key);
+        }
+        for e in entries(2, 2000) {
+            if es.binary_search_by(|x| x.key.cmp(&e.key)).is_err() {
+                assert_eq!(s.get(&e.key).unwrap(), None);
+            }
+        }
+        assert_eq!(s.entries().unwrap(), es, "a full scan gives back the input in order");
+    }
+
+    #[test]
+    fn the_same_entries_give_the_same_bytes() {
+        let es = entries(3, 1000);
+        assert_eq!(encode_segment(1, 42, &es).unwrap(), encode_segment(1, 42, &es).unwrap());
+    }
+
+    #[test]
+    fn a_lookup_reads_one_block_and_a_bloom_miss_reads_none() {
+        let es = entries(4, 3000);
+        let fs = written(&es);
+        let s = Segment::open(&fs, path()).unwrap();
+        let f = fs.file(path()).unwrap();
+        let before = f.calls(SimOp::Read);
+        for e in es.iter().take(100) {
+            s.get(&e.key).unwrap();
+        }
+        assert_eq!(f.calls(SimOp::Read) - before, 100, "one read per present key");
+        let absent: Vec<Vec<u8>> = (0..10_000u32).map(|i| sort_key(9, format!("absent-{}", i).as_bytes())).collect();
+        let before = f.calls(SimOp::Read);
+        for k in &absent {
+            assert_eq!(s.get(k).unwrap(), None);
+        }
+        let reads = f.calls(SimOp::Read) - before;
+        assert!(reads < 300, "the Bloom filter answers most absent keys without a read: {} of 10000", reads);
+    }
+
+    #[test]
+    fn keys_of_the_longest_length_fit() {
+        let es: Vec<SegEntry> = (0..50u32)
+            .map(|i| SegEntry { key: sort_key(1, format!("{:04}{}", i, "k".repeat(MAX_KEY_BYTES - 4)).as_bytes()), entry: Entry::Row(row(i as u64)) })
+            .collect();
+        let s = Segment::open(&written(&es), path()).unwrap();
+        for e in &es {
+            assert_eq!(s.get(&e.key).unwrap(), Some(e.entry));
+        }
+    }
+
+    #[test]
+    fn an_empty_segment_opens_and_finds_nothing() {
+        let fs = written(&[]);
+        let s = Segment::open(&fs, path()).unwrap();
+        assert_eq!(s.entry_count, 0);
+        assert_eq!(s.get(&sort_key(1, b"x")).unwrap(), None);
+        assert!(s.entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_writer_refuses_unsorted_duplicate_and_overlong_keys() {
+        let a = SegEntry { key: sort_key(1, b"b"), entry: Entry::Tombstone };
+        let b = SegEntry { key: sort_key(1, b"a"), entry: Entry::Tombstone };
+        assert!(matches!(encode_segment(1, 0, &[a.clone(), b]), Err(SegmentError::Unsorted)));
+        assert!(matches!(encode_segment(1, 0, &[a.clone(), a]), Err(SegmentError::Unsorted)));
+        let long = SegEntry { key: sort_key(1, &vec![b'k'; MAX_KEY_BYTES + 1]), entry: Entry::Tombstone };
+        assert!(matches!(encode_segment(1, 0, &[long]), Err(SegmentError::KeyTooLong(_))));
+    }
+
+    /// Flips one byte at `at` in the stored segment.
+    fn damaged(es: &[SegEntry], at: u64) -> SimFs {
+        let fs = written(es);
+        let f = fs.file(path()).unwrap();
+        let mut b = [0u8; 1];
+        f.read_at(at, &mut b).unwrap();
+        f.write_at(at, &[b[0] ^ 0x5A]).unwrap();
+        fs
+    }
+
+    #[test]
+    fn damage_is_an_error_never_a_wrong_or_missing_entry() {
+        let es = entries(5, 2000);
+        let len = encode_segment(1, 42, &es).unwrap().len() as u64;
+        // Header, trailer, index region: open refuses.
+        for at in [3, 20, len - BLOCK as u64 + 2, len - BLOCK as u64 + 50] {
+            assert!(matches!(Segment::open(&damaged(&es, at), path()), Err(SegmentError::Corrupt(_))), "byte {}", at);
+        }
+        let s = Segment::open(&written(&es), path()).unwrap();
+        let index_at = (1 + s.data_blocks) * BLOCK as u64 + 5;
+        assert!(matches!(Segment::open(&damaged(&es, index_at), path()), Err(SegmentError::Corrupt(_))));
+        // A data block: the lookups that read it are errors; the others still answer.
+        let fs = damaged(&es, BLOCK as u64 + 100);
+        let s = Segment::open(&fs, path()).unwrap();
+        let first_block_key = &es[0].key;
+        assert!(matches!(s.get(first_block_key), Err(SegmentError::Corrupt(_))), "a damaged block is not 'not found'");
+        assert!(s.entries().is_err());
+        assert_eq!(s.get(&es.last().unwrap().key).unwrap(), Some(es.last().unwrap().entry));
+        // A truncated file.
+        let fs = written(&es);
+        fs.file(path()).unwrap().set_len(len - 1).unwrap();
+        assert!(Segment::open(&fs, path()).is_err());
+    }
+
+    #[test]
+    fn the_bloom_filter_has_no_false_negatives_and_few_false_positives() {
+        let es = entries(6, 20_000);
+        let mut bloom = Bloom::with_keys(es.len());
+        for e in &es {
+            bloom.insert(&e.key);
+        }
+        assert!(es.iter().all(|e| bloom.may_contain(&e.key)));
+        let fp = (0..100_000u32).filter(|i| bloom.may_contain(&sort_key(77, format!("no-{}", i).as_bytes()))).count();
+        assert!(fp < 2_500, "false positives: {} of 100000", fp);
+    }
+}

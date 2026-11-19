@@ -40,6 +40,7 @@ pub mod throttle;
 pub mod trace;
 pub mod s3_api;
 pub mod scheduler;
+pub mod segment;
 pub mod sigv4;
 pub mod spill;
 pub mod auth;
