@@ -58,6 +58,14 @@ jobs:
         run: python3 scripts/test_check_profile.py && python3 scripts/check_profile.py
       - name: s3-tests ratchet log self-tests
         run: python3 scripts/test_check_ratchet_log.py
+      - name: Feature registry self-tests and check
+        run: |
+          python3 scripts/test_features.py
+          python3 tests/s3tests/test_conformance_map.py
+          S3TESTS_COMMIT=$(sed -n 's/^[[:space:]]*S3TESTS_COMMIT=\([0-9a-f]\{40\}\).*/\1/p' .github/workflows/s3-tests.yml)
+          curl -fsSL --retry 5 --retry-all-errors -o /tmp/test_s3.py "https://raw.githubusercontent.com/ceph/s3-tests/$S3TESTS_COMMIT/s3tests/functional/test_s3.py"
+          curl -fsSL --retry 5 --retry-all-errors -o /tmp/test_headers.py "https://raw.githubusercontent.com/ceph/s3-tests/$S3TESTS_COMMIT/s3tests/functional/test_headers.py"
+          python3 scripts/features.py check --ceph-suite /tmp/test_s3.py /tmp/test_headers.py
       - name: Every test removed from passing.txt has a RATCHET_LOG.md row
         if: github.event_name == 'pull_request'
         run: |
