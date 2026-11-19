@@ -88,8 +88,22 @@ jobs:
       # measurements/: a report step with "if: always()" prints whatever is at its path, so a
       # job that measured nothing would otherwise print a committed report as its own output
       # (that happened in run 43398517562; see bench-full.yml).
+      - name: Exclude benchmark data directory from Windows Defender
+        if: runner.os == 'Windows'
+        shell: powershell
+        continue-on-error: true
+        run: |
+          Add-MpPreference -ExclusionPath "${{ runner.temp }}"
+          if ($env:TEMP -and ($env:TEMP -ne "${{ runner.temp }}")) {
+            Add-MpPreference -ExclusionPath "$env:TEMP"
+          }
+          Write-Host "Added Windows Defender exclusion for ${{ runner.temp }}"
       - name: Ratio check against MinIO (builds the server, fetches MinIO if missing)
         timeout-minutes: 120
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
         run: |
           python -c "import os; os.path.exists('selfhosted_ratio.md') and os.remove('selfhosted_ratio.md')"
           python -u benchmarks/bench.py --runs ${{ inputs.runs || '3' }} --duration ${{ inputs.duration || '30' }} --output selfhosted_ratio.md
@@ -103,14 +117,33 @@ jobs:
       - name: What a durable append costs on this machine's disk
         if: ${{ !cancelled() }}
         continue-on-error: true
-        run: python -u benchmarks/sync_probe.py --count 100 --report selfhosted_probe.md
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: python -u benchmarks/sync_probe.py --count 100 --dir "${{ runner.temp }}" --report selfhosted_probe.md
       # Runs even when the ratio check failed: the two measure different things.
       - name: Full matrix (AwanFS, MinIO, RustFS where present)
         if: ${{ !cancelled() }}
         timeout-minutes: 180
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
         run: |
           python -c "import os; os.path.exists('selfhosted_full.md') and os.remove('selfhosted_full.md')"
           python -u benchmarks/run_warp_benchmark.py --sizes ${{ inputs.sizes || '64KiB,1MiB,1GiB' }} --concurrent 64 --duration ${{ inputs.duration || '30' }}s --output selfhosted_full.md
+      - name: Does --memory-budget hold on Windows?
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          python -c "import os; os.path.exists('selfhosted_budget.md') and os.remove('selfhosted_budget.md')"
+          python -u benchmarks/budget_rss.py --server-bin server/target/release/s3-server.exe --budget 256MiB --budget-mib 256 --concurrency 64 --size 1MiB --duration 10 --overhead 200 --data-dir "${{ runner.temp }}/budget_rss" --report selfhosted_budget.md
       - name: Report
         if: always()
         shell: python
@@ -118,7 +151,7 @@ jobs:
           import os
           out = os.environ["GITHUB_STEP_SUMMARY"]
           wrote = False
-          for p in ("selfhosted_probe.md", "selfhosted_ratio.md", "selfhosted_full.md"):
+          for p in ("selfhosted_probe.md", "selfhosted_ratio.md", "selfhosted_full.md", "selfhosted_budget.md"):
               if os.path.exists(p) and os.path.getsize(p) > 0:
                   text = open(p, encoding="utf-8").read()
                   print(text)
@@ -138,4 +171,5 @@ jobs:
             selfhosted_probe.md
             selfhosted_ratio.md
             selfhosted_full.md
+            selfhosted_budget.md
           if-no-files-found: warn

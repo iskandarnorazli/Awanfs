@@ -1,3 +1,5 @@
+> **Superseded.** This note came from awan-lang and is kept for history. The clustering design for AwanFS is [`CLUSTERING.md`](CLUSTERING.md) (#52); `libs/awan-cluster`'s quorum model described below is not the design.
+
 # Awan Storage Distributed Topology & Clustering
 
 > **Multi-Node Architecture, Consensus Quorum, and Durability Modeling**

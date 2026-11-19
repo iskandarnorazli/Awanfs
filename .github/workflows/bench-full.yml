@@ -112,6 +112,13 @@ jobs:
       # that is on D:, where a flush takes about 0.1 ms; Python's default temp directory is on
       # C:, where one takes about 4 ms (measurements/2026-11-14-sync-probe.md), and the first
       # runs of this job measured that disk more than the servers.
+      - name: Exclude benchmark data directory from Windows Defender
+        if: runner.os == 'Windows'
+        shell: powershell
+        continue-on-error: true
+        run: |
+          Add-MpPreference -ExclusionPath "${{ runner.temp }}"
+          Write-Host "Added Windows Defender exclusion for ${{ runner.temp }}"
       - name: What a durable append costs on the data disk
         shell: bash
         env:
