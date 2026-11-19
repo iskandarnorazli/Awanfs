@@ -233,6 +233,7 @@ test_s3::test_multipart_upload_small
 test_s3::test_non_multipart_get_part
 test_s3::test_non_multipart_sse_c_get_part
 test_s3::test_object_anon_put
+test_s3::test_object_content_encoding_aws_chunked
 test_s3::test_object_copy_16m
 test_s3::test_object_copy_bucket_not_found
 test_s3::test_object_copy_canned_acl
