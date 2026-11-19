@@ -15,6 +15,7 @@ on:
       - "benchmarks/sync_probe.py"
       - "benchmarks/put_path_probe.py"
       - "benchmarks/large_volume_probe.py"
+      - "benchmarks/test_large_volume_probe.py"
       - "server/tests/commit_cost_probe.rs"
       - ".github/workflows/probe-sync.yml"
 
@@ -78,6 +79,8 @@ jobs:
         run: |
           cargo test --locked --release --manifest-path server/Cargo.toml --test commit_cost_probe -- --ignored --nocapture | tee commit_cost.txt
           grep -E '^(Data under|\|)' commit_cost.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Probe self-tests
+        run: python benchmarks/test_large_volume_probe.py
       # Decision 52: new volumes grow. Does that cost anything once the volume is large?
       - name: A large volume, growing against sparse
         shell: bash

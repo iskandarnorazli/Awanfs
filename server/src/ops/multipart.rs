@@ -192,6 +192,10 @@ pub async fn create_multipart_upload(
         Ok(a) => a,
         Err(resp) => return Ok(resp),
     };
+    let tag_set = match crate::ops::tagging::parse_tagging_header_from(headers, key) {
+        Ok(t) => t,
+        Err(resp) => return Ok(resp),
+    };
     let upload_id = match state.multipart.create_upload(bucket, b_id, key) {
         Ok(id) => id,
         Err(e) => return Ok(internal_error_response(key, &format!("could not start the upload: {}", e))),
@@ -201,6 +205,9 @@ pub async fn create_multipart_upload(
     }
     if let (Some((alg, _)), Some(ref ct)) = (&req_cksum, &cksum_type) {
         state.multipart.set_upload_checksum(&upload_id, *alg, ct.clone());
+    }
+    if let Some(tags) = tag_set {
+        state.multipart.set_upload_tags(&upload_id, tags);
     }
     let xml = initiate_multipart_upload_result_xml(bucket, key, &upload_id);
     let mut resp = Response::builder()
@@ -634,6 +641,11 @@ pub async fn complete_multipart_upload(
             attrs.set_part_sizes(&part_sizes);
             if let Some((alg, ref ct, ref val)) = final_cksum {
                 attrs.set_checksum(alg, ct, val);
+            }
+            if let Some(ref tag_set) = upload_meta.as_ref().and_then(|u| u.tags.as_ref()) {
+                if !tag_set.tags.is_empty() {
+                    attrs.set(crate::attrs::TAG_TAGGING, &crate::attrs::encode_tags(tag_set));
+                }
             }
             let attrs_bytes = match attrs.encode() {
                 Ok(b) => b,

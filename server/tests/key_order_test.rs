@@ -161,7 +161,7 @@ async fn zero_byte_objects_and_overwrites_survive_restart() {
         let (url, _h) = spawn(Arc::new(S3ServiceState::with_data_dir(&dir))).await;
         assert_eq!(c.put(format!("{}/bkt", url)).send().await.unwrap().status(), StatusCode::OK);
         for (key, body) in [("k", &b"hello"[..]), ("k", &b""[..]), ("folder/", &b""[..])] {
-            let res = c.put(format!("{}/bkt/{}", url, key)).body(body.to_vec()).send().await.unwrap();
+            let res = c.put(format!("{}/bkt/{}", url, key)).header(reqwest::header::CONTENT_LENGTH, body.len()).body(body.to_vec()).send().await.unwrap();
             assert_eq!(res.status(), StatusCode::OK, "PUT {}", key);
         }
     }

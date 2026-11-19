@@ -28,6 +28,7 @@ async fn test_zero_byte_object_and_folder_marker() {
     // 1. Upload 0-byte object
     let res = client
         .put(&format!("{}/zb-bucket/empty.txt", base_url))
+        .header(CONTENT_LENGTH, 0)
         .body(Vec::new())
         .send()
         .await
@@ -39,6 +40,7 @@ async fn test_zero_byte_object_and_folder_marker() {
     // 2. Upload folder/ marker
     let res_f = client
         .put(&format!("{}/zb-bucket/folder/", base_url))
+        .header(CONTENT_LENGTH, 0)
         .body(Vec::new())
         .send()
         .await

@@ -403,3 +403,269 @@ async fn test_tagging_restart_persistence() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+#[tokio::test]
+async fn test_copy_object_tagging_directive() {
+    let (base_url, _state, _handle) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    assert_eq!(client.put(format!("{}/cp-bkt", base_url)).send().await.unwrap().status(), StatusCode::OK);
+
+    // Put source object with x-amz-tagging: foo (empty value) and Content-Type
+    let res = client
+        .put(format!("{}/cp-bkt/src", base_url))
+        .header(CONTENT_TYPE, "text/plain")
+        .header("x-amz-tagging", "foo")
+        .body("copy payload")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Default directive (COPY) copies source tags
+    let res = client
+        .put(format!("{}/cp-bkt/dst-copy", base_url))
+        .header("x-amz-copy-source", "/cp-bkt/src")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let tags = client.get(format!("{}/cp-bkt/dst-copy?tagging", base_url)).send().await.unwrap().text().await.unwrap();
+    assert!(tags.contains("<Key>foo</Key>"));
+    assert!(tags.contains("<Value></Value>"));
+
+    // Self-copy with x-amz-tagging-directive: REPLACE and x-amz-tagging: bar=bar
+    let res = client
+        .put(format!("{}/cp-bkt/src", base_url))
+        .header("x-amz-copy-source", "/cp-bkt/src")
+        .header("x-amz-tagging-directive", "REPLACE")
+        .header("x-amz-tagging", "bar=bar")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let tags = client.get(format!("{}/cp-bkt/src?tagging", base_url)).send().await.unwrap().text().await.unwrap();
+    assert!(tags.contains("<Key>bar</Key>") && tags.contains("<Value>bar</Value>"));
+    assert!(!tags.contains("<Key>foo</Key>"));
+    let head = client.head(format!("{}/cp-bkt/src", base_url)).send().await.unwrap();
+    assert_eq!(head.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap(), "text/plain");
+    assert_eq!(head.headers().get("x-amz-tagging-count").unwrap().to_str().unwrap(), "1");
+
+    // REPLACE without x-amz-tagging clears tags
+    let res = client
+        .put(format!("{}/cp-bkt/dst-empty", base_url))
+        .header("x-amz-copy-source", "/cp-bkt/src")
+        .header("x-amz-tagging-directive", "REPLACE")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let head = client.head(format!("{}/cp-bkt/dst-empty", base_url)).send().await.unwrap();
+    assert!(head.headers().get("x-amz-tagging-count").is_none());
+
+    // Metadata REPLACE + tagging COPY preserves source tags
+    let res = client
+        .put(format!("{}/cp-bkt/dst-meta", base_url))
+        .header("x-amz-copy-source", "/cp-bkt/src")
+        .header("x-amz-metadata-directive", "REPLACE")
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .header("x-amz-tagging-directive", "COPY")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let head = client.head(format!("{}/cp-bkt/dst-meta", base_url)).send().await.unwrap();
+    assert_eq!(head.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap(), "application/octet-stream");
+    assert_eq!(head.headers().get("x-amz-tagging-count").unwrap().to_str().unwrap(), "1");
+
+    // Invalid x-amz-tagging-directive -> 400 InvalidArgument
+    let res = client
+        .put(format!("{}/cp-bkt/dst-bad", base_url))
+        .header("x-amz-copy-source", "/cp-bkt/src")
+        .header("x-amz-tagging-directive", "BOGUS")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_multipart_upload_tagging() {
+    let (base_url, _state, _handle) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    assert_eq!(client.put(format!("{}/mp-bkt", base_url)).send().await.unwrap().status(), StatusCode::OK);
+
+    // Invalid x-amz-tagging on CreateMultipartUpload -> 400 InvalidTag
+    let res = client
+        .post(format!("{}/mp-bkt/bad?uploads", base_url))
+        .header("x-amz-tagging", "aws:reserved=1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(res.text().await.unwrap().contains("InvalidTag"));
+
+    // CreateMultipartUpload with x-amz-tagging: k1=v1&k2=v2
+    let init = client
+        .post(format!("{}/mp-bkt/obj?uploads", base_url))
+        .header("x-amz-tagging", "k1=v1&k2=v2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(init.status(), StatusCode::OK);
+    let init_xml = init.text().await.unwrap();
+    let start = init_xml.find("<UploadId>").unwrap() + "<UploadId>".len();
+    let end = init_xml.find("</UploadId>").unwrap();
+    let upload_id = &init_xml[start..end];
+
+    let part = client
+        .put(format!("{}/mp-bkt/obj?partNumber=1&uploadId={}", base_url, upload_id))
+        .body("hello multipart tagging")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(part.status(), StatusCode::OK);
+    let etag = part.headers().get("etag").unwrap().to_str().unwrap().to_string();
+
+    let complete_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etag
+    );
+    let comp = client
+        .post(format!("{}/mp-bkt/obj?uploadId={}", base_url, upload_id))
+        .body(complete_xml)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(comp.status(), StatusCode::OK);
+
+    let head = client.head(format!("{}/mp-bkt/obj", base_url)).send().await.unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(head.headers().get("x-amz-tagging-count").unwrap().to_str().unwrap(), "2");
+
+    let tags = client.get(format!("{}/mp-bkt/obj?tagging", base_url)).send().await.unwrap().text().await.unwrap();
+    assert!(tags.contains("<Key>k1</Key>") && tags.contains("<Value>v1</Value>"));
+    assert!(tags.contains("<Key>k2</Key>") && tags.contains("<Value>v2</Value>"));
+}
+
+#[tokio::test]
+async fn test_get_object_tagging_sorted_by_key() {
+    let (base_url, _state, _handle) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    assert_eq!(client.put(format!("{}/sort-bkt", base_url)).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        client
+            .put(format!("{}/sort-bkt/obj", base_url))
+            .header("x-amz-tagging", "foo=bar&bar")
+            .body("payload")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    let xml = client
+        .get(format!("{}/sort-bkt/obj?tagging", base_url))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let bar_pos = xml.find("<Key>bar</Key>").expect("bar tag");
+    let foo_pos = xml.find("<Key>foo</Key>").expect("foo tag");
+    assert!(bar_pos < foo_pos, "expected bar before foo in:\n{xml}");
+}
+
+#[tokio::test]
+async fn test_bucket_tagging_put_get_delete_and_404_when_unset() {
+    let dir = temp_dir("bucket_tagging");
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let client = reqwest::Client::new();
+
+    {
+        let state = Arc::new(S3ServiceState::with_data_dir(&dir));
+        let handle = start_s3_reactor(addr, Arc::clone(&state)).await.unwrap();
+        let base_url = format!("http://{}", handle.local_addr);
+
+        // Non-existent bucket -> 404 NoSuchBucket
+        let res = client.get(format!("{}/no-such-bkt?tagging", base_url)).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(res.text().await.unwrap().contains("NoSuchBucket"));
+
+        // Create bucket
+        assert_eq!(client.put(format!("{}/bkt-tags", base_url)).send().await.unwrap().status(), StatusCode::OK);
+
+        // GET ?tagging when unset -> 404 NoSuchTagSet
+        let res = client.get(format!("{}/bkt-tags?tagging", base_url)).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body = res.text().await.unwrap();
+        assert!(body.contains("<Code>NoSuchTagSet</Code>"), "got: {body}");
+        assert!(body.contains("The TagSet does not exist"), "got: {body}");
+
+        // Empty body -> 400 MalformedXML
+        let res = client.put(format!("{}/bkt-tags?tagging", base_url)).body("").send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(res.text().await.unwrap().contains("MalformedXML"));
+
+        // Malformed XML -> 400 MalformedXML
+        let res = client.put(format!("{}/bkt-tags?tagging", base_url)).body("<Tagging><Broken>").send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(res.text().await.unwrap().contains("MalformedXML"));
+
+        // 51 tags -> 400 InvalidTag (bucket max is 50)
+        let bkt_51: Vec<(String, String)> = (0..51).map(|i| (format!("k{i}"), format!("v{i}"))).collect();
+        let bkt_51_refs: Vec<(&str, &str)> = bkt_51.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let res = client.put(format!("{}/bkt-tags?tagging", base_url)).body(tagging_xml(&bkt_51_refs)).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(res.text().await.unwrap().contains("InvalidTag"));
+
+        // PUT ?tagging with 2 tags -> 204 No Content
+        let res = client
+            .put(format!("{}/bkt-tags?tagging", base_url))
+            .body(tagging_xml(&[("Hello", "World"), ("Append", "Test")]))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // GET ?tagging returns tags sorted by key
+        let res = client.get(format!("{}/bkt-tags?tagging", base_url)).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let xml = res.text().await.unwrap();
+        let append_pos = xml.find("<Key>Append</Key>").expect("Append tag");
+        let hello_pos = xml.find("<Key>Hello</Key>").expect("Hello tag");
+        assert!(append_pos < hello_pos, "expected Append before Hello in:\n{xml}");
+        assert!(xml.contains("<Value>Test</Value>"));
+        assert!(xml.contains("<Value>World</Value>"));
+    }
+
+    // Restart from same data_dir preserves bucket tags, then DELETE clears them
+    {
+        let state = Arc::new(S3ServiceState::with_data_dir(&dir));
+        let handle = start_s3_reactor(addr, Arc::clone(&state)).await.unwrap();
+        let base_url = format!("http://{}", handle.local_addr);
+
+        let res = client.get(format!("{}/bkt-tags?tagging", base_url)).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let xml = res.text().await.unwrap();
+        assert!(xml.contains("<Key>Append</Key>") && xml.contains("<Value>Test</Value>"));
+        assert!(xml.contains("<Key>Hello</Key>") && xml.contains("<Value>World</Value>"));
+
+        // DELETE ?tagging -> 204 No Content
+        let res = client.delete(format!("{}/bkt-tags?tagging", base_url)).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // GET ?tagging after delete -> 404 NoSuchTagSet
+        let res = client.get(format!("{}/bkt-tags?tagging", base_url)).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(res.text().await.unwrap().contains("<Code>NoSuchTagSet</Code>"));
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

@@ -37,7 +37,15 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from run_warp_benchmark import get_free_port, get_process_peak_rss_mb, run_workload_phase  # noqa: E402
+from run_warp_benchmark import (  # noqa: E402
+    affinity_labels,
+    affinity_masks,
+    can_pin,
+    get_free_port,
+    get_process_peak_rss_mb,
+    run_workload_phase,
+    set_affinity_mask,
+)
 
 KIB = 1024
 MIB = 1024 * 1024
@@ -101,7 +109,8 @@ def check_rss(rss: Optional[Dict[str, List[float]]], baseline: Optional[dict]) -
 
 
 def render(rows: List[tuple], awanfs: Dict[str, List[float]], minio: Dict[str, List[float]], cmd: str, runs: int,
-           rss: Optional[Dict[str, List[float]]] = None, rss_ceiling: Optional[float] = None) -> str:
+           rss: Optional[Dict[str, List[float]]] = None, rss_ceiling: Optional[float] = None,
+           pin_labels: Optional[Tuple[str, str]] = None) -> str:
     def f(x):
         return "-" if x is None else f"{x:.2f}"
 
@@ -112,6 +121,10 @@ def render(rows: List[tuple], awanfs: Dict[str, List[float]], minio: Dict[str, L
         "",
         f"Machine: {platform.node()} ({platform.platform()}, {os.cpu_count()} CPUs). {runs} runs per server, "
         "order alternating; medians of MiB/s from successful responses.",
+    ]
+    if pin_labels:
+        lines.append(f"Core pinning: server `{pin_labels[0]}`, client `{pin_labels[1]}`.")
+    lines += [
         "",
         "| workload | AwanFS MiB/s (median) | MinIO MiB/s (median) | ratio | baseline | verdict |",
         "|---|---|---|---|---|---|",
@@ -153,6 +166,9 @@ def start_awanfs(server_bin: str) -> Tuple[subprocess.Popen, int, str]:
     port = get_free_port()
     proc = subprocess.Popen([server_bin, "--port", str(port), "--data-dir", data, "--allow-anonymous"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if can_pin():
+        srv_mask, _ = affinity_masks()
+        set_affinity_mask(proc.pid, srv_mask)
     if not wait_port(port):
         proc.kill()
         raise RuntimeError("s3-server did not start")
@@ -172,6 +188,9 @@ def start_minio(minio_bin: str, mc_bin: str) -> Tuple[subprocess.Popen, int, str
     proc = subprocess.Popen([minio_bin, "server", data, "--address", f"127.0.0.1:{port}",
                              "--console-address", f"127.0.0.1:{console}"],
                             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if can_pin():
+        srv_mask, _ = affinity_masks()
+        set_affinity_mask(proc.pid, srv_mask)
     if not wait_port(port):
         proc.kill()
         raise RuntimeError("minio did not start")
@@ -217,6 +236,12 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     cmd = "python benchmarks/ratio_check.py " + " ".join(argv if argv is not None else sys.argv[1:])
 
+    pin_labels = None
+    if can_pin():
+        _, cli_mask = affinity_masks()
+        set_affinity_mask(None, cli_mask)
+        pin_labels = affinity_labels()
+
     awanfs: Dict[str, List[float]] = {n: [] for n in WORKLOADS}
     minio: Dict[str, List[float]] = {n: [] for n in WORKLOADS}
     rss: Dict[str, List[float]] = {"awanfs": [], "minio": []}
@@ -244,7 +269,7 @@ def main(argv=None) -> int:
     rows, bad = compare(ratios, baseline)
     _, ceiling, rss_bad = check_rss(rss, baseline)
     bad += rss_bad
-    report = render(rows, awanfs, minio, cmd, a.runs, rss, ceiling)
+    report = render(rows, awanfs, minio, cmd, a.runs, rss, ceiling, pin_labels=pin_labels)
     if baseline is None:
         suggestion = {"tolerance": 0.20, "_machine": "github ubuntu-latest",
                       "rss_ceiling_mib": round(2 * statistics.median(rss["awanfs"])) if rss.get("awanfs") else None,

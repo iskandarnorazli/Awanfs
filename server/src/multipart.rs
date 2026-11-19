@@ -60,6 +60,7 @@ pub struct MultipartUpload {
     pub checksum_alg: Option<crate::checksum::ChecksumAlgorithm>,
     pub checksum_type: Option<String>,
     pub attrs: crate::attrs::Attrs,
+    pub tags: Option<crate::tagging::TagSet>,
 }
 
 #[derive(Clone, Debug)]
@@ -208,6 +209,7 @@ impl MultipartManager {
             checksum_alg: None,
             checksum_type: None,
             attrs: crate::attrs::Attrs::new(),
+            tags: None,
         };
 
         self.upload_states.write().insert(upload_id.clone(), crate::fsm::UploadState::Open);
@@ -253,6 +255,12 @@ impl MultipartManager {
     pub fn set_upload_attrs(&self, upload_id: &str, attrs: crate::attrs::Attrs) {
         if let Some(u) = self.uploads.write().get_mut(upload_id) {
             u.attrs = attrs;
+        }
+    }
+
+    pub fn set_upload_tags(&self, upload_id: &str, tags: crate::tagging::TagSet) {
+        if let Some(u) = self.uploads.write().get_mut(upload_id) {
+            u.tags = Some(tags);
         }
     }
 
