@@ -232,9 +232,16 @@ test_s3::test_multipart_upload_missing_part
 test_s3::test_multipart_upload_multiple_sizes
 test_s3::test_multipart_upload_overwrite_existing_object
 test_s3::test_multipart_upload_small
+test_s3::test_multipart_use_cksum_helper_crc32
+test_s3::test_multipart_use_cksum_helper_crc32c
+test_s3::test_multipart_use_cksum_helper_crc64nvme
+test_s3::test_multipart_use_cksum_helper_sha1
+test_s3::test_multipart_use_cksum_helper_sha256
 test_s3::test_non_multipart_get_part
 test_s3::test_non_multipart_sse_c_get_part
 test_s3::test_object_anon_put
+test_s3::test_object_checksum_crc64nvme
+test_s3::test_object_checksum_sha256
 test_s3::test_object_content_encoding_aws_chunked
 test_s3::test_object_copy_16m
 test_s3::test_object_copy_bucket_not_found
