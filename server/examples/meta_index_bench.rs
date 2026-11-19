@@ -5,6 +5,10 @@
 //!   meta_index_bench build --store redb|seg|prod --dir DIR --keys N
 //!   meta_index_bench query --store redb|seg|prod --dir DIR --keys N [--gets 1000000] [--scans 1000]
 //!
+//! `--store prod@M` is the production store with a cache budget of M MiB (`prod` uses the
+//! server's `SPILL_CACHE_BYTES`, the same 64 MiB redb gets), for experiments on the memtable's
+//! share.
+//!
 //! Each run prints one JSON line. `build` inserts N keys in a scrambled order, as PUTs arrive.
 //! `query` opens what `build` left (its time is the open time), gets present and absent keys,
 //! and scans prefixes. Read system calls (`reads_per_get`) are counted by the OS for both
@@ -19,11 +23,54 @@
 //! live segments, so open reads footers and nothing else. There is no compaction.
 
 use s3_server::meta_index::ObjectMeta;
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+
+/// Counts the heap this process holds, so a run can tell heap from the rest of its RSS.
+struct Counting;
+
+static HEAP_LIVE: AtomicUsize = AtomicUsize::new(0);
+static HEAP_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+fn heap_grew(by: usize) {
+    let now = HEAP_LIVE.fetch_add(by, Ordering::Relaxed) + by;
+    HEAP_PEAK.fetch_max(now, Ordering::Relaxed);
+}
+
+// SAFETY: every call goes to the system allocator unchanged; this only counts bytes.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc(layout);
+        if !p.is_null() {
+            heap_grew(layout.size());
+        }
+        p
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout);
+        HEAP_LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = System.realloc(ptr, layout, new_size);
+        if !p.is_null() {
+            HEAP_LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            heap_grew(new_size);
+        }
+        p
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+fn mib(bytes: usize) -> f64 {
+    bytes as f64 / 1048576.0
+}
 
 const BUCKET: u32 = 1;
 const MEMTABLE_ROWS: usize = 1_000_000;
@@ -516,7 +563,10 @@ fn open_store(kind: &str, dir: &Path) -> Box<dyn Store> {
         "redb" => Box::new(Redb(redb_spill::RedbSpill::open(&dir.join("metadata.db")).expect("open redb"))),
         "seg" => Box::new(Seg::open(dir)),
         "prod" => Box::new(Prod(s3_server::spill::SpillIndex::open(dir).expect("open prod"))),
-        other => panic!("--store redb|seg|prod, not {}", other),
+        other => match other.strip_prefix("prod@").and_then(|m| m.parse::<usize>().ok()) {
+            Some(mib) => Box::new(Prod(s3_server::spill::SpillIndex::open_with_cache_size(dir, mib << 20).expect("open prod"))),
+            None => panic!("--store redb|seg|prod|prod@MIB, not {}", other),
+        },
     }
 }
 
@@ -542,14 +592,18 @@ fn main() {
             }
             store.finish();
             let secs = t.elapsed().as_secs_f64();
+            // Live heap after the build: what the open store keeps (filters, fences, caches).
+            let heap_after = HEAP_LIVE.load(Ordering::Relaxed);
             println!(
-                "{{\"store\":\"{}\",\"phase\":\"build\",\"keys\":{},\"secs\":{:.3},\"puts_per_s\":{:.0},\"bytes_on_disk\":{},\"peak_rss_mib\":{}}}",
+                "{{\"store\":\"{}\",\"phase\":\"build\",\"keys\":{},\"secs\":{:.3},\"puts_per_s\":{:.0},\"bytes_on_disk\":{},\"peak_rss_mib\":{},\"peak_heap_mib\":{:.3},\"heap_after_mib\":{:.3}}}",
                 kind,
                 keys,
                 secs,
                 keys as f64 / secs,
                 dir_bytes(&dir),
-                json_num(peak_rss_mib())
+                json_num(peak_rss_mib()),
+                mib(HEAP_PEAK.load(Ordering::Relaxed)),
+                mib(heap_after)
             );
         }
         "query" => {

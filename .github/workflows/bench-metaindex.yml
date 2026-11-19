@@ -24,6 +24,9 @@ on:
       scans:
         description: "Prefix scans of up to 1000 keys"
         default: "1000"
+      stores:
+        description: "Stores to run (redb, seg, prod, prod@MIB); the report needs redb"
+        default: "redb seg prod"
 
 permissions:
   contents: read
@@ -55,6 +58,7 @@ jobs:
           KEYS: ${{ inputs.keys || '10000000' }}
           GETS: ${{ inputs.gets || '1000000' }}
           SCANS: ${{ inputs.scans || '1000' }}
+          STORES: ${{ inputs.stores || 'redb seg prod' }}
           # The runner's temp directory: on Windows it is on the fast disk (D:), see AGENTS.md.
           DATA: ${{ runner.temp }}/meta
         run: |
@@ -63,7 +67,7 @@ jobs:
           [ -f "$bin.exe" ] && bin="$bin.exe"
           out=results.jsonl
           : > "$out"
-          for s in redb seg prod; do
+          for s in $STORES; do
             "$bin" build --store "$s" --dir "$DATA/$s" --keys "$KEYS" | tee -a "$out"
             if [ "$RUNNER_OS" = "Linux" ]; then
               # A cold open: nothing of the index in the page cache.
@@ -73,6 +77,10 @@ jobs:
             fi
             "$bin" query --store "$s" --dir "$DATA/$s" --keys "$KEYS" --gets "$GETS" --scans "$SCANS" | tee -a "$out"
           done
+          case " $STORES " in
+            *" redb "*) ;;
+            *) echo "No redb run: an experiment, no report."; exit 0 ;;
+          esac
           set +e
           python benchmarks/meta_index_report.py "$out" --title "Metadata index at $KEYS keys: redb against segments ($RUNNER_OS)" --report meta_index.md
           code=$?

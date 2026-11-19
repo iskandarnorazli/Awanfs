@@ -216,8 +216,9 @@ impl SpillIndex {
                     out.push((k[4..].to_vec(), *m));
                 }
             } else {
-                let (k, m) = seg_buf.pop_front().expect("checked");
-                out.push((k[4..].to_vec(), m));
+                let (mut k, m) = seg_buf.pop_front().expect("checked");
+                k.drain(..4); // the bucket id; in place, no new allocation
+                out.push((k, m));
             }
         }
         Ok(out)

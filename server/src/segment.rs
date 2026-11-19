@@ -388,12 +388,54 @@ pub struct Segment<F: VolFile> {
     pub entry_count: u64,
     data_blocks: u64,
     len_bytes: u64,
-    fences: Vec<Vec<u8>>,
+    fences: Fences,
     /// The last entry's sort key (empty when the segment has no entries).
     last_key: Vec<u8>,
     bloom: Bloom,
     /// Counts each block read, when the segment belongs to a server's index (stage 3).
     work: Option<Arc<WorkCounters>>,
+}
+
+/// The first key of each data block, in one buffer: one heap allocation per segment, not one per
+/// block (#26 stage 6: at 10M keys the per-block vectors were about 16 MB of the build's peak RSS).
+struct Fences {
+    keys: Vec<u8>,
+    /// `keys[ends[i-1]..ends[i]]` is block `i`'s first key.
+    ends: Vec<u32>,
+}
+
+impl Fences {
+    fn with_capacity(n: usize, bytes: usize) -> Self {
+        Fences { keys: Vec::with_capacity(bytes), ends: Vec::with_capacity(n) }
+    }
+
+    fn push(&mut self, key: &[u8]) {
+        self.keys.extend_from_slice(key);
+        self.ends.push(self.keys.len() as u32);
+    }
+
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    fn get(&self, i: usize) -> &[u8] {
+        let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };
+        &self.keys[start..self.ends[i] as usize]
+    }
+
+    /// The number of blocks whose first key is at or before `key`.
+    fn at_or_before(&self, key: &[u8]) -> usize {
+        let (mut lo, mut hi) = (0, self.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.get(mid) <= key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
 }
 
 fn corrupt(what: impl Into<String>) -> SegmentError {
@@ -477,7 +519,7 @@ impl<F: VolFile> Segment<F> {
         if crc32c::crc32c(&idx) != u32at(&t, 48) {
             return Err(corrupt("index CRC"));
         }
-        let mut fences = Vec::with_capacity(nfences as usize);
+        let mut fences = Fences::with_capacity(nfences as usize, fence_len as usize);
         let mut p = 0usize;
         for _ in 0..nfences {
             if p + 2 > fence_len as usize {
@@ -487,7 +529,7 @@ impl<F: VolFile> Segment<F> {
             if p + 2 + l > fence_len as usize {
                 return Err(corrupt("fence region"));
             }
-            fences.push(idx[p + 2..p + 2 + l].to_vec());
+            fences.push(&idx[p + 2..p + 2 + l]);
             p += 2 + l;
         }
         if p != fence_len as usize {
@@ -509,7 +551,7 @@ impl<F: VolFile> Segment<F> {
             file.read_at(data_blocks * BLOCK as u64, &mut b)?;
             let es = parse_block(&b, data_blocks - 1)?;
             match es.last() {
-                Some(e) if e.key.as_slice() >= fences[fences.len() - 1].as_slice() => last_key = e.key.clone(),
+                Some(e) if e.key.as_slice() >= fences.get(fences.len() - 1) => last_key = e.key.clone(),
                 _ => return Err(corrupt("last data block")),
             }
         }
@@ -518,7 +560,7 @@ impl<F: VolFile> Segment<F> {
 
     /// The first and last sort keys, or `None` for a segment with no entries.
     pub fn key_range(&self) -> Option<(&[u8], &[u8])> {
-        (self.data_blocks > 0).then(|| (self.fences[0].as_slice(), self.last_key.as_slice()))
+        (self.data_blocks > 0).then(|| (self.fences.get(0), self.last_key.as_slice()))
     }
 
     /// Whether `key` lies between the first and last keys (no read).
@@ -552,7 +594,7 @@ impl<F: VolFile> Segment<F> {
         if self.data_blocks == 0 || !self.bloom.may_contain(key) {
             return Ok(None);
         }
-        let i = self.fences.partition_point(|f| f.as_slice() <= key);
+        let i = self.fences.at_or_before(key);
         if i == 0 {
             return Ok(None);
         }
@@ -563,7 +605,7 @@ impl<F: VolFile> Segment<F> {
     /// A cursor over the entries with a key at or after `start`, reading each block only when
     /// the scan reaches it.
     pub fn scan_from(&self, start: &[u8]) -> Cursor<'_, F> {
-        let first = self.fences.partition_point(|f| f.as_slice() <= start).saturating_sub(1) as u64;
+        let first = self.fences.at_or_before(start).saturating_sub(1) as u64;
         Cursor { seg: self, block: first, buf: Vec::new(), pos: 0, start: start.to_vec(), loaded: false }
     }
 
@@ -603,10 +645,11 @@ impl<F: VolFile> Cursor<'_, F> {
                 self.loaded = true;
             }
             while self.pos < self.buf.len() {
-                let e = &self.buf[self.pos];
+                let e = &mut self.buf[self.pos];
                 self.pos += 1;
                 if e.key.as_slice() >= self.start.as_slice() {
-                    return Ok(Some(e.clone()));
+                    // Moved out, not cloned: the cursor never reads an entry twice.
+                    return Ok(Some(SegEntry { key: std::mem::take(&mut e.key), entry: e.entry }));
                 }
             }
             self.block += 1;
@@ -648,6 +691,30 @@ mod tests {
         let fs = SimFs::new();
         write_segment(&fs, path(), 1, 42, es).unwrap();
         fs
+    }
+
+    /// The packed fences answer as a vector of keys searched with `partition_point` would,
+    /// for keys before, between, on and after the fences, the empty key included.
+    #[test]
+    fn packed_fences_find_the_same_block_as_a_vector_of_keys() {
+        let mut rng = SimRng::new(26);
+        for round in 0..200 {
+            let mut keys: Vec<Vec<u8>> = (0..rng.below(40) + 1).map(|_| (0..rng.below(6)).map(|_| b"ab\xff"[rng.below(3) as usize]).collect()).collect();
+            keys.sort();
+            keys.dedup();
+            let mut f = Fences::with_capacity(keys.len(), 0);
+            for k in &keys {
+                f.push(k);
+            }
+            assert_eq!(f.len(), keys.len());
+            for (i, k) in keys.iter().enumerate() {
+                assert_eq!(f.get(i), k.as_slice());
+            }
+            for _ in 0..50 {
+                let probe: Vec<u8> = (0..rng.below(7)).map(|_| b"ab\xff"[rng.below(3) as usize]).collect();
+                assert_eq!(f.at_or_before(&probe), keys.partition_point(|k| k.as_slice() <= probe.as_slice()), "round {} probe {:?}", round, probe);
+            }
+        }
     }
 
     #[test]

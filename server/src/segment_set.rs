@@ -14,8 +14,6 @@ use crate::meta_index::ObjectMeta;
 use crate::segment::{Cursor, Entry, SegEntry, Segment, SegmentError};
 use crate::vfile::VolFile;
 use crate::work::WorkCounters;
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 /// The deepest level.
@@ -228,48 +226,47 @@ impl<'a, F: VolFile> Src<'a, F> {
 
 /// A k-way merge of sources in sort-key order: for each key, the entry of the first source (in
 /// precedence order) that has it; the others' entries for that key are skipped.
+///
+/// The smallest head is found by a linear pass, not a heap: a merge has a few sources (level 0's
+/// segments and one per deeper level), and a heap would copy every key it orders (#26 stage 6:
+/// those copies made prefix scans slower than redb's).
 pub struct Merge<'a, F: VolFile> {
     srcs: Vec<Src<'a, F>>,
+    /// Each source's next entry; index 0 is the newest source.
     heads: Vec<Option<SegEntry>>,
-    /// Min-heap on (key, rank): rank 0 is the newest source, so on equal keys it comes first.
-    heap: BinaryHeap<Reverse<(Vec<u8>, usize)>>,
 }
 
 impl<'a, F: VolFile> Merge<'a, F> {
     fn new(mut srcs: Vec<Src<'a, F>>) -> Result<Self, SegmentError> {
-        let mut heap = BinaryHeap::new();
         let mut heads = Vec::with_capacity(srcs.len());
-        for (rank, s) in srcs.iter_mut().enumerate() {
-            let e = s.next_entry()?;
-            if let Some(e) = &e {
-                heap.push(Reverse((e.key.clone(), rank)));
-            }
-            heads.push(e);
+        for s in srcs.iter_mut() {
+            heads.push(s.next_entry()?);
         }
-        Ok(Merge { srcs, heads, heap })
-    }
-
-    fn advance(&mut self, rank: usize) -> Result<(), SegmentError> {
-        self.heads[rank] = self.srcs[rank].next_entry()?;
-        if let Some(e) = &self.heads[rank] {
-            self.heap.push(Reverse((e.key.clone(), rank)));
-        }
-        Ok(())
+        Ok(Merge { srcs, heads })
     }
 
     /// The next winning entry, a tombstone included.
     pub fn next_entry(&mut self) -> Result<Option<SegEntry>, SegmentError> {
-        let Some(Reverse((key, rank))) = self.heap.pop() else { return Ok(None) };
-        let winner = self.heads[rank].take().expect("a heap entry has its head");
-        while let Some(Reverse((k, r))) = self.heap.peek() {
-            if *k != key {
-                break;
+        // The smallest key; on equal keys the lowest rank (the newest source) wins, because a
+        // later head replaces the choice only when strictly smaller.
+        let mut best: Option<usize> = None;
+        for (rank, h) in self.heads.iter().enumerate() {
+            if let Some(e) = h {
+                if best.is_none_or(|b| e.key < self.heads[b].as_ref().expect("chosen").key) {
+                    best = Some(rank);
+                }
             }
-            let r = *r;
-            self.heap.pop();
-            self.advance(r)?;
         }
-        self.advance(rank)?;
+        let Some(rank) = best else { return Ok(None) };
+        let winner = self.heads[rank].take().expect("chosen");
+        // Older sources' entries for the same key are hidden. A source holds each key once, so
+        // one step past it is enough.
+        for r in rank + 1..self.heads.len() {
+            if self.heads[r].as_ref().is_some_and(|e| e.key == winner.key) {
+                self.heads[r] = self.srcs[r].next_entry()?;
+            }
+        }
+        self.heads[rank] = self.srcs[rank].next_entry()?;
         Ok(Some(winner))
     }
 }
