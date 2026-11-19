@@ -138,8 +138,11 @@ mod tests {
     use super::*;
 
     fn dir(name: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let d = std::env::temp_dir().join(format!("awanfs_vfile_{}_{}_{}", name, std::process::id(), nanos));
+        // No wall clock outside clock.rs (clock_and_dates_test): a counter keeps names apart.
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("awanfs_vfile_{}_{}_{}", name, std::process::id(), n));
+        std::fs::remove_dir_all(&d).ok();
         std::fs::create_dir_all(&d).unwrap();
         d
     }
