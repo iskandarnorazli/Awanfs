@@ -652,3 +652,147 @@ async fn complete_multipart_versioning_return_version_id() {
     handle.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+struct ChildServer(std::process::Child);
+
+impl Drop for ChildServer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+async fn start_binary_server(tag: &str, extra_args: &[&str]) -> (ChildServer, String, std::path::PathBuf) {
+    let dir = temp_dir(tag);
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_s3-server"))
+        .args([
+            "--port",
+            &port.to_string(),
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--allow-anonymous",
+            "--auto-compaction",
+            "off",
+        ])
+        .args(extra_args)
+        .env("AWANFS_LOG", "off")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn s3-server");
+    let server = ChildServer(child);
+    let base = format!("http://127.0.0.1:{}", port);
+    let c = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if let Ok(r) = c.get(format!("{}/_awanfs/health/ready", base)).send().await {
+            if r.status() == StatusCode::OK {
+                return (server, base, dir);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("s3-server binary did not become ready on {}", base);
+}
+
+#[test]
+fn cli_help_documents_allow_small_parts() {
+    let dir = temp_dir("cli_help");
+    let out_path = dir.join("help.stdout");
+    let err_path = dir.join("help.stderr");
+    for flag in ["--help", "-h"] {
+        let out_file = std::fs::File::create(&out_path).unwrap();
+        let err_file = std::fs::File::create(&err_path).unwrap();
+        let mut child = ChildServer(
+            std::process::Command::new(env!("CARGO_BIN_EXE_s3-server"))
+                .arg(flag)
+                .stdout(std::process::Stdio::from(out_file))
+                .stderr(std::process::Stdio::from(err_file))
+                .spawn()
+                .expect("spawn s3-server --help"),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let status = loop {
+            match child.0.try_wait().unwrap() {
+                Some(st) => break st,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.0.kill();
+                    let _ = child.0.wait();
+                    panic!("s3-server {} did not exit immediately", flag);
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(25)),
+            }
+        };
+        let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
+        let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+        assert!(status.success(), "s3-server {} exited {:?}: stderr={}", flag, status.code(), stderr);
+        assert!(
+            stdout.contains("--allow-small-parts"),
+            "s3-server {} stdout must document --allow-small-parts; got:\n{}",
+            flag,
+            stdout
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn cli_default_rejects_small_parts_and_flag_allows_them() {
+    let c = reqwest::Client::new();
+    let part_body = vec![b'a'; 256 * 1024];
+
+    // 1. Default s3-server (without --allow-small-parts): < 5 MiB non-final part -> 400 EntityTooSmall.
+    let (mut srv_default, base_default, dir_default) = start_binary_server("cli_default_small", &[]).await;
+    assert_eq!(c.put(format!("{}/bkt", base_default)).send().await.unwrap().status(), StatusCode::OK);
+    let uid = create_upload(&c, &base_default, "bkt", "obj").await;
+    let e1 = upload_part(&c, &base_default, "bkt", "obj", &uid, 1, part_body.clone()).await;
+    let e2 = upload_part(&c, &base_default, "bkt", "obj", &uid, 2, part_body.clone()).await;
+    let cmp = c
+        .post(format!("{}/bkt/obj?uploadId={}", base_default, uid))
+        .body(format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>\"{}\"</ETag></Part>\
+             <Part><PartNumber>2</PartNumber><ETag>\"{}\"</ETag></Part>\
+             </CompleteMultipartUpload>",
+            e1, e2
+        ))
+        .send()
+        .await
+        .unwrap();
+    let status = cmp.status();
+    let body = cmp.text().await.unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "default server must reject <5MiB non-final part: {}", body);
+    assert_eq!(between(&body, "<Code>", "</Code>"), Some("EntityTooSmall"), "{}", body);
+    let _ = srv_default.0.kill();
+    let _ = srv_default.0.wait();
+    drop(srv_default);
+    let _ = std::fs::remove_dir_all(&dir_default);
+
+    // 2. s3-server --allow-small-parts: 4 x 256 KiB parts (as in mpu_1m) succeed with 200 OK.
+    let (mut srv_allow, base_allow, dir_allow) =
+        start_binary_server("cli_allow_small", &["--allow-small-parts"]).await;
+    assert_eq!(c.put(format!("{}/bkt", base_allow)).send().await.unwrap().status(), StatusCode::OK);
+    let uid = create_upload(&c, &base_allow, "bkt", "obj").await;
+    let mut parts_xml = String::from("<CompleteMultipartUpload>");
+    for p in 1..=4u32 {
+        let etag = upload_part(&c, &base_allow, "bkt", "obj", &uid, p, part_body.clone()).await;
+        parts_xml.push_str(&format!("<Part><PartNumber>{}</PartNumber><ETag>\"{}\"</ETag></Part>", p, etag));
+    }
+    parts_xml.push_str("</CompleteMultipartUpload>");
+    let cmp = c
+        .post(format!("{}/bkt/obj?uploadId={}", base_allow, uid))
+        .body(parts_xml)
+        .send()
+        .await
+        .unwrap();
+    let status = cmp.status();
+    let body = cmp.text().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "--allow-small-parts must accept 4x256KiB parts: {}", body);
+    let got = c.get(format!("{}/bkt/obj", base_allow)).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(got.len(), 4 * 256 * 1024);
+    let _ = srv_allow.0.kill();
+    let _ = srv_allow.0.wait();
+    drop(srv_allow);
+    let _ = std::fs::remove_dir_all(&dir_allow);
+}

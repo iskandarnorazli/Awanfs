@@ -14,16 +14,6 @@ use crate::xml::xml_escape;
 
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024; // 5 MiB
 
-static ALLOW_SMALL_PARTS: AtomicBool = AtomicBool::new(false);
-
-pub fn set_allow_small_parts(allow: bool) {
-    ALLOW_SMALL_PARTS.store(allow, Ordering::SeqCst);
-}
-
-pub fn is_allow_small_parts() -> bool {
-    ALLOW_SMALL_PARTS.load(Ordering::Relaxed)
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartExtent {
     pub vol_offset: u64,
@@ -383,7 +373,7 @@ impl MultipartManager {
         }
 
         // 3. Verify min part size >= 5 MiB for all except last part (EntityTooSmall)
-        let enforce_min = self.enforce_min_part_size.load(Ordering::Relaxed) && !is_allow_small_parts();
+        let enforce_min = self.enforce_min_part_size.load(Ordering::Relaxed);
         if enforce_min {
             for staged in staged_selected.iter().take(staged_selected.len().saturating_sub(1)) {
                 if staged.size < MIN_PART_SIZE {

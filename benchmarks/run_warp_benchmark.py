@@ -469,6 +469,32 @@ def format_markdown_report(
     return "\n".join(lines) + "\n"
 
 
+def build_awanfs_server_argv(
+    server_bin: str,
+    port: int,
+    data_dir: str,
+    allow_small_parts: bool = False,
+) -> List[str]:
+    """Builds CLI arguments for starting `s3-server`; keeps defaults intact unless requested."""
+    argv = [server_bin, "--port", str(port), "--data-dir", data_dir, "--allow-anonymous"]
+    if allow_small_parts:
+        argv.append("--allow-small-parts")
+    return argv
+
+
+def wait_for_port(host: str, port: int, timeout_sec: float = 10.0) -> bool:
+    deadline = time.perf_counter() + timeout_sec
+    while time.perf_counter() < deadline:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.2)
+                s.connect((host, port))
+                return True
+        except Exception:
+            time.sleep(0.05)
+    return False
+
+
 def start_logged(argv: List[str], log_path: str) -> subprocess.Popen:
     """Starts `argv` with stdout and stderr appended to `log_path`.
 
@@ -942,11 +968,14 @@ def run_multipart_upload_duration_phase(
     lat_lock = threading.Lock()
     total_bytes = 0
     bytes_lock = threading.Lock()
+    errors = 0
+    error_statuses: Dict[int, int] = {}
 
     def worker(worker_id: int):
-        nonlocal total_bytes
+        nonlocal total_bytes, errors
         local_lats: List[float] = []
         local_bytes = 0
+        local_errors: Dict[int, int] = {}
         conn = http.client.HTTPConnection(host, port, timeout=15.0)
         obj_path = f"/{bucket}/mpu_worker_{worker_id}.bin"
 
@@ -957,11 +986,15 @@ def run_multipart_upload_duration_phase(
                 conn.request("POST", f"{obj_path}?uploads", headers={"Content-Length": "0", "Connection": "keep-alive"})
                 resp = conn.getresponse()
                 xml_data = resp.read().decode("utf-8", errors="ignore")
+                if resp.status != 200:
+                    local_errors[resp.status] = local_errors.get(resp.status, 0) + 1
+                    continue
                 m = re.search(r"<UploadId>([^<]+)</UploadId>", xml_data)
                 upload_id = m.group(1) if m else "upload-1"
 
                 # 2. UploadPart 1..K
                 etags = []
+                part_failed = False
                 for p_num in range(1, parts_per_object + 1):
                     conn.request(
                         "PUT",
@@ -971,8 +1004,14 @@ def run_multipart_upload_duration_phase(
                     )
                     p_resp = conn.getresponse()
                     p_resp.read()
+                    if p_resp.status != 200:
+                        local_errors[p_resp.status] = local_errors.get(p_resp.status, 0) + 1
+                        part_failed = True
+                        break
                     etag = p_resp.getheader("ETag", '"00000000000000000000000000000000"')
                     etags.append((p_num, etag))
+                if part_failed:
+                    continue
 
                 # 3. CompleteMultipartUpload
                 parts_xml = "".join(
@@ -988,11 +1027,12 @@ def run_multipart_upload_duration_phase(
                 )
                 c_resp = conn.getresponse()
                 c_resp.read()
+                t1 = time.perf_counter()
                 if c_resp.status == 200:
                     local_bytes += part_size * parts_per_object
-
-                t1 = time.perf_counter()
-                local_lats.append((t1 - t0) * 1000.0)
+                    local_lats.append((t1 - t0) * 1000.0)
+                else:
+                    local_errors[c_resp.status] = local_errors.get(c_resp.status, 0) + 1
             except Exception:
                 try:
                     conn.close()
@@ -1009,6 +1049,9 @@ def run_multipart_upload_duration_phase(
             latencies.extend(local_lats)
         with bytes_lock:
             total_bytes += local_bytes
+            for st, n in local_errors.items():
+                errors += n
+                error_statuses[st] = error_statuses.get(st, 0) + n
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(concurrency)]
     t_start = time.perf_counter()
@@ -1033,9 +1076,47 @@ def run_multipart_upload_duration_phase(
         p99_ms=p99,
         p999_ms=p999,
         peak_rss_mb=peak_rss,
-        measured=not stuck,
-        note=(f"{stuck} workers did not finish their request" if stuck else ""),
+        measured=not stuck and errors == 0 and ops > 0,
+        note=", ".join(
+            x for x in (
+                f"{errors} requests failed ({', '.join(f'HTTP {k} x{v}' for k, v in sorted(error_statuses.items()))})"
+                if errors else "",
+                f"{stuck} workers did not finish their request" if stuck else "",
+            ) if x
+        ),
     )
+
+
+def run_awanfs_mpu_1m_phase(
+    server_bin: str,
+    bucket: str,
+    dur_sec: float,
+    srv_mask: int,
+) -> BenchmarkMetrics:
+    """Runs `mpu_1m` (4 x 256 KiB parts) on an isolated AwanFS server started with `--allow-small-parts`."""
+    mpu_data_dir = tempfile.mkdtemp(prefix="s3_server_bench_mpu_")
+    mpu_port = get_free_port()
+    mpu_log = os.path.join(tempfile.gettempdir(), f"awanfs_bench_mpu_{mpu_port}.log")
+    mpu_proc = start_logged(
+        build_awanfs_server_argv(server_bin, mpu_port, mpu_data_dir, allow_small_parts=True),
+        mpu_log,
+    )
+    print(f"AwanFS mpu_1m log (--allow-small-parts): {mpu_log}", flush=True)
+    try:
+        set_affinity_mask(mpu_proc.pid, srv_mask)
+        if not wait_for_port("127.0.0.1", mpu_port):
+            return BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0, measured=False, note="s3-server --allow-small-parts did not become ready")
+        conn = http.client.HTTPConnection("127.0.0.1", mpu_port, timeout=5.0)
+        try:
+            conn.request("PUT", f"/{bucket}")
+            conn.getresponse().read()
+        finally:
+            conn.close()
+        return run_multipart_upload_duration_phase("127.0.0.1", mpu_port, bucket, 256 * 1024, 4, 16, dur_sec, mpu_proc.pid)
+    finally:
+        mpu_proc.terminate()
+        mpu_proc.wait()
+        shutil.rmtree(mpu_data_dir, ignore_errors=True)
 
 
 def run_large_multipart_object_phase(
@@ -1355,7 +1436,7 @@ def main():
     port = get_free_port()
     server_log = os.path.join(tempfile.gettempdir(), f"awanfs_bench_{port}.log")
     server_proc = start_logged(
-        [server_bin, "--port", str(port), "--data-dir", s3_data_dir, "--allow-anonymous"],
+        build_awanfs_server_argv(server_bin, port, s3_data_dir),
         server_log,
     )
     print(f"AwanFS log: {server_log}", flush=True)
@@ -1389,9 +1470,6 @@ def main():
     print(f"  [5/10] Running 1 MiB GET phase ({dur_sec}s, {min(args.concurrent, 32)} workers)...")
     awan_results["get_1m"] = run_workload_phase(host, port, bucket, 1024 * 1024, min(args.concurrent, 32), dur_sec, "get", server_proc.pid)
 
-    print(f"  [6/10] Running 1 MiB S3 Multipart Upload (4 x 256 KiB parts + CompleteMultipartUpload) phase ({dur_sec}s, 16 workers)...")
-    awan_results["mpu_1m"] = run_multipart_upload_duration_phase(host, port, bucket, 256 * 1024, 4, 16, dur_sec, server_proc.pid)
-
     print(f"  Running 64 KiB Mixed (80% GET / 20% PUT) phase ({dur_sec}s, {args.concurrent} workers)...")
     awan_results["mixed_64k"] = run_workload_phase(host, port, bucket, 64 * 1024, args.concurrent, dur_sec, "mixed", server_proc.pid)
 
@@ -1420,7 +1498,11 @@ def main():
     server_proc.terminate()
     server_proc.wait()
     shutil.rmtree(s3_data_dir, ignore_errors=True)
-    time.sleep(2.5)
+    time.sleep(1.0)
+
+    print(f"  [6/10] Running 1 MiB S3 Multipart Upload (4 x 256 KiB parts + CompleteMultipartUpload, --allow-small-parts) phase ({dur_sec}s, 16 workers)...")
+    awan_results["mpu_1m"] = run_awanfs_mpu_1m_phase(server_bin, bucket, dur_sec, srv_mask)
+    time.sleep(1.5)
 
     # Discover real MinIO binary or fall back to local reference baseline
     minio_bin, mc_bin = find_minio_binaries()

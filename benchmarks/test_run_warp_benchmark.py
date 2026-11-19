@@ -381,5 +381,110 @@ class AffinitySplittingTests(unittest.TestCase):
             self.assertEqual(cli16, "Cores 8..15 (Affinity Mask 0xFF00)")
 
 
+class SmallPartsFlagForMpu1mTests(unittest.TestCase):
+    """#111 (owner decision 2026-11-19): mpu_1m passes --allow-small-parts while default flags stay intact elsewhere."""
+
+    def test_default_server_argv_omits_allow_small_parts(self):
+        import run_warp_benchmark as r
+        argv = r.build_awanfs_server_argv("s3-server", 9000, "/tmp/data")
+        self.assertEqual(argv, ["s3-server", "--port", "9000", "--data-dir", "/tmp/data", "--allow-anonymous"])
+        self.assertNotIn("--allow-small-parts", argv)
+        self.assertNotIn("--durability", argv)
+
+    def test_mpu_1m_server_argv_adds_allow_small_parts(self):
+        import run_warp_benchmark as r
+        argv = r.build_awanfs_server_argv("s3-server", 9001, "/tmp/mpu", allow_small_parts=True)
+        self.assertIn("--allow-small-parts", argv)
+        self.assertEqual(
+            argv,
+            ["s3-server", "--port", "9001", "--data-dir", "/tmp/mpu", "--allow-anonymous", "--allow-small-parts"],
+        )
+
+    def test_run_awanfs_mpu_1m_phase_launches_server_with_allow_small_parts(self):
+        from unittest import mock
+        import run_warp_benchmark as r
+
+        launched_argvs = []
+        fake_proc = mock.MagicMock()
+        fake_proc.pid = 4242
+
+        class FakeConn:
+            def __init__(self, *a, **kw):
+                pass
+            def request(self, *a, **kw):
+                pass
+            def getresponse(self):
+                resp = mock.MagicMock()
+                resp.status = 200
+                resp.read.return_value = b""
+                return resp
+            def close(self):
+                pass
+
+        expected_metrics = BenchmarkMetrics(100.0, 100.0, 1.0, 2.0, 3.0, 4.0, 32.0, measured=True)
+
+        with mock.patch.object(r, "start_logged", side_effect=lambda argv, log: launched_argvs.append(argv) or fake_proc), \
+             mock.patch.object(r, "wait_for_port", return_value=True), \
+             mock.patch.object(r, "set_affinity_mask"), \
+             mock.patch.object(r.http.client, "HTTPConnection", FakeConn), \
+             mock.patch.object(r, "run_multipart_upload_duration_phase", return_value=expected_metrics) as mock_phase:
+            got = r.run_awanfs_mpu_1m_phase("s3-server", "warp-bench-bucket", 2.0, 0x0F)
+
+        self.assertEqual(got, expected_metrics)
+        self.assertEqual(len(launched_argvs), 1)
+        self.assertIn("--allow-small-parts", launched_argvs[0])
+        self.assertEqual(mock_phase.call_args[0][3:5], (256 * 1024, 4))
+        fake_proc.terminate.assert_called_once()
+        fake_proc.wait.assert_called_once()
+
+    def test_main_uses_default_flags_for_main_server_and_dedicated_helper_for_mpu_1m(self):
+        import inspect
+        import run_warp_benchmark as r
+        main_src = inspect.getsource(r.main)
+        self.assertIn("build_awanfs_server_argv(server_bin, port, s3_data_dir)", main_src)
+        self.assertIn("run_awanfs_mpu_1m_phase(", main_src)
+
+    def test_multipart_duration_phase_marks_400_errors_as_not_measured(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import run_warp_benchmark as r
+
+        class RejectCompleteHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            def log_message(self, *a):
+                pass
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(n)
+                if "?uploads" in self.path:
+                    body = b"<InitiateMultipartUploadResult><UploadId>u1</UploadId></InitiateMultipartUploadResult>"
+                    self.send_response(200)
+                else:
+                    body = b"<Error><Code>EntityTooSmall</Code></Error>"
+                    self.send_response(400)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def do_PUT(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(n)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.send_header("ETag", '"abc"')
+                self.end_headers()
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), RejectCompleteHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            m = r.run_multipart_upload_duration_phase("127.0.0.1", srv.server_address[1], "bkt", 1024, 2, 2, 0.25)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertFalse(m.measured)
+        self.assertEqual(m.mib_per_sec, 0.0)
+        self.assertEqual(m.ops_per_sec, 0.0)
+        self.assertIn("HTTP 400", m.note)
+
+
 if __name__ == "__main__":
     unittest.main()
