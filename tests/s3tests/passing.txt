@@ -58,6 +58,7 @@ test_s3::test_bucket_create_naming_good_starts_alpha
 test_s3::test_bucket_create_naming_good_starts_digit
 test_s3::test_bucket_delete_nonempty
 test_s3::test_bucket_delete_notexist
+test_s3::test_bucket_get_location
 test_s3::test_bucket_head
 test_s3::test_bucket_head_notexist
 test_s3::test_bucket_list_delimiter_alt
@@ -272,6 +273,7 @@ test_s3::test_object_raw_get_x_amz_expires_not_expired
 test_s3::test_object_raw_get_x_amz_expires_not_expired_tenant
 test_s3::test_object_raw_response_headers
 test_s3::test_object_read_not_exist
+test_s3::test_object_read_unreadable
 test_s3::test_object_requestid_matches_header_on_error
 test_s3::test_object_set_get_metadata_none_to_empty
 test_s3::test_object_set_get_metadata_none_to_good

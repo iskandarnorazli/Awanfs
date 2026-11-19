@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crate::iam::{Iam, Principal};
 use crate::s3_api::{
     body_limit_for, empty_body, entity_too_large, full_body, parse_s3_target, percent_decode,
-    percent_decode_path, validate_s3_key, ParsedTarget, ResponseBody, S3ServiceState,
+    percent_decode_path, percent_decode_path_bytes, raw_s3_key, validate_s3_key, ParsedTarget, ResponseBody, S3ServiceState,
 };
 use crate::xml::s3_error_xml;
 
@@ -746,6 +746,18 @@ pub fn authorize(r: Resolved) -> Result<Authorized, Response<ResponseBody>> {
 pub fn validate(a: Authorized) -> Result<Validated, Response<ResponseBody>> {
     let c = &a.resolved.auth.classified;
     if let Some(ref key) = c.key {
+        let host_hdr = c.parts.headers.get(HOST).and_then(|v| v.to_str().ok());
+        let invalid_utf8 = raw_s3_key(c.parts.uri.path(), host_hdr)
+            .is_some_and(|raw_key| std::str::from_utf8(&percent_decode_path_bytes(raw_key)).is_err());
+        let has_c1_or_del = key.chars().any(|ch| matches!(ch, '\u{007f}' | '\u{0080}'..='\u{009f}'));
+        if invalid_utf8 || has_c1_or_del {
+            let xml = s3_error_xml("InvalidURI", "Couldn't parse the specified URI.", c.parts.uri.path(), "req-val-uri");
+            return Err(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(full_body(Bytes::from(xml)))
+                .unwrap());
+        }
         if let Err(err_code) = validate_s3_key(key) {
             let xml = s3_error_xml(err_code.as_str(), err_code.description(), key, "req-val-key");
             return Err(Response::builder()
