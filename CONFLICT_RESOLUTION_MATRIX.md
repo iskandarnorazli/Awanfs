@@ -1,5 +1,7 @@
 # Awan Storage Conflict Resolution & Design Invariant Matrix
 
+> **Background from before the PoC (written 2026-11-10/11, in part for awan-lang).** Kept for its reasoning; it is not the design and does not list what AwanFS does. Where it disagrees with [`ARCHITECTURE.md`](ARCHITECTURE.md), [`FORMAT.md`](FORMAT.md) or the code, those win.
+
 > **Deep Systems Analysis: Memory Lifecycles, Value Semantics, Engine Parity, and Cross-Platform Boundaries**
 
 ---
@@ -45,7 +47,7 @@ This document details the **5 critical conflict zones**, their failure modes, an
 
 ### Conflict 2: Value Semantics & CoW (`MAKE_MUT`) vs High-Throughput In-Place Mutation
 - **The Tension:** Awan enforces strict value semantics (Decisions N13/N14). By default, container index assignments (`arr[i] = v`) pass through the VSSA frontend's `vssa_lower_mut_place`, emitting copy-on-write checks (`VSSA_OP_MAKE_MUT`) to prevent aliasing.
-- **The Failure Mode:** When streaming 10,000 chunks of 64 KB (640 MB), checking `MAKE_MUT` on every packet iteration adds 13,000,000 C runtime calls, causing severe register spilling and killing throughput (as diagnosed in [Issue #436](../docs/measurements/pipeline_plain_lists_ir_2026-11-08.md)).
+- **The Failure Mode:** When streaming 10,000 chunks of 64 KB (640 MB), checking `MAKE_MUT` on every packet iteration adds 13,000,000 C runtime calls, causing severe register spilling and killing throughput (as diagnosed in awan-lang issue #436 (`docs/measurements/pipeline_plain_lists_ir_2026-11-08.md` in awan-lang)).
 - **Formal Resolution (Provably Unshared Analysis):**
   - Leverage the whole-program unshared container analysis implemented in `vssa_builder.awan`:
     - When a chunk ring buffer is allocated locally with a fresh literal or leased from the runtime slab, and never escapes to global references, `vssa_is_provably_unshared` returns `true`.

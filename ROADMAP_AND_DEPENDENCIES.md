@@ -19,7 +19,7 @@ take which issue is in [`AGENTS.md`](AGENTS.md).
 ## Status (2026-11-13)
 
 - **Phase 1:** done except #57 (multipart throughput on Linux CI).
-- **Phase 2:** done except #58 (benchmark methodology for public claims) and S3 conformance: tracker #123, with area issues #111-#122 (244 of 838 ceph s3-tests pass).
+- **Phase 2:** done except #58 (benchmark methodology for public claims) and S3 conformance: tracker #123, with area issues #111-#122 (335 of 886 ceph s3-tests pass, 2026-11-19). Closed: #113, #114, #115, #116, #117, #140, #152, #160. Open: #111 (multipart), #112 (conditional), #118 (lifecycle), #119 (POST object), #120 (object lock), #121 (encryption), #122 (policies, ACLs, anonymous access). A second suite (Mint, #278) and a feature registry (#277) are next.
 - **Phase 3:** done (#13, #28, #31, #50, #51) except #26 (measured by #207: decision 59) and #104 (`unmeasured`, decision 32).
 - **Phase 4:** design approved ([`CLUSTERING.md`](CLUSTERING.md), decision 64); no code before #26 lands.
 
