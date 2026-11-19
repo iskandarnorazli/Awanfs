@@ -285,6 +285,12 @@ impl VolFs for SimFs {
             .map(|_| ())
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{} does not exist", path.display())))
     }
+
+    fn list(&self, dir: &Path) -> io::Result<Vec<PathBuf>> {
+        let mut out: Vec<PathBuf> = self.files.lock().keys().filter(|p| p.parent() == Some(dir)).cloned().collect();
+        out.sort();
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
