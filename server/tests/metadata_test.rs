@@ -470,8 +470,25 @@ async fn prop_no_crlf_injection_and_exact_roundtrip_plus_aws_chunked_literal_enc
     assert_eq!(ce_put.status(), StatusCode::OK);
     let ce_get = c.get(format!("{}/pbkt/ce-literal", url)).send().await.unwrap();
     assert_eq!(ce_get.status(), StatusCode::OK);
-    assert_eq!(ce_get.headers().get("content-encoding").unwrap().to_str().unwrap(), "aws-chunked");
+    assert!(ce_get.headers().get("content-encoding").is_none());
     assert_eq!(ce_get.bytes().await.unwrap().as_ref(), b"plain-body-not-chunked");
+
+    // 3. Non-streaming PutObject with Content-Encoding: gzip, aws-chunked stores and returns gzip.
+    let ce_gzip_put = c
+        .put(format!("{}/pbkt/ce-gzip", url))
+        .header("content-encoding", "gzip, aws-chunked")
+        .body("gzip-plus-aws-chunked-body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ce_gzip_put.status(), StatusCode::OK);
+    let ce_gzip_get = c.get(format!("{}/pbkt/ce-gzip", url)).send().await.unwrap();
+    assert_eq!(ce_gzip_get.status(), StatusCode::OK);
+    assert_eq!(
+        ce_gzip_get.headers().get("content-encoding").unwrap().to_str().unwrap(),
+        "gzip"
+    );
+    assert_eq!(ce_gzip_get.bytes().await.unwrap().as_ref(), b"gzip-plus-aws-chunked-body");
 
     handle.shutdown();
 }
