@@ -229,6 +229,16 @@ def _sample_results():
                 2: cs.PointResult(reason="rustfs binary not found"),
                 4: cs.PointResult(reason="rustfs binary not found"),
             },
+            "Garage": {
+                1: cs.PointResult(ops_per_sec=3200.0, p50_ms=4.2, p99_ms=11.0, cpu_pct=88.0, ops_per_busy_core=3636.4),
+                2: cs.PointResult(ops_per_sec=6100.0, p50_ms=4.4, p99_ms=11.5, cpu_pct=175.0, ops_per_busy_core=3485.7),
+                4: cs.PointResult(ops_per_sec=11000.0, p50_ms=4.8, p99_ms=13.0, cpu_pct=340.0, ops_per_busy_core=3235.3, shares_cores=True),
+            },
+            "SeaweedFS": {
+                1: cs.PointResult(ops_per_sec=4500.0, p50_ms=3.2, p99_ms=8.5, cpu_pct=92.0, ops_per_busy_core=4891.3),
+                2: cs.PointResult(ops_per_sec=8500.0, p50_ms=3.4, p99_ms=9.2, cpu_pct=185.0, ops_per_busy_core=4594.6),
+                4: cs.PointResult(ops_per_sec=15000.0, p50_ms=3.9, p99_ms=10.8, cpu_pct=355.0, ops_per_busy_core=4225.4, shares_cores=True),
+            },
         }
     return cores, results
 
@@ -405,11 +415,10 @@ class ChartTests(unittest.TestCase):
                 self.assertEqual(ax.get_xscale(), "log")
                 self.assertEqual(ax.get_ylabel(), expected_y)
 
-            # Panel (a) on PUT 4 KiB has 3 server lines + 1 MAX line
+            # Panel (a) on PUT 4 KiB has 5 server lines + 1 MAX line
             panel_a_labels = [ln.get_label() for ln in put4k_axes[0].lines]
-            self.assertIn("AwanFS", panel_a_labels)
-            self.assertIn("MinIO", panel_a_labels)
-            self.assertIn("RustFS", panel_a_labels)
+            for srv in cs.SERVERS:
+                self.assertIn(srv, panel_a_labels)
             self.assertIn("MAX", panel_a_labels)
 
             # RustFS failed -> all NaN in chart, never 0
@@ -422,7 +431,7 @@ class ChartTests(unittest.TestCase):
                 for ln in put4k_axes[0].lines
                 if ln.get_label() in cs.SERVERS
             }
-            self.assertEqual(len(set(server_styles.values())), 3)
+            self.assertEqual(len(set(server_styles.values())), 5)
 
             # GET 4 KiB panel (a) has NO MAX line
             _get4k_fig, get4k_axes = captured_figs[2]
@@ -672,9 +681,9 @@ class MatrixChartTests(unittest.TestCase):
                     written = cs.write_matrix_charts(results, patterns, sizes, cores, concs, report_path)
                 captured_figs = [(f, list(f.axes)) for f in created_figs]
 
-            # 8 core-scaling figs + 8 concurrency-sweep figs + 3 heatmap figs + 1 summary fig = 20 figures -> 40 files
-            self.assertEqual(len(captured_figs), 20)
-            self.assertEqual(len(written), 40)
+            # 8 core-scaling figs + 8 concurrency-sweep figs + 5 heatmap figs + 1 summary fig = 22 figures -> 44 files
+            self.assertEqual(len(captured_figs), 22)
+            self.assertEqual(len(written), 44)
             for p in written:
                 self.assertTrue(os.path.isfile(p), f"missing chart {p}")
                 self.assertGreater(os.path.getsize(p), 0)
@@ -695,22 +704,23 @@ class MatrixChartTests(unittest.TestCase):
                 for ln in core_axes[0].lines
                 if ln.get_label() in cs.SERVERS
             }
-            self.assertEqual(len(set(styles.values())), 3)
+            self.assertEqual(len(set(styles.values())), 5)
 
-            # 2) Concurrency sweep figure (figs 8..15): 2 rows x 3 servers, log2 x, same y scale across servers, c=256 MinIO gap
+            # 2) Concurrency sweep figure (figs 8..15): 2 rows x 5 servers, log2 x, same y scale across servers, c=256 MinIO gap
             conc_fig, conc_axes = captured_figs[8]
-            self.assertEqual(len(conc_axes), 6)
+            n_srv = len(cs.SERVERS)
+            self.assertEqual(len(conc_axes), 2 * n_srv)
             for ax in conc_axes:
                 self.assertEqual(ax.get_xscale(), "log")
-            ops_ylims = [conc_axes[i].get_ylim() for i in range(3)]
-            p99_ylims = [conc_axes[i].get_ylim() for i in range(3, 6)]
+            ops_ylims = [conc_axes[i].get_ylim() for i in range(n_srv)]
+            p99_ylims = [conc_axes[i].get_ylim() for i in range(n_srv, 2 * n_srv)]
             self.assertEqual(len(set(ops_ylims)), 1, f"ops/s ylims differ across servers: {ops_ylims}")
             self.assertEqual(len(set(p99_ylims)), 1, f"P99 ylims differ across servers: {p99_ylims}")
             minio_ops_lines = conc_axes[1].lines
             self.assertEqual(len(minio_ops_lines), len(cores))
             self.assertTrue(math.isnan(float(minio_ops_lines[0].get_ydata()[-1])))
 
-            # 3) Heatmaps per server at 4 KiB (figs 16..18): 4 panels (one per pattern), MinIO c=256 is NaN
+            # 3) Heatmaps per server at 4 KiB (figs 16..20): 4 panels (one per pattern), MinIO c=256 is NaN
             minio_hm_fig, minio_hm_axes = captured_figs[17]
             self.assertEqual(len(minio_hm_axes), 4)
             for ax in minio_hm_axes:
@@ -720,8 +730,8 @@ class MatrixChartTests(unittest.TestCase):
                 self.assertEqual(len(img_data[0]), len(concs))
                 self.assertTrue(math.isnan(float(img_data[0][-1])))
 
-            # 4) Summary figure (fig 19): grouped bars per server at 4 cores, c=64, RustFS is NaN (never 0)
-            sum_fig, sum_axes = captured_figs[19]
+            # 4) Summary figure (fig 21): grouped bars per server at 4 cores, c=64, RustFS is NaN (never 0)
+            sum_fig, sum_axes = captured_figs[21]
             self.assertEqual(len(sum_axes), len(sizes))
             if not has_mpl:
                 rustfs_bar = next(b for b in sum_axes[0].bars if b["label"] == "RustFS")
@@ -783,6 +793,165 @@ class MatrixExecutionTests(unittest.TestCase):
                         self.assertTrue(pt.measured, f"{pat} {sz} failed: {pt.reason}")
                         self.assertGreater(pt.ops_per_sec, 0.0)
                         self.assertGreater(pt.mib_per_sec, 0.0)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+
+class GarageAndSeaweedfsTests(unittest.TestCase):
+    def test_five_servers_registered_with_distinct_styles(self):
+        self.assertEqual(cs.SERVERS, ("AwanFS", "MinIO", "RustFS", "Garage", "SeaweedFS"))
+        styles = {
+            (cs.SERVER_STYLES[s]["linestyle"], cs.SERVER_STYLES[s]["marker"])
+            for s in cs.SERVERS
+        }
+        self.assertEqual(len(styles), 5)
+
+    def test_durability_rows_cover_all_five_servers_and_put_sync_semantics(self):
+        posix_rows = {srv: (default_cfg, waits_sync, note) for srv, default_cfg, waits_sync, note in cs.server_durability_rows("posix")}
+        self.assertEqual(set(posix_rows.keys()), set(cs.SERVERS))
+        self.assertEqual(posix_rows["AwanFS"][1], "Yes")
+        self.assertEqual(posix_rows["MinIO"][1], "Yes")
+        self.assertEqual(posix_rows["RustFS"][1], "Yes")
+        self.assertEqual(posix_rows["Garage"][1], "No")
+        self.assertEqual(posix_rows["SeaweedFS"][1], "No")
+        self.assertIn("metadata_fsync = false", posix_rows["Garage"][0])
+        self.assertIn("data_fsync = false", posix_rows["Garage"][0])
+        self.assertIn("fsync", posix_rows["SeaweedFS"][0].lower())
+
+        nt_rows = {srv: (default_cfg, waits_sync, note) for srv, default_cfg, waits_sync, note in cs.server_durability_rows("nt")}
+        self.assertIn("No", nt_rows["MinIO"][1])
+
+        cores, results = _sample_results()
+        md = cs.render_report(
+            cmd="python benchmarks/core_scaling.py",
+            cores=cores,
+            results=results,
+            total_cores=4,
+            runs=2,
+            duration_sec=2.0,
+        )
+        self.assertIn("## Durability Settings", md)
+        self.assertIn("PUT waits for sync?", md)
+        for srv in cs.SERVERS:
+            self.assertIn(f"| {srv} |", md)
+
+    def test_five_server_matrix_report_includes_durability_and_unmeasured_garage(self):
+        patterns, sizes, cores, concs, results = _sample_matrix_results()
+        for pat in patterns:
+            for sz in sizes:
+                for n in cores:
+                    for c in concs:
+                        results[pat][sz]["Garage"][n][c] = cs.PointResult(
+                            reason="garage binary not found (upstream releases Linux binaries only)"
+                        )
+        md = cs.render_matrix_report(
+            cmd="python benchmarks/core_scaling.py --matrix",
+            patterns=patterns,
+            sizes=sizes,
+            cores=cores,
+            concurrencies=concs,
+            results=results,
+            total_cores=4,
+            runs=2,
+            duration_sec=2.0,
+            seed=42,
+            memory_budget="32MiB",
+            prefill_bytes=48 * cs.MIB,
+        )
+        self.assertIn("AwanFS vs MinIO vs RustFS vs Garage vs SeaweedFS", md)
+        self.assertIn("## Durability Settings", md)
+        self.assertIn("| Garage | seq-write | 4 KiB | 1 | 1 | not measured (garage binary not found (upstream releases Linux binaries only)) |", md)
+        self.assertIn("| SeaweedFS | seq-write | 4 KiB | 1 | 1 |", md)
+
+    def test_garage_config_toml_and_missing_binary_not_measured(self):
+        cfg = cs.garage_config_toml("/tmp/meta", "/tmp/data", s3_port=3900, rpc_port=3901, rpc_secret="ab" * 32)
+        self.assertIn("replication_factor = 1", cfg)
+        self.assertIn('s3_region = "garage"', cfg)
+        self.assertIn('api_bind_addr = "127.0.0.1:3900"', cfg)
+        self.assertIn('rpc_bind_addr = "127.0.0.1:3901"', cfg)
+        self.assertNotIn("metadata_fsync = true", cfg)
+        self.assertNotIn("data_fsync = true", cfg)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(RuntimeError) as ctx:
+                cs._start_garage(None, 1, tmpdir)
+            self.assertIn("not found", str(ctx.exception).lower())
+
+    def test_seaweedfs_argv_env_and_missing_binary_not_measured(self):
+        argv = cs.seaweedfs_mini_argv(
+            "/usr/bin/weed",
+            "/tmp/sw",
+            ports=(8333, 18333, 9333, 19333, 9340, 19340, 8888, 18888, 12535, 22535),
+            bucket="core-scaling-bench",
+        )
+        self.assertEqual(argv[:4], ["/usr/bin/weed", "mini", "-dir", "/tmp/sw"])
+        self.assertIn("-s3.port", argv)
+        self.assertIn("8333", argv)
+        self.assertIn("-bucket", argv)
+        self.assertIn("core-scaling-bench", argv)
+        self.assertIn("-master.telemetry=false", argv)
+
+        env = cs._seaweedfs_env({"PATH": "/bin", "AWS_ACCESS_KEY_ID": "abc", "AWS_SECRET_ACCESS_KEY": "xyz"})
+        self.assertNotIn("AWS_ACCESS_KEY_ID", env)
+        self.assertNotIn("AWS_SECRET_ACCESS_KEY", env)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(RuntimeError) as ctx:
+                cs._start_seaweedfs(None, 1, tmpdir)
+            self.assertIn("weed binary not found", str(ctx.exception).lower())
+
+    def test_sigv4_signer_signs_requests_for_auth_required_servers(self):
+        auth = cs.S3Auth(access_key="GK0123456789abcdef0123456789abcdef", secret_key="ab" * 32, region="garage")
+        signer = cs.SigV4Signer(auth)
+        hdrs = signer.sign_headers("PUT", "/core-scaling-bench/seq/000000", "127.0.0.1:3900", {"Content-Length": "4096"})
+        self.assertIn("Authorization", hdrs)
+        self.assertTrue(hdrs["Authorization"].startswith("AWS4-HMAC-SHA256 Credential=GK0123456789abcdef0123456789abcdef/"))
+        self.assertIn("SignedHeaders=host;x-amz-content-sha256;x-amz-date", hdrs["Authorization"])
+        self.assertEqual(hdrs["x-amz-content-sha256"], "UNSIGNED-PAYLOAD")
+        self.assertEqual(hdrs["Host"], "127.0.0.1:3900")
+
+        # Verify against a stub HTTP server that rejects unsigned requests with 403
+        import http.server
+        import threading
+
+        class AuthRequiredHandler(cs.rwb.BaselineFileS3Handler):
+            def _check_auth(self):
+                auth_hdr = self.headers.get("Authorization", "")
+                if not auth_hdr.startswith("AWS4-HMAC-SHA256 ") or self.headers.get("x-amz-content-sha256") != "UNSIGNED-PAYLOAD":
+                    self.send_response(403)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return False
+                return True
+
+            def do_PUT(self):
+                if self._check_auth():
+                    super().do_PUT()
+
+            def do_GET(self):
+                if self._check_auth():
+                    super().do_GET()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            AuthRequiredHandler.storage_root = tmpdir
+            port = cs.rwb.get_free_port()
+            httpd = cs.rwb.ThreadedHTTPServer(("127.0.0.1", port), AuthRequiredHandler)
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            os.makedirs(os.path.join(tmpdir, cs.BUCKET), exist_ok=True)
+            try:
+                err = cs._prefill_server(
+                    "127.0.0.1", port, cs.BUCKET, seed=42, prefill_bytes=16 * cs.KIB,
+                    patterns=["seq-write", "seq-read"], sizes=[4 * cs.KIB], timeout_sec=10.0, auth=auth,
+                )
+                self.assertIsNone(err)
+                pt = cs._run_pattern_phase_with_cpu(
+                    "127.0.0.1", port, cs.BUCKET, "seq-read", 4 * cs.KIB, concurrency=2, duration_sec=0.06,
+                    seed=42, prefill_bytes=16 * cs.KIB, server_pid=os.getpid(), shares_cores=True, auth=auth,
+                )
+                self.assertTrue(pt.measured, f"signed read phase failed: {pt.reason}")
+                self.assertGreater(pt.ops_per_sec, 0.0)
             finally:
                 httpd.shutdown()
                 httpd.server_close()

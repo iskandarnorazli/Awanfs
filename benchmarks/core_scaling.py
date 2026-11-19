@@ -1,4 +1,4 @@
-"""CPU core scaling benchmark: PUT and GET throughput against cores, AwanFS vs MinIO vs RustFS.
+"""CPU core scaling benchmark: PUT and GET throughput against cores, AwanFS vs MinIO vs RustFS vs Garage vs SeaweedFS.
 
     python benchmarks/core_scaling.py [--cores 1,2,4] [--runs 2] [--duration 3] [--output core_scaling.md]
 
@@ -7,12 +7,15 @@ busy core scale with N pinned server cores (1, 2, 4, ...). Writes a markdown rep
 its command and SeaStore-style 4-panel PNG and SVG charts next to the report.
 """
 import argparse
+import hashlib
+import hmac
 import http.client
 import math
 import os
 import platform
 import random
 import re
+import secrets
 import shutil
 import socket
 import statistics
@@ -21,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -34,7 +38,7 @@ import sync_probe  # noqa: E402
 KIB = 1024
 MIB = 1024 * 1024
 BUCKET = "core-scaling-bench"
-SERVERS: Tuple[str, ...] = ("AwanFS", "MinIO", "RustFS")
+SERVERS: Tuple[str, ...] = ("AwanFS", "MinIO", "RustFS", "Garage", "SeaweedFS")
 PATTERNS: Tuple[str, ...] = ("seq-write", "rand-write", "seq-read", "rand-read")
 
 DEFAULT_SIZES = "4KiB,1MiB"
@@ -51,10 +55,12 @@ WORKLOADS: List[Tuple[str, str, str, int]] = [
     ("get_64k", "GET 64 KiB", "get", 64 * KIB),
 ]
 
-SERVER_STYLES: Dict[str, Dict[str, str]] = {
+SERVER_STYLES: Dict[str, Dict[str, object]] = {
     "AwanFS": {"linestyle": "-", "marker": "o", "color": "#1f77b4", "hatch": ""},
     "MinIO": {"linestyle": "--", "marker": "s", "color": "#d62728", "hatch": "//"},
     "RustFS": {"linestyle": "-.", "marker": "^", "color": "#2ca02c", "hatch": ".."},
+    "Garage": {"linestyle": ":", "marker": "D", "color": "#9467bd", "hatch": "xx"},
+    "SeaweedFS": {"linestyle": (0, (3, 1, 1, 1)), "marker": "v", "color": "#ff7f0e", "hatch": "\\\\"},
 }
 
 CORE_STYLES: Tuple[Dict[str, str], ...] = (
@@ -89,6 +95,143 @@ class RequestSpec:
     key: str
     range_start: Optional[int] = None
     range_end: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class S3Auth:
+    """Credentials for S3 servers that require AWS SigV4 (e.g. Garage)."""
+    access_key: str
+    secret_key: str
+    region: str = "garage"
+    service: str = "s3"
+
+
+class SigV4Signer:
+    """Thread-safe AWS SigV4 header signer using UNSIGNED-PAYLOAD and cached daily keys."""
+
+    def __init__(self, auth: S3Auth):
+        self.auth = auth
+        self._lock = threading.Lock()
+        self._cached_sec: int = -1
+        self._cached_amz_date: str = ""
+        self._cached_date_stamp: str = ""
+        self._key_date: str = ""
+        self._signing_key: bytes = b""
+
+    @staticmethod
+    def _hmac(key: bytes, msg: bytes) -> bytes:
+        return hmac.new(key, msg, hashlib.sha256).digest()
+
+    def _date_and_key(self, utc_ts: Optional[float] = None) -> Tuple[str, str, bytes]:
+        sec = int(time.time() if utc_ts is None else utc_ts)
+        with self._lock:
+            if sec != self._cached_sec:
+                tm = time.gmtime(sec)
+                self._cached_date_stamp = time.strftime("%Y%m%d", tm)
+                self._cached_amz_date = time.strftime("%Y%m%dT%H%M%SZ", tm)
+                self._cached_sec = sec
+            date_stamp = self._cached_date_stamp
+            amz_date = self._cached_amz_date
+            if date_stamp != self._key_date:
+                k_date = self._hmac(("AWS4" + self.auth.secret_key).encode("utf-8"), date_stamp.encode("ascii"))
+                k_region = self._hmac(k_date, self.auth.region.encode("utf-8"))
+                k_service = self._hmac(k_region, self.auth.service.encode("utf-8"))
+                self._signing_key = self._hmac(k_service, b"aws4_request")
+                self._key_date = date_stamp
+            return amz_date, date_stamp, self._signing_key
+
+    def sign_headers(
+        self,
+        method: str,
+        path: str,
+        host_header: str,
+        extra_headers: Optional[Dict[str, str]] = None,
+        utc_ts: Optional[float] = None,
+    ) -> Dict[str, str]:
+        amz_date, date_stamp, signing_key = self._date_and_key(utc_ts)
+        canonical_uri = urllib.parse.quote(path, safe="/-_.~")
+        canonical_headers = (
+            f"host:{host_header}\n"
+            f"x-amz-content-sha256:UNSIGNED-PAYLOAD\n"
+            f"x-amz-date:{amz_date}\n"
+        )
+        signed_headers = "host;x-amz-content-sha256;x-amz-date"
+        canonical_request = (
+            f"{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\nUNSIGNED-PAYLOAD"
+        )
+        req_hash = hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
+        scope = f"{date_stamp}/{self.auth.region}/{self.auth.service}/aws4_request"
+        string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{req_hash}"
+        signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+        headers: Dict[str, str] = dict(extra_headers) if extra_headers else {}
+        headers["Host"] = host_header
+        headers["x-amz-date"] = amz_date
+        headers["x-amz-content-sha256"] = "UNSIGNED-PAYLOAD"
+        headers["Authorization"] = (
+            f"AWS4-HMAC-SHA256 Credential={self.auth.access_key}/{scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}"
+        )
+        return headers
+
+
+def server_durability_rows(os_name: Optional[str] = None) -> List[Tuple[str, str, str, str]]:
+    """Return `(server, documented_default, put_waits_for_sync, notes)` for all five servers."""
+    plat = os.name if os_name is None else os_name
+    minio_row = (
+        (
+            "MinIO",
+            "fdatasync_unsupported.go (no-op on Windows)",
+            "No (for > 4 KiB)",
+            "Only files <= 4 KiB open write-through on Windows; 64 KiB and 1 MiB PUTs do not wait for disk sync.",
+        )
+        if plat == "nt"
+        else (
+            "MinIO",
+            "O_DSYNC / fdatasync",
+            "Yes",
+            "Syncs each PUT (O_DSYNC / fdatasync) before returning 200 OK.",
+        )
+    )
+    return [
+        (
+            "AwanFS",
+            "--durability=group (group commit, #29)",
+            "Yes",
+            "Concurrent PUTs share one fsync before 200 OK.",
+        ),
+        minio_row,
+        (
+            "RustFS",
+            "RUSTFS_DURABILITY_MODE=strict",
+            "Yes",
+            "Syncs data, xl.meta, and directories before 200 OK.",
+        ),
+        (
+            "Garage",
+            "metadata_fsync = false, data_fsync = false (LMDB)",
+            "No",
+            "Default single-node config skips fsync on metadata and data blocks (cluster mode relies on replication); client uses AWS SigV4 (UNSIGNED-PAYLOAD).",
+        ),
+        (
+            "SeaweedFS",
+            "weed mini (filer.conf fsync unset / false)",
+            "No",
+            "Default storage rule skips fsync on volume .dat/.idx and filer metadata unless fsync = true is configured.",
+        ),
+    ]
+
+
+def _durability_section_lines(os_name: Optional[str] = None) -> List[str]:
+    lines = [
+        "## Durability Settings",
+        "",
+        "| Server | Documented Single-Node Default | PUT waits for sync? | Notes |",
+        "|---|---|---|---|",
+    ]
+    for srv, default_cfg, waits_sync, note in server_durability_rows(os_name):
+        lines.append(f"| {srv} | {default_cfg} | {waits_sync} | {note} |")
+    lines.append("")
+    return lines
 
 
 _SIZE_RE = re.compile(r"^\s*(\d+)\s*([a-zA-Z]*)\s*$")
@@ -654,6 +797,345 @@ def _start_rustfs(rustfs_bin: Optional[str], mc_bin: Optional[str], n_cores: int
     return proc, port, data, log_path
 
 
+def _free_ports(count: int) -> List[int]:
+    """Allocate `count` distinct ephemeral localhost ports at once."""
+    socks: List[socket.socket] = []
+    ports: List[int] = []
+    try:
+        for _ in range(count):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("127.0.0.1", 0))
+            socks.append(s)
+            ports.append(s.getsockname()[1])
+        return ports
+    finally:
+        for s in socks:
+            s.close()
+
+
+def find_garage_binary() -> Optional[str]:
+    candidates = [
+        os.path.join(REPO_ROOT, ".tmp", "garage", "garage.exe"),
+        os.path.join(REPO_ROOT, ".tmp", "garage", "garage"),
+        shutil.which("garage.exe"),
+        shutil.which("garage"),
+    ]
+    return next((p for p in candidates if p and os.path.isfile(p)), None)
+
+
+def find_seaweedfs_binary() -> Optional[str]:
+    candidates = [
+        os.path.join(REPO_ROOT, ".tmp", "seaweedfs", "weed.exe"),
+        os.path.join(REPO_ROOT, ".tmp", "seaweedfs", "weed"),
+        shutil.which("weed.exe"),
+        shutil.which("weed"),
+    ]
+    return next((p for p in candidates if p and os.path.isfile(p)), None)
+
+
+def garage_config_toml(
+    meta_dir: str,
+    data_dir: str,
+    s3_port: int,
+    rpc_port: int,
+    rpc_secret: str,
+    region: str = "garage",
+) -> str:
+    """Minimal single-node Garage config leaving fsync/db defaults untouched."""
+    meta_posix = meta_dir.replace("\\", "/")
+    data_posix = data_dir.replace("\\", "/")
+    return (
+        f'metadata_dir = "{meta_posix}"\n'
+        f'data_dir = "{data_posix}"\n'
+        f"replication_factor = 1\n"
+        f'rpc_bind_addr = "127.0.0.1:{rpc_port}"\n'
+        f'rpc_public_addr = "127.0.0.1:{rpc_port}"\n'
+        f'rpc_secret = "{rpc_secret}"\n\n'
+        f"[s3_api]\n"
+        f's3_region = "{region}"\n'
+        f'api_bind_addr = "127.0.0.1:{s3_port}"\n'
+    )
+
+
+def _signed_put_ok(host: str, port: int, bucket: str, auth: S3Auth) -> bool:
+    signer = SigV4Signer(auth)
+    path = f"/{bucket}/__harness_probe"
+    headers = signer.sign_headers("PUT", path, f"{host}:{port}", {"Content-Length": "1", "Connection": "close"})
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=5.0)
+        conn.request("PUT", path, body=b"x", headers=headers)
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        return resp.status == 200
+    except Exception:
+        return False
+
+
+def _start_garage(
+    garage_bin: Optional[str],
+    n_cores: int,
+    data_root: str,
+) -> Tuple[subprocess.Popen, int, str, str, S3Auth]:
+    if not garage_bin or not os.path.isfile(garage_bin):
+        if sys.platform == "win32":
+            raise RuntimeError("garage binary not found (upstream releases Linux binaries only)")
+        raise RuntimeError("garage binary not found")
+    data = tempfile.mkdtemp(prefix="scaling_garage_", dir=data_root)
+    meta_dir = os.path.join(data, "meta")
+    blocks_dir = os.path.join(data, "data")
+    os.makedirs(meta_dir, exist_ok=True)
+    os.makedirs(blocks_dir, exist_ok=True)
+    s3_port, rpc_port = _free_ports(2)
+    log_path = os.path.join(data_root, f"scaling_garage_{s3_port}.log")
+    cfg_path = os.path.join(data, "garage.toml")
+    rpc_secret = secrets.token_hex(32)
+    access_key = "GK" + secrets.token_hex(16)
+    secret_key = secrets.token_hex(32)
+    with open(cfg_path, "w", encoding="utf-8") as fh:
+        fh.write(garage_config_toml(meta_dir, blocks_dir, s3_port, rpc_port, rpc_secret))
+    env = dict(
+        os.environ,
+        GARAGE_DEFAULT_ACCESS_KEY=access_key,
+        GARAGE_DEFAULT_SECRET_KEY=secret_key,
+        GARAGE_DEFAULT_BUCKET=BUCKET,
+    )
+    proc = _spawn_pinned(
+        [garage_bin, "-c", cfg_path, "server", "--single-node", "--default-bucket"],
+        n_cores,
+        log_path,
+        env=env,
+    )
+    err = _wait_port(proc, s3_port, timeout=25.0)
+    if err:
+        _stop_proc(proc)
+        tail = _tail_log(log_path)
+        shutil.rmtree(data, ignore_errors=True)
+        raise RuntimeError(f"garage {err}" + (f": {tail}" if tail else ""))
+    auth = S3Auth(access_key=access_key, secret_key=secret_key, region="garage")
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            tail = _tail_log(log_path)
+            shutil.rmtree(data, ignore_errors=True)
+            raise RuntimeError(f"garage exited with code {proc.returncode}" + (f": {tail}" if tail else ""))
+        if _signed_put_ok("127.0.0.1", s3_port, BUCKET, auth):
+            return proc, s3_port, data, log_path, auth
+        time.sleep(0.2)
+    _stop_proc(proc)
+    tail = _tail_log(log_path)
+    shutil.rmtree(data, ignore_errors=True)
+    raise RuntimeError("garage setup failed: signed PUT probe failed" + (f": {tail}" if tail else ""))
+
+
+def seaweedfs_mini_argv(
+    weed_bin: str,
+    data_dir: str,
+    ports: Sequence[int],
+    bucket: str = BUCKET,
+) -> List[str]:
+    if len(ports) != 10:
+        raise ValueError(f"expected 10 ports for weed mini, got {len(ports)}")
+    s3_p, s3_g, m_p, m_g, v_p, v_g, f_p, f_g, a_p, a_g = ports
+    return [
+        weed_bin,
+        "mini",
+        "-dir", data_dir,
+        "-ip", "127.0.0.1",
+        "-ip.bind", "127.0.0.1",
+        "-master.port", str(m_p), "-master.port.grpc", str(m_g),
+        "-volume.port", str(v_p), "-volume.port.grpc", str(v_g),
+        "-filer.port", str(f_p), "-filer.port.grpc", str(f_g),
+        "-s3.port", str(s3_p), "-s3.port.grpc", str(s3_g),
+        "-s3.port.iceberg", "0", "-s3.port.lance", "0",
+        "-admin.port", str(a_p), "-admin.port.grpc", str(a_g), "-admin.port.legacy", "0",
+        "-webdav=false",
+        "-admin.ui=false",
+        "-master.telemetry=false",
+        "-bucket", bucket,
+    ]
+
+
+def _seaweedfs_env(base_env: Dict[str, str]) -> Dict[str, str]:
+    """Strip AWS credential env vars so `weed mini` runs with anonymous S3 access enabled."""
+    env = dict(base_env)
+    for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "S3_BUCKET", "S3_TABLE_BUCKET", "S3_VECTOR_BUCKET"):
+        env.pop(k, None)
+    return env
+
+
+def _start_seaweedfs(weed_bin: Optional[str], n_cores: int, data_root: str) -> Tuple[subprocess.Popen, int, str, str]:
+    if not weed_bin or not os.path.isfile(weed_bin):
+        raise RuntimeError("weed binary not found")
+    data = tempfile.mkdtemp(prefix="scaling_seaweedfs_", dir=data_root)
+    ports = _free_ports(10)
+    s3_port = ports[0]
+    log_path = os.path.join(data_root, f"scaling_seaweedfs_{s3_port}.log")
+    argv = seaweedfs_mini_argv(weed_bin, data, ports, BUCKET)
+    proc = _spawn_pinned(argv, n_cores, log_path, env=_seaweedfs_env(os.environ))
+    err = _wait_port(proc, s3_port, timeout=25.0)
+    if err:
+        _stop_proc(proc)
+        tail = _tail_log(log_path)
+        shutil.rmtree(data, ignore_errors=True)
+        raise RuntimeError(f"seaweedfs {err}" + (f": {tail}" if tail else ""))
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            tail = _tail_log(log_path)
+            shutil.rmtree(data, ignore_errors=True)
+            raise RuntimeError(f"seaweedfs exited with code {proc.returncode}" + (f": {tail}" if tail else ""))
+        if rwb.anonymous_put_ok("127.0.0.1", s3_port, BUCKET):
+            return proc, s3_port, data, log_path
+        time.sleep(0.2)
+    _stop_proc(proc)
+    tail = _tail_log(log_path)
+    shutil.rmtree(data, ignore_errors=True)
+    raise RuntimeError("seaweedfs setup failed: anonymous PUT probe failed" + (f": {tail}" if tail else ""))
+
+
+def _unpack_starter_result(res) -> Tuple[subprocess.Popen, int, str, str, Optional[S3Auth]]:
+    if len(res) == 5:
+        return res
+    proc, port, data_dir, log_path = res
+    return proc, port, data_dir, log_path, None
+
+
+def _make_headers(
+    signer: Optional[SigV4Signer],
+    method: str,
+    path: str,
+    host_header: str,
+    base_headers: Dict[str, str],
+) -> Dict[str, str]:
+    if signer is None:
+        return base_headers
+    return signer.sign_headers(method, path, host_header, base_headers)
+
+
+def _run_signed_workload_phase(
+    host: str,
+    port: int,
+    bucket: str,
+    size: int,
+    concurrency: int,
+    duration_sec: float,
+    mode: str,
+    server_pid: int,
+    shares_cores: bool,
+    auth: S3Auth,
+) -> PointResult:
+    """Equivalent to `rwb.run_workload_phase` for servers requiring SigV4 requests."""
+    signer = SigV4Signer(auth)
+    host_hdr = f"{host}:{port}"
+    pool_keys_per_worker = 4 if size >= MIB else 8
+    payload = deterministic_bytes(size, DEFAULT_SEED)
+    if mode == "get":
+        conn = http.client.HTTPConnection(host, port, timeout=10.0)
+        try:
+            for w in range(concurrency):
+                for k in range(pool_keys_per_worker):
+                    path = f"/{bucket}/worker_{w}_obj_{k}.dat"
+                    hdrs = signer.sign_headers("PUT", path, host_hdr, {"Content-Length": str(size), "Connection": "keep-alive"})
+                    conn.request("PUT", path, body=payload, headers=hdrs)
+                    resp = conn.getresponse()
+                    resp.read()
+                    if resp.status != 200:
+                        return PointResult(reason=f"warm-up PUT HTTP {resp.status}", shares_cores=shares_cores)
+        except Exception as e:
+            return PointResult(reason=f"warm-up failed: {e}", shares_cores=shares_cores)
+        finally:
+            conn.close()
+
+    stop_event = threading.Event()
+    latencies: List[float] = []
+    lat_lock = threading.Lock()
+    errors = 0
+    error_notes: Dict[str, int] = {}
+    metrics_lock = threading.Lock()
+
+    def worker(wid: int):
+        nonlocal errors
+        local_lats: List[float] = []
+        local_errs: Dict[str, int] = {}
+        conn = http.client.HTTPConnection(host, port, timeout=15.0)
+        req_count = 0
+        while not stop_event.is_set():
+            key = f"worker_{wid}_obj_{req_count % pool_keys_per_worker}.dat"
+            req_count += 1
+            path = f"/{bucket}/{key}"
+            t0 = time.perf_counter()
+            try:
+                if mode == "put":
+                    hdrs = signer.sign_headers("PUT", path, host_hdr, {"Content-Length": str(size), "Connection": "keep-alive"})
+                    conn.request("PUT", path, body=payload, headers=hdrs)
+                    resp = conn.getresponse()
+                    resp.read()
+                else:
+                    hdrs = signer.sign_headers("GET", path, host_hdr, {"Connection": "keep-alive"})
+                    conn.request("GET", path, headers=hdrs)
+                    resp = conn.getresponse()
+                    resp.read()
+                t1 = time.perf_counter()
+                if resp.status == 200:
+                    local_lats.append((t1 - t0) * 1000.0)
+                else:
+                    msg = f"HTTP {resp.status}"
+                    local_errs[msg] = local_errs.get(msg, 0) + 1
+            except Exception as e:
+                msg = type(e).__name__
+                local_errs[msg] = local_errs.get(msg, 0) + 1
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = http.client.HTTPConnection(host, port, timeout=15.0)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        with lat_lock:
+            latencies.extend(local_lats)
+        with metrics_lock:
+            for m, cnt in local_errs.items():
+                errors += cnt
+                error_notes[m] = error_notes.get(m, 0) + cnt
+
+    threads = [threading.Thread(target=worker, args=(w,), daemon=True) for w in range(concurrency)]
+    cpu_0 = process_cpu_times_total(server_pid)
+    t_start = time.perf_counter()
+    for t in threads:
+        t.start()
+    time.sleep(duration_sec)
+    stop_event.set()
+    stuck = rwb.join_all(threads, f"{mode} {size}B c={concurrency}", timeout_sec=max(20.0, duration_sec * 10.0))
+    t_total = time.perf_counter() - t_start
+    cpu_1 = process_cpu_times_total(server_pid)
+    if stuck or errors > 0 or not latencies or t_total <= 0:
+        reasons = []
+        if errors > 0:
+            summary = ", ".join(f"{k} x{v}" for k, v in sorted(error_notes.items()))
+            reasons.append(f"{errors} failed ({summary})")
+        if stuck:
+            reasons.append(f"{stuck} stuck workers")
+        if not latencies and not reasons:
+            reasons.append("no requests completed")
+        return PointResult(reason="; ".join(reasons), shares_cores=shares_cores)
+
+    ops_per_sec = len(latencies) / t_total
+    p50, _p90, p99, _p999 = rwb.calculate_percentiles(latencies)
+    pct = cpu_percent(cpu_0, cpu_1, t_total)
+    eff = ops_per_busy_core(ops_per_sec, pct)
+    return PointResult(
+        ops_per_sec=ops_per_sec,
+        p50_ms=p50,
+        p99_ms=p99,
+        cpu_pct=pct,
+        ops_per_busy_core=eff,
+        shares_cores=shares_cores,
+    )
+
+
 def _run_phase_with_cpu(
     host: str,
     port: int,
@@ -664,8 +1146,13 @@ def _run_phase_with_cpu(
     mode: str,
     server_pid: int,
     shares_cores: bool,
+    auth: Optional[S3Auth] = None,
 ) -> PointResult:
-    """Runs `run_workload_phase` and measures server CPU time (children included) over its timed window."""
+    """Runs `run_workload_phase` (or signed equivalent) and measures server CPU time over its timed window."""
+    if auth is not None:
+        return _run_signed_workload_phase(
+            host, port, bucket, size, concurrency, duration_sec, mode, server_pid, shares_cores, auth
+        )
     samples: List[Tuple[float, Tuple[float, float]]] = []
     orig_cpu_fn = rwb.get_process_cpu_times
 
@@ -705,7 +1192,7 @@ def _run_phase_with_cpu(
 
 def measure_server_for_cores(
     server_name: str,
-    starter: Callable[[], Tuple[subprocess.Popen, int, str, str]],
+    starter: Callable[[], Tuple],
     n_cores: int,
     cli_cores: Sequence[int],
     shares_cores: bool,
@@ -714,7 +1201,7 @@ def measure_server_for_cores(
 ) -> Dict[str, PointResult]:
     """Starts one server, pins the load generator to `cli_cores`, runs all workloads, cleans up."""
     try:
-        proc, port, data_dir, log_path = starter()
+        proc, port, data_dir, log_path, auth = _unpack_starter_result(starter())
     except Exception as e:
         reason = str(e).strip() or f"{server_name} failed to start"
         return {wkey: PointResult(reason=reason, shares_cores=shares_cores) for wkey, *_ in workloads}
@@ -726,7 +1213,7 @@ def measure_server_for_cores(
         for wkey, label, mode, size in workloads:
             print(f"    {server_name} N={n_cores} (c={concurrency}): {label}...", flush=True)
             out[wkey] = _run_phase_with_cpu(
-                "127.0.0.1", port, BUCKET, size, concurrency, duration_sec, mode, proc.pid, shares_cores
+                "127.0.0.1", port, BUCKET, size, concurrency, duration_sec, mode, proc.pid, shares_cores, auth=auth
             )
     finally:
         _stop_proc(proc)
@@ -904,16 +1391,19 @@ def render_report(
     lines = [
         f"Command: `{cmd}`",
         "",
-        f"# Core Scaling Benchmark: AwanFS vs MinIO vs RustFS ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
+        f"# Core Scaling Benchmark: AwanFS vs MinIO vs RustFS vs Garage vs SeaweedFS ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
         "",
         f"- **Machine:** {platform.node()} ({platform.platform()}, {total_cores} logical cores, {rwb.host_ram_gb()} GB RAM, CPU: {rwb.cpu_model()})",
         f"- **Methodology:** `cores = {', '.join(str(n) for n in cores)}`, `concurrency = 16 × N`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase.",
         f"- **Core pinning:** {sharing_note}",
-        f"- **Durability:** AwanFS group commit (#29). {rwb.minio_durability_note()} {probe_note}",
-        "",
-        "## Throughput and Latency (`ops/s (P50, P99 ms)`)",
+        f"- **Durability:** AwanFS group commit (#29). {rwb.minio_durability_note()} RustFS strict fsync (`RUSTFS_DURABILITY_MODE=strict`). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default. {probe_note}",
         "",
     ]
+    lines.extend(_durability_section_lines())
+    lines.extend([
+        "## Throughput and Latency (`ops/s (P50, P99 ms)`)",
+        "",
+    ])
 
     core_headers = [f"{n} core" if n == 1 else f"{n} cores" for n in cores]
     lines.append("| Workload | Size | Server | " + " | ".join(core_headers) + f" | Scaling ({max_n}/1) |")
@@ -980,12 +1470,15 @@ def _prefill_server(
     patterns: Sequence[str],
     sizes: Sequence[int],
     timeout_sec: float = 120.0,
+    auth: Optional[S3Auth] = None,
 ) -> Optional[str]:
     """Writes identical deterministic prefill data before timing read/overwrite phases."""
     need_4k = any(p in ("seq-read", "rand-read") for p in patterns) and any(s < MIB for s in sizes)
     need_large = any(p in ("seq-read", "rand-read") for p in patterns) and any(s >= MIB for s in sizes)
     need_rand_write = "rand-write" in patterns
     deadline = time.perf_counter() + timeout_sec
+    signer = SigV4Signer(auth) if auth is not None else None
+    host_hdr = f"{host}:{port}"
 
     if need_4k:
         prefill_count = max(1, prefill_bytes // (4 * KIB))
@@ -1007,7 +1500,9 @@ def _prefill_server(
                         i = next_idx
                         next_idx += 1
                     try:
-                        conn.request("PUT", f"/{bucket}/prefill_4k/{i:06d}", body=payload_4k, headers=headers)
+                        path = f"/{bucket}/prefill_4k/{i:06d}"
+                        req_hdrs = _make_headers(signer, "PUT", path, host_hdr, headers)
+                        conn.request("PUT", path, body=payload_4k, headers=req_hdrs)
                         resp = conn.getresponse()
                         resp.read()
                         if resp.status != 200:
@@ -1038,12 +1533,11 @@ def _prefill_server(
         large_payload = deterministic_bytes(prefill_bytes, seed + 1)
         conn = http.client.HTTPConnection(host, port, timeout=max(30.0, timeout_sec))
         try:
-            conn.request(
-                "PUT",
-                f"/{bucket}/prefill_large/seq_obj.bin",
-                body=large_payload,
-                headers={"Content-Length": str(len(large_payload)), "Connection": "close"},
+            path = f"/{bucket}/prefill_large/seq_obj.bin"
+            req_hdrs = _make_headers(
+                signer, "PUT", path, host_hdr, {"Content-Length": str(len(large_payload)), "Connection": "close"}
             )
+            conn.request("PUT", path, body=large_payload, headers=req_hdrs)
             resp = conn.getresponse()
             resp.read()
             if resp.status != 200:
@@ -1063,7 +1557,9 @@ def _prefill_server(
                 for i in range(ks):
                     if time.perf_counter() > deadline:
                         return f"prefill rand-write timed out ({i}/{ks})"
-                    conn.request("PUT", f"/{bucket}/rand/{i:06d}", body=payload, headers=headers)
+                    path = f"/{bucket}/rand/{i:06d}"
+                    req_hdrs = _make_headers(signer, "PUT", path, host_hdr, headers)
+                    conn.request("PUT", path, body=payload, headers=req_hdrs)
                     resp = conn.getresponse()
                     resp.read()
                     if resp.status != 200:
@@ -1088,6 +1584,7 @@ def _run_pattern_phase_with_cpu(
     prefill_bytes: int,
     server_pid: int,
     shares_cores: bool,
+    auth: Optional[S3Auth] = None,
 ) -> PointResult:
     """Runs one `(pattern, size, concurrency)` phase and measures server CPU % over its timed window."""
     prefill_count = max(1, prefill_bytes // (4 * KIB))
@@ -1106,6 +1603,8 @@ def _run_pattern_phase_with_cpu(
     errors = 0
     error_notes: Dict[str, int] = {}
     metrics_lock = threading.Lock()
+    signer = SigV4Signer(auth) if auth is not None else None
+    host_hdr = f"{host}:{port}"
 
     def worker():
         nonlocal total_bytes, errors
@@ -1122,7 +1621,8 @@ def _run_pattern_phase_with_cpu(
             t0 = time.perf_counter()
             try:
                 if spec.method == "PUT":
-                    conn.request("PUT", path, body=put_payload, headers=put_headers)
+                    req_hdrs = _make_headers(signer, "PUT", path, host_hdr, put_headers)
+                    conn.request("PUT", path, body=put_payload, headers=req_hdrs)
                     resp = conn.getresponse()
                     resp.read()
                     ok = resp.status == 200
@@ -1132,7 +1632,13 @@ def _run_pattern_phase_with_cpu(
                         msg = f"HTTP {resp.status}"
                         local_errs[msg] = local_errs.get(msg, 0) + 1
                 elif spec.range_start is not None and spec.range_end is not None:
-                    hdrs = {"Connection": "keep-alive", "Range": f"bytes={spec.range_start}-{spec.range_end}"}
+                    hdrs = _make_headers(
+                        signer,
+                        "GET",
+                        path,
+                        host_hdr,
+                        {"Connection": "keep-alive", "Range": f"bytes={spec.range_start}-{spec.range_end}"},
+                    )
                     conn.request("GET", path, headers=hdrs)
                     resp = conn.getresponse()
                     data = resp.read()
@@ -1153,7 +1659,8 @@ def _run_pattern_phase_with_cpu(
                         msg = f"HTTP {resp.status}"
                         local_errs[msg] = local_errs.get(msg, 0) + 1
                 else:
-                    conn.request("GET", path, headers=get_headers)
+                    req_hdrs = _make_headers(signer, "GET", path, host_hdr, get_headers)
+                    conn.request("GET", path, headers=req_hdrs)
                     resp = conn.getresponse()
                     data = resp.read()
                     ok = resp.status == 200
@@ -1227,7 +1734,7 @@ def _run_pattern_phase_with_cpu(
 
 def measure_server_matrix_for_cores(
     server_name: str,
-    starter: Callable[[], Tuple[subprocess.Popen, int, str, str]],
+    starter: Callable[[], Tuple],
     n_cores: int,
     cli_cores: Sequence[int],
     shares_cores: bool,
@@ -1241,7 +1748,7 @@ def measure_server_matrix_for_cores(
     """Starts one server, prefills reads once, runs the `(pattern, size, concurrency)` sweep, cleans up."""
     all_keys = [(pat, sz, c) for pat in patterns for sz in sizes for c in concurrencies]
     try:
-        proc, port, data_dir, log_path = starter()
+        proc, port, data_dir, log_path, auth = _unpack_starter_result(starter())
     except Exception as e:
         reason = str(e).strip() or f"{server_name} failed to start"
         return {k: PointResult(reason=reason, shares_cores=shares_cores) for k in all_keys}
@@ -1250,7 +1757,7 @@ def measure_server_matrix_for_cores(
     try:
         pin_process(os.getpid(), cli_cores)
         print(f"    {server_name} N={n_cores}: prefilling {format_size(prefill_bytes)}...", flush=True)
-        prefill_err = _prefill_server("127.0.0.1", port, BUCKET, seed, prefill_bytes, patterns, sizes)
+        prefill_err = _prefill_server("127.0.0.1", port, BUCKET, seed, prefill_bytes, patterns, sizes, auth=auth)
         if prefill_err:
             print(f"    {server_name} N={n_cores}: prefill failed: {prefill_err}", flush=True)
             for k in all_keys:
@@ -1273,6 +1780,7 @@ def measure_server_matrix_for_cores(
                         prefill_bytes,
                         proc.pid,
                         shares_cores,
+                        auth=auth,
                     )
     finally:
         _stop_proc(proc)
@@ -1367,7 +1875,7 @@ def write_matrix_charts(
     for pat in patterns:
         for sz in sizes:
             sz_lbl = format_size(sz)
-            fig, axes = plt.subplots(2, len(SERVERS), figsize=(15, 7.6))
+            fig, axes = plt.subplots(2, len(SERVERS), figsize=(max(15.0, 4.0 * len(SERVERS)), 7.6))
             row_metrics = [
                 ("ops/s", "ops_per_sec"),
                 ("P99 latency (ms)", "p99_ms"),
@@ -1470,7 +1978,7 @@ def write_matrix_charts(
     if len(sizes) == 1:
         axes_s = [axes_s]
     x_pos = list(range(len(patterns)))
-    bar_w = 0.24
+    bar_w = min(0.24, 0.8 / max(1, len(SERVERS)))
     for ax, sz in zip(axes_s, sizes):
         for s_idx, srv in enumerate(SERVERS):
             st = SERVER_STYLES[srv]
@@ -1544,19 +2052,22 @@ def render_matrix_report(
     lines = [
         f"Command: `{cmd}`",
         "",
-        f"# Pattern & Concurrency Scaling Benchmark: AwanFS vs MinIO vs RustFS ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
+        f"# Pattern & Concurrency Scaling Benchmark: AwanFS vs MinIO vs RustFS vs Garage vs SeaweedFS ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
         "",
         f"- **Machine:** {platform.node()} ({platform.platform()}, {total_cores} logical cores, {rwb.host_ram_gb()} GB RAM, CPU: {rwb.cpu_model()})",
         f"- **Methodology:** `patterns = {', '.join(patterns)}`, `sizes = {', '.join(format_size(s) for s in sizes)}`, `cores = {', '.join(str(n) for n in cores)}`, `concurrencies = {', '.join(str(c) for c in concurrencies)}`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase, seed = `{seed}`.",
         f"- **Cache & Prefill:** AwanFS `--memory-budget {format_size(budget_bytes)}` (stated cache half = {format_size(cache_bytes)}). Read prefill size = {format_size(prefill_bytes)} ({prefill_bytes // (4 * KIB):,} x 4 KiB objects + 1 x {format_size(prefill_bytes)} large object for range GETs), identical deterministic bytes for every server, written before timing.",
         f"- **Core pinning:** {sharing_note}",
-        f"- **Durability:** AwanFS group commit (#29). {rwb.minio_durability_note()}",
+        f"- **Durability:** AwanFS group commit (#29). {rwb.minio_durability_note()} RustFS strict fsync (`RUSTFS_DURABILITY_MODE=strict`). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default.",
         "",
+    ]
+    lines.extend(_durability_section_lines())
+    lines.extend([
         "## All Measured Points",
         "",
         "| Server | Pattern | Size | Cores | Concurrency | ops/s | MiB/s | P50 (ms) | P99 (ms) | CPU % |",
         "|---|---|---|---|---|---|---|---|---|---|",
-    ]
+    ])
 
     for srv in SERVERS:
         for pat in patterns:
@@ -1592,6 +2103,31 @@ def _default_awanfs_bin() -> Optional[str]:
     return p if os.path.isfile(p) else None
 
 
+def _starter_for(
+    srv: str,
+    n: int,
+    data_root: str,
+    awanfs_bin: Optional[str],
+    minio_bin: Optional[str],
+    mc_bin: Optional[str],
+    rustfs_bin: Optional[str],
+    garage_bin: Optional[str],
+    seaweedfs_bin: Optional[str],
+    memory_budget: Optional[str] = None,
+) -> Callable[[], Tuple]:
+    if srv == "AwanFS":
+        return lambda: _start_awanfs(awanfs_bin, n, data_root, memory_budget=memory_budget)
+    if srv == "MinIO":
+        return lambda: _start_minio(minio_bin, mc_bin, n, data_root)
+    if srv == "RustFS":
+        return lambda: _start_rustfs(rustfs_bin, mc_bin, n, data_root)
+    if srv == "Garage":
+        return lambda: _start_garage(garage_bin, n, data_root)
+    if srv == "SeaweedFS":
+        return lambda: _start_seaweedfs(seaweedfs_bin, n, data_root)
+    raise ValueError(f"unknown server {srv!r}")
+
+
 def _run_matrix_mode(
     a: argparse.Namespace,
     cmd: str,
@@ -1602,6 +2138,8 @@ def _run_matrix_mode(
     minio_bin: Optional[str],
     mc_bin: Optional[str],
     rustfs_bin: Optional[str],
+    garage_bin: Optional[str],
+    seaweedfs_bin: Optional[str],
 ) -> int:
     patterns = parse_patterns(a.pattern)
     sizes = parse_sizes(a.sizes)
@@ -1643,12 +2181,10 @@ def _run_matrix_mode(
                         f"(client cores={cli_cores}, shares={shares})...",
                         flush=True,
                     )
-                    if srv == "AwanFS":
-                        starter = lambda n=n: _start_awanfs(awanfs_bin, n, data_root, memory_budget=a.memory_budget)
-                    elif srv == "MinIO":
-                        starter = lambda n=n: _start_minio(minio_bin, mc_bin, n, data_root)
-                    else:
-                        starter = lambda n=n: _start_rustfs(rustfs_bin, mc_bin, n, data_root)
+                    starter = _starter_for(
+                        srv, n, data_root, awanfs_bin, minio_bin, mc_bin, rustfs_bin,
+                        garage_bin, seaweedfs_bin, memory_budget=a.memory_budget,
+                    )
 
                     phase_map = measure_server_matrix_for_cores(
                         server_name=srv,
@@ -1729,6 +2265,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--minio-bin", default="", help="Path to MinIO binary")
     ap.add_argument("--mc-bin", default="", help="Path to MinIO mc binary")
     ap.add_argument("--rustfs-bin", default="", help="Path to RustFS binary")
+    ap.add_argument("--garage-bin", default="", help="Path to Garage binary")
+    ap.add_argument("--seaweedfs-bin", default="", help="Path to SeaweedFS weed binary")
     ap.add_argument("--data-dir", default="", help="Directory for temporary server data and sync_probe (defaults to temp dir)")
     ap.add_argument("--skip-sync-probe", action="store_true", help="Skip disk sync_probe MAX baseline")
     ap.add_argument("--output", "--report", dest="output", default="core_scaling.md",
@@ -1748,6 +2286,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     minio_bin = a.minio_bin or auto_minio
     mc_bin = a.mc_bin or auto_mc
     rustfs_bin = a.rustfs_bin or rwb.find_rustfs_binary()
+    garage_bin = a.garage_bin or find_garage_binary()
+    seaweedfs_bin = a.seaweedfs_bin or find_seaweedfs_binary()
 
     if a.matrix or a.pattern or a.sizes or a.concurrencies:
         return _run_matrix_mode(
@@ -1760,6 +2300,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             minio_bin=minio_bin,
             mc_bin=mc_bin,
             rustfs_bin=rustfs_bin,
+            garage_bin=garage_bin,
+            seaweedfs_bin=seaweedfs_bin,
         )
 
     orig_affinity = get_process_affinity(os.getpid())
@@ -1790,12 +2332,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 order = server_order_for_run(run_idx, SERVERS)
                 for srv in order:
                     print(f"[N={n}, run {run_idx + 1}/{a.runs}] Starting {srv} (client cores={cli_cores}, shares={shares})...", flush=True)
-                    if srv == "AwanFS":
-                        starter = lambda n=n: _start_awanfs(awanfs_bin, n, data_root)
-                    elif srv == "MinIO":
-                        starter = lambda n=n: _start_minio(minio_bin, mc_bin, n, data_root)
-                    else:
-                        starter = lambda n=n: _start_rustfs(rustfs_bin, mc_bin, n, data_root)
+                    starter = _starter_for(
+                        srv, n, data_root, awanfs_bin, minio_bin, mc_bin, rustfs_bin,
+                        garage_bin, seaweedfs_bin,
+                    )
 
                     phase_map = measure_server_for_cores(srv, starter, n, cli_cores, shares, a.duration)
                     for wkey, pt in phase_map.items():
