@@ -16,6 +16,7 @@ decisions are numbered in [`ARCHITECTURE.md`](ARCHITECTURE.md); stored bytes are
 - Work only on issues labelled `ready:antigravity` with no `wip:` label. An empty queue means stop and say so.
 - An issue blocked by another (GitHub's "blocked by" link, or a first line "Blocked by #N") waits until #N is closed.
 - Never start an issue labelled `outline` or `needs-decision`.
+- **An owner decision is a comment the owner wrote on the issue** (owner, 2026-11-19). Cite it by its link. A decision given anywhere else (a chat, a task file) is not one until the owner posts it there: stop with `needs-decision` and the options instead. On 2026-11-18 three evidence comments cited an "owner decision" that was on no issue, and two of them set aside a failing gate test.
 - **A gate line is checked on the PR** (owner, 2026-11-17). Whoever writes an issue writes each gate line as something the PR's checks or a command run on its branch can show, before merge: never "the nightly run shows". A conformance gate names its tests (must pass, and owned elsewhere with the owning issue), as `CONFORMANCE_DESIGN.md` 6.1 says. A gate line the builder cannot check on the PR is a reason to stop and ask, not to skip it.
 - These need Claude or the owner, even when an issue seems to ask for them. Stop with `needs-decision` and say which:
   - stored bytes in volumes: the needle header, the journal, the volume format (`FORMAT.md`). A bucket manifest record is allowed when the issue gives its exact text and its gate has restart and replay tests;
@@ -69,6 +70,6 @@ function; they do not decide transitions.
 - **A measurement file starts with the command that produced it**, and its numbers are that command's output. A number nobody measured is written "not measured". Benchmark jobs write to their own paths, never over a file in `measurements/` (`scripts/check_workflow_outputs.py`).
 - **Windows runners have two disks.** Python's temp directory is on C:, where a flush takes 3.9 ms; the runner's temp directory is on D:, where one takes 0.09 ms. Benchmarks put data under `runner.temp`.
 - **In `scripts/verify_drive.sh`, `A && local x; x=... && B` is two lists:** a failure in A is masked. The script refuses that pattern at startup.
-- **MinIO does not flush PUTs on Windows** (its fdatasync is a no-op there). Its Windows PUT rows are not durable writes.
+- **MinIO does not flush PUTs on Windows** (its fdatasync is a no-op there). Its Windows PUT rows are not durable writes. They are never a target: a Windows gate "at or above MinIO" compares with servers that sync their writes (RustFS) and notes MinIO's row (owner, 2026-11-19, #57).
 - **The laptop's checkout has the self-hosted runner inside it** (`actions-runner/`, with its credentials and private key). It is in `.gitignore`; still stage files by name, never with `git add -A` or `git add .`.
 - **This repository's workflows run under PowerShell on the self-hosted runner.** Use python for file work in steps without `shell: bash`.

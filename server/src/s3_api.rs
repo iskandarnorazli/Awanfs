@@ -485,7 +485,30 @@ pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarge
 /// Decodes %XX in a URL path. Unlike query decoding, `+` stays `+`. S3 object keys are the
 /// decoded path: a client sends "my%20file.txt" for the key "my file.txt". Keys used to be
 /// stored as sent, encoded.
-pub fn percent_decode_path(s: &str) -> String {
+/// Returns the raw (still percent-encoded) object key slice from the request URI path, if any.
+pub fn raw_s3_key<'a>(uri_path: &'a str, host_header: Option<&str>) -> Option<&'a str> {
+    let raw_path = uri_path.split('?').next().unwrap_or(uri_path);
+    let trimmed_path = raw_path.trim_start_matches('/');
+    if let Some(host) = host_header {
+        let host_no_port = host.split(':').next().unwrap_or(host);
+        for base in &["s3.localhost", "localhost", "s3.internal", "s3.amazonaws.com", "127.0.0.1"] {
+            if let Some(prefix) = host_no_port.strip_suffix(base).and_then(|p| p.strip_suffix('.')) {
+                if !prefix.is_empty() && !prefix.contains('.') && !prefix.contains('/') {
+                    return if trimmed_path.is_empty() { None } else { Some(trimmed_path) };
+                }
+            }
+        }
+    }
+    if trimmed_path.is_empty() {
+        return None;
+    }
+    let mut parts = trimmed_path.splitn(2, '/');
+    let _bucket = parts.next();
+    parts.next()
+}
+
+/// Decodes `%XX` in a URL path into raw bytes. Unlike query decoding, `+` stays `+`.
+pub fn percent_decode_path_bytes(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -500,6 +523,11 @@ pub fn percent_decode_path(s: &str) -> String {
         out.push(b[i]);
         i += 1;
     }
+    out
+}
+
+pub fn percent_decode_path(s: &str) -> String {
+    let out = percent_decode_path_bytes(s);
     String::from_utf8_lossy(&out).into_owned()
 }
 

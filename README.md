@@ -13,7 +13,7 @@ Split from `awan-lang/awan-storage` on 2026-11-12, with its git history. Measure
 Read this before you run it anywhere that matters. Plan of record: the Phase 1-4 milestones and [`ROADMAP_AND_DEPENDENCIES.md`](ROADMAP_AND_DEPENDENCIES.md); decisions in [`ARCHITECTURE.md`](ARCHITECTURE.md#0-decisions-2026-11-12); on-disk format in [`FORMAT.md`](FORMAT.md).
 
 - **Access:** SigV4 with a root key from the environment, plus users with IAM-style JSON policies in a TOML file (`--config`, #53). The server listens on 127.0.0.1 by default. HTTPS with `--cert`/`--key`, reloaded when the files change (#30).
-- **Durability:** writes are synced before the 200 by default (`group` durability, #29). The benchmark numbers below were taken before that change and will be re-run.
+- **Durability:** writes are synced before the 200 by default (`group` durability, #29). The 16-core laptop benchmarks below were re-run with `group`, `strict`, and `fast` durability ([`measurements/2026-11-18-market-claims.md`](measurements/2026-11-18-market-claims.md)).
 - **Volumes** of 32 GiB, rolled over when full (#37), compacted in the background when at least 20 % is dead (#14), at most 50 MB/s (`--compaction-rate`, #28).
 - **Bodies:** a PUT or UploadPart above 4 MiB streams to disk, `aws-chunked` included (#36); bodies above 5 GiB get 400 `EntityTooLarge` before they are read. Multipart GETs stream part by part.
 - **Observability:** request logs with request IDs; OTLP/HTTP traces with `--otlp-endpoint` (#43).
@@ -79,29 +79,29 @@ Peak RSS over the six workloads: AwanFS 117 MiB, MinIO 560 MiB (both include rec
 
 The nightly full matrix adds RustFS, latency percentiles and a concurrency sweep, on both Linux and Windows runners, one 2 s run per phase ([`measurements/2026-11-14-ci-full-matrix.md`](measurements/2026-11-14-ci-full-matrix.md)).
 
-### Earlier laptop run (2026-11-11, before durable PUTs)
+### 16-Core Laptop Benchmark (2026-11-18, durable writes & 3-run spread)
 
-> **Provisional.** These are real measurements from one laptop run, but they do not yet support a general "faster than MinIO" claim: PUT rows compare an unsynced AwanFS write with MinIO's synced one, the data set fits in memory, each phase ran 2 s once, and MinIO and RustFS ran in single-drive default setups. #58 tracks the benchmark that would support or refute the claim. The nightly CI runs (`.github/workflows/bench-full.yml`, `bench-ratio.yml`) track regressions.
+Measured live on `LAPTOP-6RBIQUM5` (AMD64, 16 logical cores, 31.4 GB RAM, Windows 11; server pinned to cores `0..3` / `0x0F`, client pinned to cores `4..7` / `0xF0`), 3 alternating rounds of 30.0s per phase, reporting `median (min..max)` ([`measurements/2026-11-18-market-claims.md`](measurements/2026-11-18-market-claims.md), GitHub Actions run `44312933524`).
 
-Measured live on physical AMD64 NVMe storage (16 logical cores, 32 GB RAM, Windows 11) using persistent HTTP/1.1 keep-alive connections across 64 concurrent client workers (`python benchmarks/run_warp_benchmark.py`):
+- **Durability & competitor setups:** AwanFS ran in `--durability=group` (default, shared group commit sync), `--durability=strict` (per-write sync), and `--durability=fast` (NO-SYNC, ~1s background flush). MinIO (`RELEASE.2025-09-07T16-13-09Z`) ran as a 4-directory erasure set (`minio server dir1..dir4`); on Windows its `fdatasync` is a no-op for objects >4 KiB, so its PUT and mixed rows there are not durable writes and are not like for like. RustFS (`1.0.5`) ran in its single-drive release default (sync not independently probed).
+- **MinIO `warp` client:** measured on MinIO and RustFS (`warp.exe`); `not measured` on AwanFS (`Error preparing server: The requested sub-resource is not implemented.`).
 
-| Workload | `s3-server` (`--release`) | MinIO Reference (`RELEASE.2025-09-07`) | RustFS Reference (`v1.0.5`) | Speedup vs MinIO (provisional) |
-| :--- | :---: | :---: | :---: | :---: |
-| **64 KiB PUT (Single Object)** | **349.4 MiB/s (5,590 ops/s)** | 8.5 MiB/s (136 ops/s) | 9.4 MiB/s (150 ops/s) | **41.1x faster** (P50 = 10.1 ms) (not durable, see note) |
-| **64 KiB GET (Single Object)** | **339.1 MiB/s (5,425 ops/s)** | 225.6 MiB/s (3,610 ops/s) | 256.4 MiB/s (4,102 ops/s) | **1.50x faster** (P50 = 10.6 ms) |
-| **64 KiB Mixed (80% GET / 20% PUT)** | **310.1 MiB/s (4,962 ops/s)** | 37.9 MiB/s (606 ops/s) | 40.0 MiB/s (641 ops/s) | **8.18x faster** (P99 = 41.1 ms) (not durable, see note) |
-| **64 KiB Range GET (bytes=0-4095)** | **23.1 MiB/s (5,907 ops/s)** | 14.1 MiB/s (3,612 ops/s) | 17.1 MiB/s (4,377 ops/s) | **1.64x faster** (P50 = 9.1 ms) |
-| **1 MiB PUT (Single Object)** | **737.3 MiB/s (737 ops/s)** | 126.3 MiB/s (126 ops/s) | 65.0 MiB/s (65 ops/s) | **5.84x faster** (P50 = 40.6 ms) (not durable, see note) |
-| **1 MiB GET (Single Object)** | **2,165.6 MiB/s** | 1,307.7 MiB/s | 773.7 MiB/s | **1.65x faster** (P50 = 14.1 ms) |
-| **1 MiB Mixed (80% GET / 20% PUT)** | **1,734.5 MiB/s** | 481.0 MiB/s | 305.4 MiB/s | **3.61x faster** (P50 = 17.3 ms) (not durable, see note) |
-| **1 GiB Multipart Upload (16 x 64 MiB parts)** | 628.2 MiB/s | **848.1 MiB/s** | 453.9 MiB/s | **0.74x (slower)** (P50 = 841.9 ms) |
-| **1 GiB Multipart Range GET (16 parallel ranges)** | 1,119.3 MiB/s | **1,252.3 MiB/s** | 879.1 MiB/s | **0.89x (slower)** (P50 = 401.1 ms) |
-| **10 GiB Volume PUT (160 x 64 MiB parts)** | 140.3 MiB/s | 154.9 MiB/s | **253.2 MiB/s** | **0.91x (slower)** (P50 = 1,875.9 ms) |
-| **10 GiB Volume Parallel GET** | **1,412.7 MiB/s** | 1,149.2 MiB/s | 834.8 MiB/s | **1.23x faster** (P50 = 354.7 ms) |
-| **Concurrency Scaling (C = 128)** | **324.1 MiB/s** (P99 = 60.0 ms) | 37.8 MiB/s (P99 = 1,239.4 ms) | 39.4 MiB/s (P99 = 959.0 ms) | **8.57x faster (20x lower P99)** (not durable, see note) |
-| **Server Peak RAM (Working Set)** | **Bounded ~245 MB (64K-1M)** | ~936 MB (Go GC Heap) | ~172 MB (Rust jemalloc) | **3.8x lower RAM vs MinIO** |
+| Workload (http client) | AwanFS `group` (default, durable) | AwanFS `strict` (per-write sync) | AwanFS `fast` (NO-SYNC) | MinIO (4-dir erasure) | RustFS (`1.0.5`) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **64 KiB PUT (c=64)** | 203.8 (156.9..205.2) MiB/s<br>3260.4 (2511.1..3282.5) ops/s | 102.7 (102.1..105.9) MiB/s<br>1643.7 (1633.7..1693.8) ops/s | 242.7 (148.7..248.4) MiB/s<br>3883.6 (2379.6..3974.4) ops/s | 2.7 (2.6..2.8) MiB/s<br>43.6 (41.1..44.7) ops/s<br>(`warp`: 10.3 (9.6..10.3) MiB/s) | 8.3 (8.3..8.4) MiB/s<br>132.6 (132.5..135.2) ops/s<br>(`warp`: 17.3 (17.0..18.1) MiB/s) |
+| **64 KiB GET (default cache)** | 305.8 (305.3..307.5) MiB/s<br>4892.1 (4885.6..4919.5) ops/s | 294.2 (283.5..299.7) MiB/s<br>4707.1 (4535.7..4794.6) ops/s | 300.2 (299.9..302.0) MiB/s<br>4803.3 (4797.7..4831.8) ops/s | 92.3 (77.7..93.4) MiB/s<br>1476.9 (1243.1..1494.3) ops/s<br>(`warp`: 88.7 (84.1..90.1) MiB/s) | 265.8 (261.5..271.2) MiB/s<br>4252.4 (4183.4..4339.7) ops/s<br>(`warp`: 545.6 (526.3..547.2) MiB/s) |
+| **64 KiB Cold GET (`16MiB` budget, >6 MiB cache)** | 294.9 (281.9..298.9) MiB/s<br>4718.6 (4510.6..4782.1) ops/s | 285.9 (285.4..295.2) MiB/s<br>4573.9 (4566.2..4724.0) ops/s | 293.3 (292.5..299.8) MiB/s<br>4692.2 (4680.3..4796.5) ops/s | 86.7 (85.2..91.3) MiB/s<br>1387.3 (1363.1..1460.5) ops/s | 262.1 (252.3..266.8) MiB/s<br>4194.2 (4037.1..4269.0) ops/s |
+| **64 KiB Mixed 80/20** | 269.2 (265.4..270.7) MiB/s<br>4306.5 (4247.1..4331.6) ops/s | 263.3 (252.8..265.5) MiB/s<br>4212.4 (4045.4..4248.0) ops/s | 288.9 (286.1..294.8) MiB/s<br>4622.3 (4578.0..4717.6) ops/s | 12.2 (10.5..12.5) MiB/s<br>195.9 (168.4..200.2) ops/s<br>(`warp`: 34.0 (31.6..34.5) MiB/s) | 36.8 (36.4..38.2) MiB/s<br>588.1 (581.9..611.3) ops/s<br>(`warp`: 64.1 (62.7..65.0) MiB/s) |
+| **64 KiB Range GET (4 KiB)** | 19.9 (19.8..20.0) MiB/s<br>5104.4 (5066.3..5130.1) ops/s | 19.4 (18.5..19.4) MiB/s<br>4962.6 (4748.1..4972.7) ops/s | 19.7 (19.5..19.9) MiB/s<br>5037.6 (4999.0..5082.5) ops/s | 6.1 (5.8..6.2) MiB/s<br>1559.2 (1488.1..1575.6) ops/s | 16.8 (16.7..17.1) MiB/s<br>4305.7 (4268.4..4369.0) ops/s |
+| **1 MiB PUT** | 200.1 (170.4..223.7) MiB/s | 254.6 (84.5..274.3) MiB/s | 201.0 (192.6..208.7) MiB/s | 30.0 (26.9..30.2) MiB/s | 67.5 (65.2..67.6) MiB/s |
+| **1 MiB GET (default cache)** | 1664.0 (1605.4..1805.7) MiB/s | 1718.3 (1647.9..1755.2) MiB/s | 1706.6 (1644.6..1766.7) MiB/s | 861.0 (775.3..864.8) MiB/s | 735.4 (689.3..738.5) MiB/s |
+| **1 MiB Cold GET (`16MiB` budget, >6 MiB cache)** | 1404.6 (1370.9..1448.4) MiB/s | 1473.9 (1429.8..1486.3) MiB/s | 1473.2 (1434.7..1477.7) MiB/s | 815.7 (813.8..824.7) MiB/s | 731.8 (701.0..737.9) MiB/s |
+| **LIST 1,000 keys (`ListObjectsV2`)** | 141.5 (134.4..143.4) MiB/s<br>633.4 (601.5..642.0) ops/s | 135.8 (130.7..139.7) MiB/s<br>607.7 (585.0..625.3) ops/s | 138.6 (137.8..141.1) MiB/s<br>620.4 (616.7..631.7) ops/s | 0.5 (0.4..0.5) MiB/s<br>2.2 (2.1..2.3) ops/s<br>(`warp`: 34.5 (33.9..34.5) ops/s) | 1.4 (1.4..1.4) MiB/s<br>7.2 (7.1..7.3) ops/s<br>(`warp`: 92.7 (90.4..92.8) ops/s) |
+| **HEAD 64 KiB object** | 5321.2 (5052.1..5323.9) ops/s | 5244.9 (5185.6..5256.7) ops/s | 5292.2 (5264.6..5334.3) ops/s | 1397.9 (1329.9..1426.7) ops/s | 4843.8 (4767.8..4862.0) ops/s |
+| **DELETE 64 KiB object** | 4150.7 (4019.8..4362.8) ops/s | 1646.1 (1587.7..1695.5) ops/s | 4239.0 (4080.3..4245.4) ops/s | 156.1 (154.5..163.1) ops/s | 148.7 (148.3..151.3) ops/s |
+| **Peak RSS (64K PUT / Cold 64K / after DELETE)** | 110.5 (109.7..111.1) MB / 60.1 (59.7..60.2) MB / 397.5 (390.7..397.7) MB | 106.0 (104.2..107.0) MB / 59.8 (59.7..60.4) MB / 317.3 (316.3..318.0) MB | 95.0 (94.9..95.2) MB / 60.1 (59.9..60.2) MB / 403.2 (402.2..406.9) MB | 609.1 (589.4..616.3) MB / 624.8 (608.7..637.0) MB / 1097.9 (1071.6..1178.0) MB | 109.6 (108.6..109.7) MB / 152.8 (152.7..153.1) MB / 167.0 (166.0..167.2) MB |
 
-The table lists every workload in the report, including the three where `s3-server` is slower.  **Durability:** when this report was made, `s3-server` acknowledged a PUT before it was flushed to disk, while MinIO and RustFS fsync each PUT; `group` durability (#29) is now the default. Rows marked "not durable" compare a non-durable write with durable ones, so their speedups are not like for like. Each workload ran once for 2 seconds on one Windows laptop; the full report with its command is [`measurements/s3_warp_minio_vs_awan.md`](measurements/s3_warp_minio_vs_awan.md).
+Not measured in [`measurements/2026-11-18-market-claims.md`](measurements/2026-11-18-market-claims.md): `warp` against AwanFS (`not measured`), 1 MiB Mixed (`not measured`), 1 GiB / 10 GiB multipart (`not measured`), `C=128` concurrency sweep (`not measured`), `--profile community` 800 KiB compressible documents (`not measured`), and Garage / SeaweedFS / HS5 (`not measured`). See the full report (including P50/P99 latency spreads, disk used, server CPU time, and `/_awanfs/metrics` cold-read cache hit/miss verification) in [`measurements/2026-11-18-market-claims.md`](measurements/2026-11-18-market-claims.md).
 
 ---
 

@@ -9,6 +9,21 @@ name: Benchmarks on the self-hosted runner
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Benchmark mode: standard (ratio + full), market_claims, or all"
+        type: choice
+        options:
+          - standard
+          - market_claims
+          - all
+        default: standard
+      profile:
+        description: "Market-claims profile (full or community)"
+        type: choice
+        options:
+          - full
+          - community
+        default: full
       duration:
         description: "Seconds per phase"
         default: "30"
@@ -46,26 +61,35 @@ jobs:
       - uses: actions/cache@v4
         id: tools
         with:
-          path: .tmp/minio
-          key: selfhosted-tools-Windows-${{ env.MINIO_RELEASE }}-v1
+          path: |
+            .tmp/minio
+            .tmp/warp
+          key: selfhosted-tools-Windows-${{ env.MINIO_RELEASE }}-warp-v1
       - uses: actions/setup-go@v5
         if: steps.tools.outputs.cache-hit != 'true'
         with:
           go-version: stable
           cache: false
-      - name: Build MinIO and mc from source (pinned release)
+      - name: Build MinIO, mc, and warp from source (pinned MinIO release)
         if: steps.tools.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          mkdir -p .tmp/minio
+          mkdir -p .tmp/minio .tmp/warp
           git clone -q --depth 1 --branch "$MINIO_RELEASE" https://github.com/minio/minio "$RUNNER_TEMP/minio-src"
           (cd "$RUNNER_TEMP/minio-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/minio.exe" .)
           git clone -q --depth 1 https://github.com/minio/mc "$RUNNER_TEMP/mc-src"
           (cd "$RUNNER_TEMP/mc-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/mc.exe" .)
+          git clone -q --depth 1 https://github.com/minio/warp "$RUNNER_TEMP/warp-src"
+          (cd "$RUNNER_TEMP/warp-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/warp/warp.exe" .)
       - uses: actions/upload-artifact@v4
         with:
           name: minio-windows
           path: .tmp/minio
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: warp-windows
+          path: .tmp/warp
           retention-days: 3
 
   bench:
@@ -78,6 +102,10 @@ jobs:
         with:
           name: minio-windows
           path: .tmp/minio
+      - uses: actions/download-artifact@v4
+        with:
+          name: warp-windows
+          path: .tmp/warp
       - name: MinIO and mc are here
         run: python -c "import os,sys; m=[f for f in ('minio.exe','mc.exe') if not os.path.isfile(os.path.join('.tmp','minio',f))]; print('missing:', m) if m else print('minio.exe and mc.exe are in .tmp/minio'); sys.exit(1 if m else 0)"
       - name: Machine (more than 8 cores, or this belongs on a hosted runner)
@@ -92,8 +120,23 @@ jobs:
       # measurements/: a report step with "if: always()" prints whatever is at its path, so a
       # job that measured nothing would otherwise print a committed report as its own output
       # (that happened in run 43398517562; see bench-full.yml).
+      - name: Exclude benchmark data directory from Windows Defender
+        if: runner.os == 'Windows'
+        shell: powershell
+        continue-on-error: true
+        run: |
+          Add-MpPreference -ExclusionPath "${{ runner.temp }}"
+          if ($env:TEMP -and ($env:TEMP -ne "${{ runner.temp }}")) {
+            Add-MpPreference -ExclusionPath "$env:TEMP"
+          }
+          Write-Host "Added Windows Defender exclusion for ${{ runner.temp }}"
       - name: Ratio check against MinIO (builds the server, fetches MinIO if missing)
+        if: ${{ !cancelled() && inputs.mode != 'market_claims' }}
         timeout-minutes: 120
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
         run: |
           python -c "import os; os.path.exists('selfhosted_ratio.md') and os.remove('selfhosted_ratio.md')"
           python -u benchmarks/bench.py --runs ${{ inputs.runs || '3' }} --duration ${{ inputs.duration || '30' }} --output selfhosted_ratio.md
@@ -107,23 +150,53 @@ jobs:
       - name: What a durable append costs on this machine's disk
         if: ${{ !cancelled() }}
         continue-on-error: true
-        run: python -u benchmarks/sync_probe.py --count 100 --report selfhosted_probe.md
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: python -u benchmarks/sync_probe.py --count 100 --dir "${{ runner.temp }}" --report selfhosted_probe.md
       # Runs even when the ratio check failed: the two measure different things.
       - name: Full matrix (AwanFS, MinIO, RustFS where present)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && inputs.mode != 'market_claims' }}
         timeout-minutes: 180
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
         run: |
           python -c "import os; os.path.exists('selfhosted_full.md') and os.remove('selfhosted_full.md')"
           python -u benchmarks/run_warp_benchmark.py --sizes ${{ inputs.sizes || '64KiB,1MiB,1GiB' }} --concurrent 64 --duration ${{ inputs.duration || '30' }}s --runs ${{ inputs.runs || '3' }} --rss-ceiling-mib ${{ inputs.rss_ceiling_mib || '2500' }} --output selfhosted_full.md
+      - name: Does --memory-budget hold on Windows?
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          python -c "import os; os.path.exists('selfhosted_budget.md') and os.remove('selfhosted_budget.md')"
+          python -u benchmarks/budget_rss.py --server-bin server/target/release/s3-server.exe --budget 256MiB --budget-mib 256 --concurrency 64 --size 1MiB --duration 10 --overhead 200 --data-dir "${{ runner.temp }}/budget_rss" --report selfhosted_budget.md
+      - name: Market claims benchmark (synced writes, cold reads, 4-dir MinIO, spread)
+        if: ${{ !cancelled() && (inputs.mode == 'market_claims' || inputs.mode == 'all') }}
+        timeout-minutes: 240
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          python -c "import os; p=os.path.join(os.environ['RUNNER_TEMP'],'selfhosted_market_claims.md'); os.path.exists(p) and os.remove(p)"
+          python -u benchmarks/market_claims.py --build --profile ${{ inputs.profile || 'full' }} --runs ${{ inputs.runs || '3' }} --duration ${{ inputs.duration || '30' }} --output ${{runner.temp}}/selfhosted_market_claims.md
       - name: Report
         if: always()
         shell: python
         run: |
           import os
           out = os.environ["GITHUB_STEP_SUMMARY"]
+          mc_path = os.path.join(os.environ.get("RUNNER_TEMP", ""), "selfhosted_market_claims.md")
           wrote = False
-          for p in ("selfhosted_probe.md", "selfhosted_ratio.md", "selfhosted_full.md"):
-              if os.path.exists(p) and os.path.getsize(p) > 0:
+          for p in ("selfhosted_probe.md", "selfhosted_ratio.md", "selfhosted_full.md", "selfhosted_budget.md", mc_path):
+              if p and os.path.exists(p) and os.path.getsize(p) > 0:
                   text = open(p, encoding="utf-8").read()
                   print(text)
                   open(out, "a", encoding="utf-8").write(text + "\n\n")
@@ -142,4 +215,6 @@ jobs:
             selfhosted_probe.md
             selfhosted_ratio.md
             selfhosted_full.md
+            selfhosted_budget.md
+            ${{ runner.temp }}/selfhosted_market_claims.md
           if-no-files-found: warn

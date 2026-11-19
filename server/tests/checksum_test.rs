@@ -565,3 +565,129 @@ async fn complete_multipart_returns_checksum_in_xml_and_supports_full_object_crc
 
     handle.shutdown();
 }
+
+#[tokio::test]
+async fn get_object_part_number_returns_part_checksum_and_type() {
+    let dir = temp_dir("mp_part_cksum");
+    let c = reqwest::Client::new();
+    let (_state, url, handle) = start(&dir).await;
+    assert_eq!(c.put(format!("{}/mpckbkt", url)).send().await.unwrap().status(), StatusCode::OK);
+
+    let cases = [
+        (ChecksumAlgorithm::Sha256, "COMPOSITE", "obj-sha256"),
+        (ChecksumAlgorithm::Crc64Nvme, "FULL_OBJECT", "obj-crc64"),
+    ];
+
+    for (alg, cksum_type, key) in cases {
+        let init = c
+            .post(format!("{}/mpckbkt/{}?uploads", url, key))
+            .header("x-amz-checksum-algorithm", alg.name())
+            .header("x-amz-checksum-type", cksum_type)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(init.status(), StatusCode::OK);
+        let uid = between(&init.text().await.unwrap(), "<UploadId>", "</UploadId>").unwrap().to_string();
+
+        let p1 = vec![b'A'; 1024];
+        let p2 = vec![b'B'; 1024];
+        let c1 = compute_b64(alg, &p1);
+        let c2 = compute_b64(alg, &p2);
+        let hdr = header_name(alg);
+
+        let r1 = c
+            .put(format!("{}/mpckbkt/{}?partNumber=1&uploadId={}", url, key, uid))
+            .header(hdr, &c1)
+            .body(p1.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let e1 = r1.headers().get("etag").unwrap().to_str().unwrap().to_string();
+
+        let r2 = c
+            .put(format!("{}/mpckbkt/{}?partNumber=2&uploadId={}", url, key, uid))
+            .header(hdr, &c2)
+            .body(p2.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        let e2 = r2.headers().get("etag").unwrap().to_str().unwrap().to_string();
+
+        let tag = xml_tag(alg);
+        let cmp = c
+            .post(format!("{}/mpckbkt/{}?uploadId={}", url, key, uid))
+            .body(format!(
+                "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag><{}>{}</{}></Part><Part><PartNumber>2</PartNumber><ETag>{}</ETag><{}>{}</{}></Part></CompleteMultipartUpload>",
+                e1, tag, c1, tag, e2, tag, c2, tag
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cmp.status(), StatusCode::OK);
+
+        // GetObject with PartNumber (without ChecksumMode=ENABLED) must return ChecksumType and the part checksum.
+        for (pn, expected_cksum, expected_bytes) in [(1, &c1, &p1), (2, &c2, &p2)] {
+            let g = c
+                .get(format!("{}/mpckbkt/{}?partNumber={}", url, key, pn))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(g.status(), StatusCode::OK);
+            assert_eq!(
+                g.headers().get("x-amz-checksum-type").and_then(|v| v.to_str().ok()),
+                Some(cksum_type),
+                "missing/wrong x-amz-checksum-type for {} part {}",
+                alg.name(),
+                pn
+            );
+            assert_eq!(
+                g.headers().get(hdr).and_then(|v| v.to_str().ok()),
+                Some(expected_cksum.as_str()),
+                "missing/wrong part checksum for {} part {}",
+                alg.name(),
+                pn
+            );
+            assert_eq!(g.bytes().await.unwrap().as_ref(), expected_bytes.as_slice());
+        }
+    }
+
+    handle.shutdown();
+}
+
+#[tokio::test]
+async fn put_object_invalid_checksum_header_returns_400_bad_digest() {
+    let dir = temp_dir("bad_cksum_hdr");
+    let c = reqwest::Client::new();
+    let (_state, url, handle) = start(&dir).await;
+    assert_eq!(c.put(format!("{}/badckbkt", url)).send().await.unwrap().status(), StatusCode::OK);
+
+    let payload = vec![b'A'; 1024];
+    for (alg, bad_val) in [
+        (ChecksumAlgorithm::Crc64Nvme, "bad"),
+        (ChecksumAlgorithm::Sha256, "bad"),
+        (ChecksumAlgorithm::Sha256, "AAAA"),
+    ] {
+        let res = c
+            .put(format!("{}/badckbkt/obj-{}", url, alg.name()))
+            .header("x-amz-sdk-checksum-algorithm", alg.name())
+            .header(header_name(alg), bad_val)
+            .body(payload.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = res.text().await.unwrap();
+        assert_eq!(
+            between(&body, "<Code>", "</Code>"),
+            Some("BadDigest"),
+            "expected BadDigest for {:?} with {:?}, got {}",
+            alg,
+            bad_val,
+            body
+        );
+    }
+
+    handle.shutdown();
+}

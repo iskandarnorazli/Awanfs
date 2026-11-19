@@ -81,11 +81,11 @@ fn list_page(state: &S3ServiceState, b_id: u32, prefix: &[u8], delimiter: &[u8],
     page
 }
 
-fn encode_hex_token(b: &[u8]) -> String {
+pub(crate) fn encode_hex_token(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
-fn decode_hex_token(t: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_hex_token(t: &str) -> Option<Vec<u8>> {
     if t.len() % 2 != 0 {
         return None;
     }
@@ -209,7 +209,7 @@ pub async fn create_bucket(
             },
             crate::fsm::BucketEvent::Create {
                 caller_id: if same_owner { 0 } else { 1 },
-                is_us_east_1: state.region == "us-east-1",
+                is_us_east_1: state.region == "us-east-1" || state.region == "default",
             },
         );
         return match step {
@@ -490,7 +490,7 @@ pub async fn list_objects(
         };
         list_objects_v1_xml(
             bucket,
-            &enc(prefix),
+            prefix,
             &enc(delimiter),
             &enc(q("marker")),
             max_keys as u32,

@@ -59,6 +59,7 @@ pub struct MultipartUpload {
     pub parts: BTreeMap<u32, StagedPart>,
     pub checksum_alg: Option<crate::checksum::ChecksumAlgorithm>,
     pub checksum_type: Option<String>,
+    pub tags: Option<crate::tagging::TagSet>,
 }
 
 #[derive(Clone, Debug)]
@@ -206,6 +207,7 @@ impl MultipartManager {
             parts: BTreeMap::new(),
             checksum_alg: None,
             checksum_type: None,
+            tags: None,
         };
 
         self.upload_states.write().insert(upload_id.clone(), crate::fsm::UploadState::Open);
@@ -245,6 +247,12 @@ impl MultipartManager {
         if let Some(u) = self.uploads.write().get_mut(upload_id) {
             u.checksum_alg = Some(alg);
             u.checksum_type = Some(checksum_type);
+        }
+    }
+
+    pub fn set_upload_tags(&self, upload_id: &str, tags: crate::tagging::TagSet) {
+        if let Some(u) = self.uploads.write().get_mut(upload_id) {
+            u.tags = Some(tags);
         }
     }
 

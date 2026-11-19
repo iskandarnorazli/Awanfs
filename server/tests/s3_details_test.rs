@@ -158,6 +158,42 @@ async fn get_bucket_location_and_create_bucket_constraint() {
     );
 
     handle.shutdown();
+
+    // 3. Region "default" (ceph s3-tests default api_name): GetBucketLocation returns "default",
+    // both empty body and <LocationConstraint>default</LocationConstraint> succeed on CreateBucket,
+    // and repeated CreateBucket by same owner is idempotent (200 OK).
+    let (base_url, _addr, _state, handle) = spawn_with_region("default", AuthConfig::open()).await;
+    let client = reqwest::Client::new();
+
+    // CreateBucket with empty body succeeds
+    let resp = client.put(format!("{}/loc-ceph-default-bkt", base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Repeated CreateBucket by same owner in "default" region returns 200 OK (idempotent)
+    let resp = client.put(format!("{}/loc-ceph-default-bkt", base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // GetBucketLocation returns <LocationConstraint>default</LocationConstraint>
+    let resp = client.get(format!("{}/loc-ceph-default-bkt?location", base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">default</LocationConstraint>"),
+        "expected default LocationConstraint, got: {}",
+        body
+    );
+
+    // CreateBucket with explicit <LocationConstraint>default</LocationConstraint> also succeeds
+    let default_xml = r#"<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LocationConstraint>default</LocationConstraint></CreateBucketConfiguration>"#;
+    let resp = client
+        .put(format!("{}/loc-ceph-explicit-bkt", base_url))
+        .body(default_xml)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    handle.shutdown();
 }
 
 #[tokio::test]
@@ -277,5 +313,134 @@ async fn other_expect_values_are_not_refused() {
         let got = c.get(format!("{}/{}/k", base_url, bucket)).send().await.unwrap().text().await.unwrap();
         assert_eq!(got, "bar");
     }
+    handle.shutdown();
+}
+
+
+#[tokio::test]
+async fn invalid_utf8_and_control_char_keys_return_400() {
+    let (base_url, addr, state, handle) = spawn_with_region("us-east-1", AuthConfig::open()).await;
+    state.engine.write().create_bucket("uri-bkt").unwrap();
+    let client = reqwest::Client::new();
+
+    // 1. Valid non-ASCII UTF-8 key works
+    let resp = client
+        .put(format!("{}/uri-bkt/caf%C3%A9-%C2%AE", base_url))
+        .body("ok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = client
+        .get(format!("{}/uri-bkt/caf%C3%A9-%C2%AE", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 2. Percent-decoded bytes that are not valid UTF-8 -> 400 InvalidURI on every operation
+    for method in ["GET", "PUT", "HEAD", "DELETE"] {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "{} /uri-bkt/%AE%8A- HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            method, addr
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&buf);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 400 "),
+            "expected 400 on {} for invalid UTF-8 key, got: {:?}",
+            method,
+            resp_str
+        );
+        if method != "HEAD" {
+            assert!(resp_str.contains("<Code>InvalidURI</Code>"), "got: {:?}", resp_str);
+            assert!(resp_str.contains("Couldn&apos;t parse the specified URI."), "got: {:?}", resp_str);
+        }
+    }
+
+    // 3. C1 control character (e.g. U+008A from Python '\xae\x8a-' -> %C2%AE%C2%8A-) -> 400 InvalidURI
+    for method in [reqwest::Method::GET, reqwest::Method::PUT, reqwest::Method::HEAD, reqwest::Method::DELETE] {
+        let is_head = method == reqwest::Method::HEAD;
+        let resp = client
+            .request(method.clone(), format!("{}/uri-bkt/%C2%AE%C2%8A-", base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400 on {} for C1 control char key",
+            method
+        );
+        if !is_head {
+            let body = resp.text().await.unwrap();
+            assert!(body.contains("<Code>InvalidURI</Code>"), "got: {}", body);
+            assert!(body.contains("Couldn&apos;t parse the specified URI."), "got: {}", body);
+        }
+    }
+
+    handle.shutdown();
+}
+
+
+/// #160: PUT object without Content-Length (and without chunked transfer) returns 411 MissingContentLength.
+#[tokio::test]
+async fn put_object_without_content_length_returns_411() {
+    let (base_url, addr, state, handle) = spawn_with_region("us-east-1", AuthConfig::open()).await;
+    state.engine.write().create_bucket("len-bkt").unwrap();
+
+    // 1. PUT without Content-Length and without Transfer-Encoding -> 411 MissingContentLength
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let req = format!("PUT /len-bkt/no-len HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", addr);
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut raw_resp = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), stream.read_to_end(&mut raw_resp))
+        .await
+        .expect("timed out waiting for 411")
+        .unwrap();
+    let resp_str = String::from_utf8_lossy(&raw_resp);
+    assert!(resp_str.starts_with("HTTP/1.1 411"), "expected 411 Length Required, got: {:?}", resp_str);
+    assert!(resp_str.contains("<Code>MissingContentLength</Code>"), "got: {:?}", resp_str);
+
+    // Object must not have been created.
+    let c = reqwest::Client::new();
+    let get_missing = c.get(format!("{}/len-bkt/no-len", base_url)).send().await.unwrap();
+    assert_eq!(get_missing.status(), StatusCode::NOT_FOUND);
+
+    // 2. PUT with Content-Length: 0 -> 200 OK
+    let mut stream_zero = TcpStream::connect(addr).await.unwrap();
+    let req_zero = format!(
+        "PUT /len-bkt/zero HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        addr
+    );
+    stream_zero.write_all(req_zero.as_bytes()).await.unwrap();
+    let mut resp_zero = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), stream_zero.read_to_end(&mut resp_zero))
+        .await
+        .expect("timed out waiting for 200 on Content-Length: 0")
+        .unwrap();
+    let resp_zero_str = String::from_utf8_lossy(&resp_zero);
+    assert!(resp_zero_str.starts_with("HTTP/1.1 200 OK"), "expected 200 OK, got: {:?}", resp_zero_str);
+
+    // 3. PUT with Transfer-Encoding: chunked (no Content-Length) -> 200 OK
+    let mut stream_chunked = TcpStream::connect(addr).await.unwrap();
+    let req_chunked = format!(
+        "PUT /len-bkt/chunked HTTP/1.1\r\nHost: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nfoo\r\n0\r\n\r\n",
+        addr
+    );
+    stream_chunked.write_all(req_chunked.as_bytes()).await.unwrap();
+    let mut resp_chunked = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), stream_chunked.read_to_end(&mut resp_chunked))
+        .await
+        .expect("timed out waiting for 200 on Transfer-Encoding: chunked")
+        .unwrap();
+    let resp_chunked_str = String::from_utf8_lossy(&resp_chunked);
+    assert!(resp_chunked_str.starts_with("HTTP/1.1 200 OK"), "expected 200 OK, got: {:?}", resp_chunked_str);
+    let got = c.get(format!("{}/len-bkt/chunked", base_url)).send().await.unwrap().text().await.unwrap();
+    assert_eq!(got, "foo");
+
     handle.shutdown();
 }
