@@ -1,0 +1,195 @@
+name: Core scaling benchmark
+
+# Measures PUT and GET throughput, latency (P50, P99), server CPU %, and ops/s per busy core
+# across pinned core counts (N = 1, 2, 4, ...) for AwanFS, MinIO, and RustFS (Issue #250).
+# Outputs go to $RUNNER_TEMP/core_scaling so no run ever overwrites measurements/.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cores:
+        description: "Comma-separated core counts (default: 1,2,4 on hosted; auto powers of 2 on self-hosted)"
+        default: ""
+      duration:
+        description: "Seconds per workload phase"
+        default: "3"
+      runs:
+        description: "Alternating rounds per core count"
+        default: "2"
+      include_self_hosted:
+        description: "Also run on the self-hosted bench runner"
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - "benchmarks/core_scaling.py"
+      - "benchmarks/test_core_scaling.py"
+      - ".github/workflows/bench-scaling.yml"
+
+permissions:
+  contents: read
+
+env:
+  MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+  RUSTFS_TAG: 1.0.5
+
+jobs:
+  scaling:
+    name: Core scaling (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Build s3-server (--release)
+        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+
+      - uses: actions/cache@v4
+        id: tools
+        with:
+          path: |
+            .tmp/minio
+            .tmp/rustfs
+          key: bench-tools-${{ runner.os }}-${{ env.MINIO_RELEASE }}-rustfs-${{ env.RUSTFS_TAG }}-v1
+      - uses: actions/setup-go@v5
+        if: steps.tools.outputs.cache-hit != 'true'
+        with:
+          go-version: stable
+          cache: false
+      - name: Build MinIO and mc from source (pinned release)
+        if: steps.tools.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: |
+          exe=""; [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
+          mkdir -p .tmp/minio
+          git clone -q --depth 1 --branch "$MINIO_RELEASE" https://github.com/minio/minio "$RUNNER_TEMP/minio-src"
+          (cd "$RUNNER_TEMP/minio-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/minio$exe" .)
+          git clone -q --depth 1 https://github.com/minio/mc "$RUNNER_TEMP/mc-src"
+          (cd "$RUNNER_TEMP/mc-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/mc$exe" .)
+      - name: Download RustFS release
+        if: steps.tools.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .tmp/rustfs "$RUNNER_TEMP/rustfs-dl"
+          if [ "$RUNNER_OS" = "Windows" ]; then want='windows.*(x86_64|amd64).*\.zip$'; bin=rustfs.exe; else want='linux.*(x86_64|amd64).*\.zip$'; bin=rustfs; fi
+          tag=""
+          for t in "$RUSTFS_TAG" "v$RUSTFS_TAG"; do
+            if gh release view "$t" -R rustfs/rustfs >/dev/null 2>&1; then tag="$t"; break; fi
+          done
+          if [ -z "$tag" ]; then echo "::warning::RustFS release $RUSTFS_TAG not found"; exit 0; fi
+          asset=$(gh release view "$tag" -R rustfs/rustfs --json assets --jq '.assets[].name' | grep -Ei "$want" | grep -vi musl | head -1)
+          [ -z "$asset" ] && asset=$(gh release view "$tag" -R rustfs/rustfs --json assets --jq '.assets[].name' | grep -Ei "$want" | head -1)
+          if [ -z "$asset" ]; then echo "::warning::no RustFS asset for $RUNNER_OS in $tag"; exit 0; fi
+          gh release download "$tag" -R rustfs/rustfs -p "$asset" -D "$RUNNER_TEMP/rustfs-dl"
+          (cd "$RUNNER_TEMP/rustfs-dl" && unzip -q -o "$asset")
+          found=$(find "$RUNNER_TEMP/rustfs-dl" -type f -name "$bin" | head -1)
+          if [ -z "$found" ]; then echo "::warning::$bin not in $asset"; exit 0; fi
+          cp "$found" ".tmp/rustfs/$bin"
+          chmod +x ".tmp/rustfs/$bin" || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python benchmark dependencies
+        run: python -m pip install -q psutil matplotlib
+
+      - name: Run core scaling self-tests
+        run: python benchmarks/test_core_scaling.py
+
+      - name: Run core scaling benchmark
+        timeout-minutes: 60
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/core_scaling"
+          cores_arg="${{ inputs.cores }}"
+          if [ -z "$cores_arg" ]; then cores_arg="1,2,4"; fi
+          python -u benchmarks/core_scaling.py \
+            --cores "$cores_arg" \
+            --runs "${{ inputs.runs || '2' }}" \
+            --duration "${{ inputs.duration || '3' }}" \
+            --data-dir "$RUNNER_TEMP" \
+            --output $RUNNER_TEMP/core_scaling/report.md
+
+      - name: Report to the job summary
+        if: always()
+        run: |
+          if [ -s "$RUNNER_TEMP/core_scaling/report.md" ]; then
+            cat "$RUNNER_TEMP/core_scaling/report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "This run produced no core scaling report." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: core-scaling-${{ matrix.os }}
+          path: ${{ runner.temp }}/core_scaling
+          if-no-files-found: warn
+
+  scaling-selfhosted:
+    name: Core scaling (self-hosted)
+    if: inputs.include_self_hosted == true
+    runs-on: [ self-hosted, bench ]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build s3-server (--release)
+        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Fetch RustFS if missing
+        continue-on-error: true
+        run: python benchmarks/fetch_rustfs.py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python benchmark dependencies
+        run: python -m pip install -q psutil matplotlib
+      - name: Run core scaling benchmark (self-hosted)
+        shell: python
+        run: |
+          import os, subprocess, sys
+          out_dir = os.path.join(os.environ["RUNNER_TEMP"], "core_scaling")
+          os.makedirs(out_dir, exist_ok=True)
+          cmd = [
+              sys.executable, "-u", "benchmarks/core_scaling.py",
+              "--runs", "${{ inputs.runs || '2' }}",
+              "--duration", "${{ inputs.duration || '3' }}",
+              "--data-dir", os.environ["RUNNER_TEMP"],
+              "--output", os.path.join(out_dir, "report.md"),
+          ]
+          cores = "${{ inputs.cores }}".strip()
+          if cores:
+              cmd.extend(["--cores", cores])
+          subprocess.run(cmd, check=True)
+      - name: Report to the job summary
+        if: always()
+        shell: python
+        run: |
+          import os
+          report = os.path.join(os.environ["RUNNER_TEMP"], "core_scaling", "report.md")
+          out = os.environ["GITHUB_STEP_SUMMARY"]
+          if os.path.exists(report):
+              text = open(report, encoding="utf-8").read()
+              print(text)
+              open(out, "a", encoding="utf-8").write(text + "\n")
+          else:
+              open(out, "a", encoding="utf-8").write("This run produced no core scaling report.\n")
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: core-scaling-selfhosted
+          path: ${{ runner.temp }}/core_scaling
+          if-no-files-found: warn
