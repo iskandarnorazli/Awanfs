@@ -35,6 +35,10 @@ pub trait VolFile: Send + Sync + 'static {
     fn set_len(&self, len: u64) -> io::Result<()>;
     /// The data and the length are durable when this returns.
     fn sync_data(&self) -> io::Result<()>;
+    /// As `sync_data`, and the file's metadata too (used after recovery cuts a torn tail).
+    fn sync_all(&self) -> io::Result<()> {
+        self.sync_data()
+    }
     /// Marks the file sparse where the platform needs it (Windows); a no-op elsewhere.
     fn make_sparse(&self) -> io::Result<()>;
     /// The read mapping over the whole file, where there is one. `None` makes reads use
@@ -105,6 +109,9 @@ impl VolFile for DiskFile {
     }
     fn sync_data(&self) -> io::Result<()> {
         self.sync.sync_data()
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        self.main.sync_all()
     }
     fn make_sparse(&self) -> io::Result<()> {
         self.main.make_sparse()
