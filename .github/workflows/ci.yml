@@ -38,6 +38,7 @@ jobs:
         run: |
           python benchmarks/test_ratio_check.py
           python benchmarks/test_bench.py
+          python benchmarks/test_market_claims.py
           python benchmarks/test_core_scaling.py
       - name: Local benchmark smoke run (AwanFS only, 1 round of 1 s)
         run: python benchmarks/bench.py --awanfs-only --runs 1 --duration 1 --output bench_smoke.md
