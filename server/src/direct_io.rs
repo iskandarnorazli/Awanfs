@@ -138,6 +138,13 @@ impl AlignedFile {
         })
     }
 
+    /// Opens or creates a file for reading and writing through the page cache, never with
+    /// direct I/O: for small unaligned writes such as a volume's journal.
+    pub fn open_buffered(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).create(true).open(path)?;
+        Ok(Self { file, direct_io_active: false })
+    }
+
     pub fn is_direct_io(&self) -> bool {
         self.direct_io_active
     }
@@ -278,6 +285,37 @@ impl AlignedFile {
     /// `fdatasync` on Unix, `FlushFileBuffers` on Windows: the data and the size are durable.
     pub fn sync_data(&self) -> io::Result<()> {
         self.file.sync_data()
+    }
+}
+
+/// A positioned write of all of `buf` at `offset` (no alignment), without a shared cursor.
+pub fn write_all_at(file: &File, offset: u64, buf: &[u8]) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut total = 0;
+        while total < buf.len() {
+            let n = file.seek_write(&buf[total..], offset + total as u64)?;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "zero bytes written in seek_write"));
+            }
+            total += n;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(buf, offset)
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file_clone = file.try_clone()?;
+        file_clone.seek(SeekFrom::Start(offset))?;
+        file_clone.write_all(buf)
     }
 }
 

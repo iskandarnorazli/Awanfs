@@ -43,6 +43,8 @@ pub mod scheduler;
 pub mod sigv4;
 pub mod spill;
 pub mod auth;
+pub mod sim;
+pub mod vfile;
 pub mod volume;
 pub mod stream_read;
 pub mod tagging;

@@ -203,6 +203,22 @@ object's Last-Modified; its ordering time stays 0, so which version is current d
 and no clock reading decides it (decision 63). Not chosen: giving the null version its real time
 as its ordering time and raising the next stamp above it, which reopens the clock-step risk.
 
+**Decision 67 (Claude, 2026-11-19, #213 and #26): a volume reaches its files only through a
+file seam, so a seeded simulation can crash and fail them.** `server/src/vfile.rs` defines
+`VolFile` (aligned and unaligned positioned writes and reads, length, resize, `sync_data`, sparse,
+and the read mapping where there is one) and `VolFs` (open a data file or a journal, exists,
+remove). Production uses `DiskFile` and `DiskFs`, which keep today's three handles per file: the
+write handle, a second open used only to sync (a Windows sync through the write handle stalls
+every writer), and a read-only handle for page-cache reads (#155). `server/src/sim.rs` implements both in memory: a `SimFile` keeps the
+bytes made durable by `sync_data` apart from the writes since, so a crash drops them, keeps a
+seeded prefix in write order, or tears the next one; faults (`EIO`, `ENOSPC`) are armed by name
+per operation. The volume code becomes generic over `VolFs` with `DiskFs` as the default (stage 1b),
+so production is monomorphised and pays nothing; #26's segment files and manifest use the same
+seam from their first commit. Not covered by the simulation: HTTP, real thread interleavings, and
+the mapped read path (`SimFile` has no mapping, so simulated reads use positioned reads; the mapped
+path keeps its own tests). Not chosen: a whole-server simulation, and `loom` or `shuttle` for
+interleavings (owner, 2026-11-16, option B).
+
 **Decision 66 (owner, 2026-11-17): no GPU or APU code path for now.** Erasure coding (decision
 64) is built with CPU vector instructions first and measured against the network rate. A GPU path
 on unified-memory APUs (Strix Halo, MI300A) is weighed only if CPU erasure coding cannot keep up
