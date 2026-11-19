@@ -189,3 +189,115 @@ async fn prefix_basic_alt_empty() {
     assert_eq!(tags(&xml, "Prefix"), vec![""]);
     assert_eq!(tags(&xml, "Key"), vec!["bar", "baz", "foo/bar", "foo/baz", "quux"]);
 }
+
+
+#[tokio::test]
+async fn list_objects_v1_prefix_unreadable_not_url_encoded() {
+    let (url, _h) = server().await;
+    let c = reqwest::Client::new();
+    setup_bucket(&c, &url, "unrd-bkt", &["foo/bar", "quux"]).await;
+
+    // V1 with encoding-type=url (as botocore sends): <Prefix> must remain raw '\n', not '%0A'
+    let xml = c
+        .get(format!("{}/unrd-bkt?prefix=%0A&encoding-type=url", url))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(tags(&xml, "EncodingType"), vec!["url"]);
+    assert_eq!(tags(&xml, "Prefix"), vec!["\n"]);
+
+    // V2 with encoding-type=url: botocore's decode_list_object_v2 decodes <Prefix>, so %0A is expected
+    let xml = c
+        .get(format!("{}/unrd-bkt?list-type=2&prefix=%0A&encoding-type=url", url))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(tags(&xml, "EncodingType"), vec!["url"]);
+    assert_eq!(tags(&xml, "Prefix"), vec!["%0A"]);
+}
+
+#[tokio::test]
+async fn list_buckets_pagination_and_prefix() {
+    let (url, _h) = server().await;
+    let c = reqwest::Client::new();
+
+    // Empty account
+    let xml = c.get(format!("{}/?max-buckets=1", url)).send().await.unwrap().text().await.unwrap();
+    assert!(tags(&xml, "Name").is_empty());
+    assert!(tags(&xml, "ContinuationToken").is_empty());
+
+    for b in ["bkt-a", "bkt-b", "other-c"] {
+        assert_eq!(c.put(format!("{}/{}", url, b)).send().await.unwrap().status(), StatusCode::OK);
+    }
+
+    // Page 1
+    let xml = c.get(format!("{}/?max-buckets=1", url)).send().await.unwrap().text().await.unwrap();
+    assert_eq!(tags(&xml, "Name"), vec!["bkt-a"]);
+    let tok1 = tags(&xml, "ContinuationToken");
+    assert_eq!(tok1.len(), 1);
+
+    // Page 2
+    let xml = c
+        .get(format!("{}/?max-buckets=1&continuation-token={}", url, tok1[0]))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(tags(&xml, "Name"), vec!["bkt-b"]);
+    let tok2 = tags(&xml, "ContinuationToken");
+    assert_eq!(tok2.len(), 1);
+
+    // Page 3 (final)
+    let xml = c
+        .get(format!("{}/?max-buckets=1&continuation-token={}", url, tok2[0]))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(tags(&xml, "Name"), vec!["other-c"]);
+    assert!(tags(&xml, "ContinuationToken").is_empty());
+
+    // Prefix filter + pagination
+    let xml = c
+        .get(format!("{}/?prefix=bkt-&max-buckets=1", url))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(tags(&xml, "Prefix"), vec!["bkt-"]);
+    assert_eq!(tags(&xml, "Name"), vec!["bkt-a"]);
+    let ptok = tags(&xml, "ContinuationToken");
+    assert_eq!(ptok.len(), 1);
+
+    let xml = c
+        .get(format!("{}/?prefix=bkt-&max-buckets=1&continuation-token={}", url, ptok[0]))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(tags(&xml, "Prefix"), vec!["bkt-"]);
+    assert_eq!(tags(&xml, "Name"), vec!["bkt-b"]);
+    assert!(tags(&xml, "ContinuationToken").is_empty());
+
+    // Invalid max-buckets / continuation-token -> 400 InvalidArgument
+    for query in ["max-buckets=0", "max-buckets=-1", "max-buckets=abc", "continuation-token=zzz"] {
+        let resp = c.get(format!("{}/?{}", url, query)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "query {} should return 400", query);
+        let xml = resp.text().await.unwrap();
+        assert_eq!(tags(&xml, "Code"), vec!["InvalidArgument"]);
+    }
+}

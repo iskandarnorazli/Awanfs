@@ -312,5 +312,74 @@ class CpuSamplerTests(unittest.TestCase):
         self.assertGreaterEqual(u, 0.0)
         self.assertGreaterEqual(s, 0.0)
 
+    def test_get_system_cpu_times_returns_valid_busy_and_total(self):
+        from run_warp_benchmark import get_system_cpu_times
+        busy, total = get_system_cpu_times()
+        self.assertGreaterEqual(busy, 0.0)
+        self.assertGreaterEqual(total, busy)
+
+    def test_cpu_sampler_measures_client_and_system_cpu_pct(self):
+        from run_warp_benchmark import CpuSampler
+        with CpuSampler(os.getpid(), every=0.02) as sampler:
+            x = 0
+            for i in range(400_000):
+                x += i * i
+        self.assertGreaterEqual(sampler.server_cpu_s, 0.0)
+        self.assertGreaterEqual(sampler.client_cpu_s, 0.0)
+        self.assertGreaterEqual(sampler.system_cpu_s, 0.0)
+        self.assertGreaterEqual(sampler.server_cpu_pct, 0.0)
+        self.assertGreaterEqual(sampler.client_cpu_pct, 0.0)
+        self.assertGreaterEqual(sampler.system_cpu_pct, 0.0)
+        self.assertLessEqual(sampler.system_cpu_pct, 100.0)
+
+    def test_cpu_sampler_without_server_pid_leaves_server_zero(self):
+        from run_warp_benchmark import CpuSampler
+        with CpuSampler(None, every=0.02) as sampler:
+            sum(range(100_000))
+        self.assertEqual(sampler.server_cpu_s, 0.0)
+        self.assertEqual(sampler.server_cpu_pct, 0.0)
+
+    def test_report_includes_cpu_breakdown_with_percentages(self):
+        awan = {
+            "get_64k": BenchmarkMetrics(
+                ops_per_sec=5000.0, mib_per_sec=312.5,
+                p50_ms=1.0, p90_ms=2.0, p99_ms=3.0, p999_ms=4.0,
+                peak_rss_mb=40.0,
+                server_cpu_s=1.2, client_cpu_s=2.4, system_cpu_s=1.5,
+                server_cpu_pct=60.0, client_cpu_pct=120.0, system_cpu_pct=45.0,
+            ),
+        }
+        report = format_markdown_report("cmd", {}, awan, {})
+        self.assertIn("CPU Breakdown", report)
+        self.assertIn("Server CPU %", report)
+        self.assertIn("60.0%", report)
+        self.assertIn("120.0%", report)
+        self.assertIn("45.0%", report)
+
+
+class AffinitySplittingTests(unittest.TestCase):
+    def test_affinity_masks_split_cores_into_disjoint_halves(self):
+        from run_warp_benchmark import affinity_masks
+        self.assertEqual(affinity_masks(8), (0x0F, 0xF0))
+        srv16, cli16 = affinity_masks(16)
+        self.assertEqual((srv16, cli16), (0x00FF, 0xFF00))
+        self.assertEqual(srv16 & cli16, 0)
+        self.assertEqual(srv16 | cli16, (1 << 16) - 1)
+        srv20, cli20 = affinity_masks(20)
+        self.assertEqual((srv20, cli20), (0x03FF, 0xFFC00))
+        self.assertEqual(srv20 & cli20, 0)
+        self.assertEqual(srv20 | cli20, (1 << 20) - 1)
+
+    def test_affinity_labels_reflect_core_count(self):
+        import run_warp_benchmark as r
+        srv4, cli4 = r.affinity_labels(4)
+        self.assertIn("not pinned (4 logical cores", srv4)
+        self.assertEqual(srv4, cli4)
+        if r.can_pin(16):
+            srv16, cli16 = r.affinity_labels(16)
+            self.assertEqual(srv16, "Cores 0..7 (Affinity Mask 0x00FF)")
+            self.assertEqual(cli16, "Cores 8..15 (Affinity Mask 0xFF00)")
+
+
 if __name__ == "__main__":
     unittest.main()
