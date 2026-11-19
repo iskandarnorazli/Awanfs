@@ -22,6 +22,7 @@ All integers are little-endian. Sectors are 4096 bytes.
 | `buckets.manifest` | One line per bucket event: `+<id>:<name>` created, `-<id>:<name>` deleted. |
 | `metadata.db` | redb spill index (rebuilt from the volumes if lost). To be replaced by metadata segment files and their manifest (#26, decision 59), documented here before they are written. |
 | `meta/seg_<seq>.seg` | A metadata segment (#26, decision 59): sorted rows of the metadata index, immutable once written. `<seq>` is 16 lowercase hex digits; a higher sequence number is newer. Below. Not read by the server until #26 stage 6 switches from redb; the manifest that names the live segments comes in stage 4. |
+| `meta/manifest.0`, `meta/manifest.1` | The metadata manifest's two slots (#26 stage 4): which segments are live and the log position they cover. Below. |
 | `.staging/upload-<hex>/part_NNNNN.dat` | Multipart part files; the parts of completed objects stay here. |
 
 ## Metadata segment (`meta/seg_<seq>.seg`, #26 stage 2)
@@ -101,6 +102,45 @@ The fence keys, then the Bloom filter, padded with zeros to a block boundary:
   tombstone hides every older entry of its key.
 - Written in full, then `sync_data`, then (stage 4) named in the manifest. A segment the
   manifest does not name is ignored, so a crash mid-write leaves nothing visible.
+
+## Metadata manifest (`meta/manifest.0`, `meta/manifest.1`, #26 stage 4)
+
+The checkpoint of the metadata index: the live segments, and the position in the volume log
+they cover. Boot reads it, opens those segments and replays only the needles after that
+position. Without a valid manifest, boot replays every volume, as it does today: the volumes
+are the record, so losing the manifest costs time, never data.
+
+**Two slots.** A new manifest is written to the slot that does not hold the current one, with a
+generation one higher than both, then synced. Boot reads both slots and uses the valid one with
+the higher generation. A slot whose write a crash tore fails its length or CRC check and is not
+valid, so the other slot, the previous manifest, is used. No rename is needed.
+
+| Bytes | Field |
+|---|---|
+| 0..4 | magic `0x4D535741` ("AWSM") |
+| 4..6 | manifest format version, 1 |
+| 6..8 | flags, 0 |
+| 8..16 | generation |
+| 16..20 | replay volume id: the volume holding the first needle not covered |
+| 20..28 | replay offset in that volume: needles at this offset and after, and every needle of a higher volume id, are replayed; everything before is in the segments |
+| 28..36 | next segment sequence number |
+| 36..40 | live segment count `N` (at most 1024) |
+| 40..40+8N | the live segments' sequence numbers, strictly increasing |
+| 40+8N..44+8N | CRC32C of bytes 0..40+8N |
+
+The file is exactly `44 + 8N` bytes. A length that disagrees, a wrong magic, a newer format or a
+CRC mismatch makes the slot invalid.
+
+### The rules (checked by `verification/tla/Manifest.tla`)
+- **Sync the segment first:** a manifest names only segments already written in full and synced.
+  (`manifest_switch_before_sync` breaks this: a crash loses a named segment whose rows are
+  before the replay position.)
+- **Alternate slots:** a new manifest never overwrites the slot holding the current one.
+  (`manifest_one_slot`: a torn write leaves boot with no manifest.)
+- **Delete after the switch is durable:** a segment is deleted only after a durable manifest of a
+  higher generation stops naming it. (`manifest_gc_before_sync`: a merge deleted its inputs, a
+  crash tore the new manifest, and the old one named segments that were gone.)
+- A segment file the valid manifest does not name is ignored at boot and may be deleted.
 
 ## Superblock (sector 0 of a volume)
 
