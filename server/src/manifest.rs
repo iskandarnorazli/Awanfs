@@ -360,7 +360,7 @@ mod tests {
         let m = Manifest { generation: 7, replay_from: at(123), next_seq: 9, segments: live(&[(2, 0), (5, 1), (8, 7)]) };
         let b = m.encode().unwrap();
         assert_eq!(b.len(), 44 + 48);
-        assert_eq!(Manifest::decode(&b), Some(m));
+        assert_eq!(Manifest::decode(&b), Some(m.clone()));
         for i in 0..b.len() {
             let mut d = b.clone();
             d[i] ^= 0x10;
