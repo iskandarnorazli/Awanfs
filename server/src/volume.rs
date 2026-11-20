@@ -139,6 +139,8 @@ pub struct NeedleWriter<Fs: VolFs = DiskFs> {
     created_at: Option<u64>,
     /// Where the writer is: `crate::fsm::needle_step` decides every move (STATE_MACHINES.md).
     state: crate::fsm::NeedleState,
+    /// Tracks the streaming buffers held in memory while this writer is open.
+    _inflight: crate::work::InflightGuard,
 }
 
 fn refused(r: crate::fsm::Refusal, what: &str) -> VolumeError {
@@ -1218,6 +1220,7 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             chunk_fill: 0,
             created_at: None,
             state: crate::fsm::NeedleState::Receiving { declared: payload_size, written: 0 },
+            _inflight: self.work.hold_inflight((STREAM_CHUNK + SECTOR_SIZE) as u64),
         };
         // The writer now owns the count: its `Drop` gives it back.
         std::mem::forget(in_flight);

@@ -3,7 +3,7 @@
 //! Zero-allocation in-memory metadata substrate with 64-byte packed records,
 //! arena-backed key indexing, and O(1) hash table lookup.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::panic::catch_unwind;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -194,7 +194,6 @@ pub struct StorageEngine {
     pub hash_slots: HashMap<(u32, u64), Vec<usize>>,
     pub slab_bytes: usize,
     pub spill_index: Option<SpillIndex>,
-    pub spilled_keys: HashMap<u32, BTreeSet<Vec<u8>>>,
 }
 
 pub type AwanStorageEngine = StorageEngine;
@@ -218,7 +217,6 @@ impl StorageEngine {
             hash_slots: HashMap::with_capacity(max_objects.min(1_000_000)),
             slab_bytes,
             spill_index: None,
-            spilled_keys: HashMap::new(),
         }
     }
 
@@ -387,10 +385,11 @@ impl StorageEngine {
             return Ok(());
         }
 
-        // Check if object is already spilled or in-memory capacity is reached
+        // Past the in-memory rows, every key that is not in them goes to the spill index. The
+        // table never shrinks (a delete leaves its row), so a key in the spill index cannot later
+        // get a row in memory: no set of spilled keys is needed (#208).
         if let Some(ref spill) = self.spill_index {
-            let is_spilled = self.spilled_keys.get(&bucket_id).map_or(false, |set| set.contains(key));
-            if is_spilled || self.table.key_hashes.len() >= self.max_objects {
+            if self.table.key_hashes.len() >= self.max_objects {
                 let meta = ObjectMeta {
                     key_hash,
                     bucket_flags,
@@ -404,7 +403,6 @@ impl StorageEngine {
                 // A failed spill write must not be acknowledged: the object would be on the
                 // volume but missing from the index until a restart.
                 spill.put(bucket_id, key, &meta).map_err(|_| ERR_SPILL)?;
-                self.spilled_keys.entry(bucket_id).or_default().insert(key.to_vec());
                 return Ok(());
             }
         }
@@ -490,11 +488,8 @@ impl StorageEngine {
 
         let mut spilled_deleted = false;
         if let Some(ref spill) = self.spill_index {
-            if let Some(set) = self.spilled_keys.get_mut(&bucket_id) {
-                if set.remove(key) {
-                    let _ = spill.delete(bucket_id, key);
-                    spilled_deleted = true;
-                }
+            if !in_memory_deleted {
+                spilled_deleted = spill.delete(bucket_id, key).map_err(|_| ERR_SPILL)?;
             }
         }
 

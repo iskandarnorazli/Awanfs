@@ -1,0 +1,101 @@
+name: Compaction cost with large objects (experiment)
+
+# #269: measures bytes and time compaction spends copying live large objects against live
+# small objects across three mixes and two delete fractions, for #26's compaction design.
+# Outputs go under $RUNNER_TEMP/compaction_cost so no run overwrites measurements/.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Runs per mix and delete fraction"
+        default: "3"
+      mixes:
+        description: "Comma-separated mixes (small-heavy,balanced,90-10)"
+        default: "small-heavy,balanced,90-10"
+      delete_fractions:
+        description: "Comma-separated fractions of small objects to delete"
+        default: "0.50,0.90"
+      compaction_rate:
+        description: "Compaction rate limit in bytes/sec (0 = unlimited)"
+        default: "0"
+  pull_request:
+    paths:
+      - "server/examples/compaction_cost.rs"
+      - "benchmarks/compaction_cost.py"
+      - "benchmarks/test_compaction_cost.py"
+      - ".github/workflows/bench-compaction-cost.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: Compaction cost (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Self-tests
+        run: python benchmarks/test_compaction_cost.py
+
+      - name: Build compaction_cost example (--release)
+        run: cargo build --locked --release --example compaction_cost --manifest-path server/Cargo.toml
+
+      - name: Run compaction cost measurement
+        shell: bash
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+          RUNS: ${{ inputs.runs || '3' }}
+          MIXES: ${{ inputs.mixes || 'small-heavy,balanced,90-10' }}
+          FRACS: ${{ inputs.delete_fractions || '0.50,0.90' }}
+          RATE: ${{ inputs.compaction_rate || '0' }}
+        run: |
+          set -euo pipefail
+          bin=server/target/release/examples/compaction_cost
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          out_dir="$RUNNER_TEMP/compaction_cost"
+          mkdir -p "$out_dir/data"
+          python -u benchmarks/compaction_cost.py \
+            --bin "$bin" \
+            --data-dir "$out_dir/data" \
+            --runs "$RUNS" \
+            --mixes "$MIXES" \
+            --delete-fractions "$FRACS" \
+            --compaction-rate "$RATE" \
+            --results "$out_dir/results.jsonl" \
+            --output $RUNNER_TEMP/compaction_cost/report.md \
+            --title "Compaction cost with live large and small objects (#269, $RUNNER_OS)"
+
+      - name: Report to job summary
+        if: always()
+        shell: bash
+        run: |
+          report="$RUNNER_TEMP/compaction_cost/report.md"
+          if [ -s "$report" ]; then
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "This run produced no compaction cost report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compaction-cost-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/compaction_cost/results.jsonl
+            ${{ runner.temp }}/compaction_cost/report.md
+          if-no-files-found: warn
