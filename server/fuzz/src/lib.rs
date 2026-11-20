@@ -326,18 +326,26 @@ pub fn check_raw_s3_key(data: &[u8]) {
     let encoded_all = percent_encode_bytes(data, false);
     assert_eq!(percent_decode_path_bytes(&encoded_all), data);
 
-    let path_uri = format!("/mybucket/{}", encoded_all);
-    let extracted = raw_s3_key(&path_uri, None).expect("path-style URI must yield raw_s3_key");
-    assert_eq!(percent_decode_path_bytes(extracted), data);
+    // An empty key leaves `/mybucket/`: a single trailing slash names the bucket, not an object
+    // with an empty key (#260, PR #284), so no key comes back.
+    if data.is_empty() {
+        assert_eq!(raw_s3_key("/mybucket/", None), None);
+        assert_eq!(raw_s3_key("/mybucket/?partNumber=1&ignored=%20", None), None);
+        assert!(matches!(parse_s3_target("/mybucket/", None), ParsedTarget::Bucket { .. }));
+    } else {
+        let path_uri = format!("/mybucket/{}", encoded_all);
+        let extracted = raw_s3_key(&path_uri, None).expect("path-style URI must yield raw_s3_key");
+        assert_eq!(percent_decode_path_bytes(extracted), data);
 
-    let path_uri_with_query = format!("/mybucket/{}?partNumber=1&ignored=%20", encoded_all);
-    let extracted_q = raw_s3_key(&path_uri_with_query, None).expect("query-bearing path must yield raw_s3_key");
-    assert_eq!(percent_decode_path_bytes(extracted_q), data);
+        let path_uri_with_query = format!("/mybucket/{}?partNumber=1&ignored=%20", encoded_all);
+        let extracted_q = raw_s3_key(&path_uri_with_query, None).expect("query-bearing path must yield raw_s3_key");
+        assert_eq!(percent_decode_path_bytes(extracted_q), data);
 
-    let encoded_with_slash = percent_encode_bytes(data, true);
-    let path_slash_uri = format!("/mybucket/{}", encoded_with_slash);
-    let extracted_slash = raw_s3_key(&path_slash_uri, None).expect("path-style URI with literal slashes must yield raw_s3_key");
-    assert_eq!(percent_decode_path_bytes(extracted_slash), data);
+        let encoded_with_slash = percent_encode_bytes(data, true);
+        let path_slash_uri = format!("/mybucket/{}", encoded_with_slash);
+        let extracted_slash = raw_s3_key(&path_slash_uri, None).expect("path-style URI with literal slashes must yield raw_s3_key");
+        assert_eq!(percent_decode_path_bytes(extracted_slash), data);
+    }
 
     if !data.is_empty() {
         let vhost_uri = format!("/{}", encoded_all);
