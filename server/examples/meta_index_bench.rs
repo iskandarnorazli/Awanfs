@@ -558,6 +558,36 @@ fn percentile(sorted: &[u64], p: f64) -> f64 {
     sorted[((sorted.len() - 1) as f64 * p) as usize] as f64 / 1000.0
 }
 
+/// `writers` threads insert keys `t, t + writers, ...` below `keys` at once. Each thread's
+/// vector holds its elapsed time in ns first, then each put's latency in ns.
+fn run_writers(writers: u64, keys: u64, put: impl Fn(&[u8], &ObjectMeta) + Sync) -> Vec<Vec<u64>> {
+    let start = std::sync::Barrier::new(writers as usize);
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..writers)
+            .map(|t| {
+                let (put, start) = (&put, &start);
+                sc.spawn(move || {
+                    let mut out = Vec::with_capacity((keys / writers + 2) as usize);
+                    out.push(0);
+                    start.wait();
+                    let t0 = Instant::now();
+                    let mut i = t;
+                    while i < keys {
+                        let (k, r) = (key(i), row(i));
+                        let p = Instant::now();
+                        put(&k, &r);
+                        out.push(p.elapsed().as_nanos() as u64);
+                        i += writers;
+                    }
+                    out[0] = t0.elapsed().as_nanos() as u64;
+                    out
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().expect("writer")).collect()
+    })
+}
+
 fn open_store(kind: &str, dir: &Path) -> Box<dyn Store> {
     match kind {
         "redb" => Box::new(Redb(redb_spill::RedbSpill::open(&dir.join("metadata.db")).expect("open redb"))),
@@ -583,6 +613,37 @@ fn main() {
     assert!(keys % PERMUTE != 0, "--keys must not be a multiple of {}", PERMUTE);
 
     match phase.as_str() {
+        "writers" => {
+            // #26's gate: `--writers` threads insert their share of fresh keys at once; the insert
+            // rate and every put's latency.
+            let writers: u64 = arg("--writers", "64").parse().unwrap();
+            let lat: Vec<Vec<u64>> = match kind.as_str() {
+                "redb" => {
+                    let db = redb_spill::RedbSpill::open(&dir.join("metadata.db")).expect("open redb");
+                    run_writers(writers, keys, |k, r| db.put(BUCKET, k, r).expect("redb put"))
+                }
+                "prod" => {
+                    let ix = s3_server::spill::SpillIndex::open(&dir).expect("open prod");
+                    let lat = run_writers(writers, keys, |k, r| ix.put(BUCKET, k, r).expect("prod put"));
+                    ix.flush().expect("prod flush");
+                    lat
+                }
+                other => panic!("writers: --store redb|prod, not {}", other),
+            };
+            let secs = lat.iter().map(|l| l[0]).max().unwrap_or(0) as f64 / 1e9;
+            let mut all: Vec<u64> = lat.iter().flat_map(|l| l[1..].iter().copied()).collect();
+            all.sort_unstable();
+            println!(
+                "{{\"store\":\"{}\",\"phase\":\"writers\",\"writers\":{},\"keys\":{},\"secs\":{:.3},\"puts_per_s\":{:.0},\"put_p50_us\":{:.2},\"put_p99_us\":{:.2}}}",
+                kind,
+                writers,
+                all.len(),
+                secs,
+                all.len() as f64 / secs,
+                percentile(&all, 0.50),
+                percentile(&all, 0.99)
+            );
+        }
         "build" => {
             let t = Instant::now();
             let mut store = open_store(&kind, &dir);

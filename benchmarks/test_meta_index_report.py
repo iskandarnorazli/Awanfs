@@ -54,6 +54,15 @@ class Report(unittest.TestCase):
         lines = [rec(s, p) for s in ("seg", "prod") for p in ("build", "query")]
         self.assertEqual(report(load(lines), "t")[0], 2)
 
+    def test_writers_rows_appear_for_the_stores_that_ran_them(self):
+        lines = FULL + [rec("redb", "writers", writers=64, puts_per_s=2000, put_p99_us=90.5)]
+        code, text = report(load(lines), "t")
+        self.assertEqual(code, 0, text)
+        row = next(l for l in text.splitlines() if l.startswith("| inserts per second, 64 writers"))
+        self.assertEqual(row, "| inserts per second, 64 writers at once | 2,000 | not measured |")
+        self.assertIn("| put P99 with 64 writers, us | 90.500 | not measured |", text)
+        self.assertNotIn("writers", report(load(FULL), "t")[1])
+
     def test_non_json_lines_are_ignored(self):
         self.assertEqual(report(load(["Compiling...", *FULL]), "t")[0], 0)
 
