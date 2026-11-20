@@ -486,5 +486,17 @@ class SmallPartsFlagForMpu1mTests(unittest.TestCase):
         self.assertIn("HTTP 400", m.note)
 
 
+class SizeFlagDecouplingTests(unittest.TestCase):
+    """#57: requesting 1GiB in bench-full runs the 1 GiB multipart workload without 10GiB."""
+
+    def test_one_gib_flag_does_not_enable_ten_gib(self):
+        import inspect
+        import run_warp_benchmark as r
+        src = inspect.getsource(r.main)
+        self.assertIn('if "1GiB" in size_set:', src)
+        self.assertIn('if "10GiB" in size_set:', src)
+        self.assertNotIn('if "1GiB" in args.sizes or "10GiB" in args.sizes:', src)
+
+
 if __name__ == "__main__":
     unittest.main()

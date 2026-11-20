@@ -223,16 +223,38 @@ impl MultipartManager {
     /// Starts a part whose body arrives in pieces (#36): see `PartWriter`.
     pub fn begin_part(&self, upload_id: &str, part_number: u32) -> std::io::Result<PartWriter> {
         let upload_dir = self.staging_dir.join(upload_id);
-        std::fs::create_dir_all(&upload_dir)?;
         let path = upload_dir.join(format!("part_{:05}.dat", part_number));
         let nanos = self.clock.now_ns();
         let tmp = upload_dir.join(format!("part_{:05}.dat.partial-{}", part_number, nanos));
-        let file = std::fs::File::create(&tmp)?;
-        Ok(PartWriter { file, tmp, path, buf: Vec::new(), written: 0, work: Arc::clone(&self.work), done: false })
+        let file = match std::fs::File::create(&tmp) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&upload_dir)?;
+                std::fs::File::create(&tmp)?
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(PartWriter { file, tmp, path, buf: Vec::new(), written: 0, work: Arc::clone(&self.work), done: false, coalesced: false })
     }
 
     pub fn get_upload(&self, upload_id: &str) -> Option<MultipartUpload> {
         self.uploads.read().get(upload_id).cloned()
+    }
+
+    /// Returns `(checksum_alg, checksum_type)` if `upload_id` exists, without cloning the part map.
+    pub fn upload_checksum_info(&self, upload_id: &str) -> Option<(Option<crate::checksum::ChecksumAlgorithm>, Option<String>)> {
+        self.uploads.read().get(upload_id).map(|u| (u.checksum_alg, u.checksum_type.clone()))
+    }
+
+    /// Returns `(checksum_alg, checksum_type, tags)` if `upload_id` exists, without cloning the part map.
+    pub fn upload_complete_info(
+        &self,
+        upload_id: &str,
+    ) -> Option<(Option<crate::checksum::ChecksumAlgorithm>, Option<String>, Option<crate::tagging::TagSet>)> {
+        self.uploads
+            .read()
+            .get(upload_id)
+            .map(|u| (u.checksum_alg, u.checksum_type.clone(), u.tags.clone()))
     }
 
     pub fn set_upload_checksum(&self, upload_id: &str, alg: crate::checksum::ChecksumAlgorithm, checksum_type: String) {
@@ -464,6 +486,7 @@ pub struct PartWriter {
     written: u64,
     work: Arc<crate::work::WorkCounters>,
     done: bool,
+    coalesced: bool,
 }
 
 impl PartWriter {
@@ -488,6 +511,16 @@ impl PartWriter {
         Ok(())
     }
 
+    /// Writes a chunk already coalesced into a `PART_CHUNK` buffer on the async pipeline.
+    pub fn write_coalesced(&mut self, data: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        self.coalesced = true;
+        self.file.write_all(data)?;
+        self.work.disk_write(data.len() as u64);
+        self.written += data.len() as u64;
+        Ok(())
+    }
+
     /// One write of a whole part held in memory: no buffer, no copy.
     fn write_unbuffered(&mut self, data: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
@@ -509,12 +542,12 @@ impl PartWriter {
 
     /// Writes what is left, syncs, and renames the file into place.
     pub fn finish(mut self) -> std::io::Result<PathBuf> {
-        let buffered = self.buf.capacity() > 0;
+        let buffered = self.buf.capacity() > 0 || self.coalesced;
         self.flush()?;
         if buffered {
             self.work.payload_copy(self.written);
         }
-        self.file.sync_all()?;
+        self.file.sync_data()?;
         self.work.disk_sync();
         std::fs::rename(&self.tmp, &self.path)?;
         self.done = true;

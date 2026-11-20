@@ -974,3 +974,105 @@ mod pipeline_tests {
     }
 }
 
+
+/// State of a streamed UploadPart's bounded hash-and-write pipeline (#57).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartPipelineState {
+    Filling,
+    Draining,
+    Failed,
+    Done,
+}
+
+/// Event driving [`part_pipeline_step`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartPipelineEvent {
+    Frame,
+    EndOfBody,
+    Drained,
+    HashError,
+    WriteError,
+    Disconnect,
+    LengthMismatch,
+}
+
+pub const PART_PIPELINE_TERMINAL: Refusal = Refusal {
+    status: 400,
+    code: "InvalidPipelineState",
+    why: "streamed UploadPart pipeline is not in a valid state for this event",
+};
+
+/// Pure transition function for the streamed UploadPart hash/write pipeline (#57).
+pub fn part_pipeline_step(state: PartPipelineState, event: PartPipelineEvent) -> Result<PartPipelineState, Refusal> {
+    match (state, event) {
+        (PartPipelineState::Filling, PartPipelineEvent::Frame) => Ok(PartPipelineState::Filling),
+        (PartPipelineState::Filling, PartPipelineEvent::EndOfBody) => Ok(PartPipelineState::Draining),
+        (PartPipelineState::Draining, PartPipelineEvent::Drained) => Ok(PartPipelineState::Done),
+        (
+            PartPipelineState::Filling | PartPipelineState::Draining,
+            PartPipelineEvent::HashError
+            | PartPipelineEvent::WriteError
+            | PartPipelineEvent::Disconnect
+            | PartPipelineEvent::LengthMismatch,
+        ) => Ok(PartPipelineState::Failed),
+        _ => Err(PART_PIPELINE_TERMINAL),
+    }
+}
+
+#[cfg(test)]
+mod part_pipeline_tests {
+    use super::*;
+
+    #[test]
+    fn part_pipeline_every_pair_is_decided() {
+        let states = [
+            PartPipelineState::Filling,
+            PartPipelineState::Draining,
+            PartPipelineState::Failed,
+            PartPipelineState::Done,
+        ];
+        let events = [
+            PartPipelineEvent::Frame,
+            PartPipelineEvent::EndOfBody,
+            PartPipelineEvent::Drained,
+            PartPipelineEvent::HashError,
+            PartPipelineEvent::WriteError,
+            PartPipelineEvent::Disconnect,
+            PartPipelineEvent::LengthMismatch,
+        ];
+        let mut count = 0usize;
+        for s in states {
+            for e in events {
+                let res = part_pipeline_step(s, e);
+                match (s, e) {
+                    (PartPipelineState::Filling, PartPipelineEvent::Frame) => {
+                        assert_eq!(res, Ok(PartPipelineState::Filling));
+                    }
+                    (PartPipelineState::Filling, PartPipelineEvent::EndOfBody) => {
+                        assert_eq!(res, Ok(PartPipelineState::Draining));
+                    }
+                    (PartPipelineState::Draining, PartPipelineEvent::Drained) => {
+                        assert_eq!(res, Ok(PartPipelineState::Done));
+                    }
+                    (
+                        PartPipelineState::Filling | PartPipelineState::Draining,
+                        PartPipelineEvent::HashError
+                        | PartPipelineEvent::WriteError
+                        | PartPipelineEvent::Disconnect
+                        | PartPipelineEvent::LengthMismatch,
+                    ) => {
+                        assert_eq!(res, Ok(PartPipelineState::Failed));
+                    }
+                    (PartPipelineState::Filling, PartPipelineEvent::Drained)
+                    | (PartPipelineState::Draining, PartPipelineEvent::Frame | PartPipelineEvent::EndOfBody)
+                    | (PartPipelineState::Failed, _)
+                    | (PartPipelineState::Done, _) => {
+                        assert_eq!(res, Err(PART_PIPELINE_TERMINAL));
+                    }
+                }
+                count += 1;
+            }
+        }
+        assert_eq!(count, states.len() * events.len());
+    }
+}

@@ -1409,6 +1409,7 @@ def main():
     args = parser.parse_args()
 
     dur_sec = float(args.duration.rstrip("s"))
+    size_set = {s.strip() for s in args.sizes.split(",") if s.strip()}
     cmd = f"python benchmarks/run_warp_benchmark.py --sizes {args.sizes} --concurrent {args.concurrent} --duration {args.duration} --output {args.output}"
 
     # Pin benchmark client to second half of cores, server to first half (when cpu_count >= 8)
@@ -1480,7 +1481,7 @@ def main():
     for c in [8, 32, 64, 128]:
         concurrency_data["s3-server"][c] = run_workload_phase(host, port, bucket, 64 * 1024, c, 1.5, "mixed", server_proc.pid)
 
-    if "1GiB" in args.sizes or "10GiB" in args.sizes:
+    if "1GiB" in size_set:
         part_sz = 64 * 1024 * 1024  # 64 MiB S3 multipart chunks
         print("  [7/10] & [8/10] Running 1 GiB S3 Multipart Upload (16 x 64 MiB parts) & Parallel RFC 9110 Range GET (8 workers)...")
         mpu_put_1g, mpu_get_1g = run_large_multipart_object_phase(
@@ -1489,6 +1490,8 @@ def main():
         awan_results["mpu_put_1g"] = mpu_put_1g
         awan_results["mpu_get_1g"] = mpu_get_1g
 
+    if "10GiB" in size_set:
+        part_sz = 64 * 1024 * 1024  # 64 MiB S3 multipart chunks
         print("  [9/10] Running 10 GiB Volume PUT phase (160 x 64 MiB chunks, 8 workers)...")
         awan_results["put_10g"] = run_fixed_volume_phase(host, port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "put", server_proc.pid, key_modulus=4)
 
@@ -1579,7 +1582,7 @@ def main():
         for c in [8, 32, 64, 128]:
             concurrency_data["minio"][c] = run_workload_phase(host, minio_port, bucket, 64 * 1024, c, 1.5, "mixed", minio_proc.pid)
 
-        if "1GiB" in args.sizes or "10GiB" in args.sizes:
+        if "1GiB" in size_set:
             part_sz = 64 * 1024 * 1024
             print("  [7/10] & [8/10] MinIO: Running 1 GiB Multipart Upload (16 x 64 MiB parts) & Range GET (8 workers)...")
             mpu_put_1g, mpu_get_1g = run_large_multipart_object_phase(
@@ -1588,6 +1591,8 @@ def main():
             baseline_results["mpu_put_1g"] = mpu_put_1g
             baseline_results["mpu_get_1g"] = mpu_get_1g
 
+        if "10GiB" in size_set:
+            part_sz = 64 * 1024 * 1024
             print("  [9/10] MinIO: Running 10 GiB Volume PUT phase (160 x 64 MiB chunks, 8 workers)...")
             baseline_results["put_10g"] = run_fixed_volume_phase(host, minio_port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "put", minio_proc.pid, key_modulus=4)
 
@@ -1620,10 +1625,12 @@ def main():
         for c in [8, 32, 64, 128]:
             concurrency_data["minio"][c] = run_workload_phase(host, base_port, bucket, 64 * 1024, c, 1.0, "mixed", os.getpid())
 
-        if "1GiB" in args.sizes or "10GiB" in args.sizes:
+        if "1GiB" in size_set:
             part_sz = 64 * 1024 * 1024
             baseline_results["mpu_put_1g"] = run_fixed_volume_phase(host, base_port, bucket, 1024 * 1024 * 1024, part_sz, 8, "put", os.getpid(), key_modulus=4)
             baseline_results["mpu_get_1g"] = run_fixed_volume_phase(host, base_port, bucket, 1024 * 1024 * 1024, part_sz, 8, "get", os.getpid(), key_modulus=4)
+        if "10GiB" in size_set:
+            part_sz = 64 * 1024 * 1024
             baseline_results["put_10g"] = run_fixed_volume_phase(host, base_port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "put", os.getpid(), key_modulus=4)
             baseline_results["get_10g"] = run_fixed_volume_phase(host, base_port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "get", os.getpid(), key_modulus=4)
 
@@ -1702,7 +1709,7 @@ def main():
         for c in [8, 32, 64, 128]:
             concurrency_data["rustfs"][c] = run_workload_phase(host, rustfs_port, bucket, 64 * 1024, c, 1.5, "mixed", rustfs_proc.pid)
 
-        if "1GiB" in args.sizes or "10GiB" in args.sizes:
+        if "1GiB" in size_set:
             part_sz = 64 * 1024 * 1024
             print("  [7/10] & [8/10] RustFS: Running 1 GiB Multipart Upload (16 x 64 MiB parts) & Range GET (8 workers)...")
             mpu_put_1g, mpu_get_1g = run_large_multipart_object_phase(
@@ -1711,6 +1718,8 @@ def main():
             rustfs_results["mpu_put_1g"] = mpu_put_1g
             rustfs_results["mpu_get_1g"] = mpu_get_1g
 
+        if "10GiB" in size_set:
+            part_sz = 64 * 1024 * 1024
             print("  [9/10] RustFS: Running 10 GiB Volume PUT phase (160 x 64 MiB chunks, 8 workers)...")
             rustfs_results["put_10g"] = run_fixed_volume_phase(host, rustfs_port, bucket, 10 * 1024 * 1024 * 1024, part_sz, 8, "put", rustfs_proc.pid, key_modulus=4)
 
