@@ -99,6 +99,28 @@ fn valid_header_str<'a>(val: &'a hyper::header::HeaderValue, key: &str) -> Resul
         .map_err(|_| bad_request("InvalidArgument", "Metadata header value must be valid UTF-8.", key))
 }
 
+/// A user metadata value as text, one character per byte (ISO-8859-1), so any bytes the
+/// client sent come back unchanged (`header_bytes`): Python's http.client sends Latin-1, other
+/// clients send UTF-8, and both round-trip. ASCII is unchanged. CR and LF stay refused.
+fn meta_value_text(val: &hyper::header::HeaderValue, key: &str) -> Result<String, Response<ResponseBody>> {
+    let bytes = val.as_bytes();
+    if bytes.iter().any(|&b| b == b'\r' || b == b'\n') {
+        return Err(bad_request("InvalidArgument", "Metadata header value must not contain CR or LF.", key));
+    }
+    Ok(bytes.iter().map(|&b| b as char).collect())
+}
+
+/// The bytes `meta_value_text` read, from its text. A character above U+00FF cannot come from
+/// it; one written before it existed goes out as its UTF-8 bytes.
+fn header_bytes(text: &str) -> hyper::header::HeaderValue {
+    let bytes: Vec<u8> = if text.chars().all(|c| (c as u32) <= 0xFF) {
+        text.chars().map(|c| c as u32 as u8).collect()
+    } else {
+        text.as_bytes().to_vec()
+    };
+    hyper::header::HeaderValue::from_bytes(&bytes).unwrap_or_else(|_| hyper::header::HeaderValue::from_static(""))
+}
+
 fn strip_aws_chunked(raw: &str) -> String {
     raw.split(',')
         .map(str::trim)
@@ -147,15 +169,15 @@ pub(crate) fn request_attrs_map(
             if suffix.is_empty() {
                 continue;
             }
-            let val = valid_header_str(value, key)?;
+            let val = meta_value_text(value, key)?;
             let lower = suffix.to_ascii_lowercase();
             user_meta
                 .entry(lower)
                 .and_modify(|existing| {
                     existing.push_str(", ");
-                    existing.push_str(val);
+                    existing.push_str(&val);
                 })
-                .or_insert_with(|| val.to_string());
+                .or_insert(val);
         }
     }
     let total_user_meta: usize = user_meta.iter().map(|(k, v)| k.len() + v.len()).sum();
@@ -307,7 +329,7 @@ impl MetadataHeadersExt for hyper::http::response::Builder {
             self = self.header("x-amz-website-redirect-location", v);
         }
         for (k, v) in view.attrs.user_meta() {
-            self = self.header(format!("x-amz-meta-{}", k), v);
+            self = self.header(format!("x-amz-meta-{}", k), header_bytes(v));
         }
         self
     }
