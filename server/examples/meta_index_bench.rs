@@ -4,6 +4,7 @@
 //!
 //!   meta_index_bench build --store redb|seg|prod --dir DIR --keys N
 //!   meta_index_bench query --store redb|seg|prod --dir DIR --keys N [--gets 1000000] [--scans 1000]
+//!   meta_index_bench writers --store redb|prod --dir DIR --keys N [--writers 1,4,16,64]
 //!
 //! `--store prod@M` is the production store with a cache budget of M MiB (`prod` uses the
 //! server's `SPILL_CACHE_BYTES`, the same 64 MiB redb gets), for experiments on the memtable's
@@ -588,6 +589,92 @@ fn run_writers(writers: u64, keys: u64, put: impl Fn(&[u8], &ObjectMeta) + Sync)
     })
 }
 
+fn parse_writers(spec: &str) -> Vec<u64> {
+    let out: Vec<u64> = spec
+        .split(',')
+        .map(|s| s.trim().parse::<u64>().expect("--writers counts must be positive integers"))
+        .collect();
+    assert!(!out.is_empty() && out.iter().all(|&w| w > 0), "--writers must be a non-empty list of positive integers");
+    out
+}
+
+fn meta_segments(dir: &Path) -> usize {
+    std::fs::read_dir(dir.join("meta"))
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("seg_") && n.ends_with(".seg")))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+struct WriterStats {
+    writers: u64,
+    keys: usize,
+    secs: f64,
+    puts_per_s: f64,
+    put_p50_us: f64,
+    put_p99_us: f64,
+    put_p999_us: f64,
+    flushes: usize,
+}
+
+impl WriterStats {
+    fn from_latencies(writers: u64, lat: Vec<Vec<u64>>, flushes: usize) -> Self {
+        let secs = lat.iter().map(|l| l[0]).max().unwrap_or(0) as f64 / 1e9;
+        let mut all: Vec<u64> = lat.iter().flat_map(|l| l[1..].iter().copied()).collect();
+        all.sort_unstable();
+        let keys = all.len();
+        let puts_per_s = if secs > 0.0 { keys as f64 / secs } else { 0.0 };
+        Self {
+            writers,
+            keys,
+            secs,
+            puts_per_s,
+            put_p50_us: percentile(&all, 0.50),
+            put_p99_us: percentile(&all, 0.99),
+            put_p999_us: percentile(&all, 0.999),
+            flushes,
+        }
+    }
+
+    fn json_line(&self, store: &str) -> String {
+        format!(
+            "{{\"store\":\"{}\",\"phase\":\"writers\",\"writers\":{},\"keys\":{},\"secs\":{:.3},\"puts_per_s\":{:.0},\"put_p50_us\":{:.2},\"put_p99_us\":{:.2},\"put_p999_us\":{:.2},\"flushes\":{}}}",
+            store,
+            self.writers,
+            self.keys,
+            self.secs,
+            self.puts_per_s,
+            self.put_p50_us,
+            self.put_p99_us,
+            self.put_p999_us,
+            self.flushes
+        )
+    }
+}
+
+fn run_writers_once(kind: &str, dir: &Path, writers: u64, keys: u64, prod_cache_bytes: Option<usize>) -> WriterStats {
+    std::fs::create_dir_all(dir).unwrap();
+    let before = meta_segments(dir);
+    let lat: Vec<Vec<u64>> = match kind {
+        "redb" => {
+            let db = redb_spill::RedbSpill::open(&dir.join("metadata.db")).expect("open redb");
+            run_writers(writers, keys, |k, r| db.put(BUCKET, k, r).expect("redb put"))
+        }
+        "prod" => {
+            let ix = match prod_cache_bytes {
+                Some(bytes) => s3_server::spill::SpillIndex::open_with_cache_size(dir, bytes).expect("open prod"),
+                None => s3_server::spill::SpillIndex::open(dir).expect("open prod"),
+            };
+            run_writers(writers, keys, |k, r| ix.put(BUCKET, k, r).expect("prod put"))
+        }
+        other => panic!("writers: --store redb|prod, not {}", other),
+    };
+    let flushes = meta_segments(dir).saturating_sub(before);
+    WriterStats::from_latencies(writers, lat, flushes)
+}
+
 fn open_store(kind: &str, dir: &Path) -> Box<dyn Store> {
     match kind {
         "redb" => Box::new(Redb(redb_spill::RedbSpill::open(&dir.join("metadata.db")).expect("open redb"))),
@@ -614,35 +701,12 @@ fn main() {
 
     match phase.as_str() {
         "writers" => {
-            // #26's gate: `--writers` threads insert their share of fresh keys at once; the insert
-            // rate and every put's latency.
-            let writers: u64 = arg("--writers", "64").parse().unwrap();
-            let lat: Vec<Vec<u64>> = match kind.as_str() {
-                "redb" => {
-                    let db = redb_spill::RedbSpill::open(&dir.join("metadata.db")).expect("open redb");
-                    run_writers(writers, keys, |k, r| db.put(BUCKET, k, r).expect("redb put"))
-                }
-                "prod" => {
-                    let ix = s3_server::spill::SpillIndex::open(&dir).expect("open prod");
-                    let lat = run_writers(writers, keys, |k, r| ix.put(BUCKET, k, r).expect("prod put"));
-                    ix.flush().expect("prod flush");
-                    lat
-                }
-                other => panic!("writers: --store redb|prod, not {}", other),
-            };
-            let secs = lat.iter().map(|l| l[0]).max().unwrap_or(0) as f64 / 1e9;
-            let mut all: Vec<u64> = lat.iter().flat_map(|l| l[1..].iter().copied()).collect();
-            all.sort_unstable();
-            println!(
-                "{{\"store\":\"{}\",\"phase\":\"writers\",\"writers\":{},\"keys\":{},\"secs\":{:.3},\"puts_per_s\":{:.0},\"put_p50_us\":{:.2},\"put_p99_us\":{:.2}}}",
-                kind,
-                writers,
-                all.len(),
-                secs,
-                all.len() as f64 / secs,
-                percentile(&all, 0.50),
-                percentile(&all, 0.99)
-            );
+            let counts = parse_writers(&arg("--writers", "1,4,16,64"));
+            for &w in &counts {
+                let wdir = if counts.len() == 1 { dir.clone() } else { dir.join(format!("w{}", w)) };
+                let stats = run_writers_once(&kind, &wdir, w, keys, None);
+                println!("{}", stats.json_line(&kind));
+            }
         }
         "build" => {
             let t = Instant::now();
@@ -939,5 +1003,77 @@ mod redb_spill {
 
             Ok(results)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn test_dir(name: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("awanfs_meta_bench_{}_{}_{}", name, std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn parse_writers_accepts_single_and_lists() {
+        assert_eq!(parse_writers("64"), vec![64]);
+        assert_eq!(parse_writers("1, 4, 16, 64"), vec![1, 4, 16, 64]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn parse_writers_rejects_zero() {
+        parse_writers("1,0");
+    }
+
+    #[test]
+    fn percentile_computes_p50_p99_p999() {
+        let sorted: Vec<u64> = (1..=1001).map(|i| i * 1000).collect();
+        assert_eq!(percentile(&sorted, 0.50), 501.0);
+        assert_eq!(percentile(&sorted, 0.99), 991.0);
+        assert_eq!(percentile(&sorted, 0.999), 1000.0);
+    }
+
+    #[test]
+    fn writers_prod_counts_flushes_after_less_before() {
+        let d = test_dir("prod");
+        let small = run_writers_once("prod", &d, 2, 20, Some(256 << 10));
+        assert_eq!(small.keys, 20);
+        assert_eq!(small.flushes, 0, "below mem_limit writes zero segments");
+        assert_eq!(meta_segments(&d), 0);
+
+        let first = run_writers_once("prod", &d, 2, 700, Some(256 << 10));
+        assert_eq!(first.keys, 700);
+        assert!(first.flushes >= 1, "exceeding 64 KiB mem_limit flushes at least once");
+        let after_first = meta_segments(&d);
+        assert_eq!(first.flushes, after_first);
+
+        let second = run_writers_once("prod", &d, 2, 700, Some(256 << 10));
+        assert!(second.flushes >= 1, "second run flushes on top of existing segments");
+        assert_eq!(second.flushes, meta_segments(&d) - after_first, "flushes counts segments after less before");
+        let line = second.json_line("prod");
+        assert!(line.contains("\"writers\":2,"), "json line missing writers: {}", line);
+        assert!(line.contains("\"put_p999_us\":"), "json line missing put_p999_us: {}", line);
+        assert!(line.contains(&format!("\"flushes\":{}", second.flushes)), "json line missing flushes: {}", line);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn writers_redb_reports_zero_flushes_and_p999() {
+        let d = test_dir("redb");
+        let stats = run_writers_once("redb", &d, 2, 20, None);
+        assert_eq!(stats.writers, 2);
+        assert_eq!(stats.keys, 20);
+        assert_eq!(stats.flushes, 0);
+        let line = stats.json_line("redb");
+        assert!(line.contains("\"put_p999_us\":"), "json line missing put_p999_us: {}", line);
+        assert!(line.contains("\"flushes\":0"), "json line missing flushes: {}", line);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
