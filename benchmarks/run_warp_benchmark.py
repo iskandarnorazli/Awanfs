@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -50,6 +51,10 @@ class BenchmarkMetrics:
     peak_rss_min_mb: Optional[float] = None
     peak_rss_max_mb: Optional[float] = None
     peak_inflight_mb: Optional[float] = None
+    peak_rss_file_mb: Optional[float] = None
+    peak_rss_anon_mb: Optional[float] = None
+    peak_win_private_mb: Optional[float] = None
+    peak_win_wset_mb: Optional[float] = None
 
 
 def calculate_percentiles(latencies: List[float]) -> Tuple[float, float, float, float]:
@@ -113,6 +118,192 @@ def get_process_peak_rss_mb(pid: int) -> float:
         except Exception:
             pass
     return 0.0
+
+
+def parse_proc_status(text: str) -> Dict[str, float]:
+    """Parses Linux /proc/<pid>/status memory fields (VmHWM, VmRSS, RssAnon, RssFile, RssShmem) into MiB."""
+    out: Dict[str, float] = {}
+    for line in text.splitlines():
+        name, _, rest = line.partition(":")
+        if name in ("VmHWM", "VmRSS", "RssAnon", "RssFile", "RssShmem"):
+            fields = rest.split()
+            if len(fields) == 2 and fields[1] == "kB" and fields[0].isdigit():
+                out[name] = int(fields[0]) / 1024.0
+    return out
+
+
+def parse_windows_memory_info(info) -> Dict[str, float]:
+    """Extracts Windows `private`, `wset`, and `peak_wset` in MiB from a psutil memory_full_info() object."""
+    out: Dict[str, float] = {}
+    for attr in ("private", "wset", "peak_wset"):
+        val = getattr(info, attr, None)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and val >= 0:
+            out[attr] = float(val) / (1024.0 * 1024.0)
+    return out
+
+
+def _win32_process_memory_counters_ex(pid: int):
+    """Queries Win32 PROCESS_MEMORY_COUNTERS_EX for PrivateUsage, WorkingSetSize, and PeakWorkingSetSize."""
+    class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+            ("PrivateUsage", ctypes.c_size_t),
+        ]
+
+    PROCESS_QUERY_INFORMATION = 0x0400
+    PROCESS_VM_READ = 0x0010
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+    if not handle:
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        exit_code = wintypes.DWORD()
+        if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)) and exit_code.value != STILL_ACTIVE:
+            return None
+        counters = PROCESS_MEMORY_COUNTERS_EX()
+        counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS_EX)
+        psapi = ctypes.windll.psapi
+        psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+        if psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            return types.SimpleNamespace(
+                private=counters.PrivateUsage,
+                wset=counters.WorkingSetSize,
+                peak_wset=counters.PeakWorkingSetSize,
+            )
+    finally:
+        kernel32.CloseHandle(handle)
+    return None
+
+
+def sample_windows_memory(pid: int) -> Dict[str, float]:
+    """Reads Windows `private` and `wset` (in MiB) via psutil memory_full_info(), falling back to Win32 API."""
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        try:
+            info = psutil.Process(pid).memory_full_info()
+            got = parse_windows_memory_info(info)
+            if "private" in got and "wset" in got:
+                return got
+        except (AttributeError, NotImplementedError):
+            pass
+        except Exception:
+            return {}
+    if sys.platform == "win32":
+        info = _win32_process_memory_counters_ex(pid)
+        if info is not None:
+            return parse_windows_memory_info(info)
+    return {}
+
+
+class PeakRssSampler:
+    """Samples peak memory split while a benchmark phase runs:
+    - Linux: RssFile and RssAnon (plus VmHWM/VmRSS) from /proc/<pid>/status.
+    - Windows: private and wset from psutil memory_full_info() (or Win32 PROCESS_MEMORY_COUNTERS_EX).
+    Fields stay None when unavailable (missing/exited process or unsupported platform)."""
+
+    def __init__(self, pid: Optional[int], every: float = 0.05, status_path: Optional[str] = None):
+        self.pid = pid
+        self.every = every
+        self._default_path = f"/proc/{pid}/status" if pid is not None else None
+        self._explicit_path = status_path is not None
+        self.path = status_path if status_path is not None else self._default_path
+        self.peak_rss_mb: Optional[float] = None
+        self.rss_file_mb: Optional[float] = None
+        self.rss_anon_mb: Optional[float] = None
+        self.win_private_mb: Optional[float] = None
+        self.win_wset_mb: Optional[float] = None
+        self._stop: Optional[threading.Event] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def sample(self) -> None:
+        if self.pid is None and not self._explicit_path:
+            return
+        use_proc = self._explicit_path or (self.path != self._default_path) or sys.platform != "win32"
+        if use_proc:
+            if not self.path:
+                return
+            try:
+                with open(self.path, encoding="ascii") as fh:
+                    got = parse_proc_status(fh.read())
+            except OSError:
+                return
+            if "RssFile" in got:
+                self.rss_file_mb = max(self.rss_file_mb or 0.0, got["RssFile"])
+            if "RssAnon" in got:
+                self.rss_anon_mb = max(self.rss_anon_mb or 0.0, got["RssAnon"])
+            for k in ("VmHWM", "VmRSS"):
+                if k in got:
+                    self.peak_rss_mb = max(self.peak_rss_mb or 0.0, got[k])
+            return
+        if self.pid is not None and sys.platform == "win32":
+            got = sample_windows_memory(self.pid)
+            if "private" in got:
+                self.win_private_mb = max(self.win_private_mb or 0.0, got["private"])
+            if "wset" in got:
+                self.win_wset_mb = max(self.win_wset_mb or 0.0, got["wset"])
+            for k in ("peak_wset", "wset"):
+                if k in got:
+                    self.peak_rss_mb = max(self.peak_rss_mb or 0.0, got[k])
+
+    def __enter__(self):
+        self.sample()
+        if self.pid is None and not self._explicit_path:
+            return self
+        self._stop = threading.Event()
+
+        def loop():
+            while not self._stop.wait(self.every):
+                self.sample()
+
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        self.sample()
+        return False
+
+
+def instant_memory_split(pid: Optional[int]) -> PeakRssSampler:
+    """Takes a single instantaneous memory-split sample for `pid`."""
+    sampler = PeakRssSampler(pid)
+    sampler.sample()
+    return sampler
+
+
+def _rss_split_fields(server_pid: Optional[int], sampler: PeakRssSampler) -> dict:
+    """Returns BenchmarkMetrics keyword fields for total peak RSS and platform memory split."""
+    peak_rss = max(get_process_peak_rss_mb(server_pid) if server_pid else 0.0, sampler.peak_rss_mb or 0.0)
+    return {
+        "peak_rss_mb": peak_rss,
+        "peak_rss_file_mb": sampler.rss_file_mb,
+        "peak_rss_anon_mb": sampler.rss_anon_mb,
+        "peak_win_private_mb": sampler.win_private_mb,
+        "peak_win_wset_mb": sampler.win_wset_mb,
+    }
 
 
 def get_process_cpu_times(pid: int) -> Tuple[float, float]:
@@ -329,6 +520,10 @@ def aggregate_rounds(rounds: List[Dict]) -> Dict:
                 seen.add(k)
                 keys.append(k)
 
+    def med(vals: List[Optional[float]]) -> Optional[float]:
+        vals = [v for v in vals if v is not None]
+        return statistics.median(vals) if vals else None
+
     out = {}
     for k in keys:
         samples = [r[k] for r in rounds if k in r]
@@ -356,6 +551,8 @@ def aggregate_rounds(rounds: List[Dict]) -> Dict:
             peak_rss_min_mb=min(rss_vals) if rss_vals else None,
             peak_rss_max_mb=max(rss_vals) if rss_vals else None,
             peak_inflight_mb=statistics.median(inflight_vals) if inflight_vals else None,
+            # #274's memory split, as medians like the other columns.
+            **{f: med([getattr(x, f) for x in pool]) for f in ("peak_rss_file_mb", "peak_rss_anon_mb", "peak_win_private_mb", "peak_win_wset_mb")},
         )
     return out
 
@@ -384,6 +581,48 @@ def format_rss_cell(m: BenchmarkMetrics) -> str:
     return f"{m.peak_rss_mb:.1f} MB"
 
 
+def _detect_memory_split_kind(hw_info: Dict[str, str], *metric_dicts: Dict[str, BenchmarkMetrics]) -> str:
+    for d in metric_dicts:
+        for m in d.values():
+            if m.peak_rss_file_mb is not None or m.peak_rss_anon_mb is not None:
+                return "linux"
+            if m.peak_win_private_mb is not None or m.peak_win_wset_mb is not None:
+                return "windows"
+    os_str = str(hw_info.get("os", "")).lower()
+    if "windows" in os_str:
+        return "windows"
+    if "linux" in os_str:
+        return "linux"
+    return "windows" if sys.platform == "win32" else "linux"
+
+
+def _format_split_cells(m: BenchmarkMetrics, split_kind: str, bold: bool = False) -> Tuple[str, str]:
+    if split_kind == "windows":
+        vals = (m.peak_win_private_mb, m.peak_win_wset_mb)
+    else:
+        vals = (m.peak_rss_file_mb, m.peak_rss_anon_mb)
+
+    def fmt(v: Optional[float]) -> str:
+        if v is None:
+            return "not measured"
+        return f"**{v:.1f} MB**" if bold else f"{v:.1f} MB"
+
+    return fmt(vals[0]), fmt(vals[1])
+
+
+def _format_summary_split(metrics_dict: Dict[str, BenchmarkMetrics], split_kind: str) -> str:
+    def fmt(v: Optional[float]) -> str:
+        return "not measured" if v is None else f"{v:.1f} MB"
+
+    if split_kind == "windows":
+        priv = max((v.peak_win_private_mb for v in metrics_dict.values() if v.peak_win_private_mb is not None), default=None)
+        wset = max((v.peak_win_wset_mb for v in metrics_dict.values() if v.peak_win_wset_mb is not None), default=None)
+        return f"private {fmt(priv)}, wset {fmt(wset)}"
+    file_p = max((v.peak_rss_file_mb for v in metrics_dict.values() if v.peak_rss_file_mb is not None), default=None)
+    anon_p = max((v.peak_rss_anon_mb for v in metrics_dict.values() if v.peak_rss_anon_mb is not None), default=None)
+    return f"RssFile {fmt(file_p)}, RssAnon {fmt(anon_p)}"
+
+
 def format_markdown_report(
     cmd: str,
     hw_info: Dict[str, str],
@@ -403,6 +642,12 @@ def format_markdown_report(
         minio_or_baseline = {}
     if rust_fb is None:
         rust_fb = {}
+
+    split_kind = _detect_memory_split_kind(hw_info, awan, minio_or_baseline, rust_fb)
+    if split_kind == "windows":
+        split_headers = ("Private Bytes (private, MB)", "Working Set (wset, MB)")
+    else:
+        split_headers = ("File-Backed (RssFile, MB)", "Anonymous (RssAnon, MB)")
 
     lines = [
         f"`{cmd}`",
@@ -426,8 +671,8 @@ def format_markdown_report(
         "",
         "## 2. Live Measured HTTP/1.1 Keep-Alive Throughput & Latency Matrix (64 KiB – 10 GiB)",
         "",
-        "| Workload | Target Engine | Throughput (MiB/s) | Operations/sec | P50 (ms) | P90 (ms) | P99 (ms) | P99.9 (ms) | Peak RSS (MB) |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        f"| Workload | Target Engine | Throughput (MiB/s) | Operations/sec | P50 (ms) | P90 (ms) | P99 (ms) | P99.9 (ms) | Peak RSS (MB) | {split_headers[0]} | {split_headers[1]} |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ])
 
     workloads = [
@@ -454,28 +699,31 @@ def format_markdown_report(
 
         # A phase that did not finish is not a slow phase: say so in the row (#135).
         if not a.measured and a.note:
-            lines.append(f"| **{label}** | **S3 Storage Server** | did not finish: {a.note} | | | | | | |")
+            lines.append(f"| **{label}** | **S3 Storage Server** | did not finish: {a.note} | | | | | | | | |")
 
+        a_s1, a_s2 = _format_split_cells(a, split_kind, bold=True)
         lines.append(
-            f"| **{label}** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **{a.mib_per_sec:.1f}** | **{a.ops_per_sec:.1f}** | **{a.p50_ms:.2f}** | **{a.p90_ms:.2f}** | **{a.p99_ms:.2f}** | **{a.p999_ms:.2f}** | **{format_rss_cell(a)}** |"
+            f"| **{label}** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **{a.mib_per_sec:.1f}** | **{a.ops_per_sec:.1f}** | **{a.p50_ms:.2f}** | **{a.p90_ms:.2f}** | **{a.p99_ms:.2f}** | **{a.p999_ms:.2f}** | **{format_rss_cell(a)}** | {a_s1} | {a_s2} |"
         )
         if m.measured:
+            m_s1, m_s2 = _format_split_cells(m, split_kind)
             if m.ops_per_sec == 0.0 and m.mib_per_sec == 0.0:
                 lines.append(
-                    f"| **{label}** | {baseline_server_label} | N/A (S3 $\\ge$5MiB spec limit) | N/A | N/A | N/A | N/A | N/A | {format_rss_cell(m)} |"
+                    f"| **{label}** | {baseline_server_label} | N/A (S3 $\\ge$5MiB spec limit) | N/A | N/A | N/A | N/A | N/A | {format_rss_cell(m)} | {m_s1} | {m_s2} |"
                 )
             else:
                 lines.append(
-                    f"| **{label}** | {baseline_server_label} | {m.mib_per_sec:.1f} | {m.ops_per_sec:.1f} | {m.p50_ms:.2f} | {m.p90_ms:.2f} | {m.p99_ms:.2f} | {m.p999_ms:.2f} | {format_rss_cell(m)} |"
+                    f"| **{label}** | {baseline_server_label} | {m.mib_per_sec:.1f} | {m.ops_per_sec:.1f} | {m.p50_ms:.2f} | {m.p90_ms:.2f} | {m.p99_ms:.2f} | {m.p999_ms:.2f} | {format_rss_cell(m)} | {m_s1} | {m_s2} |"
                 )
         if r.measured:
+            r_s1, r_s2 = _format_split_cells(r, split_kind)
             if r.ops_per_sec == 0.0 and r.mib_per_sec == 0.0:
                 lines.append(
-                    f"| **{label}** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | N/A (S3 $\\ge$5MiB spec limit) | N/A | N/A | N/A | N/A | N/A | {format_rss_cell(r)} |"
+                    f"| **{label}** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | N/A (S3 $\\ge$5MiB spec limit) | N/A | N/A | N/A | N/A | N/A | {format_rss_cell(r)} | {r_s1} | {r_s2} |"
                 )
             else:
                 lines.append(
-                    f"| **{label}** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | {r.mib_per_sec:.1f} | {r.ops_per_sec:.1f} | {r.p50_ms:.2f} | {r.p90_ms:.2f} | {r.p99_ms:.2f} | {r.p999_ms:.2f} | {format_rss_cell(r)} |"
+                    f"| **{label}** | RustFS Community Server (Official Rust binary: rustfs.exe v1.0.5) | {r.mib_per_sec:.1f} | {r.ops_per_sec:.1f} | {r.p50_ms:.2f} | {r.p90_ms:.2f} | {r.p99_ms:.2f} | {r.p999_ms:.2f} | {format_rss_cell(r)} | {r_s1} | {r_s2} |"
                 )
 
     put_64k = awan.get("put_64k", BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0))
@@ -531,11 +779,15 @@ def format_markdown_report(
     else:
         section_num = "3"
 
+    a_split = _format_summary_split(awan, split_kind)
+    m_split = _format_summary_split(minio_or_baseline, split_kind)
+    r_split = _format_summary_split(rust_fb, split_kind)
+
     lines.extend([
         "",
         f"## {section_num}. Open-Source S3 Alternatives Reference Comparison",
         "",
-        f"> **Provenance Note (Audit Rule 3):** MinIO ({hw_info.get('minio_status', 'not measured')}) and RustFS ({hw_info.get('rustfs_status', 'not measured')}) ran on this machine ({hw_info.get('os', platform.platform())}) with anonymous access enabled via `mc`, receiving the same persistent HTTP/1.1 keep-alive requests as `s3-server`. Server pinning: {hw_info.get('affinity_server', 'not recorded')}. Peak RSS comes from the OS (`GetProcessMemoryInfo` on Windows, `/proc/<pid>/status` VmHWM on Linux). Note that for 1 MiB multipart upload with 256 KiB parts, both MinIO and RustFS strictly reject parts smaller than 5 MiB with HTTP 400 `EntityTooSmall` per AWS S3 RFC specification, whereas `s3-server` accepts them, which does not conform to S3. Reference figures for SeaweedFS, Garage and Ceph RGW are not measured here and are left out.",
+        f"> **Provenance Note (Audit Rule 3):** MinIO ({hw_info.get('minio_status', 'not measured')}) and RustFS ({hw_info.get('rustfs_status', 'not measured')}) ran on this machine ({hw_info.get('os', platform.platform())}) with anonymous access enabled via `mc`, receiving the same persistent HTTP/1.1 keep-alive requests as `s3-server`. Server pinning: {hw_info.get('affinity_server', 'not recorded')}. Peak RSS comes from the OS (`GetProcessMemoryInfo` / `PROCESS_MEMORY_COUNTERS_EX` `private` & `wset` on Windows, `/proc/<pid>/status` `VmHWM`, `RssFile`, `RssAnon` on Linux). Note that for 1 MiB multipart upload with 256 KiB parts, both MinIO and RustFS strictly reject parts smaller than 5 MiB with HTTP 400 `EntityTooSmall` per AWS S3 RFC specification, whereas `s3-server` accepts them, which does not conform to S3. Reference figures for SeaweedFS, Garage and Ceph RGW are not measured here and are left out.",
         "",
         "| Dimension | `s3-server` (Measured Local) | MinIO (Go, Measured Local) | RustFS (Rust, Measured Local) |",
         "| :--- | :--- | :--- | :--- |",
@@ -543,7 +795,7 @@ def format_markdown_report(
         f"| **64 KiB GET Throughput** | **{get_64k.mib_per_sec:.1f} MiB/s ({get_64k.ops_per_sec:.0f} ops/s)** | {m_get_64k.mib_per_sec:.1f} MiB/s ({m_get_64k.ops_per_sec:.0f} ops/s) | {r_get_64k.mib_per_sec:.1f} MiB/s ({r_get_64k.ops_per_sec:.0f} ops/s) |",
         f"| **1 MiB PUT Throughput** | **{put_1m.mib_per_sec:.1f} MiB/s ({put_1m.ops_per_sec:.0f} ops/s)** | {m_put_1m.mib_per_sec:.1f} MiB/s ({m_put_1m.ops_per_sec:.0f} ops/s) | {r_put_1m.mib_per_sec:.1f} MiB/s ({r_put_1m.ops_per_sec:.0f} ops/s) |",
         f"| **1 MiB / 10 GiB GET Throughput** | **{get_1m.mib_per_sec:.1f} – {get_10g.mib_per_sec:.1f} MiB/s** | {m_get_1m.mib_per_sec:.1f} – {m_get_10g.mib_per_sec:.1f} MiB/s | {r_get_1m.mib_per_sec:.1f} – {r_get_10g.mib_per_sec:.1f} MiB/s |",
-        f"| **Server Peak RSS (64K–10G)** | **{max_rss:.1f} MB (1 GiB payload cache cap)** | {m_max_rss:.1f} MB (Go GC heap) | {r_max_rss:.1f} MB (Rust jemalloc) |",
+        f"| **Server Peak RSS (64K–10G)** | **{max_rss:.1f} MB ({a_split}; 1 GiB payload cache cap)** | {m_max_rss:.1f} MB ({m_split}; Go GC heap) | {r_max_rss:.1f} MB ({r_split}; Rust jemalloc) |",
         "| **Metadata Layout** | **64B `ObjectMeta` Columnar SoA** | Per-object `xl.meta` file | Multi-volume FS Metadata |",
         "| **Small-File Disk Layout** | **4096B WORM Needle Volume** | 2+ files/inodes per object | Multi-volume File Store |",
         "| **License** | **Permissive (Workspace / MIT / Apache-2.0)** | AGPLv3 (Active Community OSS) | Apache 2.0 (Active Rust OSS) |",
@@ -1034,7 +1286,7 @@ def run_workload_phase(
                 error_statuses[st] = error_statuses.get(st, 0) + n
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(concurrency)]
-    with CpuSampler(server_pid) as cpu_sampler:
+    with CpuSampler(server_pid) as cpu_sampler, PeakRssSampler(server_pid) as rss_sampler:
         t_start = time.perf_counter()
         for t in threads:
             t.start()
@@ -1049,7 +1301,6 @@ def run_workload_phase(
     ops_per_sec = ops / t_total if t_total > 0 else 0.0
     mib_per_sec = (total_bytes / (1024.0 * 1024.0)) / t_total if t_total > 0 else 0.0
     p50, p90, p99, p999 = calculate_percentiles(latencies)
-    peak_rss = get_process_peak_rss_mb(server_pid) if server_pid else 0.0
 
     return BenchmarkMetrics(
         ops_per_sec=ops_per_sec,
@@ -1058,7 +1309,7 @@ def run_workload_phase(
         p90_ms=p90,
         p99_ms=p99,
         p999_ms=p999,
-        peak_rss_mb=peak_rss,
+        **_rss_split_fields(server_pid, rss_sampler),
         server_cpu_s=cpu_sampler.server_cpu_s,
         client_cpu_s=cpu_sampler.client_cpu_s,
         system_cpu_s=cpu_sampler.system_cpu_s,
@@ -1182,19 +1433,19 @@ def run_multipart_upload_duration_phase(
                 error_statuses[st] = error_statuses.get(st, 0) + n
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(concurrency)]
-    t_start = time.perf_counter()
-    for t in threads:
-        t.start()
-    time.sleep(duration_sec)
-    stop_event.set()
-    stuck = join_all(threads, phase_label)
-    t_total = time.perf_counter() - t_start
+    with PeakRssSampler(server_pid) as rss_sampler:
+        t_start = time.perf_counter()
+        for t in threads:
+            t.start()
+        time.sleep(duration_sec)
+        stop_event.set()
+        stuck = join_all(threads, phase_label)
+        t_total = time.perf_counter() - t_start
 
     ops = len(latencies)
     ops_per_sec = ops / t_total if t_total > 0 else 0.0
     mib_per_sec = (total_bytes / (1024.0 * 1024.0)) / t_total if t_total > 0 else 0.0
     p50, p90, p99, p999 = calculate_percentiles(latencies)
-    peak_rss = get_process_peak_rss_mb(server_pid) if server_pid else 0.0
 
     return BenchmarkMetrics(
         ops_per_sec=ops_per_sec,
@@ -1203,7 +1454,7 @@ def run_multipart_upload_duration_phase(
         p90_ms=p90,
         p99_ms=p99,
         p999_ms=p999,
-        peak_rss_mb=peak_rss,
+        **_rss_split_fields(server_pid, rss_sampler),
         measured=not stuck and errors == 0 and ops > 0,
         note=", ".join(
             x for x in (
@@ -1311,28 +1562,28 @@ def run_large_multipart_object_phase(
         w_conn.close()
 
     threads = [threading.Thread(target=upload_worker, daemon=True) for _ in range(concurrency)]
-    for t in threads:
-        t.start()
-    stuck = join_all(threads, phase_label)
+    with PeakRssSampler(server_pid) as up_rss_sampler:
+        for t in threads:
+            t.start()
+        stuck = join_all(threads, phase_label)
 
-    parts_xml = "".join(
-        f"<Part><PartNumber>{p}</PartNumber><ETag>{etags[p]}</ETag></Part>"
-        for p in sorted(etags.keys())
-    )
-    complete_body = f"<CompleteMultipartUpload>{parts_xml}</CompleteMultipartUpload>".encode("utf-8")
-    conn = http.client.HTTPConnection(host, port, timeout=30.0)
-    conn.request(
-        "POST",
-        f"{obj_path}?uploadId={upload_id}",
-        body=complete_body,
-        headers={"Content-Length": str(len(complete_body))},
-    )
-    conn.getresponse().read()
-    conn.close()
+        parts_xml = "".join(
+            f"<Part><PartNumber>{p}</PartNumber><ETag>{etags[p]}</ETag></Part>"
+            for p in sorted(etags.keys())
+        )
+        complete_body = f"<CompleteMultipartUpload>{parts_xml}</CompleteMultipartUpload>".encode("utf-8")
+        conn = http.client.HTTPConnection(host, port, timeout=30.0)
+        conn.request(
+            "POST",
+            f"{obj_path}?uploadId={upload_id}",
+            body=complete_body,
+            headers={"Content-Length": str(len(complete_body))},
+        )
+        conn.getresponse().read()
+        conn.close()
     t_up_total = time.perf_counter() - t_up_start
 
     up_p50, up_p90, up_p99, up_p999 = calculate_percentiles(up_lats)
-    up_rss = get_process_peak_rss_mb(server_pid) if server_pid else 0.0
     put_metrics = BenchmarkMetrics(
         ops_per_sec=len(up_lats) / t_up_total if t_up_total > 0 else 0.0,
         mib_per_sec=(up_bytes / (1024.0 * 1024.0)) / t_up_total if t_up_total > 0 else 0.0,
@@ -1340,7 +1591,7 @@ def run_large_multipart_object_phase(
         p90_ms=up_p90,
         p99_ms=up_p99,
         p999_ms=up_p999,
-        peak_rss_mb=up_rss,
+        **_rss_split_fields(server_pid, up_rss_sampler),
         measured=not stuck,
         note=(f"{stuck} workers did not finish their request" if stuck else ""),
     )
@@ -1376,15 +1627,15 @@ def run_large_multipart_object_phase(
                     down_bytes += len(data)
         w_conn.close()
 
-    t_down_start = time.perf_counter()
-    threads = [threading.Thread(target=range_get_worker, daemon=True) for _ in range(concurrency)]
-    for t in threads:
-        t.start()
-    stuck = join_all(threads, phase_label)
-    t_down_total = time.perf_counter() - t_down_start
+    with PeakRssSampler(server_pid) as down_rss_sampler:
+        t_down_start = time.perf_counter()
+        threads = [threading.Thread(target=range_get_worker, daemon=True) for _ in range(concurrency)]
+        for t in threads:
+            t.start()
+        stuck = join_all(threads, phase_label)
+        t_down_total = time.perf_counter() - t_down_start
 
     d_p50, d_p90, d_p99, d_p999 = calculate_percentiles(down_lats)
-    down_rss = get_process_peak_rss_mb(server_pid) if server_pid else 0.0
     get_metrics = BenchmarkMetrics(
         ops_per_sec=len(down_lats) / t_down_total if t_down_total > 0 else 0.0,
         mib_per_sec=(down_bytes / (1024.0 * 1024.0)) / t_down_total if t_down_total > 0 else 0.0,
@@ -1392,7 +1643,7 @@ def run_large_multipart_object_phase(
         p90_ms=d_p90,
         p99_ms=d_p99,
         p999_ms=d_p999,
-        peak_rss_mb=down_rss,
+        **_rss_split_fields(server_pid, down_rss_sampler),
         measured=not stuck,
         note=(f"{stuck} workers did not finish their request" if stuck else ""),
     )
@@ -1473,17 +1724,17 @@ def run_fixed_volume_phase(
             total_bytes += local_bytes
 
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(concurrency)]
-    t_start = time.perf_counter()
-    for t in threads:
-        t.start()
-    stuck = join_all(threads, phase_label)
-    t_total = time.perf_counter() - t_start
+    with PeakRssSampler(server_pid) as rss_sampler:
+        t_start = time.perf_counter()
+        for t in threads:
+            t.start()
+        stuck = join_all(threads, phase_label)
+        t_total = time.perf_counter() - t_start
 
     ops = len(latencies)
     ops_per_sec = ops / t_total if t_total > 0 else 0.0
     mib_per_sec = (total_bytes / (1024.0 * 1024.0)) / t_total if t_total > 0 else 0.0
     p50, p90, p99, p999 = calculate_percentiles(latencies)
-    peak_rss = get_process_peak_rss_mb(server_pid) if server_pid else 0.0
 
     return BenchmarkMetrics(
         ops_per_sec=ops_per_sec,
@@ -1492,7 +1743,7 @@ def run_fixed_volume_phase(
         p90_ms=p90,
         p99_ms=p99,
         p999_ms=p999,
-        peak_rss_mb=peak_rss,
+        **_rss_split_fields(server_pid, rss_sampler),
         measured=not stuck,
         note=(f"{stuck} workers did not finish their request" if stuck else ""),
     )
@@ -1572,8 +1823,7 @@ def run_server_suite(
         pass  # measured on its own server by the caller (#111: AwanFS runs it with --allow-small-parts)
     elif mpu_1m_spec_limit:
         print(f"  [6/10] {label}: 1 MiB Multipart Upload (4 x 256 KiB parts) -> EntityTooSmall (S3 >=5MiB spec constraint)...")
-        rss = get_process_peak_rss_mb(server_pid) if server_pid else 0.0
-        record("mpu_1m", BenchmarkMetrics(0, 0, 0, 0, 0, 0, rss, measured=True))
+        record("mpu_1m", BenchmarkMetrics(0, 0, 0, 0, 0, 0, **_rss_split_fields(server_pid, instant_memory_split(server_pid)), measured=True))
     else:
         print(f"  [6/10] {label}: Running 1 MiB S3 Multipart Upload (4 x 256 KiB parts + CompleteMultipartUpload) phase ({dur_sec}s, 16 workers)...")
         record("mpu_1m", run_multipart_upload_duration_phase(host, port, bucket, 256 * 1024, 4, 16, dur_sec, server_pid))

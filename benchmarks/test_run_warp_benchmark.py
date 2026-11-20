@@ -632,5 +632,233 @@ class SizeFlagDecouplingTests(unittest.TestCase):
         self.assertNotIn('"1GiB" in sizes or "10GiB" in sizes', src)
 
 
+class MemorySplitParsingTests(unittest.TestCase):
+    """#274: parse Linux /proc/<pid>/status and Windows psutil memory_full_info() splits."""
+
+    AWANFS_PROC_STATUS = (
+        "Name:\ts3-server\n"
+        "VmHWM:\t 1193984 kB\n"
+        "VmRSS:\t 1180000 kB\n"
+        "RssAnon:\t   40960 kB\n"
+        "RssFile:\t 1139024 kB\n"
+        "RssShmem:\t       0 kB\n"
+    )
+    MINIO_PROC_STATUS = (
+        "Name:\tminio\n"
+        "VmHWM:\t 1018880 kB\n"
+        "VmRSS:\t 1005000 kB\n"
+        "RssAnon:\t  950272 kB\n"
+        "RssFile:\t   54728 kB\n"
+        "RssShmem:\t       0 kB\n"
+    )
+
+    def test_parse_proc_status_linux_fixed_samples(self):
+        import run_warp_benchmark as r
+        awan = r.parse_proc_status(self.AWANFS_PROC_STATUS)
+        self.assertAlmostEqual(awan["VmHWM"], 1193984 / 1024.0)
+        self.assertAlmostEqual(awan["VmRSS"], 1180000 / 1024.0)
+        self.assertAlmostEqual(awan["RssAnon"], 40.0)
+        self.assertAlmostEqual(awan["RssFile"], 1139024 / 1024.0)
+        self.assertEqual(awan["RssShmem"], 0.0)
+
+        minio = r.parse_proc_status(self.MINIO_PROC_STATUS)
+        self.assertAlmostEqual(minio["VmHWM"], 995.0)
+        self.assertAlmostEqual(minio["VmRSS"], 1005000 / 1024.0)
+        self.assertAlmostEqual(minio["RssAnon"], 928.0)
+        self.assertAlmostEqual(minio["RssFile"], 54728 / 1024.0)
+
+        self.assertEqual(r.parse_proc_status("RssAnon:\t12 MB\nRssFile:\tbad kB\n"), {})
+
+    def test_parse_windows_memory_info_fixed_samples(self):
+        import types
+        import run_warp_benchmark as r
+        mib = 1024 * 1024
+        awan_info = types.SimpleNamespace(private=48 * mib, wset=268 * mib, peak_wset=270 * mib)
+        minio_info = types.SimpleNamespace(private=980 * mib, wset=1050 * mib, peak_wset=1052 * mib)
+
+        got_awan = r.parse_windows_memory_info(awan_info)
+        self.assertEqual(got_awan, {"private": 48.0, "wset": 268.0, "peak_wset": 270.0})
+        got_minio = r.parse_windows_memory_info(minio_info)
+        self.assertEqual(got_minio, {"private": 980.0, "wset": 1050.0, "peak_wset": 1052.0})
+        self.assertEqual(r.parse_windows_memory_info(types.SimpleNamespace(private=-1, wset="bad")), {})
+
+    def test_peak_rss_sampler_tracks_linux_peak_across_samples(self):
+        import tempfile
+        import time
+        import run_warp_benchmark as r
+
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "status")
+            with open(p, "w", encoding="ascii") as fh:
+                fh.write("VmHWM:\t 102400 kB\nVmRSS:\t 102400 kB\nRssAnon:\t 65536 kB\nRssFile:\t 36864 kB\n")
+            sampler = r.PeakRssSampler(1234, every=0.01, status_path=p)
+            with sampler:
+                time.sleep(0.05)
+                with open(p, "w", encoding="ascii") as fh:
+                    fh.write("VmHWM:\t 204800 kB\nVmRSS:\t 196608 kB\nRssAnon:\t 32768 kB\nRssFile:\t 163840 kB\n")
+                time.sleep(0.05)
+            self.assertAlmostEqual(sampler.peak_rss_mb, 200.0)
+            self.assertAlmostEqual(sampler.rss_anon_mb, 64.0)
+            self.assertAlmostEqual(sampler.rss_file_mb, 160.0)
+            self.assertIsNone(sampler.win_private_mb)
+            self.assertIsNone(sampler.win_wset_mb)
+
+    def test_peak_rss_sampler_tracks_windows_psutil_peak_across_samples(self):
+        import time
+        import types
+        from unittest import mock
+        import run_warp_benchmark as r
+
+        mib = 1024 * 1024
+        samples = iter([
+            types.SimpleNamespace(private=64 * mib, wset=120 * mib, peak_wset=120 * mib),
+            types.SimpleNamespace(private=40 * mib, wset=200 * mib, peak_wset=205 * mib),
+        ])
+        last = [None]
+
+        class FakeProc:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def memory_full_info(self):
+                try:
+                    last[0] = next(samples)
+                except StopIteration:
+                    pass
+                return last[0]
+
+        fake_psutil = types.SimpleNamespace(Process=FakeProc, NoSuchProcess=RuntimeError, AccessDenied=PermissionError)
+        with mock.patch.object(r.sys, "platform", "win32"), \
+             mock.patch.dict(sys.modules, {"psutil": fake_psutil}):
+            sampler = r.PeakRssSampler(9999, every=0.01)
+            with sampler:
+                time.sleep(0.05)
+        self.assertAlmostEqual(sampler.win_private_mb, 64.0)
+        self.assertAlmostEqual(sampler.win_wset_mb, 200.0)
+        self.assertAlmostEqual(sampler.peak_rss_mb, 205.0)
+        self.assertIsNone(sampler.rss_file_mb)
+        self.assertIsNone(sampler.rss_anon_mb)
+
+    def test_missing_or_exited_process_marks_split_not_measured(self):
+        import types
+        from unittest import mock
+        import run_warp_benchmark as r
+
+        missing_linux = r.PeakRssSampler(1234, status_path="/nonexistent/proc/status")
+        with missing_linux:
+            pass
+        self.assertIsNone(missing_linux.rss_file_mb)
+        self.assertIsNone(missing_linux.rss_anon_mb)
+
+        class ExitedError(Exception):
+            pass
+
+        class ExitedProc:
+            def __init__(self, pid):
+                raise ExitedError("gone")
+
+        fake_psutil = types.SimpleNamespace(Process=ExitedProc, NoSuchProcess=ExitedError, AccessDenied=PermissionError)
+        with mock.patch.object(r.sys, "platform", "win32"), \
+             mock.patch.dict(sys.modules, {"psutil": fake_psutil}):
+            self.assertEqual(r.sample_windows_memory(999999), {})
+            exited_win = r.PeakRssSampler(999999)
+            with exited_win:
+                pass
+        self.assertIsNone(exited_win.win_private_mb)
+        self.assertIsNone(exited_win.win_wset_mb)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows live memory split")
+    def test_windows_live_child_measures_private_and_wset(self):
+        import subprocess
+        import tempfile
+        import time
+        import run_warp_benchmark as r
+
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "mapped.bin")
+            with open(f, "wb") as fh:
+                fh.write(os.urandom(32 << 20))
+            code = (
+                "import mmap, sys, time\n"
+                "heap = bytearray(48 << 20)\n"
+                "for i in range(0, len(heap), 4096): heap[i] = 1\n"
+                "fh = open(sys.argv[1], 'rb')\n"
+                "m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)\n"
+                "s = sum(m[i] for i in range(0, len(m), 4096))\n"
+                "print('ready', s, flush=True); time.sleep(20)\n"
+            )
+            p = subprocess.Popen([sys.executable, "-c", code, f], stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertTrue(p.stdout.readline().startswith("ready"))
+                with r.PeakRssSampler(p.pid, every=0.02) as sampler:
+                    time.sleep(0.1)
+                self.assertGreaterEqual(sampler.win_private_mb, 44.0)
+                self.assertGreaterEqual(sampler.win_wset_mb, 70.0)
+                self.assertGreater(sampler.win_wset_mb, sampler.win_private_mb)
+            finally:
+                if p.stdout is not None:
+                    p.stdout.close()
+                p.kill()
+                p.wait()
+
+
+class MemorySplitReportTests(unittest.TestCase):
+    """#274: run_warp_benchmark report includes split next to peak RSS and handles missing samples."""
+
+    def test_report_includes_linux_rss_file_and_anon_next_to_total(self):
+        awan = {
+            "get_1m": BenchmarkMetrics(
+                4000.0, 4000.0, 1.0, 2.0, 3.0, 4.0, 1166.0,
+                peak_rss_file_mb=1110.0, peak_rss_anon_mb=42.0,
+            ),
+        }
+        minio = {
+            "get_1m": BenchmarkMetrics(
+                2000.0, 2000.0, 2.0, 4.0, 6.0, 8.0, 995.0,
+                peak_rss_file_mb=53.0, peak_rss_anon_mb=928.0,
+            ),
+        }
+        report = format_markdown_report("cmd", {"os": "Linux 6.8 (x86_64)"}, awan, minio)
+        self.assertIn("File-Backed (RssFile", report)
+        self.assertIn("Anonymous (RssAnon", report)
+        self.assertIn("**1166.0 MB** | **1110.0 MB** | **42.0 MB**", report)
+        self.assertIn("995.0 MB | 53.0 MB | 928.0 MB", report)
+        self.assertIn("RssFile 1110.0 MB, RssAnon 42.0 MB", report)
+        self.assertIn("RssFile 53.0 MB, RssAnon 928.0 MB", report)
+
+    def test_report_includes_windows_private_and_wset_labelled_explicitly(self):
+        awan = {
+            "put_64k": BenchmarkMetrics(
+                3700.0, 234.0, 15.0, 26.0, 37.0, 44.0, 88.3,
+                peak_win_private_mb=41.2, peak_win_wset_mb=88.0,
+            ),
+        }
+        minio = {
+            "put_64k": BenchmarkMetrics(
+                520.0, 32.6, 57.0, 330.0, 587.0, 656.0, 500.8,
+                peak_win_private_mb=470.5, peak_win_wset_mb=500.1,
+            ),
+        }
+        report = format_markdown_report("cmd", {"os": "Windows 11 (AMD64)"}, awan, minio)
+        self.assertIn("Private Bytes (private", report)
+        self.assertIn("Working Set (wset", report)
+        self.assertIn("**88.3 MB** | **41.2 MB** | **88.0 MB**", report)
+        self.assertIn("500.8 MB | 470.5 MB | 500.1 MB", report)
+        self.assertIn("private 41.2 MB, wset 88.0 MB", report)
+        self.assertIn("private 470.5 MB, wset 500.1 MB", report)
+
+    def test_report_marks_missing_split_samples_not_measured(self):
+        awan = {"put_64k": BenchmarkMetrics(1000.0, 62.5, 1.0, 2.0, 3.0, 4.0, 0.0)}
+        win_report = format_markdown_report("cmd", {"os": "Windows 11"}, awan, {})
+        self.assertIn("Private Bytes (private", win_report)
+        self.assertIn("Working Set (wset", win_report)
+        self.assertIn("not measured", win_report)
+
+        linux_report = format_markdown_report("cmd", {"os": "Linux 6.8"}, awan, {})
+        self.assertIn("File-Backed (RssFile", linux_report)
+        self.assertIn("Anonymous (RssAnon", linux_report)
+        self.assertIn("not measured", linux_report)
+
+
 if __name__ == "__main__":
     unittest.main()
