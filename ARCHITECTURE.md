@@ -266,8 +266,8 @@ page cache outside `--memory-budget` (#206) and one copy-on-write write transact
 spilled key. The segments of #26 do that job:
 - sorted, immutable runs of the 64-byte rows and their keys, in separate columns per block;
 - fence keys and a bloom filter in heap, read with positioned reads (decision 58);
-- a manifest of live segments, so a restart opens a checkpoint instead of rebuilding from every
-  volume;
+- a manifest of live segments, written at every flush; booting from it instead of rebuilding
+  from every volume moved to the partitioned store (#322, [owner decision, 2026-11-20](https://github.com/iskandarnorazli/Awanfs/issues/26#issuecomment-7028770759));
 - compaction that merges runs and drops dead rows.
 They borrow awan-lang's flat-memory designs: the 64-byte row as stored, columns within a block,
 and SIMD search over keys. awan-lang's own collections (`awan-db`, `awan-cache`, the OLC B+tree
@@ -297,7 +297,10 @@ gate requires that the production segments do not lose either:
 share of `--memory-budget` (#206), flushed to leveled segments (decision 68). The server deletes
 a `metadata.db` it finds at boot and keeps redb only as the benchmark's point of comparison
 (a dev-dependency). #208 is gone with it: no set of spilled keys. The index is still cleared and
-rebuilt from the volumes at boot; booting from the manifest's checkpoint is #26's next step.
+rebuilt from the volumes at boot: 254.9 s and 1,594.8 MiB peak RSS on Linux, 3,391.8 s and 1,244.6 MiB on
+Windows, at 10M objects (`measurements/2026-11-20-boot-full-replay.md`). Booting from the manifest's
+checkpoint is not #26's: it moved to the partitioned store, a checkpoint per partition (#322,
+[owner decision, 2026-11-20](https://github.com/iskandarnorazli/Awanfs/issues/26#issuecomment-7028770759)).
 
 **Decision 58 (owner, 2026-11-16): stored data is read with positioned reads, not through
 mappings, wherever the bytes could grow without bound.** Pages read through a mapping stay

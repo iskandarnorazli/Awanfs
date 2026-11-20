@@ -6,7 +6,8 @@
 //!
 //! The server empties the index at boot and rebuilds it from the volume replay (`clear`), as
 //! it did with redb: the volumes are the record. Booting from the manifest's checkpoint instead
-//! is the next stage of #26.
+//! moved to the partitioned store, a checkpoint per partition (#322; owner decision on #26,
+//! 2026-11-20).
 
 use crate::manifest::{MetaStore, ReplayFrom};
 use crate::meta_compaction::Policy;
