@@ -250,9 +250,9 @@ def server_durability_rows(os_name: Optional[str] = None) -> List[Tuple[str, str
         minio_row,
         (
             "RustFS",
-            "RUSTFS_DURABILITY_MODE=strict",
-            "Yes",
-            "Syncs data, xl.meta, and directories before 200 OK.",
+            "release defaults",
+            "Not measured",
+            "Whether it syncs a PUT before 200 OK is not measured yet (#334).",
         ),
         (
             "Garage",
@@ -1824,7 +1824,7 @@ def render_report(
         f"- **Machine:** {platform.node()} ({platform.platform()}, {total_cores} logical cores, {rwb.host_ram_gb()} GB RAM, CPU: {rwb.cpu_model()})",
         f"- **Methodology:** `cores = {', '.join(str(n) for n in cores)}`, `concurrency = 16 × N`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase.",
         f"- **Core pinning:** {sharing_note}",
-        f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()} RustFS strict fsync (`RUSTFS_DURABILITY_MODE=strict`). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default. {probe_note}",
+        f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()} RustFS at its release defaults; whether it syncs a PUT is not measured (#334). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default. {probe_note}",
         "",
     ]
     lines.extend(_durability_section_lines())
@@ -2568,7 +2568,7 @@ def render_matrix_report(
         f"- **Methodology:** `patterns = {', '.join(patterns)}`, `sizes = {', '.join(format_size(s) for s in sizes)}`, `cores = {', '.join(str(n) for n in cores)}`, `concurrencies = {', '.join(str(c) for c in concurrencies)}`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase, seed = `{seed}`.",
         f"- **Cache & Prefill:** AwanFS `--memory-budget {format_size(budget_bytes)}` (stated cache half = {format_size(cache_bytes)}). Read prefill size = {format_size(prefill_bytes)} ({describe_prefill_sets(prefill_bytes, patterns, sizes)}), identical deterministic bytes for every server, written before timing.",
         f"- **Core pinning:** {sharing_note}",
-        f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()} RustFS strict fsync (`RUSTFS_DURABILITY_MODE=strict`). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default.",
+        f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()} RustFS at its release defaults; whether it syncs a PUT is not measured (#334). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default.",
         "",
     ]
     lines.extend(_durability_section_lines())
@@ -2647,7 +2647,9 @@ def _resolve_profile_config(
     else:
         profile_cores = set(DEFAULT_PROFILE_THREAD_CORES) if auto else set()
     cmp_flag = getattr(a, "compare_fast", None)
-    compare_fast = (cmp_flag if cmp_flag is not None else auto) and (durability != "fast")
+    # Benchmarks run every server at its defaults (owner, 2026-11-20): the fast pass runs only
+    # when asked for by name, never on its own.
+    compare_fast = bool(cmp_flag) and (durability != "fast")
     return durability, profile_cores, compare_fast
 
 
@@ -2873,7 +2875,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--compare-fast", dest="compare_fast", action="store_true", default=None,
                     help="Also measure AwanFS --durability fast on PUT 4 KiB")
     ap.add_argument("--no-compare-fast", dest="compare_fast", action="store_false",
-                    help="Disable automatic --durability fast comparison on 16+ core machines")
+                    help="Do not measure AwanFS --durability fast (the default)")
     ap.add_argument("--profile-threads-cores", default="",
                     help="Comma-separated core counts where AwanFS per-thread CPU is sampled during PUT 4 KiB (default: 4,8 on 16+ core split-client runs)")
     ap.add_argument("--no-fetch-minio", action="store_true", help="Do not auto-fetch missing MinIO/mc binaries from GitHub Releases")
