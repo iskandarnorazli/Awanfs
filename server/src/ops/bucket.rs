@@ -86,7 +86,8 @@ pub(crate) fn encode_hex_token(b: &[u8]) -> String {
 }
 
 pub(crate) fn decode_hex_token(t: &str) -> Option<Vec<u8>> {
-    if t.len() % 2 != 0 {
+    // Hex digits only: `u8::from_str_radix` also takes a leading `+` (#297).
+    if t.len() % 2 != 0 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     (0..t.len()).step_by(2).map(|i| u8::from_str_radix(t.get(i..i + 2)?, 16).ok()).collect()
@@ -816,4 +817,18 @@ pub async fn delete_objects(
         .header(CONTENT_TYPE, "application/xml")
         .body(full_body(Bytes::from(xml)))
         .unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_tokens_are_hex_digits_only() {
+        assert_eq!(decode_hex_token(&encode_hex_token(b"bkt-a")), Some(b"bkt-a".to_vec()));
+        assert_eq!(decode_hex_token("2B61"), Some(b"+a".to_vec()), "either case");
+        for bad in ["+a", "+6", "-1", " 1", "0x", "zz", "abc"] {
+            assert_eq!(decode_hex_token(bad), None, "{:?}", bad);
+        }
+    }
 }
