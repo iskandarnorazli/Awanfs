@@ -20,8 +20,9 @@ All integers are little-endian. Sectors are 4096 bytes.
 | `volume_NNNN.dat` | A volume: superblock, then needles. Writes go to the highest id (#37). A growing volume's file may end in zeros past its last needle: past 64 MiB it is extended ahead of its writes (#178), and the next open trims it to its last needle. Its length is never exactly 32 GiB, the length that marks a sparse volume. |
 | `volume_NNNN.idx` | The volume's journal: one 42-byte record per needle. |
 | `buckets.manifest` | One line per bucket event: `+<id>:<name>` created, `-<id>:<name>` deleted. |
-| `metadata.db` | redb spill index (rebuilt from the volumes if lost). To be replaced by metadata segment files and their manifest (#26, decision 59), documented here before they are written. |
-| `meta/seg_<seq>.seg` | A metadata segment (#26, decision 59): sorted rows of the metadata index, immutable once written. `<seq>` is 16 lowercase hex digits; a higher sequence number is newer. Below. Not read by the server until #26 stage 6 switches from redb; the manifest that names the live segments comes in stage 4. |
+| `metadata.db` | The redb spill index of servers before #26 stage 6. A server since then deletes it at boot: it was rebuilt from the volumes at every boot, so nothing in it is needed (decision 59). |
+| `meta/seg_<seq>.seg` | A metadata segment (#26, decision 59): sorted rows of the metadata index, immutable once written. `<seq>` is 16 lowercase hex digits. Below. The server's spill index since #26 stage 6; it still clears them at boot and rebuilds them from the volumes, until boot reads the manifest's checkpoint. |
+| `meta/manifest.0`, `meta/manifest.1` | The metadata manifest's two slots (#26 stage 4): which segments are live, their levels (stage 5), and the log position they cover. Below. |
 | `.staging/upload-<hex>/part_NNNNN.dat` | Multipart part files; the parts of completed objects stay here. |
 
 ## Metadata segment (`meta/seg_<seq>.seg`, #26 stage 2)
@@ -97,10 +98,72 @@ The fence keys, then the Bloom filter, padded with zeros to a block boundary:
 - **Lookup:** the Bloom filter (a miss costs no read), then the fence to find the one data block,
   one 4096-byte read, its CRC, then a scan of its entries. A block whose CRC fails is an error,
   never "not found".
-- **Several segments:** the entry from the segment with the higher sequence number wins; a
-  tombstone hides every older entry of its key.
+- **Several segments:** they are in levels (the manifest records each one's level, #26 stage 5).
+  A lookup takes the level-0 segments, higher sequence number first, then in each deeper level
+  the one segment whose key range holds the key. The first entry found wins; a tombstone hides
+  every entry after it in that order. Below.
 - Written in full, then `sync_data`, then (stage 4) named in the manifest. A segment the
   manifest does not name is ignored, so a crash mid-write leaves nothing visible.
+
+## Metadata manifest (`meta/manifest.0`, `meta/manifest.1`, #26 stage 4)
+
+The checkpoint of the metadata index: the live segments, and the position in the volume log
+they cover. Boot reads it, opens those segments and replays only the needles after that
+position. Without a valid manifest, boot replays every volume, as it does today: the volumes
+are the record, so losing the manifest costs time, never data.
+
+**Two slots.** A new manifest is written to the slot that does not hold the current one, with a
+generation one higher than both, then synced. Boot reads both slots and uses the valid one with
+the higher generation. A slot whose write a crash tore fails its length or CRC check and is not
+valid, so the other slot, the previous manifest, is used. No rename is needed.
+
+| Bytes | Field |
+|---|---|
+| 0..4 | magic `0x4D535741` ("AWSM") |
+| 4..6 | manifest format version, 2 (format 1 is still read: below) |
+| 6..8 | flags, 0 |
+| 8..16 | generation |
+| 16..20 | replay volume id: the volume holding the first needle not covered |
+| 20..28 | replay offset in that volume: needles at this offset and after, and every needle of a higher volume id, are replayed; everything before is in the segments |
+| 28..36 | next segment sequence number |
+| 36..40 | live segment count `N` (at most 65536) |
+| 40..40+16N | the live segments, by strictly increasing sequence number, 16 bytes each: sequence number (u64), level (u8, 0 to 7), 7 bytes zero |
+| 40+16N..44+16N | CRC32C of bytes 0..40+16N |
+
+The file is exactly `44 + 16N` bytes. A length that disagrees, a wrong magic, a newer format, a
+level above 7, nonzero reserved bytes or a CRC mismatch makes the slot invalid.
+
+**Format 1** (stage 4, before levels) has 8-byte entries, the sequence number alone, and is
+exactly `44 + 8N` bytes. Its segments are read as level 0. No release wrote it: the server did
+not use the manifest before stage 6.
+
+### Levels and compaction (#26 stage 5, checked by `verification/tla/Levels.tla`)
+- A flush writes a **level-0** segment. Level-0 segments may overlap; the higher sequence number
+  is newer.
+- In each level from **1 down**, segments do not overlap: each key range belongs to at most one
+  segment of the level. Data in a shallower level is newer than data deeper down for the same
+  key.
+- A **compaction** writes the merge of its inputs one level down, as segments of at most 64 MiB
+  split at key boundaries, and switches to a manifest that names them in place of the inputs:
+  - from level 0: every level-0 segment, and the level-1 segments that overlap their key span
+    (`levels_l0_subset`: taking only some level-0 segments puts a newer one below an older one);
+  - from level `i`: one segment, and the level-`i+1` segments that overlap its key range
+    (`levels_partial_overlap`: skipping one leaves two overlapping segments in a level).
+  A segment with nothing to merge below it moves down by changing its level in the manifest.
+- **Tombstones** are dropped only when no segment deeper than the output overlaps the output's
+  key range (`levels_early_tombstones`: an older row comes back).
+- The rules of the manifest switch above apply to every compaction.
+
+### The rules (checked by `verification/tla/Manifest.tla`)
+- **Sync the segment first:** a manifest names only segments already written in full and synced.
+  (`manifest_switch_before_sync` breaks this: a crash loses a named segment whose rows are
+  before the replay position.)
+- **Alternate slots:** a new manifest never overwrites the slot holding the current one.
+  (`manifest_one_slot`: a torn write leaves boot with no manifest.)
+- **Delete after the switch is durable:** a segment is deleted only after a durable manifest of a
+  higher generation stops naming it. (`manifest_gc_before_sync`: a merge deleted its inputs, a
+  crash tore the new manifest, and the old one named segments that were gone.)
+- A segment file the valid manifest does not name is ignored at boot and may be deleted.
 
 ## Superblock (sector 0 of a volume)
 

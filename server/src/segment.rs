@@ -2,11 +2,14 @@
 //! one file, read with positioned reads, never a mapping (decision 58). The byte layout is in
 //! `FORMAT.md` ("Metadata segment"); this file follows it and nothing else.
 //!
-//! Nothing in the server reads segments yet: stage 3 adds lookups over several segments, stage 4
-//! the manifest, stage 6 the switch from redb.
+//! `SegmentWriter` writes a segment as a stream, block by block (stage 5's compaction), so a
+//! segment is never held in memory whole.
+//!
+//! The server's spill index (`spill.rs`) keeps its rows in segments since #26 stage 6.
 
 use crate::meta_index::ObjectMeta;
 use crate::vfile::{FileKind, VolFile, VolFs};
+use crate::work::WorkCounters;
 use std::path::Path;
 use std::sync::Arc;
 use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
@@ -124,8 +127,7 @@ pub fn bloom_probes(key: &[u8], nblocks: usize) -> (usize, [u32; BLOOM_PROBES as
 
 impl Bloom {
     fn with_keys(n: usize) -> Self {
-        let nblocks = ((n as u64 * BLOOM_BITS_PER_KEY).div_ceil(BLOOM_BLOCK_BITS)).max(1) as usize;
-        Bloom { blocks: vec![[0u64; 8]; nblocks] }
+        Bloom { blocks: vec![[0u64; 8]; bloom_blocks_for(n as u64) as usize] }
     }
     fn insert(&mut self, key: &[u8]) {
         let (block, bits) = bloom_probes(key, self.blocks.len());
@@ -157,12 +159,7 @@ pub fn encode_segment(seq: u64, created_at_ns: u64, entries: &[SegEntry]) -> Res
     let mut block: Vec<u8> = Vec::with_capacity(BLOCK);
     let mut count: u16 = 0;
     let flush = |out: &mut Vec<u8>, block: &mut Vec<u8>, count: &mut u16| {
-        let mut b = vec![0u8; BLOCK];
-        b[0..2].copy_from_slice(&count.to_le_bytes());
-        b[2..2 + block.len()].copy_from_slice(block);
-        let crc = crc32c::crc32c(&b[..BLOCK_PAYLOAD]);
-        b[BLOCK_PAYLOAD..].copy_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&b);
+        out.extend_from_slice(&data_block(*count, block));
         block.clear();
         *count = 0;
     };
@@ -173,19 +170,7 @@ pub fn encode_segment(seq: u64, created_at_ns: u64, entries: &[SegEntry]) -> Res
         if count == 0 {
             fences.push(&e.key);
         }
-        match e.entry {
-            Entry::Row(m) => {
-                block.push(KIND_ROW);
-                block.extend_from_slice(&(e.key.len() as u16).to_le_bytes());
-                block.extend_from_slice(&e.key);
-                encode_row(&m, &mut block);
-            }
-            Entry::Tombstone => {
-                block.push(KIND_TOMBSTONE);
-                block.extend_from_slice(&(e.key.len() as u16).to_le_bytes());
-                block.extend_from_slice(&e.key);
-            }
-        }
+        encode_entry(e, &mut block);
         count += 1;
         bloom.insert(&e.key);
     }
@@ -193,19 +178,61 @@ pub fn encode_segment(seq: u64, created_at_ns: u64, entries: &[SegEntry]) -> Res
         flush(&mut out, &mut block, &mut count);
     }
     let data_blocks = (out.len() / BLOCK - 1) as u64;
+    let (header, tail) = header_and_tail(seq, created_at_ns, entries.len() as u64, data_blocks, &fences, &bloom);
+    out[0..BLOCK].copy_from_slice(&header);
+    out.extend_from_slice(&tail);
+    if out.len() as u64 > MAX_SEGMENT_BYTES {
+        return Err(SegmentError::TooLarge(out.len() as u64));
+    }
+    Ok(out)
+}
 
-    let index_start = out.len();
-    for f in &fences {
+fn encode_entry(e: &SegEntry, block: &mut Vec<u8>) {
+    match e.entry {
+        Entry::Row(m) => {
+            block.push(KIND_ROW);
+            block.extend_from_slice(&(e.key.len() as u16).to_le_bytes());
+            block.extend_from_slice(&e.key);
+            encode_row(&m, block);
+        }
+        Entry::Tombstone => {
+            block.push(KIND_TOMBSTONE);
+            block.extend_from_slice(&(e.key.len() as u16).to_le_bytes());
+            block.extend_from_slice(&e.key);
+        }
+    }
+}
+
+/// One data block's bytes: the count, the packed entries, zeros, the CRC.
+fn data_block(count: u16, packed: &[u8]) -> Vec<u8> {
+    let mut b = vec![0u8; BLOCK];
+    b[0..2].copy_from_slice(&count.to_le_bytes());
+    b[2..2 + packed.len()].copy_from_slice(packed);
+    let crc = crc32c::crc32c(&b[..BLOCK_PAYLOAD]);
+    b[BLOCK_PAYLOAD..].copy_from_slice(&crc.to_le_bytes());
+    b
+}
+
+fn bloom_blocks_for(entries: u64) -> u64 {
+    (entries * BLOOM_BITS_PER_KEY).div_ceil(BLOOM_BLOCK_BITS).max(1)
+}
+
+/// The header block, and the index blocks and trailer that follow the data blocks.
+fn header_and_tail<K: AsRef<[u8]>>(seq: u64, created_at_ns: u64, entries: u64, data_blocks: u64, fences: &[K], bloom: &Bloom) -> (Vec<u8>, Vec<u8>) {
+    let index_block = 1 + data_blocks;
+    let mut out = Vec::new();
+    for f in fences {
+        let f = f.as_ref();
         out.extend_from_slice(&(f.len() as u16).to_le_bytes());
         out.extend_from_slice(f);
     }
-    let fence_len = (out.len() - index_start) as u64;
+    let fence_len = out.len() as u64;
     for b in &bloom.blocks {
         for w in b {
             out.extend_from_slice(&w.to_le_bytes());
         }
     }
-    let index_crc = crc32c::crc32c(&out[index_start..]);
+    let index_crc = crc32c::crc32c(&out);
     let bloom_offset = fence_len;
     while out.len() % BLOCK != 0 {
         out.push(0);
@@ -213,7 +240,7 @@ pub fn encode_segment(seq: u64, created_at_ns: u64, entries: &[SegEntry]) -> Res
 
     let mut t = vec![0u8; BLOCK];
     t[0..4].copy_from_slice(&TRAILER_MAGIC.to_le_bytes());
-    t[4..12].copy_from_slice(&((index_start / BLOCK) as u64).to_le_bytes());
+    t[4..12].copy_from_slice(&index_block.to_le_bytes());
     t[12..20].copy_from_slice(&fence_len.to_le_bytes());
     t[20..28].copy_from_slice(&(fences.len() as u64).to_le_bytes());
     t[28..36].copy_from_slice(&bloom_offset.to_le_bytes());
@@ -224,20 +251,122 @@ pub fn encode_segment(seq: u64, created_at_ns: u64, entries: &[SegEntry]) -> Res
     t[52..56].copy_from_slice(&tcrc.to_le_bytes());
     out.extend_from_slice(&t);
 
-    let h = &mut out[0..BLOCK];
+    let mut h = vec![0u8; BLOCK];
     h[0..4].copy_from_slice(&SEGMENT_MAGIC.to_le_bytes());
     h[4..6].copy_from_slice(&SEGMENT_FORMAT.to_le_bytes());
     h[8..16].copy_from_slice(&seq.to_le_bytes());
     h[16..24].copy_from_slice(&created_at_ns.to_le_bytes());
-    h[24..32].copy_from_slice(&(entries.len() as u64).to_le_bytes());
+    h[24..32].copy_from_slice(&entries.to_le_bytes());
     h[32..40].copy_from_slice(&data_blocks.to_le_bytes());
     let hcrc = crc32c::crc32c(&h[0..40]);
     h[40..44].copy_from_slice(&hcrc.to_le_bytes());
+    (h, out)
+}
 
-    if out.len() as u64 > MAX_SEGMENT_BYTES {
-        return Err(SegmentError::TooLarge(out.len() as u64));
+/// Writes a segment as a stream: each data block goes to the file when it is full, so memory
+/// holds one block, the fences and nothing else. `finish` reads the data blocks back to build
+/// the Bloom filter (its size depends on the final entry count), writes the index, the trailer
+/// and the header, and syncs. The bytes equal `encode_segment`'s for the same entries.
+pub struct SegmentWriter<F: VolFile> {
+    file: Arc<F>,
+    seq: u64,
+    created_at_ns: u64,
+    max_bytes: u64,
+    block: Vec<u8>,
+    count: u16,
+    data_blocks: u64,
+    entries: u64,
+    fences: Vec<Vec<u8>>,
+    fence_len: u64,
+    last: Option<Vec<u8>>,
+}
+
+impl<F: VolFile> SegmentWriter<F> {
+    /// Starts the segment at `path`, at most `max_bytes` long (at most `MAX_SEGMENT_BYTES`, at
+    /// least four blocks: one entry of the longest key always fits).
+    pub fn create<Fs: VolFs<File = F>>(fs: &Fs, path: &Path, seq: u64, created_at_ns: u64, max_bytes: u64) -> Result<Self, SegmentError> {
+        let max_bytes = max_bytes.clamp(4 * BLOCK as u64, MAX_SEGMENT_BYTES);
+        let file = fs.open(path, FileKind::Segment, true)?;
+        file.set_len(0)?;
+        Ok(SegmentWriter { file, seq, created_at_ns, max_bytes, block: Vec::with_capacity(BLOCK), count: 0, data_blocks: 0, entries: 0, fences: Vec::new(), fence_len: 0, last: None })
     }
-    Ok(out)
+
+    fn len_with(data_blocks: u64, fence_len: u64, entries: u64) -> u64 {
+        let index_blocks = (fence_len + 64 * bloom_blocks_for(entries)).div_ceil(BLOCK as u64);
+        (2 + data_blocks + index_blocks) * BLOCK as u64
+    }
+
+    /// Whether `e` can be added without the segment growing past its limit.
+    pub fn fits(&self, e: &SegEntry) -> bool {
+        let fence = 2 + e.key.len() as u64;
+        let (data, fences) = if self.count == 0 {
+            (self.data_blocks + 1, self.fence_len + fence)
+        } else if 2 + self.block.len() + entry_len(e) > BLOCK_PAYLOAD {
+            (self.data_blocks + 2, self.fence_len + fence)
+        } else {
+            (self.data_blocks + 1, self.fence_len)
+        };
+        Self::len_with(data, fences, self.entries + 1) <= self.max_bytes
+    }
+
+    pub fn entries(&self) -> u64 {
+        self.entries
+    }
+
+    fn write_block(&mut self) -> Result<(), SegmentError> {
+        let b = data_block(self.count, &self.block);
+        self.file.write_at((1 + self.data_blocks) * BLOCK as u64, &b)?;
+        self.data_blocks += 1;
+        self.block.clear();
+        self.count = 0;
+        Ok(())
+    }
+
+    /// Adds an entry after every entry added so far (strictly increasing sort keys).
+    pub fn push(&mut self, e: &SegEntry) -> Result<(), SegmentError> {
+        if e.key.len() > 4 + MAX_KEY_BYTES {
+            return Err(SegmentError::KeyTooLong(e.key.len()));
+        }
+        if self.last.as_ref().is_some_and(|l| *l >= e.key) {
+            return Err(SegmentError::Unsorted);
+        }
+        if !self.fits(e) {
+            return Err(SegmentError::TooLarge(self.max_bytes));
+        }
+        if self.count > 0 && 2 + self.block.len() + entry_len(e) > BLOCK_PAYLOAD {
+            self.write_block()?;
+        }
+        if self.count == 0 {
+            self.fence_len += 2 + e.key.len() as u64;
+            self.fences.push(e.key.clone());
+        }
+        encode_entry(e, &mut self.block);
+        self.count += 1;
+        self.entries += 1;
+        self.last = Some(e.key.clone());
+        Ok(())
+    }
+
+    /// Writes the rest and syncs. Returns the segment's length in bytes.
+    pub fn finish(mut self) -> Result<u64, SegmentError> {
+        if self.count > 0 {
+            self.write_block()?;
+        }
+        let mut bloom = Bloom::with_keys(self.entries as usize);
+        let mut b = vec![0u8; BLOCK];
+        for i in 0..self.data_blocks {
+            self.file.read_at((1 + i) * BLOCK as u64, &mut b)?;
+            for e in parse_block(&b, i)? {
+                bloom.insert(&e.key);
+            }
+        }
+        let (header, tail) = header_and_tail(self.seq, self.created_at_ns, self.entries, self.data_blocks, &self.fences, &bloom);
+        let tail_at = (1 + self.data_blocks) * BLOCK as u64;
+        self.file.write_at(tail_at, &tail)?;
+        self.file.write_at(0, &header)?;
+        self.file.sync_data()?;
+        Ok(tail_at + tail.len() as u64)
+    }
 }
 
 /// Writes a segment to `path` in `fs` and syncs it. The caller names it in the manifest only
@@ -258,12 +387,88 @@ pub struct Segment<F: VolFile> {
     pub created_at_ns: u64,
     pub entry_count: u64,
     data_blocks: u64,
-    fences: Vec<Vec<u8>>,
+    len_bytes: u64,
+    fences: Fences,
+    /// The last entry's sort key (empty when the segment has no entries).
+    last_key: Vec<u8>,
     bloom: Bloom,
+    /// Counts each block read, when the segment belongs to a server's index (stage 3).
+    work: Option<Arc<WorkCounters>>,
+}
+
+/// The first key of each data block, in one buffer: one heap allocation per segment, not one per
+/// block (#26 stage 6: at 10M keys the per-block vectors were about 16 MB of the build's peak RSS).
+struct Fences {
+    keys: Vec<u8>,
+    /// `keys[ends[i-1]..ends[i]]` is block `i`'s first key.
+    ends: Vec<u32>,
+}
+
+impl Fences {
+    fn with_capacity(n: usize, bytes: usize) -> Self {
+        Fences { keys: Vec::with_capacity(bytes), ends: Vec::with_capacity(n) }
+    }
+
+    fn push(&mut self, key: &[u8]) {
+        self.keys.extend_from_slice(key);
+        self.ends.push(self.keys.len() as u32);
+    }
+
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    fn get(&self, i: usize) -> &[u8] {
+        let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };
+        &self.keys[start..self.ends[i] as usize]
+    }
+
+    /// The number of blocks whose first key is at or before `key`.
+    fn at_or_before(&self, key: &[u8]) -> usize {
+        let (mut lo, mut hi) = (0, self.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.get(mid) <= key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
 }
 
 fn corrupt(what: impl Into<String>) -> SegmentError {
     SegmentError::Corrupt(what.into())
+}
+
+/// The entries of data block `i`, after its CRC check.
+fn parse_block(b: &[u8], i: u64) -> Result<Vec<SegEntry>, SegmentError> {
+    if crc32c::crc32c(&b[..BLOCK_PAYLOAD]) != u32::from_le_bytes(b[BLOCK_PAYLOAD..BLOCK].try_into().unwrap()) {
+        return Err(corrupt(format!("data block {} CRC", i)));
+    }
+    let n = u16::from_le_bytes(b[0..2].try_into().unwrap());
+    let mut out = Vec::with_capacity(n as usize);
+    let mut p = 2usize;
+    for _ in 0..n {
+        if p + 3 > BLOCK_PAYLOAD {
+            return Err(corrupt(format!("data block {} entry", i)));
+        }
+        let kind = b[p];
+        let k = u16::from_le_bytes(b[p + 1..p + 3].try_into().unwrap()) as usize;
+        let key_end = p + 3 + k;
+        let (entry, end) = match kind {
+            KIND_ROW if key_end + ROW_BYTES <= BLOCK_PAYLOAD => (Entry::Row(decode_row(&b[key_end..key_end + ROW_BYTES])), key_end + ROW_BYTES),
+            KIND_TOMBSTONE if key_end <= BLOCK_PAYLOAD => (Entry::Tombstone, key_end),
+            _ => return Err(corrupt(format!("data block {} entry", i))),
+        };
+        out.push(SegEntry { key: b[p + 3..key_end].to_vec(), entry });
+        p = end;
+    }
+    if n == 0 {
+        return Err(corrupt(format!("data block {} is empty", i)));
+    }
+    Ok(out)
 }
 
 impl<F: VolFile> Segment<F> {
@@ -314,7 +519,7 @@ impl<F: VolFile> Segment<F> {
         if crc32c::crc32c(&idx) != u32at(&t, 48) {
             return Err(corrupt("index CRC"));
         }
-        let mut fences = Vec::with_capacity(nfences as usize);
+        let mut fences = Fences::with_capacity(nfences as usize, fence_len as usize);
         let mut p = 0usize;
         for _ in 0..nfences {
             if p + 2 > fence_len as usize {
@@ -324,7 +529,7 @@ impl<F: VolFile> Segment<F> {
             if p + 2 + l > fence_len as usize {
                 return Err(corrupt("fence region"));
             }
-            fences.push(idx[p + 2..p + 2 + l].to_vec());
+            fences.push(&idx[p + 2..p + 2 + l]);
             p += 2 + l;
         }
         if p != fence_len as usize {
@@ -339,34 +544,48 @@ impl<F: VolFile> Segment<F> {
             }
             blocks.push(b);
         }
-        Ok(Segment { file, seq, created_at_ns, entry_count, data_blocks, fences, bloom: Bloom { blocks } })
+        // The last key bounds the segment's range (a level's lookups and compaction use it).
+        let mut last_key = Vec::new();
+        if data_blocks > 0 {
+            let mut b = vec![0u8; BLOCK];
+            file.read_at(data_blocks * BLOCK as u64, &mut b)?;
+            let es = parse_block(&b, data_blocks - 1)?;
+            match es.last() {
+                Some(e) if e.key.as_slice() >= fences.get(fences.len() - 1) => last_key = e.key.clone(),
+                _ => return Err(corrupt("last data block")),
+            }
+        }
+        Ok(Segment { file, seq, created_at_ns, entry_count, data_blocks, len_bytes: len, fences, last_key, bloom: Bloom { blocks }, work: None })
+    }
+
+    /// The first and last sort keys, or `None` for a segment with no entries.
+    pub fn key_range(&self) -> Option<(&[u8], &[u8])> {
+        (self.data_blocks > 0).then(|| (self.fences.get(0), self.last_key.as_slice()))
+    }
+
+    /// Whether `key` lies between the first and last keys (no read).
+    pub fn spans(&self, key: &[u8]) -> bool {
+        self.key_range().is_some_and(|(lo, hi)| lo <= key && key <= hi)
+    }
+
+    /// The file's length.
+    pub fn len_bytes(&self) -> u64 {
+        self.len_bytes
+    }
+
+    /// Counts this segment's block reads in `work` from now on.
+    pub fn with_work(mut self, work: Arc<WorkCounters>) -> Self {
+        self.work = Some(work);
+        self
     }
 
     fn read_block(&self, i: u64) -> Result<Vec<SegEntry>, SegmentError> {
         let mut b = vec![0u8; BLOCK];
         self.file.read_at((1 + i) * BLOCK as u64, &mut b)?;
-        if crc32c::crc32c(&b[..BLOCK_PAYLOAD]) != u32::from_le_bytes(b[BLOCK_PAYLOAD..].try_into().unwrap()) {
-            return Err(corrupt(format!("data block {} CRC", i)));
+        if let Some(w) = &self.work {
+            w.disk_read();
         }
-        let n = u16::from_le_bytes(b[0..2].try_into().unwrap());
-        let mut out = Vec::with_capacity(n as usize);
-        let mut p = 2usize;
-        for _ in 0..n {
-            if p + 3 > BLOCK_PAYLOAD {
-                return Err(corrupt(format!("data block {} entry", i)));
-            }
-            let kind = b[p];
-            let k = u16::from_le_bytes(b[p + 1..p + 3].try_into().unwrap()) as usize;
-            let key_end = p + 3 + k;
-            let (entry, end) = match kind {
-                KIND_ROW if key_end + ROW_BYTES <= BLOCK_PAYLOAD => (Entry::Row(decode_row(&b[key_end..key_end + ROW_BYTES])), key_end + ROW_BYTES),
-                KIND_TOMBSTONE if key_end <= BLOCK_PAYLOAD => (Entry::Tombstone, key_end),
-                _ => return Err(corrupt(format!("data block {} entry", i))),
-            };
-            out.push(SegEntry { key: b[p + 3..key_end].to_vec(), entry });
-            p = end;
-        }
-        Ok(out)
+        parse_block(&b, i)
     }
 
     /// The entry for `key`, if this segment has one. A Bloom filter miss costs no read; a hit
@@ -375,12 +594,19 @@ impl<F: VolFile> Segment<F> {
         if self.data_blocks == 0 || !self.bloom.may_contain(key) {
             return Ok(None);
         }
-        let i = self.fences.partition_point(|f| f.as_slice() <= key);
+        let i = self.fences.at_or_before(key);
         if i == 0 {
             return Ok(None);
         }
         let block = self.read_block(i as u64 - 1)?;
         Ok(block.into_iter().find(|e| e.key == key).map(|e| e.entry))
+    }
+
+    /// A cursor over the entries with a key at or after `start`, reading each block only when
+    /// the scan reaches it.
+    pub fn scan_from(&self, start: &[u8]) -> Cursor<'_, F> {
+        let first = self.fences.at_or_before(start).saturating_sub(1) as u64;
+        Cursor { seg: self, block: first, buf: Vec::new(), pos: 0, start: start.to_vec(), loaded: false }
     }
 
     /// Every entry, in sort-key order (compaction and tests).
@@ -393,6 +619,42 @@ impl<F: VolFile> Segment<F> {
             return Err(corrupt("entry count"));
         }
         Ok(out)
+    }
+}
+
+/// Walks one segment's entries in sort-key order from a start key (`Segment::scan_from`).
+pub struct Cursor<'a, F: VolFile> {
+    seg: &'a Segment<F>,
+    block: u64,
+    buf: Vec<SegEntry>,
+    pos: usize,
+    start: Vec<u8>,
+    loaded: bool,
+}
+
+impl<F: VolFile> Cursor<'_, F> {
+    /// The next entry at or after the start key, or `None` at the end of the segment.
+    pub fn next_entry(&mut self) -> Result<Option<SegEntry>, SegmentError> {
+        loop {
+            if !self.loaded {
+                if self.block >= self.seg.data_blocks {
+                    return Ok(None);
+                }
+                self.buf = self.seg.read_block(self.block)?;
+                self.pos = 0;
+                self.loaded = true;
+            }
+            while self.pos < self.buf.len() {
+                let e = &mut self.buf[self.pos];
+                self.pos += 1;
+                if e.key.as_slice() >= self.start.as_slice() {
+                    // Moved out, not cloned: the cursor never reads an entry twice.
+                    return Ok(Some(SegEntry { key: std::mem::take(&mut e.key), entry: e.entry }));
+                }
+            }
+            self.block += 1;
+            self.loaded = false;
+        }
     }
 }
 
@@ -431,6 +693,30 @@ mod tests {
         fs
     }
 
+    /// The packed fences answer as a vector of keys searched with `partition_point` would,
+    /// for keys before, between, on and after the fences, the empty key included.
+    #[test]
+    fn packed_fences_find_the_same_block_as_a_vector_of_keys() {
+        let mut rng = SimRng::new(26);
+        for round in 0..200 {
+            let mut keys: Vec<Vec<u8>> = (0..rng.below(40) + 1).map(|_| (0..rng.below(6)).map(|_| b"ab\xff"[rng.below(3) as usize]).collect()).collect();
+            keys.sort();
+            keys.dedup();
+            let mut f = Fences::with_capacity(keys.len(), 0);
+            for k in &keys {
+                f.push(k);
+            }
+            assert_eq!(f.len(), keys.len());
+            for (i, k) in keys.iter().enumerate() {
+                assert_eq!(f.get(i), k.as_slice());
+            }
+            for _ in 0..50 {
+                let probe: Vec<u8> = (0..rng.below(7)).map(|_| b"ab\xff"[rng.below(3) as usize]).collect();
+                assert_eq!(f.at_or_before(&probe), keys.partition_point(|k| k.as_slice() <= probe.as_slice()), "round {} probe {:?}", round, probe);
+            }
+        }
+    }
+
     #[test]
     fn every_entry_reads_back_and_absent_keys_are_none() {
         let es = entries(1, 5000);
@@ -446,6 +732,47 @@ mod tests {
             }
         }
         assert_eq!(s.entries().unwrap(), es, "a full scan gives back the input in order");
+    }
+
+    #[test]
+    fn the_streaming_writer_writes_the_same_bytes_and_splits_at_its_limit() {
+        for (seed, n) in [(11u64, 0usize), (12, 1), (13, 700), (14, 5000)] {
+            let es = entries(seed, n);
+            let fs = SimFs::new();
+            let mut w = SegmentWriter::create(&fs, path(), 1, 42, MAX_SEGMENT_BYTES).unwrap();
+            for e in &es {
+                w.push(e).unwrap();
+            }
+            let len = w.finish().unwrap();
+            let want = encode_segment(1, 42, &es).unwrap();
+            assert_eq!(len, want.len() as u64, "seed {}", seed);
+            assert_eq!(fs.file(path()).unwrap().contents(), want, "seed {}: the bytes of encode_segment", seed);
+            if n > 0 {
+                let s = Segment::open(&fs, path()).unwrap();
+                assert_eq!(s.key_range(), Some((es[0].key.as_slice(), es[n - 1].key.as_slice())));
+            }
+        }
+        // A small limit: the writer refuses the entry that would not fit, and what it wrote opens.
+        let es = entries(15, 3000);
+        let fs = SimFs::new();
+        let limit = 16 * BLOCK as u64;
+        let mut w = SegmentWriter::create(&fs, path(), 1, 0, limit).unwrap();
+        let mut taken = 0;
+        for e in &es {
+            if !w.fits(e) {
+                assert!(matches!(w.push(e), Err(SegmentError::TooLarge(_))));
+                break;
+            }
+            w.push(e).unwrap();
+            taken += 1;
+        }
+        assert!(taken > 0 && taken < es.len());
+        let len = w.finish().unwrap();
+        assert!(len <= limit, "{} bytes, limit {}", len, limit);
+        assert_eq!(Segment::open(&fs, path()).unwrap().entries().unwrap(), es[..taken].to_vec());
+        let mut w = SegmentWriter::create(&fs, path(), 1, 0, MAX_SEGMENT_BYTES).unwrap();
+        w.push(&es[1]).unwrap();
+        assert!(matches!(w.push(&es[0]), Err(SegmentError::Unsorted)));
     }
 
     #[test]
