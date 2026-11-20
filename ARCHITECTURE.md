@@ -366,7 +366,10 @@ the next open trims them, so only the active volume holds up to one extension of
 **Decision 53 (2026-11-15): `--memory-budget` bounds the heap, not the mapped pages.** It covers
 the payload cache and the bytes request bodies hold. Pages of the mapped volume files are
 outside it; they are bounded by taking large reads out of the mapping (#155, step two), not by
-asking the system to drop pages. #127.
+asking the system to drop pages. #127. Step three (PR #340) does the same for multipart parts above
+4 MiB, which GET used to map: a 1 GiB multipart range GET peaked at about 1,190 MB RSS through the
+mapping and 274.5 MB with positioned reads, at the same throughput on one VM
+(`measurements/2026-11-20-multipart-read-modes.md`).
 
 **Decision 54 (2026-11-15): the `--access-log` file may drop lines, and counts them,** like the
 stderr request log (decision 41): a slow or full log disk must not stall requests. An access

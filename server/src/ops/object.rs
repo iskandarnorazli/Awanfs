@@ -1732,6 +1732,13 @@ pub async fn get_or_head_object(
             let ext = &extents[(pn - 1) as usize];
             let body = if is_head {
                 empty_body()
+            } else if meta.size > VERIFY_WHILE_SENDING_MIN {
+                // A part of a large object is read from its file, not its mapping (#155
+                // requirement 5), whatever the part's own size.
+                match state.multipart_body(b_id, format!("{}/{} part {}", bucket, key, pn), &extents, ext.cumulative_end - ext.part_size, ext.part_size, true) {
+                    Ok(b) => b.boxed(),
+                    Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
+                }
             } else {
                 let b = match state.part_bytes(b_id, ext) {
                     Ok(b) => b,
@@ -1773,17 +1780,19 @@ pub async fn get_or_head_object(
     if let Some(range_opt) = range_res {
         match range_opt {
             Ok(Some(range)) => {
-                if !is_head && !is_multipart && !is_compressed && meta.size > VERIFY_WHILE_SENDING_MIN {
+                if !is_head && !is_compressed && meta.size > VERIFY_WHILE_SENDING_MIN {
                     let len = range.end - range.start + 1;
-                    let body = match state.large_payload_body(
-                        b_id,
-                        format!("{}/{}", bucket, key),
-                        meta.vol_offset,
-                        meta.size,
-                        range.start,
-                        len,
-                        false,
-                    ) {
+                    let what = format!("{}/{}", bucket, key);
+                    let body = if is_multipart {
+                        // Parts read from their files, not their mappings (#155 requirement 5).
+                        match state.multipart.get_completed_extents(b_id, key) {
+                            Some(extents) => state.multipart_body(b_id, what, &extents, range.start, len, false),
+                            None => return Ok(internal_error_response(key, "the multipart object's part list is missing")),
+                        }
+                    } else {
+                        state.large_payload_body(b_id, what, meta.vol_offset, meta.size, range.start, len, false)
+                    };
+                    let body = match body {
                         Ok(b) => b,
                         Err(e) => return Ok(internal_error_response(key, &format!("could not read the object: {:?}", e))),
                     };
@@ -1915,6 +1924,22 @@ pub async fn get_or_head_object(
             Some(e) => e,
             None => return Ok(internal_error_response(key, "the multipart object's part list is missing")),
         };
+        if meta.size > VERIFY_WHILE_SENDING_MIN {
+            // Parts read from their files, not their mappings (#155 requirement 5).
+            let body = match state.multipart_body(b_id, format!("{}/{}", bucket, key), &extents, 0, meta.size, true) {
+                Ok(b) => b,
+                Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
+            };
+            return Ok(with_tagging_count(with_checksum_headers(Response::builder()
+                .status(StatusCode::OK)
+                .with_object_metadata(&view, &overrides)
+                .header(ETAG, etag_val)
+                .header(ACCEPT_RANGES, "bytes")
+                .header(CONTENT_LENGTH, meta.size.to_string())
+                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count)
+                .body(body.boxed())
+                .unwrap());
+        }
         let mut chunks = std::collections::VecDeque::with_capacity(extents.len());
         for ext in extents {
             let chunk = match state.part_bytes(b_id, &ext) {
