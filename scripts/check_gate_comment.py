@@ -9,7 +9,7 @@ an issue's Must-pass s3-tests against a PR's passing.txt and s3tests job log.
 Exit codes:
     0  every gate line is answered (or every Must-pass test is passing / moved by owner)
     1  one or more gate lines are not answered (or a Must-pass test is not passing)
-    2  the issue has no gate section (or no Must-pass section in --pr / --passing / --log mode)
+    2  the issue has no gate section or gate bullets (or no Must-pass section in --pr / --passing / --log mode)
 """
 import argparse
 import base64
@@ -29,7 +29,10 @@ DETAILS_BLOCK_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 BULLET_RE = re.compile(r"^[ \t]*[-*]\s+(.+)$")
+GATE_BULLET_RE = re.compile(r"^ ?[-*]\s+(.+)$")
 TOP_BULLET_RE = re.compile(r"^[ \t]{0,1}[-*]\s+")
+FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})\s*$")
 BACKTICK_RE = re.compile(r"`([^`]+)`")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 GH_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+")
@@ -122,18 +125,44 @@ def fetch_pr_s3tests_log(sha: str) -> str:
     return _gh_api(f"repos/{{owner}}/{{repo}}/actions/jobs/{latest['id']}/logs", allow_escape=True)
 
 
+def _mask_fenced_code_blocks(text: str) -> str:
+    """Replace fenced code block lines with empty lines so headings and bullets inside fences are ignored."""
+    out = []
+    fence_char = ""
+    fence_len = 0
+    for line in text.splitlines():
+        if fence_char:
+            out.append("")
+            cm = FENCE_CLOSE_RE.match(line)
+            if cm and cm.group(1)[0] == fence_char and len(cm.group(1)) >= fence_len:
+                fence_char = ""
+                fence_len = 0
+            continue
+        om = FENCE_OPEN_RE.match(line)
+        if om:
+            marker, info = om.groups()
+            if not (marker[0] == "`" and "`" in info):
+                fence_char = marker[0]
+                fence_len = len(marker)
+                out.append("")
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def extract_gate_lines(body: str):
-    """Return list of gate bullet lines, or None if there is no gate heading."""
-    m = HEADING_RE.search(body)
+    """Return list of top-level gate bullet lines, or None if there is no gate heading."""
+    masked = _mask_fenced_code_blocks(body)
+    m = HEADING_RE.search(masked)
     if not m:
         return None
-    rest = body[m.end():]
+    rest = masked[m.end():]
     nxt = NEXT_HEADING_RE.search(rest)
     section = rest[:nxt.start()] if nxt else rest
     section = DETAILS_RE.sub("", section)
     lines = []
     for raw in section.splitlines():
-        bm = BULLET_RE.match(raw)
+        bm = GATE_BULLET_RE.match(raw)
         if bm:
             lines.append(bm.group(1).strip())
     return lines
@@ -203,7 +232,7 @@ def match_gate_line(gate_line: str, blocks: list[str]) -> tuple[bool, str]:
 
 def check_gate(body: str, comment: str) -> tuple[int, list[tuple[str, bool, str]]]:
     gate_lines = extract_gate_lines(body)
-    if gate_lines is None:
+    if not gate_lines:
         return 2, []
     blocks = split_blocks(comment)
     rows = []
@@ -534,7 +563,10 @@ def main(argv=None) -> int:
 
     exit_code, rows = check_gate(body, comment)
     if exit_code == 2:
-        print("No gate section found (expected heading: Gate, Done when, or Definition of done).")
+        if extract_gate_lines(body) is None:
+            print("No gate section found (expected heading: Gate, Done when, or Definition of done).")
+        else:
+            print("Gate section has no gate bullets (expected at least one top-level bullet).")
         return 2
 
     _print_table(
