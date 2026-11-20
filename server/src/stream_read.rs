@@ -99,8 +99,33 @@ pub struct PayloadRange {
     pub failures: Arc<AtomicU64>,
 }
 
+/// Where one segment's bytes are.
+pub enum Source {
+    /// A volume file; `direct` reads in aligned windows with direct I/O.
+    Volume { vm: Arc<VolumeManager>, direct: bool },
+    /// A multipart object's staged part file, read through the page cache (#155 requirement 5).
+    File(Arc<std::fs::File>),
+}
+
+/// `len` bytes at position `at` of a source. `verify` is the CRC these bytes must have, for a
+/// segment that is a whole needle payload sent whole.
+pub struct Segment {
+    pub source: Source,
+    pub at: u64,
+    pub len: u64,
+    pub verify: Option<u32>,
+}
+
+/// What one response sends: its segments, in order.
+pub struct Job {
+    pub segments: Vec<Segment>,
+    pub what: String,
+    pub failures: Arc<AtomicU64>,
+    pub work: Arc<crate::work::WorkCounters>,
+}
+
 pub struct PreadBody {
-    start: Option<(PayloadRange, u64)>,
+    start: Option<Job>,
     rx: Option<tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>>,
     remaining: u64,
 }
@@ -108,8 +133,20 @@ pub struct PreadBody {
 impl PreadBody {
     /// `payload_at` is where the payload starts in the volume file (`PayloadRange::open`).
     pub fn new(range: PayloadRange, payload_at: u64) -> Self {
-        let remaining = range.len;
-        PreadBody { start: Some((range, payload_at)), rx: None, remaining }
+        let work = range.vm.work_counters();
+        let segment = Segment {
+            source: Source::Volume { vm: range.vm, direct: range.direct },
+            at: payload_at + range.start,
+            len: range.len,
+            verify: range.verify,
+        };
+        Self::from_job(Job { segments: vec![segment], what: range.what, failures: range.failures, work })
+    }
+
+    /// A body that sends `job`'s segments one after the other, as one reader.
+    pub fn from_job(job: Job) -> Self {
+        let remaining = job.segments.iter().map(|s| s.len).sum();
+        PreadBody { start: Some(job), rx: None, remaining }
     }
 }
 
@@ -122,11 +159,11 @@ impl hyper::body::Body for PreadBody {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
         let this = &mut *self;
-        if let Some((range, payload_at)) = this.start.take() {
+        if let Some(job) = this.start.take() {
             let (tx, rx) = tokio::sync::mpsc::channel(read_ahead());
             READERS.fetch_add(1, Ordering::SeqCst);
             tokio::task::spawn_blocking(move || {
-                read_into(range, payload_at, tx);
+                read_into(job, tx);
                 READERS.fetch_sub(1, Ordering::SeqCst);
             });
             this.rx = Some(rx);
@@ -178,60 +215,71 @@ impl Drop for Window {
     }
 }
 
-/// The reader: aligned windows, one chunk handed over at a time.
-fn read_into(range: PayloadRange, payload_at: u64, tx: tokio::sync::mpsc::Sender<std::io::Result<Bytes>>) {
+/// One read of `n` bytes at `pos` into `window`; returns where in the window they start.
+fn read_one(source: &Source, work: &crate::work::WorkCounters, pos: u64, n: u64, window: &mut [u8]) -> Result<usize, String> {
     let sector = SECTOR_SIZE as u64;
-    let work = range.vm.work_counters();
+    match source {
+        Source::Volume { vm, direct: true } => {
+            let lo = pos / sector * sector;
+            let hi = (pos + n).div_ceil(sector) * sector;
+            vm.read_aligned(lo, &mut window[..(hi - lo) as usize]).map(|()| (pos - lo) as usize).map_err(|e| format!("{:?}", e))
+        }
+        Source::Volume { vm, direct: false } => vm.read_cached(pos, &mut window[..n as usize]).map(|()| 0).map_err(|e| format!("{:?}", e)),
+        Source::File(file) => {
+            work.disk_read();
+            crate::direct_io::read_exact_at(file, pos, &mut window[..n as usize]).map(|()| 0).map_err(|e| format!("{:?}", e))
+        }
+    }
+}
+
+/// The reader: the segments in order, one chunk handed over at a time.
+fn read_into(job: Job, tx: tokio::sync::mpsc::Sender<std::io::Result<Bytes>>) {
+    let work = Arc::clone(&job.work);
     let mut state = StreamState::Opening;
-    let mut crc = 0u32;
-    let (begin, end) = (payload_at + range.start, payload_at + range.start + range.len);
-    let mut pos = begin;
-    // The chunk read last, held back until the next one is read (or the CRC is known).
+    // The chunk read last, held back until the next one is read (or the CRC is known), so a
+    // segment's last bytes go out only once its CRC is checked.
     let mut held: Option<Bytes> = None;
     let step = |state: StreamState, event: StreamEvent| stream_step(state, event).unwrap_or(state);
     let chunk_len = read_chunk();
-    while pos < end {
-        let n = (chunk_len as u64).min(end - pos);
-        // One buffer size for every chunk, so pooled buffers fit any read.
-        let mut window = take_buffer(chunk_len + 2 * SECTOR_SIZE);
-        let read = if range.direct {
-            let lo = pos / sector * sector;
-            let hi = (pos + n).div_ceil(sector) * sector;
-            range.vm.read_aligned(lo, &mut window[..(hi - lo) as usize]).map(|()| (pos - lo) as usize)
-        } else {
-            range.vm.read_cached(pos, &mut window[..n as usize]).map(|()| 0)
-        }
-        .map(|at| Bytes::from_owner(Window(Some(window))).slice(at..at + n as usize));
-        let chunk = match read {
-            Ok(c) => c,
-            Err(e) => {
-                state = step(state, StreamEvent::ReadError);
-                let _ = tx.blocking_send(Err(std::io::Error::other(format!("could not read the object: {:?}", e))));
-                debug_assert_eq!(state, StreamState::Aborted(StreamAbort::ReadError));
-                return;
+    for seg in &job.segments {
+        let mut crc = 0u32;
+        let (mut pos, end) = (seg.at, seg.at + seg.len);
+        while pos < end {
+            let n = (chunk_len as u64).min(end - pos);
+            // One buffer size for every chunk, so pooled buffers fit any read.
+            let mut window = take_buffer(chunk_len + 2 * SECTOR_SIZE);
+            let read = read_one(&seg.source, &work, pos, n, &mut window[..]).map(|at| Bytes::from_owner(Window(Some(window))).slice(at..at + n as usize));
+            let chunk = match read {
+                Ok(c) => c,
+                Err(e) => {
+                    state = step(state, StreamEvent::ReadError);
+                    let _ = tx.blocking_send(Err(std::io::Error::other(format!("could not read the object: {}", e))));
+                    debug_assert_eq!(state, StreamState::Aborted(StreamAbort::ReadError));
+                    return;
+                }
+            };
+            if seg.verify.is_some() {
+                crc = crc32c::crc32c_append(crc, &chunk);
+                work.payload_verify(n);
             }
-        };
-        if range.verify.is_some() {
-            crc = crc32c::crc32c_append(crc, &chunk);
-            work.payload_verify(n);
-        }
-        pos += n;
-        if let Some(prev) = held.replace(chunk) {
-            if tx.blocking_send(Ok(prev)).is_err() {
-                state = step(state, StreamEvent::ClientGone);
-                debug_assert_eq!(state, StreamState::Aborted(StreamAbort::ClientGone));
-                return;
+            pos += n;
+            if let Some(prev) = held.replace(chunk) {
+                if tx.blocking_send(Ok(prev)).is_err() {
+                    state = step(state, StreamEvent::ClientGone);
+                    debug_assert_eq!(state, StreamState::Aborted(StreamAbort::ClientGone));
+                    return;
+                }
+                state = step(state, StreamEvent::Chunk);
             }
-            state = step(state, StreamEvent::Chunk);
         }
-    }
-    let checksum_ok = range.verify.is_none_or(|want| want == crc);
-    if !checksum_ok {
-        range.failures.fetch_add(1, Ordering::SeqCst);
-        tracing::error!(object = %range.what, expected = range.verify.unwrap_or(0), actual = crc, "payload checksum mismatch while sending; the transfer is cut");
-        let _ = stream_step(state, StreamEvent::End { checksum_ok });
-        let _ = tx.blocking_send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "the object's bytes failed their checksum")));
-        return;
+        let checksum_ok = seg.verify.is_none_or(|want| want == crc);
+        if !checksum_ok {
+            job.failures.fetch_add(1, Ordering::SeqCst);
+            tracing::error!(object = %job.what, expected = seg.verify.unwrap_or(0), actual = crc, "payload checksum mismatch while sending; the transfer is cut");
+            let _ = stream_step(state, StreamEvent::End { checksum_ok });
+            let _ = tx.blocking_send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "the object's bytes failed their checksum")));
+            return;
+        }
     }
     if let Some(last) = held {
         if tx.blocking_send(Ok(last)).is_err() {
@@ -240,5 +288,5 @@ fn read_into(range: PayloadRange, payload_at: u64, tx: tokio::sync::mpsc::Sender
         }
         state = step(state, StreamEvent::Chunk);
     }
-    let _ = stream_step(state, StreamEvent::End { checksum_ok });
+    let _ = stream_step(state, StreamEvent::End { checksum_ok: true });
 }
