@@ -119,3 +119,59 @@ async fn a_streamed_body_with_a_wrong_hash_or_md5_is_refused_and_not_stored() {
     let res = c.put(format!("{}/st-bkt/ok", url)).header("x-amz-content-sha256", s3_server::sha256_hex(&data)).body(data.clone()).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 }
+
+fn aws_chunked_body(chunk: &[u8]) -> Vec<u8> {
+    let mut out = format!("{:x}\r\n", chunk.len()).into_bytes();
+    out.extend_from_slice(chunk);
+    out.extend_from_slice(b"\r\n0\r\n\r\n");
+    out
+}
+
+#[tokio::test]
+async fn a_streamed_chunked_body_shorter_or_longer_than_declared_is_refused_and_releases_stream() {
+    let dir = temp_dir("len_mismatch");
+    let c = reqwest::Client::new();
+    let (state, url, handle) = start(&dir).await;
+    assert_eq!(c.put(format!("{}/st-bkt", url)).send().await.unwrap().status(), StatusCode::OK);
+
+    let declared = STREAM_PUT_MIN + 4096;
+    let longer = pattern(declared as usize + 1024, 5);
+    let res = c
+        .put(format!("{}/st-bkt/longer", url))
+        .header("content-encoding", "aws-chunked")
+        .header("x-amz-decoded-content-length", declared.to_string())
+        .body(aws_chunked_body(&longer))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(res.text().await.unwrap().contains("IncompleteBody"));
+    assert_eq!(state.streams.in_flight(), 0, "longer body must release stream ticket");
+    assert_eq!(c.get(format!("{}/st-bkt/longer", url)).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+
+    let shorter = pattern(STREAM_PUT_MIN as usize + 2048, 6);
+    let res = c
+        .put(format!("{}/st-bkt/shorter", url))
+        .header("content-encoding", "aws-chunked")
+        .header("x-amz-decoded-content-length", (STREAM_PUT_MIN + 8192).to_string())
+        .body(aws_chunked_body(&shorter))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(res.text().await.unwrap().contains("IncompleteBody"));
+    assert_eq!(state.streams.in_flight(), 0, "shorter body must release stream ticket");
+    assert_eq!(c.get(format!("{}/st-bkt/shorter", url)).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+
+    let after = pattern(5 << 20, 7);
+    assert_eq!(c.put(format!("{}/st-bkt/after", url)).body(after.clone()).send().await.unwrap().status(), StatusCode::OK);
+    handle.shutdown();
+    drop(state);
+
+    let (_state, url, _h) = start(&dir).await;
+    assert_eq!(c.get(format!("{}/st-bkt/longer", url)).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+    assert_eq!(c.get(format!("{}/st-bkt/shorter", url)).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+    let got = c.get(format!("{}/st-bkt/after", url)).send().await.unwrap();
+    assert_eq!(got.status(), StatusCode::OK);
+    assert!(&got.bytes().await.unwrap()[..] == &after[..]);
+}

@@ -14,16 +14,6 @@ use crate::xml::xml_escape;
 
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024; // 5 MiB
 
-static ALLOW_SMALL_PARTS: AtomicBool = AtomicBool::new(false);
-
-pub fn set_allow_small_parts(allow: bool) {
-    ALLOW_SMALL_PARTS.store(allow, Ordering::SeqCst);
-}
-
-pub fn is_allow_small_parts() -> bool {
-    ALLOW_SMALL_PARTS.load(Ordering::Relaxed)
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartExtent {
     pub vol_offset: u64,
@@ -59,6 +49,7 @@ pub struct MultipartUpload {
     pub parts: BTreeMap<u32, StagedPart>,
     pub checksum_alg: Option<crate::checksum::ChecksumAlgorithm>,
     pub checksum_type: Option<String>,
+    pub attrs: crate::attrs::Attrs,
     pub tags: Option<crate::tagging::TagSet>,
 }
 
@@ -207,6 +198,7 @@ impl MultipartManager {
             parts: BTreeMap::new(),
             checksum_alg: None,
             checksum_type: None,
+            attrs: crate::attrs::Attrs::new(),
             tags: None,
         };
 
@@ -231,22 +223,52 @@ impl MultipartManager {
     /// Starts a part whose body arrives in pieces (#36): see `PartWriter`.
     pub fn begin_part(&self, upload_id: &str, part_number: u32) -> std::io::Result<PartWriter> {
         let upload_dir = self.staging_dir.join(upload_id);
-        std::fs::create_dir_all(&upload_dir)?;
         let path = upload_dir.join(format!("part_{:05}.dat", part_number));
         let nanos = self.clock.now_ns();
         let tmp = upload_dir.join(format!("part_{:05}.dat.partial-{}", part_number, nanos));
-        let file = std::fs::File::create(&tmp)?;
-        Ok(PartWriter { file, tmp, path, buf: Vec::new(), written: 0, work: Arc::clone(&self.work), done: false })
+        let file = match std::fs::File::create(&tmp) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&upload_dir)?;
+                std::fs::File::create(&tmp)?
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(PartWriter { file, tmp, path, buf: Vec::new(), written: 0, work: Arc::clone(&self.work), done: false, coalesced: false, inflight: None })
     }
 
     pub fn get_upload(&self, upload_id: &str) -> Option<MultipartUpload> {
         self.uploads.read().get(upload_id).cloned()
     }
 
+    /// Returns `(checksum_alg, checksum_type)` if `upload_id` exists, without cloning the part map.
+    pub fn upload_checksum_info(&self, upload_id: &str) -> Option<(Option<crate::checksum::ChecksumAlgorithm>, Option<String>)> {
+        self.uploads.read().get(upload_id).map(|u| (u.checksum_alg, u.checksum_type.clone()))
+    }
+
+    /// What CompleteMultipartUpload needs from an upload, without cloning its part map (#57):
+    /// `(checksum_alg, checksum_type, tags, attrs)`, the attributes given at create (#111).
+    #[allow(clippy::type_complexity)]
+    pub fn upload_complete_info(
+        &self,
+        upload_id: &str,
+    ) -> Option<(Option<crate::checksum::ChecksumAlgorithm>, Option<String>, Option<crate::tagging::TagSet>, crate::attrs::Attrs)> {
+        self.uploads
+            .read()
+            .get(upload_id)
+            .map(|u| (u.checksum_alg, u.checksum_type.clone(), u.tags.clone(), u.attrs.clone()))
+    }
+
     pub fn set_upload_checksum(&self, upload_id: &str, alg: crate::checksum::ChecksumAlgorithm, checksum_type: String) {
         if let Some(u) = self.uploads.write().get_mut(upload_id) {
             u.checksum_alg = Some(alg);
             u.checksum_type = Some(checksum_type);
+        }
+    }
+
+    pub fn set_upload_attrs(&self, upload_id: &str, attrs: crate::attrs::Attrs) {
+        if let Some(u) = self.uploads.write().get_mut(upload_id) {
+            u.attrs = attrs;
         }
     }
 
@@ -347,16 +369,25 @@ impl MultipartManager {
         let uploads = self.uploads.read();
         let upload = uploads.get(upload_id).ok_or("NoSuchUpload")?;
 
-        // 1. Verify strictly ascending part order (InvalidPartOrder)
+        // 1. Verify non-decreasing part order (InvalidPartOrder); consecutive duplicates
+        // keep the last entry so a resent part finishing last succeeds (#111).
         for i in 1..declared_parts.len() {
-            if declared_parts[i].0 <= declared_parts[i - 1].0 {
+            if declared_parts[i].0 < declared_parts[i - 1].0 {
                 return Err("InvalidPartOrder");
+            }
+        }
+        let mut deduped: Vec<(u32, &str)> = Vec::with_capacity(declared_parts.len());
+        for (p_num, etag) in declared_parts {
+            if let Some(last) = deduped.last_mut().filter(|(n, _)| *n == *p_num) {
+                last.1 = etag.as_str();
+            } else {
+                deduped.push((*p_num, etag.as_str()));
             }
         }
 
         // 2. Verify all declared parts exist and match recorded ETag (InvalidPart)
-        let mut staged_selected = Vec::with_capacity(declared_parts.len());
-        for (p_num, declared_etag) in declared_parts {
+        let mut staged_selected = Vec::with_capacity(deduped.len());
+        for (p_num, declared_etag) in &deduped {
             let staged = upload.parts.get(p_num).ok_or("InvalidPart")?;
             let clean_declared = declared_etag.trim_matches('"');
             if staged.etag_hex != clean_declared {
@@ -366,7 +397,7 @@ impl MultipartManager {
         }
 
         // 3. Verify min part size >= 5 MiB for all except last part (EntityTooSmall)
-        let enforce_min = self.enforce_min_part_size.load(Ordering::Relaxed) && !is_allow_small_parts();
+        let enforce_min = self.enforce_min_part_size.load(Ordering::Relaxed);
         if enforce_min {
             for staged in staged_selected.iter().take(staged_selected.len().saturating_sub(1)) {
                 if staged.size < MIN_PART_SIZE {
@@ -457,6 +488,8 @@ pub struct PartWriter {
     written: u64,
     work: Arc<crate::work::WorkCounters>,
     done: bool,
+    coalesced: bool,
+    inflight: Option<crate::work::InflightGuard>,
 }
 
 impl PartWriter {
@@ -468,6 +501,7 @@ impl PartWriter {
     pub fn write(&mut self, mut data: &[u8]) -> std::io::Result<()> {
         if self.buf.capacity() == 0 {
             self.buf.reserve_exact(PART_CHUNK);
+            self.inflight = Some(self.work.hold_inflight(PART_CHUNK as u64));
         }
         self.written += data.len() as u64;
         while !data.is_empty() {
@@ -478,6 +512,20 @@ impl PartWriter {
                 self.flush()?;
             }
         }
+        Ok(())
+    }
+
+    /// Writes a chunk already coalesced into a `PART_CHUNK` buffer on the async pipeline.
+    pub fn write_coalesced(&mut self, data: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        self.coalesced = true;
+        if self.inflight.is_none() {
+            // The pipeline's buffer is held while this part is written, as `write`'s own is (#133).
+            self.inflight = Some(self.work.hold_inflight(PART_CHUNK as u64));
+        }
+        self.file.write_all(data)?;
+        self.work.disk_write(data.len() as u64);
+        self.written += data.len() as u64;
         Ok(())
     }
 
@@ -502,12 +550,12 @@ impl PartWriter {
 
     /// Writes what is left, syncs, and renames the file into place.
     pub fn finish(mut self) -> std::io::Result<PathBuf> {
-        let buffered = self.buf.capacity() > 0;
+        let buffered = self.buf.capacity() > 0 || self.coalesced;
         self.flush()?;
         if buffered {
             self.work.payload_copy(self.written);
         }
-        self.file.sync_all()?;
+        self.file.sync_data()?;
         self.work.disk_sync();
         std::fs::rename(&self.tmp, &self.path)?;
         self.done = true;

@@ -135,7 +135,7 @@ jobs:
         run: |
           rm -f ci_full_matrix.md
           python -c "import tempfile; print('data under', tempfile.gettempdir())"
-          python -u benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB --concurrent 64 --duration 2 --output ci_full_matrix.md
+          python -u benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB --concurrent 64 --duration 2 --output ci_full_matrix.md
       - name: Report to the job summary
         if: always()
         run: |
