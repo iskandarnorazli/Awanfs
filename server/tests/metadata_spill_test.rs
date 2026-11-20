@@ -44,9 +44,10 @@ async fn test_s3_reactor_spill_database_end_to_end() {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
-    // 3. Verify metadata.db was created in data_dir
-    let db_path = dir.join("metadata.db");
-    assert!(db_path.exists(), "metadata.db must exist in data_dir");
+    // 3. The spill index lives in metadata segments under meta/ (#26 stage 6); redb's
+    // metadata.db is gone (decision 59).
+    assert!(dir.join("meta").is_dir(), "meta/ must exist in data_dir");
+    assert!(!dir.join("metadata.db").exists(), "no metadata.db");
 
     // 4. Verify GET returns correct data
     for i in 0..10 {
@@ -230,4 +231,37 @@ fn spill_holds_1_2_million_keys_in_bounded_memory() {
         println!("peak RSS for {} keys: {} MB", n, kb / 1024);
         assert!(kb <= 200 * 1024, "peak RSS {} MB above 200 MB", kb / 1024);
     }
+}
+
+/// #26 stage 6: a data directory written by a server that used redb (a `metadata.db` beside the
+/// volumes) starts from the volumes alone, serves every object, and loses the old file.
+#[tokio::test]
+async fn a_data_dir_with_a_redb_metadata_db_starts_from_the_volumes() {
+    let dir = temp_dir("old_redb");
+    let client = reqwest::Client::new();
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    {
+        let state = Arc::new(S3ServiceState::with_data_dir(&dir));
+        let handle = start_s3_reactor(addr, state).await.expect("start reactor");
+        let base = format!("http://{}", handle.local_addr);
+        assert_eq!(client.put(format!("{}/old-bucket", base)).send().await.unwrap().status(), StatusCode::OK);
+        for i in 0..5 {
+            let r = client.put(format!("{}/old-bucket/k{}", base, i)).body(format!("v{}", i)).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+        handle.shutdown();
+    }
+    // What a redb file left by an older server looks like to this one: bytes it never reads.
+    std::fs::write(dir.join("metadata.db"), b"redb file from an older AwanFS").unwrap();
+    let state = Arc::new(S3ServiceState::with_data_dir(&dir));
+    let handle = start_s3_reactor(addr, state).await.expect("restart reactor");
+    let base = format!("http://{}", handle.local_addr);
+    for i in 0..5 {
+        let r = client.get(format!("{}/old-bucket/k{}", base, i)).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.text().await.unwrap(), format!("v{}", i));
+    }
+    assert!(!dir.join("metadata.db").exists(), "the redb file is removed at boot");
+    handle.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }

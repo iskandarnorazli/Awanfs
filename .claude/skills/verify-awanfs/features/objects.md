@@ -6,7 +6,7 @@
 - Zero-byte objects: stored, ETag `"d41d8cd98f00b204e9800998ecf8427e"`, empty body on GET
 - DELETE of a key that does not exist answers 204, as S3 does
 - Multi-object delete, `POST /b?delete`: each key gets a tombstone; the answer lists `Deleted` and `Error`
-- Also answered, not driven: `Content-MD5` checked (400 `BadDigest`), `If-Match` (412) and `If-None-Match` (304) on GET; keys rejected when empty, over 1024 bytes, holding control bytes, or with a `..` segment
+- Also answered, not driven: `Content-MD5` checked (400 `BadDigest`), `If-Match` (412) and `If-None-Match` (304) on GET; keys rejected when empty, over 1024 bytes, holding control bytes, with a `..` segment, or with invalid-UTF-8 percent-decoded bytes (`400 InvalidURI`, #140); `PUT` without `Content-Length` or chunked transfer encoding (`411 MissingContentLength`, #160) — both raw-HTTP checks cannot be emitted by the `aws` CLI (`botocore`) and are covered by `server/tests/s3_details_test.rs` and `tests/s3tests/passing.txt`.
 
 ## How to get to it (user POV)
 `put-object`, `get-object`, `head-object`, `delete-object`, `delete-objects`.

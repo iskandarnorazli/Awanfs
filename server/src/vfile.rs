@@ -19,6 +19,8 @@ use std::sync::Arc;
 pub enum FileKind {
     Data,
     Journal,
+    /// A metadata segment (#26): written once, then read with positioned reads.
+    Segment,
 }
 
 /// One file of a volume.
@@ -53,6 +55,8 @@ pub trait VolFs: Send + Sync + 'static {
     fn open(&self, path: &Path, kind: FileKind, create: bool) -> io::Result<Arc<Self::File>>;
     fn exists(&self, path: &Path) -> bool;
     fn remove(&self, path: &Path) -> io::Result<()>;
+    /// The files directly in `dir`, in path order; empty when `dir` does not exist.
+    fn list(&self, dir: &Path) -> io::Result<Vec<std::path::PathBuf>>;
 }
 
 /// A volume file on disk, with the handles the volume code keeps today:
@@ -74,7 +78,7 @@ impl DiskFile {
         }
         let main = match kind {
             FileKind::Data => AlignedFile::open_direct(path, false)?,
-            FileKind::Journal => AlignedFile::open_buffered(path)?,
+            FileKind::Journal | FileKind::Segment => AlignedFile::open_buffered(path)?,
         };
         // Second opens, not `try_clone`: a clone shares the handle (see `sync` above).
         let sync = OpenOptions::new().write(true).open(path)?;
@@ -148,6 +152,22 @@ impl VolFs for DiskFs {
     fn remove(&self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
     }
+    fn list(&self, dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
+        let rd = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut out = Vec::new();
+        for e in rd {
+            let e = e?;
+            if e.file_type()?.is_file() {
+                out.push(e.path());
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -191,6 +211,10 @@ mod tests {
         assert_eq!(&r, b"record-onerecord-two");
         j.set_len(10).unwrap();
         assert_eq!(j.len().unwrap(), 10);
+        let mut names: Vec<_> = DiskFs.list(&d).unwrap().into_iter().map(|p| p.file_name().unwrap().to_owned()).collect();
+        names.sort();
+        assert_eq!(names, vec!["volume_0001.dat", "volume_0001.idx"]);
+        assert!(DiskFs.list(&d.join("nothing-here")).unwrap().is_empty());
         std::fs::remove_dir_all(&d).ok();
     }
 }

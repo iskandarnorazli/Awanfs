@@ -84,6 +84,16 @@ jobs:
             --junit /tmp/s3tests-results.xml --junit /tmp/s3tests-headers-results.xml \
             --suite-ref "ceph/s3-tests $(git -C /tmp/s3-tests rev-parse --short HEAD), run $GITHUB_RUN_ID" \
             --report /tmp/CONFORMANCE_MAP.md
+      - name: Feature registry report
+        if: always() && steps.changes.outputs.run == 'true'
+        run: |
+          python3 scripts/test_features.py
+          python3 scripts/features.py check --ceph-suite /tmp/s3-tests/s3tests/functional/test_s3.py /tmp/s3-tests/s3tests/functional/test_headers.py
+          python3 scripts/features.py report \
+            --ceph-junit /tmp/s3tests-results.xml /tmp/s3tests-headers-results.xml \
+            --ceph-suite /tmp/s3-tests/s3tests/functional/test_s3.py /tmp/s3-tests/s3tests/functional/test_headers.py \
+            --run-id "$GITHUB_RUN_ID" \
+            --output /tmp/FEATURES.md
       - name: Triage report
         if: always() && steps.changes.outputs.run == 'true'
         run: |
@@ -94,6 +104,7 @@ jobs:
         run: |
           [ -f /tmp/s3tests-report.md ] && cat /tmp/s3tests-report.md >> "$GITHUB_STEP_SUMMARY"
           [ -f /tmp/CONFORMANCE_MAP.md ] && sed -n '1,/^## /p' /tmp/CONFORMANCE_MAP.md | sed '$d' | tee -a "$GITHUB_STEP_SUMMARY"
+          [ -f /tmp/FEATURES.md ] && cat /tmp/FEATURES.md >> "$GITHUB_STEP_SUMMARY"
           [ -f /tmp/TRIAGE.md ] && cat /tmp/TRIAGE.md >> "$GITHUB_STEP_SUMMARY"
           tail -20 /tmp/awanfs.log || true
       - uses: actions/upload-artifact@v4
@@ -105,4 +116,5 @@ jobs:
             /tmp/s3tests-headers-results.xml
             /tmp/s3tests-report.md
             /tmp/CONFORMANCE_MAP.md
+            /tmp/FEATURES.md
             /tmp/TRIAGE.md

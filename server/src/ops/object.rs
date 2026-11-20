@@ -107,11 +107,11 @@ fn strip_aws_chunked(raw: &str) -> String {
         .join(", ")
 }
 
-fn request_attrs_with_checksum(
+pub(crate) fn request_attrs_map(
     headers: &HeaderMap,
     key: &str,
     checksum: Option<(crate::checksum::ChecksumAlgorithm, &str, &str)>,
-) -> Result<Vec<u8>, Response<ResponseBody>> {
+) -> Result<crate::attrs::Attrs, Response<ResponseBody>> {
     let mut attrs = crate::attrs::Attrs::new();
     if let Some(ct) = headers.get(CONTENT_TYPE) {
         attrs.set(crate::attrs::TAG_CONTENT_TYPE, valid_header_str(ct, key)?.as_bytes());
@@ -168,7 +168,15 @@ fn request_attrs_with_checksum(
     }
     attrs.set_user_meta(user_meta.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 
-    attrs
+    Ok(attrs)
+}
+
+fn request_attrs_with_checksum(
+    headers: &HeaderMap,
+    key: &str,
+    checksum: Option<(crate::checksum::ChecksumAlgorithm, &str, &str)>,
+) -> Result<Vec<u8>, Response<ResponseBody>> {
+    request_attrs_map(headers, key, checksum)?
         .encode()
         .map_err(|_| bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key))
 }
@@ -884,6 +892,117 @@ pub async fn copy_object(
     Ok(resp.body(full_body(Bytes::from(xml))).unwrap())
 }
 
+/// Bounded hash-and-write pipeline driver for streamed `PutObject` requests, driven by
+/// `crate::fsm::pipeline_step`.
+struct StreamPipeline {
+    state: crate::fsm::PipelineState,
+    tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    writer_task: Option<tokio::task::JoinHandle<Result<crate::volume::NeedleWriter, (&'static str, String)>>>,
+    cur_buf: Vec<u8>,
+    failure: Option<Result<Response<ResponseBody>, hyper::Error>>,
+}
+
+impl StreamPipeline {
+    fn new(
+        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        writer_task: tokio::task::JoinHandle<Result<crate::volume::NeedleWriter, (&'static str, String)>>,
+        cap: usize,
+    ) -> Self {
+        Self {
+            state: crate::fsm::PipelineState::Filling,
+            tx: Some(tx),
+            writer_task: Some(writer_task),
+            cur_buf: Vec::with_capacity(cap),
+            failure: None,
+        }
+    }
+
+    fn step(&mut self, event: crate::fsm::PipelineEvent) -> Result<crate::fsm::PipelineState, crate::fsm::Refusal> {
+        match crate::fsm::pipeline_step(self.state, event) {
+            Ok(next) => {
+                self.state = next;
+                if next == crate::fsm::PipelineState::Failed {
+                    drop(self.tx.take());
+                    self.cur_buf = Vec::new();
+                }
+                Ok(next)
+            }
+            Err(r) => {
+                self.state = crate::fsm::PipelineState::Failed;
+                drop(self.tx.take());
+                self.cur_buf = Vec::new();
+                Err(r)
+            }
+        }
+    }
+
+    fn abort(
+        &mut self,
+        event: crate::fsm::PipelineEvent,
+        key: &str,
+        resp: Result<Response<ResponseBody>, hyper::Error>,
+    ) {
+        self.failure = Some(match self.step(event) {
+            Ok(crate::fsm::PipelineState::Failed) => resp,
+            Ok(_) => Ok(internal_error_response(key, "unexpected pipeline transition")),
+            Err(r) => Ok(bad_request(r.code, r.why, key)),
+        });
+    }
+
+    async fn join_writer(&mut self, key: &str) -> Option<crate::volume::NeedleWriter> {
+        drop(self.tx.take());
+        let res = match self.writer_task.take() {
+            Some(t) => t.await,
+            None => {
+                self.abort(
+                    crate::fsm::PipelineEvent::WriteError,
+                    key,
+                    Ok(internal_error_response(key, "writer task missing")),
+                );
+                return None;
+            }
+        };
+        match res {
+            Ok(Ok(w)) => Some(w),
+            Ok(Err(("IncompleteBody", msg))) => {
+                self.abort(
+                    crate::fsm::PipelineEvent::LengthMismatch,
+                    key,
+                    Ok(bad_request("IncompleteBody", &msg, key)),
+                );
+                None
+            }
+            Ok(Err((_, msg))) => {
+                self.abort(
+                    crate::fsm::PipelineEvent::WriteError,
+                    key,
+                    Ok(internal_error_response(key, &msg)),
+                );
+                None
+            }
+            Err(e) => {
+                self.abort(
+                    crate::fsm::PipelineEvent::WriteError,
+                    key,
+                    Ok(internal_error_response(key, &format!("writer task failed: {:?}", e))),
+                );
+                None
+            }
+        }
+    }
+
+    async fn fail_from_writer(&mut self, key: &str) {
+        if let Some(w) = self.join_writer(key).await {
+            drop(w);
+            self.abort(
+                crate::fsm::PipelineEvent::WriteError,
+                key,
+                Ok(internal_error_response(key, "writer task exited unexpectedly")),
+            );
+        }
+    }
+}
+
 pub async fn put_object(
     state: Arc<S3ServiceState>,
     b_id: u32,
@@ -992,7 +1111,7 @@ pub async fn put_object(
             .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
             .map(|h| h.to_ascii_lowercase());
         let mut sha = declared_sha.as_ref().map(|_| sha2::Sha256::new());
-        let mut digest = crate::digest::StreamingDigest::new_md5_only();
+        let mut digest = Some(crate::digest::StreamingDigest::new_md5_only());
         let mut cksum_hasher = req_checksum.as_ref().map(|(alg, _)| crate::checksum::Checksum::new(*alg));
         let mut body = body;
         let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
@@ -1003,93 +1122,259 @@ pub async fn put_object(
             })
         });
         let idle_timeout = state.body_idle_timeout();
+        const COALESCE_CAP: usize = 1024 * 1024;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+        let (recycle_tx, mut recycle_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+        drop(recycle_tx.try_send(Vec::with_capacity(COALESCE_CAP)));
+        let writer_task = tokio::task::spawn_blocking(
+            move || -> Result<crate::volume::NeedleWriter, (&'static str, String)> {
+                while let Some(mut buf) = rx.blocking_recv() {
+                    if writer.written() + buf.len() as u64 > len {
+                        return Err((
+                            "IncompleteBody",
+                            "The body is longer than its declared length.".to_string(),
+                        ));
+                    }
+                    if let Err(e) = writer.write(&buf) {
+                        return Err(("InternalError", format!("could not store the object: {:?}", e)));
+                    }
+                    buf.clear();
+                    drop(recycle_tx.try_send(buf));
+                }
+                Ok(writer)
+            },
+        );
+        let mut pipe = StreamPipeline::new(tx, writer_task, COALESCE_CAP);
+        let mut total_fed: u64 = 0;
+        let mut outcome: Option<(
+            crate::volume::NeedleWriter,
+            u64,
+            u64,
+            String,
+            Option<(crate::checksum::ChecksumAlgorithm, String)>,
+        )> = None;
         loop {
-            let frame = match crate::body_timeout::next_frame_with_idle(&mut body, idle_timeout).await {
-                Ok(Some(f)) => f,
-                Ok(None) => break,
-                Err(crate::body_timeout::BodyIdleTimeout) => {
-                    drop(writer);
-                    drop(ticket);
-                    return Ok(request_timeout_response(key));
-                }
-            };
-            if let Ok(data) = frame?.into_data() {
-                if let Some(h) = sha.as_mut() {
-                    h.update(&data);
-                }
-                let mut sink = |d: &[u8]| -> Result<(), String> {
-                    if writer.written() + d.len() as u64 > len {
-                        return Err("more bytes than the declared length".to_string());
-                    }
-                    digest.update(d);
-                    if let Some(h) = cksum_hasher.as_mut() {
-                        h.update(d);
-                    }
-                    writer.write(d).map_err(|e| format!("{:?}", e))
-                };
-                let fed = match decoder.as_mut() {
-                    Some(dec) => dec.push(&data, &mut sink),
-                    None => sink(&data).map_err(crate::aws_chunked::PushError::Sink),
-                };
-                match fed {
-                    Ok(()) => {}
-                    Err(crate::aws_chunked::PushError::Decode(e)) => {
-                        drain_body(&mut body, 64 << 20).await;
-                        let status = if e == "SignatureDoesNotMatch" {
-                            StatusCode::FORBIDDEN
-                        } else {
-                            StatusCode::BAD_REQUEST
+            match pipe.state {
+                crate::fsm::PipelineState::Filling => {
+                    let frame = match crate::body_timeout::next_frame_with_idle(&mut body, idle_timeout).await {
+                        Ok(Some(Ok(f))) => f,
+                        Ok(Some(Err(e))) => {
+                            pipe.abort(crate::fsm::PipelineEvent::Disconnect, key, Err(e));
+                            continue;
+                        }
+                        Ok(None) => {
+                            if let Err(r) = pipe.step(crate::fsm::PipelineEvent::EndOfBody) {
+                                pipe.failure = Some(Ok(bad_request(r.code, r.why, key)));
+                            }
+                            continue;
+                        }
+                        Err(crate::body_timeout::BodyIdleTimeout) => {
+                            pipe.abort(crate::fsm::PipelineEvent::Disconnect, key, Ok(request_timeout_response(key)));
+                            continue;
+                        }
+                    };
+                    if let Ok(data) = frame.into_data() {
+                        match pipe.step(crate::fsm::PipelineEvent::Frame) {
+                            Ok(crate::fsm::PipelineState::Filling) => {}
+                            Ok(_) => {
+                                pipe.abort(
+                                    crate::fsm::PipelineEvent::WriteError,
+                                    key,
+                                    Ok(internal_error_response(key, "unexpected pipeline state")),
+                                );
+                                continue;
+                            }
+                            Err(r) => {
+                                pipe.failure = Some(Ok(bad_request(r.code, r.why, key)));
+                                continue;
+                            }
+                        }
+                        if let Some(h) = sha.as_mut() {
+                            h.update(&data);
+                        }
+                        let mut ready_bufs: Vec<Vec<u8>> = Vec::new();
+                        let cur_buf = &mut pipe.cur_buf;
+                        let digest_ref = digest.as_mut().expect("digest present while filling");
+                        let mut append_decoded = |mut d: &[u8]| -> Result<(), String> {
+                            if total_fed + d.len() as u64 > len {
+                                return Err("more bytes than the declared length".to_string());
+                            }
+                            total_fed += d.len() as u64;
+                            digest_ref.update(d);
+                            if let Some(h) = cksum_hasher.as_mut() {
+                                h.update(d);
+                            }
+                            while !d.is_empty() {
+                                let room = COALESCE_CAP - cur_buf.len();
+                                let n = room.min(d.len());
+                                cur_buf.extend_from_slice(&d[..n]);
+                                d = &d[n..];
+                                if cur_buf.len() == COALESCE_CAP {
+                                    let next = recycle_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(COALESCE_CAP));
+                                    ready_bufs.push(std::mem::replace(cur_buf, next));
+                                }
+                            }
+                            Ok(())
                         };
-                        return Ok(Response::builder()
-                            .status(status)
-                            .header(CONTENT_TYPE, "application/xml")
-                            .body(full_body(Bytes::from(s3_error_xml(e, "Error decoding chunked body", key, "req-put-obj"))))
-                            .unwrap());
-                    }
-                    Err(crate::aws_chunked::PushError::Sink(e)) if e.starts_with("more bytes") => {
-                        return Ok(bad_request("IncompleteBody", "The body is longer than its declared length.", key));
-                    }
-                    Err(crate::aws_chunked::PushError::Sink(e)) => {
-                        return Ok(internal_error_response(key, &format!("could not store the object: {}", e)));
+                        let fed = match decoder.as_mut() {
+                            Some(dec) => dec.push(&data, &mut append_decoded),
+                            None => append_decoded(&data).map_err(crate::aws_chunked::PushError::Sink),
+                        };
+                        match fed {
+                            Ok(()) => {}
+                            Err(crate::aws_chunked::PushError::Decode(e)) => {
+                                let status = if e == "SignatureDoesNotMatch" {
+                                    StatusCode::FORBIDDEN
+                                } else {
+                                    StatusCode::BAD_REQUEST
+                                };
+                                let resp = Response::builder()
+                                    .status(status)
+                                    .header(CONTENT_TYPE, "application/xml")
+                                    .body(full_body(Bytes::from(s3_error_xml(e, "Error decoding chunked body", key, "req-put-obj"))))
+                                    .unwrap();
+                                pipe.abort(crate::fsm::PipelineEvent::HashError, key, Ok(resp));
+                                drain_body(&mut body, 64 << 20).await;
+                                continue;
+                            }
+                            Err(crate::aws_chunked::PushError::Sink(e)) if e.starts_with("more bytes") => {
+                                pipe.abort(
+                                    crate::fsm::PipelineEvent::LengthMismatch,
+                                    key,
+                                    Ok(bad_request("IncompleteBody", "The body is longer than its declared length.", key)),
+                                );
+                                continue;
+                            }
+                            Err(crate::aws_chunked::PushError::Sink(e)) => {
+                                pipe.abort(
+                                    crate::fsm::PipelineEvent::WriteError,
+                                    key,
+                                    Ok(internal_error_response(key, &format!("could not store the object: {}", e))),
+                                );
+                                continue;
+                            }
+                        }
+                        for full_buf in ready_bufs {
+                            let send_err = match pipe.tx.as_ref() {
+                                Some(sender) => sender.send(full_buf).await.is_err(),
+                                None => true,
+                            };
+                            if send_err {
+                                pipe.fail_from_writer(key).await;
+                                break;
+                            }
+                        }
                     }
                 }
-            }
-        }
-        if decoder.as_ref().is_some_and(|d| d.finish().is_err()) || writer.written() != len {
-            return Ok(bad_request(
-                "IncompleteBody",
-                "You did not provide the number of bytes specified by the Content-Length HTTP header.",
-                key,
-            ));
-        }
-        if let (Some(h), Some(want)) = (sha, declared_sha) {
-            let got: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
-            if got != want {
-                return Ok(bad_request(
-                    "XAmzContentSHA256Mismatch",
-                    "The provided 'x-amz-content-sha256' header does not match what was computed.",
-                    key,
-                ));
-            }
-        }
-        let (etag_hi, etag_lo, etag_hex, raw_md5, _) = digest.finalize();
-        if let Some(ref content_md5) = content_md5_hdr {
-            if content_md5 != &crate::digest::base64_encode(&raw_md5) {
-                return Ok(bad_request("BadDigest", "The Content-MD5 you specified did not match what we received.", key));
-            }
-        }
-        let stream_cksum_out = match (req_checksum.as_ref(), cksum_hasher) {
-            (Some((alg, expected_opt)), Some(h)) => {
-                let got = h.finish_base64();
-                if let Some(expected) = expected_opt {
-                    if &got != expected {
-                        return Ok(bad_request("BadDigest", "The checksum you specified did not match what we received.", key));
+                crate::fsm::PipelineState::Draining => {
+                    if !pipe.cur_buf.is_empty() {
+                        let tail = std::mem::take(&mut pipe.cur_buf);
+                        let send_err = match pipe.tx.as_ref() {
+                            Some(sender) => sender.send(tail).await.is_err(),
+                            None => true,
+                        };
+                        if send_err {
+                            pipe.fail_from_writer(key).await;
+                            continue;
+                        }
+                    }
+                    let Some(writer) = pipe.join_writer(key).await else {
+                        continue;
+                    };
+                    if decoder.as_ref().is_some_and(|d| d.finish().is_err()) || writer.written() != len {
+                        drop(writer);
+                        pipe.abort(
+                            crate::fsm::PipelineEvent::LengthMismatch,
+                            key,
+                            Ok(bad_request(
+                                "IncompleteBody",
+                                "You did not provide the number of bytes specified by the Content-Length HTTP header.",
+                                key,
+                            )),
+                        );
+                        continue;
+                    }
+                    if let (Some(h), Some(want)) = (sha.take(), declared_sha.as_ref()) {
+                        let got: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+                        if &got != want {
+                            drop(writer);
+                            pipe.abort(
+                                crate::fsm::PipelineEvent::HashError,
+                                key,
+                                Ok(bad_request(
+                                    "XAmzContentSHA256Mismatch",
+                                    "The provided 'x-amz-content-sha256' header does not match what was computed.",
+                                    key,
+                                )),
+                            );
+                            continue;
+                        }
+                    }
+                    let (etag_hi, etag_lo, etag_hex, raw_md5, _) = digest.take().expect("digest present").finalize();
+                    if let Some(ref content_md5) = content_md5_hdr {
+                        if content_md5 != &crate::digest::base64_encode(&raw_md5) {
+                            drop(writer);
+                            pipe.abort(
+                                crate::fsm::PipelineEvent::HashError,
+                                key,
+                                Ok(bad_request("BadDigest", "The Content-MD5 you specified did not match what we received.", key)),
+                            );
+                            continue;
+                        }
+                    }
+                    let stream_cksum_out = match (req_checksum.as_ref(), cksum_hasher.take()) {
+                        (Some((alg, expected_opt)), Some(h)) => {
+                            let got = h.finish_base64();
+                            if let Some(expected) = expected_opt {
+                                if &got != expected {
+                                    drop(writer);
+                                    pipe.abort(
+                                        crate::fsm::PipelineEvent::HashError,
+                                        key,
+                                        Ok(bad_request("BadDigest", "The checksum you specified did not match what we received.", key)),
+                                    );
+                                    continue;
+                                }
+                            }
+                            Some((*alg, got))
+                        }
+                        _ => None,
+                    };
+                    match pipe.step(crate::fsm::PipelineEvent::Drained) {
+                        Ok(crate::fsm::PipelineState::Done) => {
+                            outcome = Some((writer, etag_hi, etag_lo, etag_hex, stream_cksum_out));
+                        }
+                        Ok(_) => {
+                            drop(writer);
+                            pipe.abort(
+                                crate::fsm::PipelineEvent::WriteError,
+                                key,
+                                Ok(internal_error_response(key, "unexpected pipeline completion state")),
+                            );
+                        }
+                        Err(r) => {
+                            drop(writer);
+                            pipe.failure = Some(Ok(bad_request(r.code, r.why, key)));
+                        }
                     }
                 }
-                Some((*alg, got))
+                crate::fsm::PipelineState::Failed => {
+                    drop(pipe.tx.take());
+                    pipe.cur_buf = Vec::new();
+                    if let Some(t) = pipe.writer_task.take() {
+                        if let Ok(Ok(w)) = t.await {
+                            drop(w);
+                        }
+                    }
+                    drop(ticket);
+                    return pipe
+                        .failure
+                        .unwrap_or_else(|| Ok(internal_error_response(key, "streamed PUT pipeline failed")));
+                }
+                crate::fsm::PipelineState::Done => break,
             }
-            _ => None,
-        };
+        }
+        let (mut writer, etag_hi, etag_lo, etag_hex, stream_cksum_out) = outcome.expect("Done guarantees outcome");
         let _key_guard = state.lock_key(b_id, key).await;
         if if_none_match_star && state.engine.read().get_object(b_id, key.as_bytes()).is_ok() {
             return Ok(Response::builder()
@@ -1177,7 +1462,7 @@ pub async fn put_object(
         };
         return Ok(after_late_failure(key, late, answer));
     }
-    let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, expected_len.map(|n| n as u64), state.body_idle_timeout(), path).await? {
+    let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, &state.work, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, expected_len.map(|n| n as u64), state.body_idle_timeout(), path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };

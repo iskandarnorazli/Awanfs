@@ -14,7 +14,8 @@ pub async fn list_buckets(
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let max_buckets = match query_map.get("max-buckets") {
         Some(s) => match s.parse::<i32>() {
-            Ok(n) if n >= 1 => (n as usize).min(10_000),
+            // 1 to 10000 as S3 allows; above it is refused, not capped (#297).
+            Ok(n) if (1..=10_000).contains(&n) => n as usize,
             _ => {
                 return Ok(bad_request(
                     "InvalidArgument",

@@ -1,0 +1,4 @@
+# Sample passing.txt fixture for check_gate_comment tests
+test_s3::test_alpha_passes
+test_s3::test_existing_passing
+test_headers::test_object_create_bad_md5_none
