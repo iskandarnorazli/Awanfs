@@ -234,7 +234,7 @@ impl MultipartManager {
             }
             Err(e) => return Err(e),
         };
-        Ok(PartWriter { file, tmp, path, buf: Vec::new(), written: 0, work: Arc::clone(&self.work), done: false, coalesced: false })
+        Ok(PartWriter { file, tmp, path, buf: Vec::new(), written: 0, work: Arc::clone(&self.work), done: false, coalesced: false, inflight: None })
     }
 
     pub fn get_upload(&self, upload_id: &str) -> Option<MultipartUpload> {
@@ -487,6 +487,7 @@ pub struct PartWriter {
     work: Arc<crate::work::WorkCounters>,
     done: bool,
     coalesced: bool,
+    inflight: Option<crate::work::InflightGuard>,
 }
 
 impl PartWriter {
@@ -498,6 +499,7 @@ impl PartWriter {
     pub fn write(&mut self, mut data: &[u8]) -> std::io::Result<()> {
         if self.buf.capacity() == 0 {
             self.buf.reserve_exact(PART_CHUNK);
+            self.inflight = Some(self.work.hold_inflight(PART_CHUNK as u64));
         }
         self.written += data.len() as u64;
         while !data.is_empty() {
@@ -515,6 +517,10 @@ impl PartWriter {
     pub fn write_coalesced(&mut self, data: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
         self.coalesced = true;
+        if self.inflight.is_none() {
+            // The pipeline's buffer is held while this part is written, as `write`'s own is (#133).
+            self.inflight = Some(self.work.hold_inflight(PART_CHUNK as u64));
+        }
         self.file.write_all(data)?;
         self.work.disk_write(data.len() as u64);
         self.written += data.len() as u64;

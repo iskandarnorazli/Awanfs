@@ -7,6 +7,7 @@
 //! (those are not system calls).
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 #[derive(Debug, Default)]
 pub struct WorkCounters {
@@ -17,6 +18,27 @@ pub struct WorkCounters {
     payload_copies: AtomicU64,
     payload_copy_bytes: AtomicU64,
     payload_verify_bytes: AtomicU64,
+    inflight_bytes: AtomicU64,
+    peak_inflight_bytes: AtomicU64,
+}
+
+/// Releases `bytes` from `WorkCounters::inflight_bytes` when dropped.
+#[derive(Debug)]
+pub struct InflightGuard {
+    work: Arc<WorkCounters>,
+    bytes: u64,
+}
+
+impl InflightGuard {
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.work.inflight_sub(self.bytes);
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +84,38 @@ impl WorkCounters {
         self.payload_verify_bytes.load(Ordering::Relaxed)
     }
 
+    /// Records `bytes` held in memory for an in-flight request and updates `peak_inflight_bytes`.
+    pub fn inflight_add(&self, bytes: u64) {
+        if bytes > 0 {
+            let cur = self.inflight_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+            self.peak_inflight_bytes.fetch_max(cur, Ordering::AcqRel);
+        }
+    }
+
+    /// Releases `bytes` held in memory by an in-flight request.
+    pub fn inflight_sub(&self, bytes: u64) {
+        if bytes > 0 {
+            self.inflight_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        }
+    }
+
+    /// Returns a RAII guard that adds `bytes` now and subtracts them when dropped.
+    pub fn hold_inflight(self: &Arc<Self>, bytes: u64) -> InflightGuard {
+        self.inflight_add(bytes);
+        InflightGuard {
+            work: Arc::clone(self),
+            bytes,
+        }
+    }
+
+    pub fn inflight_bytes(&self) -> u64 {
+        self.inflight_bytes.load(Ordering::Acquire)
+    }
+
+    pub fn peak_inflight_bytes(&self) -> u64 {
+        self.peak_inflight_bytes.load(Ordering::Acquire)
+    }
+
     pub fn snapshot(&self) -> WorkSnapshot {
         WorkSnapshot {
             disk_writes: self.disk_writes.load(Ordering::Relaxed),
@@ -85,5 +139,64 @@ impl WorkSnapshot {
             payload_copies: self.payload_copies.saturating_sub(earlier.payload_copies),
             payload_copy_bytes: self.payload_copy_bytes.saturating_sub(earlier.payload_copy_bytes),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inflight_bytes_tracks_current_and_peak_high_water_mark() {
+        let work = Arc::new(WorkCounters::default());
+        assert_eq!(work.inflight_bytes(), 0);
+        assert_eq!(work.peak_inflight_bytes(), 0);
+
+        let g_zero = work.hold_inflight(0);
+        assert_eq!(work.inflight_bytes(), 0);
+        assert_eq!(work.peak_inflight_bytes(), 0);
+        drop(g_zero);
+
+        let g1 = work.hold_inflight(4 << 20);
+        assert_eq!(work.inflight_bytes(), 4 << 20);
+        assert_eq!(work.peak_inflight_bytes(), 4 << 20);
+
+        let g2 = work.hold_inflight(8 << 20);
+        assert_eq!(work.inflight_bytes(), 12 << 20);
+        assert_eq!(work.peak_inflight_bytes(), 12 << 20);
+
+        drop(g1);
+        assert_eq!(work.inflight_bytes(), 8 << 20);
+        assert_eq!(work.peak_inflight_bytes(), 12 << 20, "peak remains at high-water mark");
+
+        let g3 = work.hold_inflight(2 << 20);
+        assert_eq!(work.inflight_bytes(), 10 << 20);
+        assert_eq!(work.peak_inflight_bytes(), 12 << 20, "smaller overlap does not lower peak");
+
+        drop(g2);
+        drop(g3);
+        assert_eq!(work.inflight_bytes(), 0);
+        assert_eq!(work.peak_inflight_bytes(), 12 << 20);
+    }
+
+    #[test]
+    fn inflight_peak_handles_concurrent_guards() {
+        let work = Arc::new(WorkCounters::default());
+        let threads: Vec<_> = (1..=8u64)
+            .map(|i| {
+                let w = Arc::clone(&work);
+                std::thread::spawn(move || {
+                    let _g = w.hold_inflight(i * 1024);
+                    std::thread::yield_now();
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(work.inflight_bytes(), 0);
+        let peak = work.peak_inflight_bytes();
+        assert!(peak >= 8 * 1024, "peak {peak} must be at least the largest single guard");
+        assert!(peak <= (1..=8u64).sum::<u64>() * 1024, "peak {peak} cannot exceed sum of all guards");
     }
 }

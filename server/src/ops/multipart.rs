@@ -583,7 +583,7 @@ pub async fn upload_part(
             },
         );
     }
-    let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, declared_len, state.body_idle_timeout(), path).await? {
+    let (raw_bytes, _body_guard) = match read_body_admitted(&state.body_budget, &state.work, body, MAX_OBJECT_BODY + CHUNK_FRAMING_SLACK, declared_len, state.body_idle_timeout(), path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };
@@ -701,7 +701,7 @@ pub async fn complete_multipart_upload(
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let upload_id = &query_map["uploadId"];
-    let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_XML_BODY, None, state.body_idle_timeout(), path).await? {
+    let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, &state.work, body, MAX_XML_BODY, None, state.body_idle_timeout(), path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };
