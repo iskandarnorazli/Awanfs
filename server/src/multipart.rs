@@ -14,16 +14,6 @@ use crate::xml::xml_escape;
 
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024; // 5 MiB
 
-static ALLOW_SMALL_PARTS: AtomicBool = AtomicBool::new(false);
-
-pub fn set_allow_small_parts(allow: bool) {
-    ALLOW_SMALL_PARTS.store(allow, Ordering::SeqCst);
-}
-
-pub fn is_allow_small_parts() -> bool {
-    ALLOW_SMALL_PARTS.load(Ordering::Relaxed)
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartExtent {
     pub vol_offset: u64,
@@ -59,6 +49,7 @@ pub struct MultipartUpload {
     pub parts: BTreeMap<u32, StagedPart>,
     pub checksum_alg: Option<crate::checksum::ChecksumAlgorithm>,
     pub checksum_type: Option<String>,
+    pub attrs: crate::attrs::Attrs,
     pub tags: Option<crate::tagging::TagSet>,
 }
 
@@ -207,6 +198,7 @@ impl MultipartManager {
             parts: BTreeMap::new(),
             checksum_alg: None,
             checksum_type: None,
+            attrs: crate::attrs::Attrs::new(),
             tags: None,
         };
 
@@ -247,6 +239,12 @@ impl MultipartManager {
         if let Some(u) = self.uploads.write().get_mut(upload_id) {
             u.checksum_alg = Some(alg);
             u.checksum_type = Some(checksum_type);
+        }
+    }
+
+    pub fn set_upload_attrs(&self, upload_id: &str, attrs: crate::attrs::Attrs) {
+        if let Some(u) = self.uploads.write().get_mut(upload_id) {
+            u.attrs = attrs;
         }
     }
 
@@ -347,16 +345,25 @@ impl MultipartManager {
         let uploads = self.uploads.read();
         let upload = uploads.get(upload_id).ok_or("NoSuchUpload")?;
 
-        // 1. Verify strictly ascending part order (InvalidPartOrder)
+        // 1. Verify non-decreasing part order (InvalidPartOrder); consecutive duplicates
+        // keep the last entry so a resent part finishing last succeeds (#111).
         for i in 1..declared_parts.len() {
-            if declared_parts[i].0 <= declared_parts[i - 1].0 {
+            if declared_parts[i].0 < declared_parts[i - 1].0 {
                 return Err("InvalidPartOrder");
+            }
+        }
+        let mut deduped: Vec<(u32, &str)> = Vec::with_capacity(declared_parts.len());
+        for (p_num, etag) in declared_parts {
+            if let Some(last) = deduped.last_mut().filter(|(n, _)| *n == *p_num) {
+                last.1 = etag.as_str();
+            } else {
+                deduped.push((*p_num, etag.as_str()));
             }
         }
 
         // 2. Verify all declared parts exist and match recorded ETag (InvalidPart)
-        let mut staged_selected = Vec::with_capacity(declared_parts.len());
-        for (p_num, declared_etag) in declared_parts {
+        let mut staged_selected = Vec::with_capacity(deduped.len());
+        for (p_num, declared_etag) in &deduped {
             let staged = upload.parts.get(p_num).ok_or("InvalidPart")?;
             let clean_declared = declared_etag.trim_matches('"');
             if staged.etag_hex != clean_declared {
@@ -366,7 +373,7 @@ impl MultipartManager {
         }
 
         // 3. Verify min part size >= 5 MiB for all except last part (EntityTooSmall)
-        let enforce_min = self.enforce_min_part_size.load(Ordering::Relaxed) && !is_allow_small_parts();
+        let enforce_min = self.enforce_min_part_size.load(Ordering::Relaxed);
         if enforce_min {
             for staged in staged_selected.iter().take(staged_selected.len().saturating_sub(1)) {
                 if staged.size < MIN_PART_SIZE {

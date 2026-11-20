@@ -107,11 +107,11 @@ fn strip_aws_chunked(raw: &str) -> String {
         .join(", ")
 }
 
-fn request_attrs_with_checksum(
+pub(crate) fn request_attrs_map(
     headers: &HeaderMap,
     key: &str,
     checksum: Option<(crate::checksum::ChecksumAlgorithm, &str, &str)>,
-) -> Result<Vec<u8>, Response<ResponseBody>> {
+) -> Result<crate::attrs::Attrs, Response<ResponseBody>> {
     let mut attrs = crate::attrs::Attrs::new();
     if let Some(ct) = headers.get(CONTENT_TYPE) {
         attrs.set(crate::attrs::TAG_CONTENT_TYPE, valid_header_str(ct, key)?.as_bytes());
@@ -168,7 +168,15 @@ fn request_attrs_with_checksum(
     }
     attrs.set_user_meta(user_meta.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 
-    attrs
+    Ok(attrs)
+}
+
+fn request_attrs_with_checksum(
+    headers: &HeaderMap,
+    key: &str,
+    checksum: Option<(crate::checksum::ChecksumAlgorithm, &str, &str)>,
+) -> Result<Vec<u8>, Response<ResponseBody>> {
+    request_attrs_map(headers, key, checksum)?
         .encode()
         .map_err(|_| bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key))
 }

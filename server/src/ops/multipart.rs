@@ -188,6 +188,10 @@ pub async fn create_multipart_upload(
     } else {
         None
     };
+    let attrs = match super::object::request_attrs_map(headers, key, None) {
+        Ok(a) => a,
+        Err(resp) => return Ok(resp),
+    };
     let tag_set = match crate::ops::tagging::parse_tagging_header_from(headers, key) {
         Ok(t) => t,
         Err(resp) => return Ok(resp),
@@ -196,6 +200,9 @@ pub async fn create_multipart_upload(
         Ok(id) => id,
         Err(e) => return Ok(internal_error_response(key, &format!("could not start the upload: {}", e))),
     };
+    if !attrs.is_empty() {
+        state.multipart.set_upload_attrs(&upload_id, attrs);
+    }
     if let (Some((alg, _)), Some(ref ct)) = (&req_cksum, &cksum_type) {
         state.multipart.set_upload_checksum(&upload_id, *alg, ct.clone());
     }
@@ -548,11 +555,16 @@ pub async fn complete_multipart_upload(
             }
         }
     }
-    let declared_parts: Vec<(u32, String, Option<String>)> = parsed_parts
-        .into_iter()
-        .enumerate()
-        .map(|(i, p)| (p.part_number, p.etag, part_cksums.get(i).cloned().flatten()))
-        .collect();
+    let mut declared_parts: Vec<(u32, String, Option<String>)> = Vec::with_capacity(parsed_parts.len());
+    for (i, p) in parsed_parts.into_iter().enumerate() {
+        let ck = part_cksums.get(i).cloned().flatten();
+        if let Some(last) = declared_parts.last_mut().filter(|(n, _, _)| *n == p.part_number) {
+            last.1 = p.etag;
+            last.2 = ck;
+        } else {
+            declared_parts.push((p.part_number, p.etag, ck));
+        }
+    }
 
     if let Some(cached) = state.multipart.get_completed_result(upload_id) {
         if cached.bucket == bucket && cached.key == key {
@@ -624,7 +636,7 @@ pub async fn complete_multipart_upload(
             } else {
                 None
             };
-            let mut attrs = crate::attrs::Attrs::new();
+            let mut attrs = upload_meta.as_ref().map(|u| u.attrs.clone()).unwrap_or_default();
             let part_sizes: Vec<u64> = extents.iter().map(|e| e.part_size).collect();
             attrs.set_part_sizes(&part_sizes);
             if let Some((alg, ref ct, ref val)) = final_cksum {
@@ -635,7 +647,16 @@ pub async fn complete_multipart_upload(
                     attrs.set(crate::attrs::TAG_TAGGING, &crate::attrs::encode_tags(tag_set));
                 }
             }
-            let attrs_bytes = attrs.encode().unwrap_or_default();
+            let attrs_bytes = match attrs.encode() {
+                Ok(b) => b,
+                Err(_) => {
+                    return Ok(bad_request(
+                        "MetadataTooLarge",
+                        "Your metadata headers exceed the maximum allowed metadata size.",
+                        key,
+                    ));
+                }
+            };
             let attrs_flag = if attrs_bytes.is_empty() { 0 } else { crate::meta_index::FLAG_ATTRS };
 
             let hex_prefix = composite_etag.split('-').next().unwrap_or("");
@@ -673,9 +694,13 @@ pub async fn complete_multipart_upload(
                     .unwrap());
             }
             let mut version_id = None;
-            if let Some((_, ts)) = stamp {
+            if let Some((extra, ts)) = stamp {
                 match finish_version_put(&state, b_id, key, ts, mp_flags, manifest_offset, total_size, hi, lo, extents.len() as u16) {
-                    Ok(v) => version_id = Some(v),
+                    Ok(v) => {
+                        if extra & crate::meta_index::FLAG_NULL_ID == 0 {
+                            version_id = Some(v);
+                        }
+                    }
                     Err(r) => return Ok(r),
                 }
             } else {
