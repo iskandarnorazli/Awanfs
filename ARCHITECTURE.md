@@ -233,6 +233,21 @@ sequence number above newer segments it had not merged, so an older row could wi
 the server used it). Not chosen: size-tiered runs (fewer rewrites, but more segments for a
 lookup to check and larger scans' merges).
 
+**Decision 69 (owner, 2026-11-20, #322): AwanFS scales across cores and disks with a
+partitioned store on today's runtime, then a data and metadata split.** P fixed partitions by
+hash(bucket, key), each with its own volume, journal, group commit, index and spill, spread over
+cores and disks; any tokio thread serves any partition (option B). Large objects then move to
+per-disk extent stores (option D). Each step is gated by a measurement: first where PUT stops
+(#262, blocked by #326, a client that is not the cap) and the index's P99 (#316), then a
+throwaway two-partition prototype, then a design issue for the owner (partition layout on disk,
+the per-partition commit path and recovery, the listing merge, memory slices, adding a partition).
+Booting from a checkpoint, one per partition, moved here from #26 (owner decision on #26,
+2026-11-20, option 3). The partition map is the one clustering uses (decision 64). Not chosen:
+finer locks on one store (option A: it keeps the single flush); shared-nothing thread-per-core
+(option C, Seastar's model) unless per-partition locks or CPU are measured as the limit after B,
+since Linux-first runtimes conflict with the both-platforms rule. The owner's agreement:
+[#322](https://github.com/iskandarnorazli/Awanfs/issues/322#issuecomment-7033753496).
+
 **Decision 66 (owner, 2026-11-17): no GPU or APU code path for now.** Erasure coding (decision
 64) is built with CPU vector instructions first and measured against the network rate. A GPU path
 on unified-memory APUs (Strix Halo, MI300A) is weighed only if CPU erasure coding cannot keep up
