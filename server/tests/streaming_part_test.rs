@@ -78,3 +78,68 @@ async fn a_failed_reupload_of_a_part_keeps_the_earlier_part() {
     let got = c.get(format!("{}/sp-bkt/obj", url)).send().await.unwrap().bytes().await.unwrap();
     assert!(&got[..] == &first[..], "the object is the first, acknowledged upload of part 1");
 }
+
+#[tokio::test]
+async fn concurrent_streamed_parts_and_hash_mismatch_cleanup() {
+    let (state, url, _h) = server().await;
+    let c = reqwest::Client::new();
+    let id = initiate(&c, &url).await;
+
+    // Upload 4 streamed parts (> STREAM_PUT_MIN = 4 MiB) concurrently.
+    let part_len = 5 * 1024 * 1024;
+    let mut handles = Vec::new();
+    for p in 1..=4usize {
+        let client = c.clone();
+        let u = url.clone();
+        let uid = id.clone();
+        handles.push(tokio::spawn(async move {
+            let body = pattern(part_len, p);
+            let res = client
+                .put(format!("{}/sp-bkt/obj?partNumber={}&uploadId={}", u, p, uid))
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let etag = res.headers().get("etag").unwrap().to_str().unwrap().to_string();
+            (p, etag, body)
+        }));
+    }
+    let mut parts = Vec::new();
+    for h in handles {
+        parts.push(h.await.unwrap());
+    }
+    parts.sort_by_key(|(p, _, _)| *p);
+
+    // A streamed UploadPart with a mismatched x-amz-content-sha256 must fail with 400 and leave no .partial-* files.
+    let bad_sha = "0".repeat(64);
+    let res = c
+        .put(format!("{}/sp-bkt/obj?partNumber=5&uploadId={}", url, id))
+        .header("x-amz-content-sha256", bad_sha)
+        .body(pattern(part_len, 9))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    let dir = state.multipart.staging_dir.join(&id);
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".partial") || n == "part_00005.dat")
+        .collect();
+    assert!(leftovers.is_empty(), "hash-mismatched part left staging artifacts: {:?}", leftovers);
+
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (p, etag, _) in &parts {
+        xml.push_str(&format!("<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>", p, etag));
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    assert_eq!(c.post(format!("{}/sp-bkt/obj?uploadId={}", url, id)).body(xml).send().await.unwrap().status(), StatusCode::OK);
+    let got = c.get(format!("{}/sp-bkt/obj", url)).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(got.len(), 4 * part_len);
+    for (i, (_, _, body)) in parts.iter().enumerate() {
+        assert!(&got[i * part_len..(i + 1) * part_len] == &body[..], "part {} mismatch", i + 1);
+    }
+}
