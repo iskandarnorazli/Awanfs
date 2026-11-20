@@ -82,6 +82,8 @@ async fn metrics_count_requests_and_match_the_work_counters() {
     assert_eq!(m["awanfs_disk_writes_total"], w.disk_writes as f64);
     assert_eq!(m["awanfs_disk_syncs_total"], w.disk_syncs as f64);
     assert_eq!(m["awanfs_payload_copies_total"], w.payload_copies as f64);
+    assert_eq!(m["awanfs_inflight_bytes"], 0.0);
+    assert!(m["awanfs_peak_inflight_bytes"] >= 1000.0);
     assert_eq!(m["awanfs_payload_cache_hits_total"], 2.0, "both GETs came from the cache");
     assert_eq!(m["awanfs_ready"], 1.0);
     assert!(m["awanfs_volume_used_bytes"] > 0.0);

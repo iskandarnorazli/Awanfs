@@ -293,8 +293,11 @@ gate requires that the production segments do not lose either:
 - boot at 10M keys under 1 s;
 - a run with concurrent writers.
 
-redb stays until #26 lands. #206 still applies until then. #208 (every spilled key also held
-in heap) goes away with redb.
+#26 stage 6 (2026-11-19) switched the spill index to the segments: a memtable inside the spill
+share of `--memory-budget` (#206), flushed to leveled segments (decision 68). The server deletes
+a `metadata.db` it finds at boot and keeps redb only as the benchmark's point of comparison
+(a dev-dependency). #208 is gone with it: no set of spilled keys. The index is still cleared and
+rebuilt from the volumes at boot; booting from the manifest's checkpoint is #26's next step.
 
 **Decision 58 (owner, 2026-11-16): stored data is read with positioned reads, not through
 mappings, wherever the bytes could grow without bound.** Pages read through a mapping stay

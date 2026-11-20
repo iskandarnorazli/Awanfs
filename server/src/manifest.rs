@@ -5,10 +5,10 @@
 //! Compaction (stage 5, decision 68) follows `verification/tla/Levels.tla`; which job runs next
 //! is `meta_compaction::pick`.
 //!
-//! Nothing in the server uses this yet: stage 6 switches the server from redb.
+//! The spill index (`spill.rs`) keeps its segments with this since #26 stage 6.
 
 use crate::meta_compaction::{pick, Job, Policy};
-use crate::segment::{write_segment, Entry, SegEntry, Segment, SegmentError, SegmentWriter};
+use crate::segment::{Entry, SegEntry, Segment, SegmentError, SegmentWriter};
 use crate::segment_set::{SegmentSet, MAX_LEVEL};
 use crate::vfile::{FileKind, VolFile, VolFs};
 use crate::work::WorkCounters;
@@ -226,9 +226,19 @@ impl<Fs: VolFs> MetaStore<Fs> {
     /// syncs it, then switches to a manifest that also names it and covers up to `replay_from`.
     /// A failure at any step leaves the previous manifest current.
     pub fn flush(&mut self, entries: &[SegEntry], replay_from: ReplayFrom, created_at_ns: u64) -> Result<u64, SegmentError> {
+        self.flush_from(entries.iter().cloned(), replay_from, created_at_ns)
+    }
+
+    /// As `flush`, writing the entries as they come (sorted), so the caller need not hold them
+    /// twice. They must fit one segment.
+    pub fn flush_from<I: IntoIterator<Item = SegEntry>>(&mut self, entries: I, replay_from: ReplayFrom, created_at_ns: u64) -> Result<u64, SegmentError> {
         let seq = self.manifest.next_seq;
         let path = segment_path(&self.dir, seq);
-        write_segment(&*self.fs, &path, seq, created_at_ns, entries)?;
+        let mut w = SegmentWriter::create(&*self.fs, &path, seq, created_at_ns, crate::segment::MAX_SEGMENT_BYTES)?;
+        for e in entries {
+            w.push(&e)?;
+        }
+        w.finish()?;
         let mut next = self.manifest.clone();
         next.segments.push(Live { seq, level: 0 });
         next.next_seq = seq + 1;

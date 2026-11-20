@@ -1,7 +1,7 @@
 name: Core scaling benchmark
 
 # Measures PUT and GET throughput, latency (P50, P99), server CPU %, and ops/s per busy core
-# across pinned core counts (N = 1, 2, 4, ...) for AwanFS, MinIO, and RustFS (Issue #250).
+# across pinned core counts (N = 1, 2, 4, ...) for AwanFS, MinIO, RustFS, Garage, and SeaweedFS (Issue #250, #268).
 # Outputs go to $RUNNER_TEMP/core_scaling so no run ever overwrites measurements/.
 
 on:
@@ -40,6 +40,10 @@ on:
     paths:
       - "benchmarks/core_scaling.py"
       - "benchmarks/test_core_scaling.py"
+      - "benchmarks/fetch_garage.py"
+      - "benchmarks/test_fetch_garage.py"
+      - "benchmarks/fetch_seaweedfs.py"
+      - "benchmarks/test_fetch_seaweedfs.py"
       - ".github/workflows/bench-scaling.yml"
 
 permissions:
@@ -48,12 +52,14 @@ permissions:
 env:
   MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
   RUSTFS_TAG: 1.0.5
+  GARAGE_TAG: v2.5.0
+  SEAWEEDFS_TAG: "4.54"
 
 jobs:
   scaling:
     name: Core scaling (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -75,7 +81,9 @@ jobs:
           path: |
             .tmp/minio
             .tmp/rustfs
-          key: bench-tools-${{ runner.os }}-${{ env.MINIO_RELEASE }}-rustfs-${{ env.RUSTFS_TAG }}-v1
+            .tmp/garage
+            .tmp/seaweedfs
+          key: bench-tools-${{ runner.os }}-${{ env.MINIO_RELEASE }}-rustfs-${{ env.RUSTFS_TAG }}-garage-${{ env.GARAGE_TAG }}-seaweedfs-${{ env.SEAWEEDFS_TAG }}-v1
       - uses: actions/setup-go@v5
         if: steps.tools.outputs.cache-hit != 'true'
         with:
@@ -113,6 +121,16 @@ jobs:
           if [ -z "$found" ]; then echo "::warning::$bin not in $asset"; exit 0; fi
           cp "$found" ".tmp/rustfs/$bin"
           chmod +x ".tmp/rustfs/$bin" || true
+      - name: Download Garage release (Linux)
+        if: steps.tools.outputs.cache-hit != 'true' && runner.os == 'Linux'
+        continue-on-error: true
+        run: python benchmarks/fetch_garage.py --tag "$GARAGE_TAG"
+      - name: Download SeaweedFS release
+        if: steps.tools.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python benchmarks/fetch_seaweedfs.py --tag "$SEAWEEDFS_TAG"
 
       - uses: actions/setup-python@v5
         with:
@@ -120,11 +138,14 @@ jobs:
       - name: Install Python benchmark dependencies
         run: python -m pip install -q psutil matplotlib
 
-      - name: Run core scaling self-tests
-        run: python benchmarks/test_core_scaling.py
+      - name: Run core scaling and fetch self-tests
+        run: |
+          python benchmarks/test_core_scaling.py
+          python benchmarks/test_fetch_garage.py
+          python benchmarks/test_fetch_seaweedfs.py
 
       - name: Run core scaling benchmark
-        timeout-minutes: 75
+        timeout-minutes: 105
         env:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
@@ -179,6 +200,12 @@ jobs:
       - name: Fetch RustFS if missing
         continue-on-error: true
         run: python benchmarks/fetch_rustfs.py
+      - name: Fetch Garage if missing
+        continue-on-error: true
+        run: python benchmarks/fetch_garage.py
+      - name: Fetch SeaweedFS if missing
+        continue-on-error: true
+        run: python benchmarks/fetch_seaweedfs.py
       # No actions/setup-python here: on the laptop runner it cannot write the machine registry
       # and its installer hangs (run 44577055366, #262). Use the runner's own Python 3.12, which
       # has psutil and matplotlib, ahead of its default python on PATH.
