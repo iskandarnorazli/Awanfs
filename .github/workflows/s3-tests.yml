@@ -16,6 +16,10 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # A PR opened with GITHUB_TOKEN starts no other workflow, so the map PR's required checks
+  # never ran and it could not merge (CONFORMANCE_MAP.md stayed at 2026-11-14 until #346).
+  # A dispatch is allowed with GITHUB_TOKEN, and required checks are matched by commit.
+  actions: write
 
 jobs:
   s3tests:
@@ -194,3 +198,7 @@ jobs:
               --title "s3-tests: refresh CONFORMANCE_MAP.md (run $GITHUB_RUN_ID)" \
               --body "$BODY"
           fi
+
+          # The required checks for the new head: see `actions: write` above.
+          gh workflow run ci.yml --ref "$BRANCH"
+          echo "Dispatched ci.yml on $BRANCH for its required checks."
