@@ -24,6 +24,9 @@ on:
       scans:
         description: "Prefix scans of up to 1000 keys"
         default: "1000"
+      writer_keys:
+        description: "Keys for the run with 64 writers at once (redb and prod; 0 skips it)"
+        default: "200000"
       stores:
         description: "Stores to run (redb, seg, prod, prod@MIB); the report needs redb"
         default: "redb seg prod"
@@ -59,6 +62,7 @@ jobs:
           GETS: ${{ inputs.gets || '1000000' }}
           SCANS: ${{ inputs.scans || '1000' }}
           STORES: ${{ inputs.stores || 'redb seg prod' }}
+          WRITER_KEYS: ${{ inputs.writer_keys || '200000' }}
           # The runner's temp directory: on Windows it is on the fast disk (D:), see AGENTS.md.
           DATA: ${{ runner.temp }}/meta
         run: |
@@ -76,6 +80,12 @@ jobs:
                 | sed 's/"phase":"query"/"phase":"query_cold"/' | tee -a "$out"
             fi
             "$bin" query --store "$s" --dir "$DATA/$s" --keys "$KEYS" --gets "$GETS" --scans "$SCANS" | tee -a "$out"
+            case "$s" in
+              redb|prod)
+                if [ "$WRITER_KEYS" != 0 ]; then
+                  "$bin" writers --store "$s" --dir "$DATA/$s-writers" --keys "$WRITER_KEYS" --writers 64 | tee -a "$out"
+                fi ;;
+            esac
           done
           case " $STORES " in
             *" redb "*) ;;

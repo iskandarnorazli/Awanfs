@@ -69,6 +69,11 @@ def report(recs, title):
     if all((s, "query_cold") in recs for s in stores):
         for field, label in (("open_secs", "open time after dropping the page cache, s"), ("get_p50_us", "get P50 after dropping the page cache, us")):
             lines.append(f"| {label} | " + " | ".join(fmt(recs[(s, "query_cold")].get(field)) for s in stores) + " |")
+    writers = [s for s in stores if (s, "writers") in recs]
+    if writers:
+        n = recs[(writers[0], "writers")].get("writers")
+        for field, label in (("puts_per_s", f"inserts per second, {n} writers at once"), ("put_p99_us", f"put P99 with {n} writers, us")):
+            lines.append(f"| {label} | " + " | ".join(fmt(recs[(s, "writers")].get(field)) if (s, "writers") in recs else "not measured" for s in stores) + " |")
     same = len({q[s]["answers"] for s in stores}) == 1
     wrong = sum(q[s]["wrong"] for s in stores)
     lines += ["", "redb as AwanFS used it is cleared at every boot and rebuilt from the volumes, so its"

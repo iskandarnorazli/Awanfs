@@ -715,6 +715,21 @@ pub struct S3ServiceState {
     pub region: String,
 }
 
+/// What `S3ServiceState::try_with_data_dir_limits` keeps in memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenLimits {
+    /// Objects kept in the in-memory table; the rest go to the spill index.
+    pub max_objects: usize,
+    /// The spill index's budget; `None` takes it from the memory budget.
+    pub spill_cache_bytes: Option<usize>,
+}
+
+impl Default for OpenLimits {
+    fn default() -> Self {
+        OpenLimits { max_objects: 100_000, spill_cache_bytes: None }
+    }
+}
+
 impl S3ServiceState {
     pub fn new() -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -810,6 +825,12 @@ impl S3ServiceState {
     }
 
     pub fn try_with_data_dir_and_clock(dir: &Path, clock: Arc<dyn Clock>) -> Result<Self, String> {
+        Self::try_with_data_dir_limits(dir, clock, OpenLimits::default())
+    }
+
+    /// As `try_with_data_dir_and_clock`, with the in-memory row count and the spill budget set,
+    /// so a test reaches the spill index and its compactions with a few thousand objects.
+    pub fn try_with_data_dir_limits(dir: &Path, clock: Arc<dyn Clock>, limits: OpenLimits) -> Result<Self, String> {
         let started_at_ns = clock.now_ns();
         let metrics = Arc::new(crate::metrics::Metrics::default());
         let scheduler = Arc::new(Scheduler::new(Arc::clone(&metrics)));
@@ -834,11 +855,11 @@ impl S3ServiceState {
         let multipart = Arc::new(
             MultipartManager::with_staging_dir(dir.join(".staging")).with_work_counters(Arc::clone(&work)).with_clock(Arc::clone(&clock)),
         );
-        let mut engine = AwanStorageEngine::new(100_000, 4_194_304, 65536);
+        let mut engine = AwanStorageEngine::new(limits.max_objects, 4_194_304, 65536);
         // The redb spill index of servers before #26 stage 6: rebuilt from the volumes at every
         // boot, so nothing in it is needed (decision 59). The segments under meta/ replace it.
         let _ = std::fs::remove_file(dir.join("metadata.db"));
-        let spill_cache_bytes = crate::memory::split_cache(crate::memory::effective().cache).0.min(usize::MAX as u64) as usize;
+        let spill_cache_bytes = limits.spill_cache_bytes.unwrap_or_else(|| crate::memory::split_cache(crate::memory::effective().cache).0.min(usize::MAX as u64) as usize);
         let spill = crate::spill::SpillIndex::open_with_cache_size(dir, spill_cache_bytes).map_err(|e| format!("metadata segments: {}", e))?;
         // Rebuilt from the volume replay below, as before (#13); booting from the manifest's
         // checkpoint comes next in #26.
