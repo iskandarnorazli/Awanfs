@@ -14,7 +14,8 @@ use parking_lot::{Mutex, RwLock};
 use xxhash_rust::xxh3::xxh3_64;
 
 pub use crate::direct_io::SECTOR_SIZE;
-use crate::direct_io::{AlignedBuffer, AlignedFile};
+use crate::direct_io::AlignedBuffer;
+use crate::vfile::{DiskFs, FileKind, VolFile, VolFs};
 use crate::work::WorkCounters;
 
 pub const NEEDLE_MAGIC: u32 = 0x41574E33; // "AWN3"
@@ -115,8 +116,8 @@ fn growth_step_from_env() -> u64 {
 }
 
 /// A needle being written as its payload arrives; see `VolumeManager::begin_needle`.
-pub struct NeedleWriter {
-    vm: Arc<VolumeManager>,
+pub struct NeedleWriter<Fs: VolFs = DiskFs> {
+    vm: Arc<VolumeManager<Fs>>,
     bucket_id: u16,
     key: String,
     flags: u16,
@@ -138,6 +139,8 @@ pub struct NeedleWriter {
     created_at: Option<u64>,
     /// Where the writer is: `crate::fsm::needle_step` decides every move (STATE_MACHINES.md).
     state: crate::fsm::NeedleState,
+    /// Tracks the streaming buffers held in memory while this writer is open.
+    _inflight: crate::work::InflightGuard,
 }
 
 fn refused(r: crate::fsm::Refusal, what: &str) -> VolumeError {
@@ -145,13 +148,13 @@ fn refused(r: crate::fsm::Refusal, what: &str) -> VolumeError {
     VolumeError::Io(std::io::Error::new(kind, what.to_string()))
 }
 
-impl NeedleWriter {
+impl<Fs: VolFs> NeedleWriter<Fs> {
     /// The needle's creation time (header bytes 36..44): a version's id (#31).
     pub fn set_created_at(&mut self, ns: u64) {
         self.created_at = Some(ns);
     }
 
-    pub fn volume(&self) -> &Arc<VolumeManager> {
+    pub fn volume(&self) -> &Arc<VolumeManager<Fs>> {
         &self.vm
     }
 
@@ -452,17 +455,17 @@ const IDX_RECORD: usize = 42;
 /// Appends the pending journal records in order. A write that fails is cut back off the file,
 /// so a partly written record never shifts the records after it, and it and the ones after
 /// it stay pending.
-fn write_pending(idx: &mut File, pending: &mut Vec<[u8; IDX_RECORD]>) -> Result<(), VolumeError> {
+fn write_pending<F: VolFile>(journal: &F, end: &mut u64, pending: &mut Vec<[u8; IDX_RECORD]>) -> Result<(), VolumeError> {
     let mut written = 0;
     let mut result = Ok(());
     for rec in pending.iter() {
-        let start = idx.seek(SeekFrom::End(0))?;
-        if let Err(e) = idx.write_all(rec) {
-            let _ = idx.set_len(start);
-            let _ = idx.seek(SeekFrom::End(0));
+        let start = *end;
+        if let Err(e) = journal.write_at(start, rec) {
+            let _ = journal.set_len(start);
             result = Err(VolumeError::Io(e));
             break;
         }
+        *end = start + IDX_RECORD as u64;
         written += 1;
     }
     pending.drain(..written);
@@ -482,18 +485,20 @@ impl Drop for InFlight<'_> {
     }
 }
 
-impl Drop for NeedleWriter {
+impl<Fs: VolFs> Drop for NeedleWriter<Fs> {
     /// The streamed write has ended: finished (its header is written) or abandoned.
     fn drop(&mut self) {
         self.vm.writers_in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-pub struct VolumeManager {
+pub struct VolumeManager<Fs: VolFs = DiskFs> {
     dir: PathBuf,
     volume_id: u32,
-    file: Arc<AlignedFile>,
-    idx_file: Mutex<File>,
+    file: Arc<Fs::File>,
+    /// The `.idx` journal, and where the next record goes.
+    journal: Arc<Fs::File>,
+    journal_end: Mutex<u64>,
     current_offset: AtomicU64,
     mmap: RwLock<Option<Arc<Mmap>>>,
     remap_count: AtomicU64,
@@ -530,16 +535,6 @@ pub struct VolumeManager {
     indexed: BTreeSet<u64>,
     /// Format version in the superblock: what the needles of this volume may use (FORMAT.md).
     format: u32,
-    /// A second handle on the journal, so a sync does not hold the append lock.
-    idx_sync: File,
-    /// A second open of the volume file, used only to flush it. On Windows a write waits for
-    /// a flush made through the same handle (a duplicate counts as the same), so flushing
-    /// through the handle the writers use stops every writer for the length of the flush:
-    /// 2.5 ms a write against 0.02 ms (`measurements/2026-11-14-sync-probe.md`). A flush
-    /// covers the file, whichever handle asks for it.
-    file_sync: File,
-    /// A read-only handle without direct I/O, for GETs read through the page cache (#155).
-    file_cached: File,
     durability: std::sync::atomic::AtomicU8,
     /// Sequence number of the last write whose needle and journal record are written.
     written_seq: AtomicU64,
@@ -547,7 +542,7 @@ pub struct VolumeManager {
     sync_done: std::sync::Condvar,
 }
 
-impl VolumeManager {
+impl VolumeManager<DiskFs> {
     pub fn open(dir: &Path, volume_id: u32) -> Result<Self, VolumeError> {
         let sparse = std::env::var("AWAN_SPARSE_VOLUME").ok().as_deref() == Some("1");
         Self::open_mode(dir, volume_id, sparse)
@@ -561,29 +556,35 @@ impl VolumeManager {
         Self::open_mode_with_clock(dir, volume_id, sparse, Arc::new(SystemClock))
     }
 
-    pub fn open_mode_with_clock(dir: &Path, volume_id: u32, mut sparse: bool, clock: Arc<dyn Clock>) -> Result<Self, VolumeError> {
+    pub fn open_mode_with_clock(dir: &Path, volume_id: u32, sparse: bool, clock: Arc<dyn Clock>) -> Result<Self, VolumeError> {
+        Self::open_with(&DiskFs, dir, volume_id, sparse, clock)
+    }
+}
+
+impl<Fs: VolFs> VolumeManager<Fs> {
+    /// Opens a volume whose files live in `fs`: the disk in production, the simulation's
+    /// files in tests (#213, decision 67).
+    pub fn open_with(fs: &Fs, dir: &Path, volume_id: u32, mut sparse: bool, clock: Arc<dyn Clock>) -> Result<Self, VolumeError> {
         let dat_path = dir.join(format!("volume_{:04}.dat", volume_id));
         let idx_path = dir.join(format!("volume_{:04}.idx", volume_id));
 
-        let file_exists = dat_path.exists();
-        let aligned_file = Arc::new(AlignedFile::open_direct(&dat_path, false)?);
+        let file_exists = fs.exists(&dat_path);
+        let aligned_file = fs.open(&dat_path, FileKind::Data, true)?;
 
-        let mut idx_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&idx_path)?;
+        let journal = fs.open(&idx_path, FileKind::Journal, true)?;
         // Read the journal, then append after it: a reopen must not overwrite earlier records.
-        let mut idx_bytes = Vec::new();
-        idx_file.read_to_end(&mut idx_bytes)?;
-        idx_file.seek(SeekFrom::End(0))?;
+        let journal_len = journal.len()?;
+        let mut idx_bytes = vec![0u8; journal_len as usize];
+        if journal_len > 0 {
+            journal.read_at(0, &mut idx_bytes)?;
+        }
         let indexed: BTreeSet<u64> = idx_bytes
             .chunks_exact(IDX_RECORD)
             .map(|r| u64::from_le_bytes(r[12..20].try_into().unwrap()))
             .filter(|&o| o >= SECTOR_SIZE as u64)
             .collect();
 
-        let mut file_len = aligned_file.metadata()?.len();
+        let mut file_len = aligned_file.len()?;
         if file_len >= MAX_VOLUME_SPAN {
             sparse = true;
         }
@@ -702,24 +703,18 @@ impl VolumeManager {
         }
 
         let initial_mmap = if sparse {
-            Some(Arc::new(unsafe { Mmap::map(aligned_file.file()) }?))
+            aligned_file.map()?.map(Arc::new)
         } else {
             None
         };
 
-        let allocated = if sparse { MAX_VOLUME_SPAN } else { aligned_file.metadata()?.len() };
-        // Second opens, not `try_clone`: see `file_sync`.
-        let idx_sync = OpenOptions::new().write(true).open(&idx_path)?;
-        let file_sync = OpenOptions::new().write(true).open(&dat_path)?;
-        let file_cached = OpenOptions::new().read(true).open(&dat_path)?;
+        let allocated = if sparse { MAX_VOLUME_SPAN } else { aligned_file.len()? };
         Ok(Self {
             dir: dir.to_path_buf(),
             volume_id,
             file: aligned_file,
-            idx_file: Mutex::new(idx_file),
-            idx_sync,
-            file_sync,
-            file_cached,
+            journal,
+            journal_end: Mutex::new(journal_len),
             durability: std::sync::atomic::AtomicU8::new(Durability::Group.code()),
             written_seq: AtomicU64::new(0),
             sync_state: std::sync::Mutex::new(SyncState::default()),
@@ -857,9 +852,9 @@ impl VolumeManager {
         }
         let target = self.written_seq.load(Ordering::SeqCst);
         self.flush_pending_journal()?;
-        self.file_sync.sync_data()?;
+        self.file.sync_data()?;
         self.work.disk_sync();
-        self.idx_sync.sync_data()?;
+        self.journal.sync_data()?;
         self.work.disk_sync();
         let mut st = self.sync_state.lock().unwrap_or_else(|e| e.into_inner());
         st.synced = st.synced.max(target);
@@ -881,20 +876,20 @@ impl VolumeManager {
         rec[28..36].copy_from_slice(&payload_size.to_le_bytes());
         rec[36..38].copy_from_slice(&flags.to_le_bytes());
         rec[38..42].copy_from_slice(&crc.to_le_bytes());
-        let mut idx = self.idx_file.lock();
+        let mut end = self.journal_end.lock();
         let mut pending = self.pending_journal.lock();
         pending.push(rec);
         if self.fail_next_index.swap(false, Ordering::SeqCst) {
             return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected index failure")));
         }
-        write_pending(&mut idx, &mut pending)
+        write_pending(&*self.journal, &mut end, &mut pending)
     }
 
     /// Writes journal records left pending by a failed append (#184).
     fn flush_pending_journal(&self) -> Result<(), VolumeError> {
-        let mut idx = self.idx_file.lock();
+        let mut end = self.journal_end.lock();
         let mut pending = self.pending_journal.lock();
-        write_pending(&mut idx, &mut pending)
+        write_pending(&*self.journal, &mut end, &mut pending)
     }
 
     /// Tests: journal records not yet written.
@@ -971,7 +966,7 @@ impl VolumeManager {
         Arc::clone(&self.work)
     }
 
-    pub fn file(&self) -> Arc<AlignedFile> {
+    pub fn file(&self) -> Arc<Fs::File> {
         Arc::clone(&self.file)
     }
 
@@ -1002,12 +997,14 @@ impl VolumeManager {
                 return Ok(Arc::clone(m));
             }
         }
-        let file_len = self.file.metadata()?.len();
+        let file_len = self.file.len()?;
         if file_len < required_end && file_len == 0 {
             return Err(VolumeError::TornNeedleAtOffset(required_end));
         }
         self.remap_count.fetch_add(1, Ordering::Relaxed);
-        let mmap = unsafe { Mmap::map(self.file.file()) }?;
+        let mmap = self.file.map()?.ok_or_else(|| {
+            VolumeError::Io(io::Error::new(io::ErrorKind::Unsupported, "this volume's files have no read mapping"))
+        })?;
         let arc_m = Arc::new(mmap);
         *guard = Some(Arc::clone(&arc_m));
         Ok(arc_m)
@@ -1179,12 +1176,12 @@ impl VolumeManager {
     /// payload is written in `STREAM_CHUNK` pieces as it arrives, and the first sector, which
     /// holds the header with the payload CRC, is written last by `NeedleWriter::finish`.
     /// A writer dropped before `finish` leaves a gap that recovery steps over (#38).
-    pub fn begin_needle(self: &Arc<Self>, bucket_id: u16, key: &str, payload_size: u64, flags: u16) -> Result<NeedleWriter, VolumeError> {
+    pub fn begin_needle(self: &Arc<Self>, bucket_id: u16, key: &str, payload_size: u64, flags: u16) -> Result<NeedleWriter<Fs>, VolumeError> {
         self.begin_needle_with_attrs(bucket_id, key, &[], payload_size, flags)
     }
 
     /// `begin_needle` with an attributes block, written before the payload (#150).
-    pub fn begin_needle_with_attrs(self: &Arc<Self>, bucket_id: u16, key: &str, attrs: &[u8], payload_size: u64, flags: u16) -> Result<NeedleWriter, VolumeError> {
+    pub fn begin_needle_with_attrs(self: &Arc<Self>, bucket_id: u16, key: &str, attrs: &[u8], payload_size: u64, flags: u16) -> Result<NeedleWriter<Fs>, VolumeError> {
         let flags = self.attrs_flags(attrs, flags)?;
         let key_len = key.len();
         let data_start = 64 + key_len as u64 + attrs.len() as u64;
@@ -1223,6 +1220,7 @@ impl VolumeManager {
             chunk_fill: 0,
             created_at: None,
             state: crate::fsm::NeedleState::Receiving { declared: payload_size, written: 0 },
+            _inflight: self.work.hold_inflight((STREAM_CHUNK + SECTOR_SIZE) as u64),
         };
         // The writer now owns the count: its `Drop` gives it back.
         std::mem::forget(in_flight);
@@ -1291,7 +1289,7 @@ impl VolumeManager {
     /// in the RSS as mapped pages do (#155).
     pub fn read_cached(&self, offset: u64, buf: &mut [u8]) -> Result<(), VolumeError> {
         self.work.disk_read();
-        crate::direct_io::read_exact_at(&self.file_cached, offset, buf)?;
+        self.file.read_at(offset, buf)?;
         Ok(())
     }
 
@@ -1426,7 +1424,7 @@ impl VolumeManager {
     {
         // The written end, not the file's length: a growing volume holds up to one growth
         // step of zeros past it (#178).
-        let file_len = self.file.metadata()?.len().min(self.current_offset.load(Ordering::SeqCst));
+        let file_len = self.file.len()?.min(self.current_offset.load(Ordering::SeqCst));
         let mut scan_offset = SECTOR_SIZE as u64;
         let mut read_buf = AlignedBuffer::new(SECTOR_SIZE);
 

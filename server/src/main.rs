@@ -29,6 +29,36 @@ fn fix_mmap_threshold() -> &'static str {
     "the platform's allocator, unchanged"
 }
 
+fn print_help() {
+    println!(
+        "\
+s3-server — AwanFS S3-compatible object storage server
+
+Usage: s3-server [OPTIONS]
+
+Options:
+  -p, --port <PORT>                Listen port (default: 9000, or S3_PORT / AWAN_S3_PORT)
+      --listen <ADDR>              Bind address (default: 127.0.0.1, or AWANFS_LISTEN)
+  -d, --data-dir <DIR>             Volume data directory (default: S3_DATA_DIR / AWAN_S3_DATA_DIR, or in-memory)
+      --durability <MODE>          group (default), fast, or strict (or AWANFS_DURABILITY)
+      --cert <PATH>                TLS certificate PEM path (or AWANFS_TLS_CERT)
+      --key <PATH>                 TLS private key PEM path (or AWANFS_TLS_KEY)
+      --http-port <PORT>           Plain HTTP listener port when TLS is enabled
+      --compaction-rate <MB/S>     Max compaction copy rate in MB/s, 0 = unlimited (default: 50)
+      --auto-compaction <on|off>   Background compaction (default: on, or AWANFS_AUTO_COMPACTION)
+      --otlp-endpoint <URL>        OpenTelemetry OTLP/HTTP trace endpoint (or OTEL_EXPORTER_OTLP_ENDPOINT)
+      --access-log <PATH|->        Write S3 access log to file or '-' for stdout (or AWANFS_ACCESS_LOG)
+      --config <PATH>              TOML config for users/policies/buckets (or AWANFS_CONFIG)
+      --memory-budget <SIZE>       Total cache + in-flight body memory budget (or AWANFS_MEMORY_BUDGET)
+      --lifecycle-day-seconds <N>  Seconds per lifecycle day (default: 86400; test use only)
+      --body-idle-timeout <DUR>    Idle timeout between request body frames (default: 20s)
+      --region <NAME>              Server region (default: us-east-1, or AWANFS_REGION)
+      --allow-anonymous            Allow unsigned requests (or AWANFS_ALLOW_ANONYMOUS=1)
+      --allow-small-parts          Allow multipart non-final parts under 5 MiB (off by default; for benchmarks)
+  -h, --help                       Print this help message and exit"
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let allocator = fix_mmap_threshold();
@@ -57,10 +87,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut lifecycle_day_seconds: u64 = 86_400;
     let mut body_idle_timeout = s3_server::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT;
     let mut region = std::env::var("AWANFS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let mut allow_small_parts = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--port" || arg == "-p" {
+        if arg == "--help" || arg == "-h" {
+            print_help();
+            return Ok(());
+        } else if arg == "--port" || arg == "-p" {
             if let Some(p_str) = args.next() {
                 if let Ok(p) = p_str.parse::<u16>() {
                     port = p;
@@ -115,6 +149,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         } else if arg == "--allow-anonymous" {
             allow_anonymous = true;
+        } else if arg == "--allow-small-parts" {
+            allow_small_parts = true;
         } else if arg == "--data-dir" || arg == "-d" {
             if let Some(d_str) = args.next() {
                 data_dir = Some(PathBuf::from(d_str));
@@ -205,6 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     state.set_durability(durability);
     state.set_body_idle_timeout(body_idle_timeout);
+    state.multipart.enforce_min_part_size.store(!allow_small_parts, std::sync::atomic::Ordering::SeqCst);
     // Compaction copies at most this many MB/s (#28, decision 24); 0 = no limit.
     state.compaction_rate.store(compaction_mb.unwrap_or(50) * 1_000_000, std::sync::atomic::Ordering::Relaxed);
     state.lifecycle_day_seconds.store(lifecycle_day_seconds, std::sync::atomic::Ordering::Relaxed);

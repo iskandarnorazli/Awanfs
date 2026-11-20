@@ -292,7 +292,8 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
         let a = decode_char(chunk[0])?;
         let b = decode_char(chunk[1])?;
         let c = if chunk[2] == b'=' {
-            if !is_last || chunk[3] != b'=' {
+            // Two '=': the low 4 bits of `b` are unused and must be zero (#296).
+            if !is_last || chunk[3] != b'=' || b & 0x0f != 0 {
                 return None;
             }
             None
@@ -300,7 +301,8 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
             Some(decode_char(chunk[2])?)
         };
         let d = if chunk[3] == b'=' {
-            if !is_last {
+            // One '=': the low 2 bits of `c` are unused and must be zero (#296).
+            if !is_last || c.is_some_and(|c| c & 0x03 != 0) {
                 return None;
             }
             None
@@ -464,6 +466,47 @@ mod tests {
             requested_checksum(&h),
             Ok(Some((ChecksumAlgorithm::Crc32, Some("y/Q5Jg==".to_string()))))
         );
+    }
+
+    /// #296: a base64 string has one canonical form. The bits below the padding must be zero,
+    /// so `rpIg5gm=` (which a lax decoder reads as `rpIg5gk=`) is refused.
+    #[test]
+    fn base64_with_bits_under_the_padding_is_refused() {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for len in 0..40usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 + len * 11) as u8).collect();
+            let enc = base64_encode(&bytes);
+            if enc.is_empty() {
+                continue;
+            }
+            assert_eq!(base64_decode(&enc), Some(bytes.clone()), "canonical {:?}", enc);
+            let pads = enc.bytes().rev().take_while(|&b| b == b'=').count();
+            if pads == 0 {
+                continue;
+            }
+            // The character before the padding carries 4 (one '=') or 2 (two '=') unused bits.
+            let at = enc.len() - pads - 1;
+            let unused = if pads == 1 { 0b11 } else { 0b1111 };
+            let v = ALPHABET.iter().position(|&c| c == enc.as_bytes()[at]).unwrap();
+            for low in 1..=unused {
+                let mut alt = enc.clone().into_bytes();
+                alt[at] = ALPHABET[(v & !unused) | low];
+                let alt = String::from_utf8(alt).unwrap();
+                assert_eq!(base64_decode(&alt), None, "{:?} is a non-canonical form of {:?}", alt, enc);
+            }
+        }
+        assert_eq!(base64_decode("rpIg5gm="), None);
+        assert_eq!(base64_decode("rpIg5gk=").map(|b| base64_encode(&b)), Some("rpIg5gk=".to_string()));
+        // The header path answers as for any other malformed value.
+        for (name, value) in [
+            ("x-amz-checksum-crc64nvme", "Qeh8oXvGiSp="),
+            ("x-amz-checksum-sha256", "arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+1="),
+        ] {
+            let mut h = HeaderMap::new();
+            h.insert(HeaderName::from_static(name), HeaderValue::from_static(value));
+            let err = requested_checksum(&h).unwrap_err();
+            assert_eq!((err.status, err.code), (400, "BadDigest"), "{} {}", name, value);
+        }
     }
 
     #[test]

@@ -66,6 +66,11 @@ jobs:
       - name: MinIO versions
         run: .tmp/minio/minio --version && .tmp/minio/mc --version
 
+      # ratio_check.py reads each server's CPU seconds with psutil (#267); the runner image does
+      # not ship it.
+      - name: Install psutil
+        run: python -m pip install --disable-pip-version-check psutil==6.1.1
+
       - name: Ratio check self-tests
         run: python benchmarks/test_ratio_check.py && python benchmarks/test_budget_rss.py
 
