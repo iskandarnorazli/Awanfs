@@ -727,8 +727,9 @@ pub async fn complete_multipart_upload(
         }
     };
     let upload_complete_meta = state.multipart.upload_complete_info(upload_id);
-    let upload_info = upload_complete_meta.as_ref().map(|(alg, ct, _)| (*alg, ct.clone()));
-    let upload_tags = upload_complete_meta.and_then(|(_, _, tags)| tags);
+    let upload_info = upload_complete_meta.as_ref().map(|(alg, ct, _, _)| (*alg, ct.clone()));
+    let upload_attrs = upload_complete_meta.as_ref().map(|(_, _, _, attrs)| attrs.clone());
+    let upload_tags = upload_complete_meta.and_then(|(_, _, tags, _)| tags);
     let mut part_cksums = Vec::new();
     if let Some((Some(alg), _)) = upload_info {
         let open = format!("<{}>", alg.xml_name());
@@ -823,7 +824,7 @@ pub async fn complete_multipart_upload(
             } else {
                 None
             };
-            let mut attrs = upload_meta.as_ref().map(|u| u.attrs.clone()).unwrap_or_default();
+            let mut attrs = upload_attrs.clone().unwrap_or_default();
             let part_sizes: Vec<u64> = extents.iter().map(|e| e.part_size).collect();
             attrs.set_part_sizes(&part_sizes);
             if let Some((alg, ref ct, ref val)) = final_cksum {

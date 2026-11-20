@@ -246,15 +246,17 @@ impl MultipartManager {
         self.uploads.read().get(upload_id).map(|u| (u.checksum_alg, u.checksum_type.clone()))
     }
 
-    /// Returns `(checksum_alg, checksum_type, tags)` if `upload_id` exists, without cloning the part map.
+    /// What CompleteMultipartUpload needs from an upload, without cloning its part map (#57):
+    /// `(checksum_alg, checksum_type, tags, attrs)`, the attributes given at create (#111).
+    #[allow(clippy::type_complexity)]
     pub fn upload_complete_info(
         &self,
         upload_id: &str,
-    ) -> Option<(Option<crate::checksum::ChecksumAlgorithm>, Option<String>, Option<crate::tagging::TagSet>)> {
+    ) -> Option<(Option<crate::checksum::ChecksumAlgorithm>, Option<String>, Option<crate::tagging::TagSet>, crate::attrs::Attrs)> {
         self.uploads
             .read()
             .get(upload_id)
-            .map(|u| (u.checksum_alg, u.checksum_type.clone(), u.tags.clone()))
+            .map(|u| (u.checksum_alg, u.checksum_type.clone(), u.tags.clone(), u.attrs.clone()))
     }
 
     pub fn set_upload_checksum(&self, upload_id: &str, alg: crate::checksum::ChecksumAlgorithm, checksum_type: String) {
