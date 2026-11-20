@@ -179,9 +179,11 @@ jobs:
       - name: Fetch RustFS if missing
         continue-on-error: true
         run: python benchmarks/fetch_rustfs.py
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      # No actions/setup-python here: on the laptop runner it cannot write the machine registry
+      # and its installer hangs (run 44577055366, #262). Use the runner's own Python 3.12, which
+      # has psutil and matplotlib, ahead of its default python on PATH.
+      - name: Use the runner's Python 3.12
+        run: py -3.12 -c "import os, sys; open(os.environ['GITHUB_PATH'], 'a').write(os.path.dirname(sys.executable) + '\n')"
       - name: Install Python benchmark dependencies
         run: python -m pip install -q psutil matplotlib
       - name: Run core scaling benchmark (self-hosted)
