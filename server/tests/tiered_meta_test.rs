@@ -125,11 +125,18 @@ async fn list_all(c: &reqwest::Client, url: &str, prefix: &str, max_keys: u64) -
     }
 }
 
+/// (status, ETag, body). An error's body is its S3 error code: the rest of an error document
+/// (the RequestId) differs between servers by design.
 async fn get(c: &reqwest::Client, url: &str, k: &str) -> (StatusCode, Option<String>, Vec<u8>) {
     let res = c.get(format!("{}/{}/{}", url, BUCKET, k)).send().await.unwrap();
     let status = res.status();
     let etag = res.headers().get("etag").map(|v| v.to_str().unwrap().to_string());
-    (status, etag, res.bytes().await.unwrap().to_vec())
+    let body = res.bytes().await.unwrap().to_vec();
+    if status.is_success() {
+        return (status, etag, body);
+    }
+    let code = tag(&String::from_utf8_lossy(&body), "Code").into_iter().next().unwrap_or_default();
+    (status, etag, code.into_bytes())
 }
 
 /// Segments at each level in a stopped server's manifest.
