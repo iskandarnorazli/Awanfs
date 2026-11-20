@@ -116,6 +116,81 @@ class CheckGateCommentTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
+    def test_133_gate_extracts_all_5_lines_and_matches_evidence(self):
+        body_path = os.path.join(FIXTURES_DIR, "issue_133_body.md")
+        comment_path = os.path.join(FIXTURES_DIR, "issue_133_comment.md")
+        with open(body_path, encoding="utf-8") as fh:
+            body_133 = fh.read()
+        lines = c.extract_gate_lines(body_133)
+        self.assertEqual(len(lines), 5, lines)
+        self.assertIn("gh pr checks <pr>", lines[0])
+        self.assertIn("peak RSS per workload", lines[1])
+        self.assertIn("measurements/<date>-large-object-rss.md", lines[2])
+        self.assertIn("self-hosted report fails", lines[3])
+        self.assertIn("bench-ratio.yml", lines[4])
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = c.main(["--body-file", body_path, "--comment-file", comment_path, "133"])
+        out = buf.getvalue()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.count("| yes |"), 5, out)
+
+    def test_code_blocks_paragraphs_and_sub_bullets_in_gate(self):
+        body = (
+            "## Problem\n"
+            "```markdown\n"
+            "## Gate\n"
+            "- fake gate before real gate\n"
+            "```\n\n"
+            "## Gate\n"
+            "- First top-level check with details:\n"
+            "  - indented sub-bullet one\n"
+            "\t- tab-indented sub-bullet two\n\n"
+            "Paragraph between bullets.\n\n"
+            "```bash\n"
+            "# bash comment must not end gate section\n"
+            "- not a gate line\n"
+            "```\n\n"
+            "~~~~\n"
+            "## tilde heading inside fence\n"
+            "* also not a gate line\n"
+            "~~~~\n\n"
+            "````markdown\n"
+            "```\n"
+            "### nested fence heading\n"
+            "```\n"
+            "````\n\n"
+            "* Second top-level check.\n"
+            " - Third top-level check.\n"
+            "\n## Files\n"
+            "- `scripts/check_gate_comment.py`\n"
+        )
+        lines = c.extract_gate_lines(body)
+        self.assertEqual(
+            lines,
+            [
+                "First top-level check with details:",
+                "Second top-level check.",
+                "Third top-level check.",
+            ],
+        )
+
+    def test_gate_heading_with_no_bullets_exits_2_with_message(self):
+        comment = "### Gate\n- `cargo test`: OK\n"
+        bodies = [
+            "## Gate\n",
+            "## Gate\n\n## Files\n- `a.py`\n",
+            "## Gate\nJust prose between headings.\n\n## Files\n- `a.py`\n",
+            "## Gate\n```sh\n- bullet inside code block\n```\n",
+            "## Gate\n<details><summary>Must pass</summary>\n\n- `test_s3::test_a`\n</details>\n",
+            "## Done when\n  - indented bullet only\n",
+        ]
+        for body in bodies:
+            rc, out = self._run_main(body, comment)
+            self.assertEqual(rc, 2, f"Expected exit 2 for {body!r}, got {rc}: {out}")
+            self.assertTrue(out.strip(), f"Expected non-empty message for {body!r}")
+
     def _run_must_pass(self, body, passing, log, comments=None, issue=None):
         with tempfile.TemporaryDirectory() as tmp:
             body_path = os.path.join(tmp, "body.md")
