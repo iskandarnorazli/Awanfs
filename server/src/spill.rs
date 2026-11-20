@@ -280,9 +280,11 @@ mod tests {
         let per_present = (reads() - before) as f64 / present as f64;
         assert!((1.0..=1.1).contains(&per_present), "{:.3} reads per present lookup", per_present);
 
+        // Absent keys between the stored ones, so every lookup is inside a segment's key range
+        // and only the Bloom filters can spare the read.
         let before = reads();
         for i in 0..n {
-            assert_eq!(s.get(1, format!("obj/~absent-{}", i).as_bytes()).unwrap(), None);
+            assert_eq!(s.get(1, format!("obj/{:08}~", i).as_bytes()).unwrap(), None);
         }
         let per_absent = (reads() - before) as f64 / n as f64;
         assert!(per_absent <= 0.15, "{:.3} reads per absent lookup", per_absent);
