@@ -25,10 +25,11 @@ Skipped tests in `tests/s3tests/CONFORMANCE_MAP.md` are skipped by `pytest` beca
 
 | Skip reason | Area | What would un-skip it |
 |---|---|---|
-| ceph client extension (`bucket_logging`, `fails_without_logging_rollover`, `bucket_logging_cleanup`) | `bucket-logging` (#153) | Installing ceph's custom botocore service model extension and implementing RGW logging journal/rollover endpoints |
+| ceph client extension (`bucket_logging`, `fails_without_logging_rollover`, `bucket_logging_cleanup`; pytest says `ceph extension to bucket logging not supported at client`) | `bucket-logging` (#153) | Installing ceph's custom botocore service model extension and implementing RGW logging journal/rollover endpoints |
 | `kms_keyid` | `encryption` (#121) | Setting `kms_keyid` in `s3tests.conf` and passing a key file via `--sse-master-key-file` |
-| storage classes (`lifecycle_transition`, `cloud_transition`, `cloud_restore`, `[s3 cloud]`) | `storage-classes` (out of scope, #162) | Configuring multiple storage classes and an `[s3 cloud]` tiering target in `s3tests.conf` |
+| storage classes (`lifecycle_transition`, `cloud_transition`, `cloud_restore`, `[s3 cloud]`; pytest says `[s3 cloud] section missing cloud_storage_class`, `no cloud_storage_class configured`, `requires 2 or more storage classes`, `requires 3 or more storage classes`, `got empty parameter set for (source_mode_key, source_storage_class, dest_storage_class)`) | `storage-classes` (out of scope, #162) | Configuring multiple storage classes and an `[s3 cloud]` tiering target in `s3tests.conf` |
 | `deny_self_denied_policy` | `policy` (#122) | Upstream conditional skip in `s3-tests` for self-denied bucket policy tests |
+| `[iam root] user does not belong to an account` | `iam` (#122) | An `[iam root]` user that belongs to an account (RGW account IAM) in `s3tests.conf` |
 
 ## Planned settings
 
