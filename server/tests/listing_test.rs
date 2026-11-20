@@ -294,10 +294,16 @@ async fn list_buckets_pagination_and_prefix() {
     assert!(tags(&xml, "ContinuationToken").is_empty());
 
     // Invalid max-buckets / continuation-token -> 400 InvalidArgument
-    for query in ["max-buckets=0", "max-buckets=-1", "max-buckets=abc", "continuation-token=zzz"] {
+    // #297: above S3's 10000 is refused, not capped; a token is hex digits only (`+a` was read
+    // as 0x0a because `from_str_radix` takes a leading sign).
+    for query in ["max-buckets=0", "max-buckets=-1", "max-buckets=abc", "max-buckets=10001", "max-buckets=20000", "continuation-token=zzz", "continuation-token=%2Ba", "continuation-token=%2B6"] {
         let resp = c.get(format!("{}/?{}", url, query)).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "query {} should return 400", query);
         let xml = resp.text().await.unwrap();
         assert_eq!(tags(&xml, "Code"), vec!["InvalidArgument"]);
     }
+    // The largest allowed value still lists.
+    let resp = c.get(format!("{}/?max-buckets=10000", url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(tags(&resp.text().await.unwrap(), "Name"), vec!["bkt-a", "bkt-b", "other-c"]);
 }

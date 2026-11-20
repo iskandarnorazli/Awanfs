@@ -1,5 +1,7 @@
 # Awan Storage Edge Cases, Failure Semantics & Error Contracts
 
+> **Written before the PoC (2026-11-10/11) and not yet checked against the code (#280).** Where it disagrees with [`ARCHITECTURE.md`](ARCHITECTURE.md), [`FORMAT.md`](FORMAT.md) or the code, those win.
+
 > **Production Hardening: Network Partitions, MVCC Isolation, Multipart Edge Cases, Torn Write Recovery, and S3 Error Matrix**
 
 ---

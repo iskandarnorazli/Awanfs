@@ -1990,6 +1990,55 @@ impl S3ServiceState {
         Ok(crate::stream_read::PreadBody::new(range, payload_at))
     }
 
+    /// A body that sends `len` bytes from offset `start` of a multipart object with positioned
+    /// reads, part by part (#155 requirement 5, decision 53): a staged part from its file, a
+    /// part stored as a needle from its volume. No part is mapped. Every part the range touches
+    /// is opened and checked against its extent now, before any response header. When
+    /// `verify`, a needle part sent whole is checked against its payload CRC as it is sent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn multipart_body(&self, b_id: u32, what: String, extents: &[crate::multipart::PartExtent], start: u64, len: u64, verify: bool) -> Result<crate::stream_read::PreadBody, VolumeError> {
+        use crate::stream_read::{Job, PreadBody, Segment, Source};
+        let end = start + len;
+        let mut segments = Vec::new();
+        for ext in extents {
+            let p_start = ext.cumulative_end - ext.part_size;
+            let (lo, hi) = (start.max(p_start), end.min(ext.cumulative_end));
+            if lo >= hi {
+                continue;
+            }
+            let (in_part, seg_len) = (lo - p_start, hi - lo);
+            let whole = in_part == 0 && seg_len == ext.part_size;
+            let segment = match &ext.staged_path {
+                Some(path) => {
+                    let file = std::fs::File::open(path)?;
+                    if file.metadata()?.len() < ext.part_size {
+                        return Err(VolumeError::CorruptIndex);
+                    }
+                    Segment { source: Source::File(Arc::new(file)), at: in_part, len: seg_len, verify: None }
+                }
+                None => {
+                    let (vm, local) = self.volume_for(ext.vol_offset)?;
+                    let (payload_at, stored) = vm.payload_extent(local)?;
+                    if stored != ext.part_size {
+                        return Err(VolumeError::CorruptIndex);
+                    }
+                    let check = if verify && whole {
+                        Some(self.needle_crc_map.read().get(&(b_id, ext.vol_offset)).copied().ok_or(VolumeError::CorruptIndex)?)
+                    } else {
+                        None
+                    };
+                    let direct = seg_len >= self.direct_read_min.load(Ordering::Relaxed);
+                    Segment { source: Source::Volume { vm, direct }, at: payload_at + in_part, len: seg_len, verify: check }
+                }
+            };
+            segments.push(segment);
+        }
+        if segments.iter().map(|s| s.len).sum::<u64>() != len {
+            return Err(VolumeError::CorruptIndex);
+        }
+        Ok(PreadBody::from_job(Job { segments, what, failures: Arc::clone(&self.read_checksum_failures), work: Arc::clone(&self.work) }))
+    }
+
     /// A large object's payload from the mapping, unread and unchecked, with the checksum it
     /// must have. GET no longer sends large objects this way (`large_payload_body`, #155);
     /// the mapping is what faulted their pages into the RSS.

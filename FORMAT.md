@@ -21,7 +21,7 @@ All integers are little-endian. Sectors are 4096 bytes.
 | `volume_NNNN.idx` | The volume's journal: one 42-byte record per needle. |
 | `buckets.manifest` | One line per bucket event: `+<id>:<name>` created, `-<id>:<name>` deleted. |
 | `metadata.db` | The redb spill index of servers before #26 stage 6. A server since then deletes it at boot: it was rebuilt from the volumes at every boot, so nothing in it is needed (decision 59). |
-| `meta/seg_<seq>.seg` | A metadata segment (#26, decision 59): sorted rows of the metadata index, immutable once written. `<seq>` is 16 lowercase hex digits. Below. The server's spill index since #26 stage 6; it still clears them at boot and rebuilds them from the volumes, until boot reads the manifest's checkpoint. |
+| `meta/seg_<seq>.seg` | A metadata segment (#26, decision 59): sorted rows of the metadata index, immutable once written. `<seq>` is 16 lowercase hex digits. Below. The server's spill index since #26 stage 6; it clears them at boot and rebuilds them from the volumes. Booting from the manifest's checkpoint moved to the partitioned store (#322). |
 | `meta/manifest.0`, `meta/manifest.1` | The metadata manifest's two slots (#26 stage 4): which segments are live, their levels (stage 5), and the log position they cover. Below. |
 | `.staging/upload-<hex>/part_NNNNN.dat` | Multipart part files; the parts of completed objects stay here. |
 
@@ -108,9 +108,11 @@ The fence keys, then the Bloom filter, padded with zeros to a block boundary:
 ## Metadata manifest (`meta/manifest.0`, `meta/manifest.1`, #26 stage 4)
 
 The checkpoint of the metadata index: the live segments, and the position in the volume log
-they cover. Boot reads it, opens those segments and replays only the needles after that
-position. Without a valid manifest, boot replays every volume, as it does today: the volumes
-are the record, so losing the manifest costs time, never data.
+they cover. It is written at every flush. Boot does not read it yet: it clears the segments and
+replays every volume. A boot that reads it would open those segments and replay only the needles
+after that position; that moved to the partitioned store, a checkpoint per partition (#322,
+[owner decision, 2026-11-20](https://github.com/iskandarnorazli/Awanfs/issues/26#issuecomment-7028770759)). Without a valid manifest, boot replays every volume: the volumes are the record, so losing
+the manifest costs time, never data.
 
 **Two slots.** A new manifest is written to the slot that does not hold the current one, with a
 generation one higher than both, then synced. Boot reads both slots and uses the valid one with

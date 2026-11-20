@@ -1119,5 +1119,343 @@ class GarageAndSeaweedfsTests(unittest.TestCase):
                 httpd.server_close()
 
 
+class ThreadCpuSamplingTests(unittest.TestCase):
+    def test_get_thread_name_linux_proc_comm(self):
+        with tempfile.TemporaryDirectory() as proc_root:
+            task_dir = os.path.join(proc_root, "123", "task", "456")
+            os.makedirs(task_dir, exist_ok=True)
+            with open(os.path.join(task_dir, "comm"), "w", encoding="utf-8") as fh:
+                fh.write("tokio-runtime-w\n")
+            name = cs.get_thread_name(123, 456, platform_name="linux", proc_root=proc_root)
+            self.assertEqual(name, "tokio-runtime-w")
+            self.assertEqual(cs.get_thread_name(123, 999, platform_name="linux", proc_root=proc_root), "")
+
+    def test_get_thread_name_psutil_attr_and_windows_description(self):
+        ps_named = types.SimpleNamespace(id=11, user_time=0.1, system_time=0.0, name="ps-worker")
+        self.assertEqual(cs.get_thread_name(1, 11, platform_name="darwin", psutil_thread=ps_named), "ps-worker")
+
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+            import threading
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.GetCurrentThread.restype = wintypes.HANDLE
+            k32.GetCurrentThreadId.restype = wintypes.DWORD
+            k32.SetThreadDescription.restype = ctypes.c_long
+            k32.SetThreadDescription.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR]
+
+            ready = threading.Event()
+            done = threading.Event()
+            seen_tid = []
+
+            def worker():
+                k32.SetThreadDescription(k32.GetCurrentThread(), "awanfs-test-worker")
+                seen_tid.append(int(k32.GetCurrentThreadId()))
+                ready.set()
+                done.wait(timeout=5.0)
+
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
+            self.assertTrue(ready.wait(timeout=5.0))
+            try:
+                self.assertEqual(
+                    cs.get_thread_name(os.getpid(), seen_tid[0], platform_name="win32"),
+                    "awanfs-test-worker",
+                )
+            finally:
+                done.set()
+                t.join(timeout=5.0)
+
+    def test_collect_thread_samples_handles_deltas_and_mid_phase_exit(self):
+        before = {10: (1.0, 0.5, "tokio-worker-0"), 20: (0.2, 0.1, "awanfs-log")}
+        last_seen = {
+            10: (1.5, 0.7),
+            20: (0.2, 0.1),
+            30: (0.4, 0.2),
+        }
+        after = {10: (2.0, 1.0, "tokio-worker-0"), 20: (0.2, 0.1, "awanfs-log")}
+        names = {10: "tokio-worker-0", 20: "awanfs-log", 30: "spawn-blocking"}
+
+        samples = cs._collect_thread_samples(before, last_seen, after, names)
+        self.assertEqual([s.tid for s in samples], [10, 30, 20])
+        self.assertAlmostEqual(samples[0].user_s, 1.0)
+        self.assertAlmostEqual(samples[0].system_s, 0.5)
+        self.assertAlmostEqual(samples[0].total_s, 1.5)
+        self.assertEqual(samples[1].name, "spawn-blocking")
+        self.assertAlmostEqual(samples[1].total_s, 0.6)
+        self.assertAlmostEqual(samples[2].total_s, 0.0)
+
+    def test_thread_cpu_sampler_polls_psutil_threads(self):
+        snapshots = [
+            [types.SimpleNamespace(id=100, user_time=0.5, system_time=0.1)],
+            [
+                types.SimpleNamespace(id=100, user_time=0.9, system_time=0.2),
+                types.SimpleNamespace(id=200, user_time=0.3, system_time=0.1),
+            ],
+            [types.SimpleNamespace(id=100, user_time=1.2, system_time=0.3)],
+        ]
+        idx = {"n": 0}
+
+        class FakeProc:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def threads(self):
+                i = min(idx["n"], len(snapshots) - 1)
+                idx["n"] += 1
+                return snapshots[i]
+
+        fake_psutil = types.SimpleNamespace(Process=FakeProc, NoSuchProcess=Exception, AccessDenied=Exception)
+        with mock.patch.dict(sys.modules, {"psutil": fake_psutil}), \
+             mock.patch.object(cs, "get_thread_name", side_effect=lambda pid, tid, **kw: f"thr-{tid}"):
+            sampler = cs.ThreadCpuSampler(999, every=0.01)
+            with sampler:
+                import time
+                time.sleep(0.05)
+            samples = sampler.samples()
+
+        by_tid = {s.tid: s for s in samples}
+        self.assertIn(100, by_tid)
+        self.assertIn(200, by_tid)
+        self.assertAlmostEqual(by_tid[100].user_s, 0.7)
+        self.assertAlmostEqual(by_tid[100].system_s, 0.2)
+        self.assertEqual(by_tid[200].name, "thr-200")
+        self.assertAlmostEqual(by_tid[200].total_s, 0.4)
+
+    def test_aggregate_runs_carries_representative_thread_cpu(self):
+        t1 = (cs.ThreadCpuSample(tid=101, name="w0", user_s=0.5, system_s=0.1),)
+        t2 = (cs.ThreadCpuSample(tid=202, name="w0", user_s=1.0, system_s=0.2),)
+        t3 = (cs.ThreadCpuSample(tid=303, name="w0", user_s=0.8, system_s=0.1),)
+        agg = cs.aggregate_runs([
+            cs.PointResult(ops_per_sec=1000.0, p50_ms=2.0, p99_ms=4.0, cpu_pct=90.0, thread_cpu=t1, wall_sec=2.0),
+            cs.PointResult(ops_per_sec=3000.0, p50_ms=1.0, p99_ms=2.0, cpu_pct=110.0, thread_cpu=t2, wall_sec=2.0),
+            cs.PointResult(ops_per_sec=2000.0, p50_ms=1.5, p99_ms=3.0, cpu_pct=100.0, thread_cpu=t3, wall_sec=2.1),
+        ])
+        self.assertAlmostEqual(agg.ops_per_sec, 2000.0)
+        self.assertEqual(agg.thread_cpu, t3)
+        self.assertAlmostEqual(agg.wall_sec, 2.1)
+
+
+class DurabilityAndAutoProfileTests(unittest.TestCase):
+    def test_start_awanfs_passes_durability_and_validates(self):
+        spawned_argvs = []
+
+        class FakeProc:
+            pid = 4242
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        class FakeResp:
+            status = 200
+
+            def read(self):
+                return b""
+
+        class FakeConn:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def request(self, *args, **kwargs):
+                pass
+
+            def getresponse(self):
+                return FakeResp()
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = os.path.join(tmpdir, "s3-server")
+            with open(fake_bin, "wb") as fh:
+                fh.write(b"bin")
+            with mock.patch.object(cs, "_spawn_pinned", side_effect=lambda argv, n, lp: spawned_argvs.append(list(argv)) or FakeProc()), \
+                 mock.patch.object(cs, "_wait_port", return_value=None), \
+                 mock.patch.object(cs.http.client, "HTTPConnection", FakeConn):
+                proc, _port, data_dir, _log = cs._start_awanfs(fake_bin, 4, tmpdir, durability="fast")
+                self.assertEqual(proc.pid, 4242)
+                cs.shutil.rmtree(data_dir, ignore_errors=True)
+
+            self.assertEqual(len(spawned_argvs), 1)
+            idx = spawned_argvs[0].index("--durability")
+            self.assertEqual(spawned_argvs[0][idx + 1], "fast")
+
+            with self.assertRaises(ValueError):
+                cs._start_awanfs(fake_bin, 4, tmpdir, durability="bogus")
+
+    def test_should_auto_profile_put_requires_16_plus_split_client_cores(self):
+        self.assertTrue(cs.should_auto_profile_put(16, [1, 2, 4, 8]))
+        self.assertFalse(cs.should_auto_profile_put(4, [1, 2, 4]))
+        self.assertFalse(cs.should_auto_profile_put(8, [1, 2, 4, 8]))
+        self.assertFalse(cs.should_auto_profile_put(16, [1, 2]))
+
+    def test_fetch_verified_binary_and_ensure_minio_binaries(self):
+        import hashlib
+
+        payload = b"fake-minio-binary-bytes"
+        good_sha = hashlib.sha256(payload).hexdigest()
+
+        class FakeResponse:
+            def __init__(self, data):
+                self._data = data
+                self._pos = 0
+
+            def read(self, n=-1):
+                if n < 0:
+                    out = self._data[self._pos:]
+                    self._pos = len(self._data)
+                    return out
+                out = self._data[self._pos:self._pos + n]
+                self._pos += len(out)
+                return out
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = os.path.join(tmpdir, "minio.exe")
+            with mock.patch("urllib.request.urlopen", return_value=FakeResponse(payload)):
+                out = cs.fetch_verified_binary("https://example.invalid/minio.exe", good_sha, dest)
+            self.assertEqual(out, dest)
+            self.assertTrue(os.path.isfile(dest))
+            with open(dest, "rb") as fh:
+                self.assertEqual(fh.read(), payload)
+
+            bad_dest = os.path.join(tmpdir, "bad.exe")
+            with mock.patch("urllib.request.urlopen", return_value=FakeResponse(payload)):
+                with self.assertRaises(RuntimeError):
+                    cs.fetch_verified_binary("https://example.invalid/bad.exe", "0" * 64, bad_dest)
+            self.assertFalse(os.path.exists(bad_dest))
+
+            # ensure_minio_binaries returns existing binaries without calling fetch_verified_binary
+            mc_existing = os.path.join(tmpdir, "mc.exe")
+            with open(mc_existing, "wb") as fh:
+                fh.write(b"mc")
+            with mock.patch.object(cs, "fetch_verified_binary", side_effect=AssertionError("should not download")):
+                got_m, got_mc = cs.ensure_minio_binaries(dest, mc_existing, auto_fetch=True, dest_dir=tmpdir)
+            self.assertEqual((got_m, got_mc), (dest, mc_existing))
+
+
+class FastAndThreadReportTests(unittest.TestCase):
+    def test_report_renders_fast_row_and_per_thread_cpu_table(self):
+        cores, results = _sample_results()
+        results["put_4k"]["AwanFS"][4] = cs.PointResult(
+            ops_per_sec=3500.0, p50_ms=1.8, p99_ms=5.0, cpu_pct=99.5, ops_per_busy_core=3517.6,
+            wall_sec=2.0,
+            thread_cpu=(
+                cs.ThreadCpuSample(tid=1001, name="tokio-runtime-worker", user_s=0.45, system_s=1.40),
+                cs.ThreadCpuSample(tid=1002, name="", user_s=0.05, system_s=0.02),
+            ),
+        )
+        fast_results = {
+            1: cs.PointResult(ops_per_sec=12000.0, p50_ms=0.8, p99_ms=2.0, cpu_pct=95.0, ops_per_busy_core=12631.6),
+            2: cs.PointResult(ops_per_sec=22000.0, p50_ms=0.9, p99_ms=2.1, cpu_pct=190.0, ops_per_busy_core=11578.9),
+            4: cs.PointResult(
+                ops_per_sec=38000.0, p50_ms=1.0, p99_ms=2.5, cpu_pct=360.0, ops_per_busy_core=10555.6,
+                wall_sec=2.0,
+                thread_cpu=(
+                    cs.ThreadCpuSample(tid=2001, name="tokio-runtime-worker", user_s=1.20, system_s=0.60),
+                ),
+            ),
+        }
+        cmd = "python benchmarks/core_scaling.py --cores 1,2,4 --runs 2 --duration 2"
+        md = cs.render_report(
+            cmd=cmd,
+            cores=cores,
+            results=results,
+            total_cores=16,
+            runs=2,
+            duration_sec=2.0,
+            max_put_ops={4096: 12000.0, 65536: 8000.0},
+            chart_paths=[],
+            fast_results=fast_results,
+        )
+        self.assertIn("| PUT 4 KiB | 4 KiB | AwanFS (--durability fast) |", md)
+        self.assertIn("360.0%", md)
+        self.assertIn("## Per-Thread CPU Breakdown", md)
+        self.assertIn("| group | 4 | 1001 | tokio-runtime-worker | 0.450 | 1.400 | 1.850 |", md)
+        self.assertIn("| group | 4 | 1002 | (unnamed) | 0.050 | 0.020 | 0.070 |", md)
+        self.assertIn("| fast | 4 | 2001 | tokio-runtime-worker | 1.200 | 0.600 | 1.800 |", md)
+
+    def test_matrix_report_renders_fast_row_and_per_thread_cpu_table(self):
+        patterns, sizes, cores, concs, results = _sample_matrix_results()
+        results["seq-write"][4096]["AwanFS"][4][64] = cs.PointResult(
+            ops_per_sec=3500.0, mib_per_sec=13.67, p50_ms=1.8, p99_ms=5.0, cpu_pct=99.5,
+            wall_sec=2.0,
+            thread_cpu=(cs.ThreadCpuSample(tid=3001, name="tokio-runtime-worker", user_s=0.50, system_s=1.40),),
+        )
+        fast_matrix = {
+            4: {
+                64: cs.PointResult(
+                    ops_per_sec=38000.0, mib_per_sec=148.44, p50_ms=1.0, p99_ms=2.5, cpu_pct=360.0,
+                    wall_sec=2.0,
+                    thread_cpu=(cs.ThreadCpuSample(tid=4001, name="tokio-runtime-worker", user_s=1.10, system_s=0.70),),
+                )
+            }
+        }
+        cmd = "python benchmarks/core_scaling.py --matrix --cores 1,2,4"
+        md = cs.render_matrix_report(
+            cmd=cmd,
+            patterns=patterns,
+            sizes=sizes,
+            cores=cores,
+            concurrencies=concs,
+            results=results,
+            total_cores=16,
+            runs=2,
+            duration_sec=2.0,
+            seed=42,
+            memory_budget="32MiB",
+            prefill_bytes=48 * 1024 * 1024,
+            chart_paths=[],
+            fast_results=fast_matrix,
+        )
+        self.assertIn("| AwanFS (--durability fast) | seq-write | 4 KiB | 4 | 64 |", md)
+        self.assertIn("## Per-Thread CPU Breakdown", md)
+        self.assertIn("| group | 4 | 3001 | tokio-runtime-worker | 0.500 | 1.400 | 1.900 |", md)
+        self.assertIn("| fast | 4 | 4001 | tokio-runtime-worker | 1.100 | 0.700 | 1.800 |", md)
+
+    def test_live_stub_phase_captures_thread_cpu_when_enabled(self):
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cs.rwb.BaselineFileS3Handler.storage_root = tmpdir
+            port = cs.rwb.get_free_port()
+            httpd = cs.rwb.ThreadedHTTPServer(("127.0.0.1", port), cs.rwb.BaselineFileS3Handler)
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            os.makedirs(os.path.join(tmpdir, cs.BUCKET), exist_ok=True)
+            try:
+                pt = cs._run_phase_with_cpu(
+                    "127.0.0.1", port, cs.BUCKET, 4 * cs.KIB, 2, 0.1, "put",
+                    os.getpid(), shares_cores=True, profile_threads=True,
+                )
+                self.assertTrue(pt.measured, pt.reason)
+                self.assertIsNotNone(pt.wall_sec)
+                self.assertGreater(pt.wall_sec, 0.0)
+                try:
+                    import psutil  # noqa: F401
+                    has_psutil = True
+                except ImportError:
+                    has_psutil = False
+                if has_psutil:
+                    self.assertIsNotNone(pt.thread_cpu)
+                    self.assertGreater(len(pt.thread_cpu), 0)
+                    self.assertTrue(all(s.tid > 0 and s.total_s >= 0.0 for s in pt.thread_cpu))
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

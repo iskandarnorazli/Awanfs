@@ -1,5 +1,7 @@
 # Awan Storage REST & S3 API Specification
 
+> **Written before the PoC (2026-11-10/11) and not yet checked against the code (#280).** Where it disagrees with [`ARCHITECTURE.md`](ARCHITECTURE.md), [`FORMAT.md`](FORMAT.md) or the code, those win.
+
 > **Wire Protocol: Drop-In S3 REST Compatibility, Dual Host Routing, `aws-chunked` Framing, and Endpoint Contracts**
 
 ---
