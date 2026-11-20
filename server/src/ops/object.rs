@@ -1732,8 +1732,9 @@ pub async fn get_or_head_object(
             let ext = &extents[(pn - 1) as usize];
             let body = if is_head {
                 empty_body()
-            } else if ext.part_size > VERIFY_WHILE_SENDING_MIN {
-                // A large part is read from its file, not its mapping (#155 requirement 5).
+            } else if meta.size > VERIFY_WHILE_SENDING_MIN {
+                // A part of a large object is read from its file, not its mapping (#155
+                // requirement 5), whatever the part's own size.
                 match state.multipart_body(b_id, format!("{}/{} part {}", bucket, key, pn), &extents, ext.cumulative_end - ext.part_size, ext.part_size, true) {
                     Ok(b) => b.boxed(),
                     Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
