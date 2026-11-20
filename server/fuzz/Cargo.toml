@@ -11,6 +11,8 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 s3-server = { path = ".." }
 hyper = "1"
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt"] }
 
 [workspace]
 
@@ -113,5 +115,23 @@ doc = false
 [[bin]]
 name = "parse_size"
 path = "fuzz_targets/parse_size.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "checksum_headers"
+path = "fuzz_targets/checksum_headers.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "list_buckets_query"
+path = "fuzz_targets/list_buckets_query.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "raw_s3_key"
+path = "fuzz_targets/raw_s3_key.rs"
 test = false
 doc = false

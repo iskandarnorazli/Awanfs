@@ -40,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, attrs_values, form_upload, cors_xml, object_lock_xml, request_xml, lifecycle_config_xml, tagging_xml, s3_target, iso8601, traceparent, version_id, parse_size ]
+        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, attrs_values, form_upload, cors_xml, object_lock_xml, request_xml, lifecycle_config_xml, tagging_xml, s3_target, iso8601, traceparent, version_id, parse_size, checksum_headers, list_buckets_query, raw_s3_key ]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
