@@ -1,7 +1,9 @@
 //! #26: the metadata segments answer exactly as the in-memory index does, across PUT, DELETE,
 //! GET, listing, restart and the segments' flushes and compactions.
 //!
-//! Two servers get the same seeded operations over HTTP. Server A keeps 40 objects in its
+//! Two servers get the same seeded operations over HTTP (3 rounds of 2,500 over 3,000 keys:
+//! the smallest spill memtable, 64 KiB, holds about 530 entries, so A flushes in every round).
+//! Server A keeps 40 objects in its
 //! in-memory table and gives the spill index its smallest budget, so almost every key lives in
 //! segments and a few thousand PUTs flush and compact them. Server B keeps every object in
 //! memory. Every status, body, ETag and listing page must be the same; after each round both are
@@ -21,9 +23,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const BUCKET: &str = "tiered-bucket";
-const KEYS: u64 = 1_200;
+const KEYS: u64 = 3_000;
 const ROUNDS: usize = 3;
-const OPS_PER_ROUND: usize = 1_200;
+const OPS_PER_ROUND: usize = 2_500;
 
 fn temp_dir(name: &str) -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
