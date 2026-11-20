@@ -330,5 +330,114 @@ class WithoutProcTests(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+class WindowsAndReportSplitTests(unittest.TestCase):
+    """#274: budget_rss parses Linux /proc and Windows psutil memory_full_info() splits and formats both."""
+
+    MINIO_STATUS = ("Name:\tminio\nVmHWM:\t 1018880 kB\nVmRSS:\t 1005000 kB\n"
+                    "RssAnon:\t  950272 kB\nRssFile:\t   54728 kB\nRssShmem:\t       0 kB\n")
+
+    def test_parse_proc_status_reads_vmrss_and_split_for_minio_and_awanfs(self):
+        got = br.parse_proc_status(self.MINIO_STATUS)
+        self.assertEqual(got["VmHWM"], 995.0)
+        self.assertAlmostEqual(got["VmRSS"], 1005000 / 1024.0)
+        self.assertEqual(got["RssAnon"], 928.0)
+        self.assertAlmostEqual(got["RssFile"], 54728 / 1024.0)
+
+    def test_windows_psutil_memory_full_info_fixed_sample_tracks_peak(self):
+        import time
+        import types
+        from unittest import mock
+
+        mib = 1024 * 1024
+        samples = iter([
+            types.SimpleNamespace(private=64 * mib, wset=110 * mib, peak_wset=110 * mib),
+            types.SimpleNamespace(private=96 * mib, wset=180 * mib, peak_wset=184 * mib),
+        ])
+        last = [None]
+
+        class FakeProc:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def memory_full_info(self):
+                try:
+                    last[0] = next(samples)
+                except StopIteration:
+                    pass
+                return last[0]
+
+        fake_psutil = types.SimpleNamespace(Process=FakeProc, NoSuchProcess=RuntimeError, AccessDenied=PermissionError)
+        with mock.patch.object(br.sys, "platform", "win32"), \
+             mock.patch.dict(sys.modules, {"psutil": fake_psutil}):
+            with br.RssSplit(4321, every=0.01) as split:
+                time.sleep(0.05)
+        self.assertEqual(split.private, 96.0)
+        self.assertEqual(split.wset, 180.0)
+        self.assertIsNone(split.anon)
+        self.assertIsNone(split.file)
+
+    def test_windows_exited_process_marks_split_not_measured(self):
+        import types
+        from unittest import mock
+
+        class ExitedError(Exception):
+            pass
+
+        class ExitedProc:
+            def __init__(self, pid):
+                raise ExitedError("exited")
+
+        fake_psutil = types.SimpleNamespace(Process=ExitedProc, NoSuchProcess=ExitedError, AccessDenied=PermissionError)
+        with mock.patch.object(br.sys, "platform", "win32"), \
+             mock.patch.dict(sys.modules, {"psutil": fake_psutil}):
+            with br.RssSplit(4321, every=0.01) as split:
+                pass
+        self.assertIsNone(split.private)
+        self.assertIsNone(split.wset)
+        self.assertEqual(br.mib_or_nm(split.private), "not measured")
+
+    def test_format_report_linux_and_windows_splits_and_missing(self):
+        linux_rows = [
+            ("put", 500.0, 500.0, 10.0, 320.0, 200.0, 115.0, 128.0, None, None),
+            ("get", 900.0, 900.0, 5.0, 340.0, None, None, None, None, None),
+        ]
+        linux_md = br.format_report(
+            cmd="python benchmarks/budget_rss.py",
+            budget="256MiB",
+            budget_mib=256.0,
+            overhead=200.0,
+            rows=linux_rows,
+            peak=340.0,
+            seen_env={},
+            size_bytes=1 << 20,
+            split_kind="linux",
+        )
+        self.assertIn("peak RSS MiB | peak heap (RssAnon) MiB | peak file pages (RssFile) MiB", linux_md)
+        self.assertIn("| put | 500.00 | 500.0 | 10.00 | 320.0 | 200.0 | 115.0 | 128.0 | 72.0 |", linux_md)
+        self.assertIn("| get | 900.00 | 900.0 | 5.00 | 340.0 | not measured | not measured | not measured | not measured |", linux_md)
+        self.assertIn("ceiling of 456.0 MiB", linux_md)
+
+        win_rows = [
+            ("put", 400.0, 400.0, 12.0, 300.0, None, None, 128.0, 210.0, 295.0),
+            ("get", 800.0, 800.0, 6.0, 350.0, None, None, 128.0, None, None),
+        ]
+        win_md = br.format_report(
+            cmd="python benchmarks/budget_rss.py",
+            budget="256MiB",
+            budget_mib=256.0,
+            overhead=200.0,
+            rows=win_rows,
+            peak=350.0,
+            seen_env={},
+            size_bytes=1 << 20,
+            split_kind="windows",
+        )
+        self.assertIn("peak RSS MiB | peak private bytes (private) MiB | peak working set (wset) MiB", win_md)
+        self.assertIn("private less cache MiB", win_md)
+        self.assertIn("| put | 400.00 | 400.0 | 12.00 | 300.0 | 210.0 | 295.0 | 128.0 | 82.0 |", win_md)
+        self.assertIn("| get | 800.00 | 800.0 | 6.00 | 350.0 | not measured | not measured | 128.0 | not measured |", win_md)
+        self.assertIn("ceiling of 456.0 MiB", win_md)
+
+
 if __name__ == "__main__":
     unittest.main()

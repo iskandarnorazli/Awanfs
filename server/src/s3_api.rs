@@ -159,16 +159,17 @@ pub(crate) fn slow_down_response(resource: &str, msg: &str) -> Response<Response
         .unwrap()
 }
 
-/// Acquires against `budget` before buffering `body`, returning the `AdmissionGuard` alongside
-/// the collected bytes so the caller holds the budget until the buffer is consumed or dropped.
+/// Acquires against `budget` before buffering `body`, returning the `AdmissionGuard` and
+/// `InflightGuard` alongside the collected bytes so the caller holds both until consumed or dropped.
 pub(crate) async fn read_body_admitted(
     budget: &crate::memory::BodyBudget,
+    work: &Arc<WorkCounters>,
     body: hyper::body::Incoming,
     limit: u64,
     estimated_bytes: Option<u64>,
     idle_timeout: std::time::Duration,
     resource: &str,
-) -> Result<Result<(Bytes, crate::memory::AdmissionGuard), Response<ResponseBody>>, hyper::Error> {
+) -> Result<Result<(Bytes, (crate::memory::AdmissionGuard, crate::work::InflightGuard)), Response<ResponseBody>>, hyper::Error> {
     use hyper::body::Body as _;
     let hint = estimated_bytes
         .or_else(|| body.size_hint().exact())
@@ -183,8 +184,17 @@ pub(crate) async fn read_body_admitted(
             )));
         }
     };
+    let inflight = work.hold_inflight(guard.bytes());
     match read_body(body, limit, idle_timeout, resource).await? {
-        Ok(bytes) => Ok(Ok((bytes, guard))),
+        Ok(bytes) => {
+            let actual = if (bytes.len() as u64) != guard.bytes() {
+                drop(inflight);
+                work.hold_inflight(bytes.len() as u64)
+            } else {
+                inflight
+            };
+            Ok(Ok((bytes, (guard, actual))))
+        }
         Err(resp) => Ok(Err(resp)),
     }
 }
@@ -433,42 +443,55 @@ pub fn parse_range_header(header: &str, object_size: u64) -> Result<Option<ByteR
     Err(())
 }
 
+fn vhost_bucket(host_header: Option<&str>) -> Option<&str> {
+    let host_no_port = host_header?.split(':').next()?;
+    for base in &["s3.localhost", "localhost", "s3.internal", "s3.amazonaws.com", "127.0.0.1"] {
+        if let Some(prefix) = host_no_port.strip_suffix(base).and_then(|p| p.strip_suffix('.')) {
+            if !prefix.is_empty() && !prefix.contains('.') && !prefix.contains('/') {
+                return Some(prefix);
+            }
+        }
+    }
+    None
+}
+
+fn split_path_style(trimmed_path: &str) -> (&str, Option<&str>) {
+    let mut parts = trimmed_path.splitn(2, '/');
+    let bucket = parts.next().unwrap_or("");
+    // Path-style bucket URIs like `/bucket/` end in a slash with an empty tail; treat as bucket, not key `""`.
+    let raw_key = parts.next().filter(|k| !k.is_empty());
+    (bucket, raw_key)
+}
+
 pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarget {
     let raw_path = uri_path.split('?').next().unwrap_or(uri_path);
     let trimmed_path = raw_path.trim_start_matches('/');
 
-    if let Some(host) = host_header {
-        let host_no_port = host.split(':').next().unwrap_or(host);
-        for base in &["s3.localhost", "localhost", "s3.internal", "s3.amazonaws.com", "127.0.0.1"] {
-            if let Some(prefix) = host_no_port.strip_suffix(base).and_then(|p| p.strip_suffix('.')) {
-                if !prefix.is_empty() && !prefix.contains('.') && !prefix.contains('/') {
-                    let bucket = prefix.to_string();
-                    if trimmed_path.is_empty() {
-                        return ParsedTarget::Bucket { bucket };
-                    } else {
-                        return ParsedTarget::Object {
-                            bucket,
-                            key: percent_decode_path(trimmed_path),
-                        };
-                    }
-                }
+    if let Some(bucket) = vhost_bucket(host_header) {
+        let bucket = bucket.to_string();
+        return if trimmed_path.is_empty() {
+            ParsedTarget::Bucket { bucket }
+        } else {
+            ParsedTarget::Object {
+                bucket,
+                key: percent_decode_path(trimmed_path),
             }
-        }
+        };
     }
 
     if trimmed_path.is_empty() {
         return ParsedTarget::Service;
     }
 
-    let mut parts = trimmed_path.splitn(2, '/');
-    let bucket = parts.next().unwrap_or("").to_string();
-    if let Some(key) = parts.next() {
-        ParsedTarget::Object {
-            bucket,
+    let (bucket, raw_key) = split_path_style(trimmed_path);
+    match raw_key {
+        Some(key) => ParsedTarget::Object {
+            bucket: bucket.to_string(),
             key: percent_decode_path(key),
-        }
-    } else {
-        ParsedTarget::Bucket { bucket }
+        },
+        None => ParsedTarget::Bucket {
+            bucket: bucket.to_string(),
+        },
     }
 }
 
@@ -479,22 +502,13 @@ pub fn parse_s3_target(uri_path: &str, host_header: Option<&str>) -> ParsedTarge
 pub fn raw_s3_key<'a>(uri_path: &'a str, host_header: Option<&str>) -> Option<&'a str> {
     let raw_path = uri_path.split('?').next().unwrap_or(uri_path);
     let trimmed_path = raw_path.trim_start_matches('/');
-    if let Some(host) = host_header {
-        let host_no_port = host.split(':').next().unwrap_or(host);
-        for base in &["s3.localhost", "localhost", "s3.internal", "s3.amazonaws.com", "127.0.0.1"] {
-            if let Some(prefix) = host_no_port.strip_suffix(base).and_then(|p| p.strip_suffix('.')) {
-                if !prefix.is_empty() && !prefix.contains('.') && !prefix.contains('/') {
-                    return if trimmed_path.is_empty() { None } else { Some(trimmed_path) };
-                }
-            }
-        }
+    if vhost_bucket(host_header).is_some() {
+        return if trimmed_path.is_empty() { None } else { Some(trimmed_path) };
     }
     if trimmed_path.is_empty() {
         return None;
     }
-    let mut parts = trimmed_path.splitn(2, '/');
-    let _bucket = parts.next();
-    parts.next()
+    split_path_style(trimmed_path).1
 }
 
 /// Decodes `%XX` in a URL path into raw bytes. Unlike query decoding, `+` stays `+`.
@@ -2105,7 +2119,7 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
     let (hits, misses) = state.payload_cache.hit_counts();
     let w = state.work.snapshot();
     let budget = crate::memory::effective();
-    let gauges: [(&str, &str, &str, u64); 23] = [
+    let gauges: [(&str, &str, &str, u64); 25] = [
         ("awanfs_volume_used_bytes", "gauge", "Bytes written into all open volumes, including dead needles.", used),
         ("awanfs_volume_free_span_bytes", "gauge", "Span left in the active volume before it rolls over.", free),
         ("awanfs_volumes_open", "gauge", "Open volumes.", state.volumes.read().len() as u64),
@@ -2119,6 +2133,8 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
         ("awanfs_disk_reads_total", "counter", "Disk read calls (not mmap page faults).", w.disk_reads),
         ("awanfs_payload_copies_total", "counter", "Copies of payload bytes into server buffers.", w.payload_copies),
         ("awanfs_payload_copy_bytes_total", "counter", "Payload bytes copied.", w.payload_copy_bytes),
+        ("awanfs_inflight_bytes", "gauge", "Bytes currently held in memory by in-flight requests.", state.work.inflight_bytes()),
+        ("awanfs_peak_inflight_bytes", "gauge", "Peak bytes held in memory concurrently by in-flight requests.", state.work.peak_inflight_bytes()),
         ("awanfs_ready", "gauge", "1 when /_awanfs/health/ready answers 200.", state.readiness().is_none() as u64),
         ("awanfs_memory_budget_bytes", "gauge", "Memory the server may hold (--memory-budget).", budget.total),
         ("awanfs_memory_budget_cache_bytes", "gauge", "The budget's half for the payload cache.", budget.cache),
