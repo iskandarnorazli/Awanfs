@@ -27,16 +27,25 @@ ROWS = [
 ]
 
 
+WRITER_ROWS = [
+    ("puts_per_s", "inserts per second, {n} writers at once"),
+    ("put_p50_us", "put P50 with {n} writers, us"),
+    ("put_p99_us", "put P99 with {n} writers, us"),
+    ("put_p999_us", "put P99.9 with {n} writers, us"),
+    ("flushes", "flushes with {n} writers"),
+]
+
+
 def load(lines):
-    """{(store, phase): record}; a later line for the same pair wins (a warm run after a cold one
-    is given a different phase name by the workflow)."""
+    """{(store, phase): record} or {(store, 'writers', count): record}; a later line wins."""
     out = {}
     for line in lines:
         line = line.strip()
         if not line.startswith("{"):
             continue
         r = json.loads(line)
-        out[(r["store"], r["phase"])] = r
+        key = (r["store"], "writers", r.get("writers")) if r["phase"] == "writers" else (r["store"], r["phase"])
+        out[key] = r
     return out
 
 
@@ -69,11 +78,17 @@ def report(recs, title):
     if all((s, "query_cold") in recs for s in stores):
         for field, label in (("open_secs", "open time after dropping the page cache, s"), ("get_p50_us", "get P50 after dropping the page cache, us")):
             lines.append(f"| {label} | " + " | ".join(fmt(recs[(s, "query_cold")].get(field)) for s in stores) + " |")
-    writers = [s for s in stores if (s, "writers") in recs]
-    if writers:
-        n = recs[(writers[0], "writers")].get("writers")
-        for field, label in (("puts_per_s", f"inserts per second, {n} writers at once"), ("put_p99_us", f"put P99 with {n} writers, us")):
-            lines.append(f"| {label} | " + " | ".join(fmt(recs[(s, "writers")].get(field)) if (s, "writers") in recs else "not measured" for s in stores) + " |")
+    writer_counts = sorted(
+        {k[2] for k in recs if len(k) == 3 and k[1] == "writers" and k[0] in stores},
+        key=lambda n: (n is None, n),
+    )
+    for n in writer_counts:
+        for field, label in WRITER_ROWS:
+            lines.append(
+                f"| {label.format(n=n)} | "
+                + " | ".join(fmt(recs[(s, "writers", n)].get(field)) if (s, "writers", n) in recs else "not measured" for s in stores)
+                + " |"
+            )
     same = len({q[s]["answers"] for s in stores}) == 1
     wrong = sum(q[s]["wrong"] for s in stores)
     lines += ["", "redb as AwanFS used it is cleared at every boot and rebuilt from the volumes, so its"
