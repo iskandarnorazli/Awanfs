@@ -23,8 +23,9 @@ control plane of 3 to 5 members manages (hundreds of nodes), and zero-pause fail
   TLA+ model (`verification/tla/ObjectVersions.tla`) checks that an acknowledged write
   survives it (`AckedStateSurvivesRestart`).
 - Durability modes (#29): `Fast`, `Group` (default), `Strict`.
-- Not yet: the metadata segments that replace redb (#26, decision 59). Past 100,000 objects
-  PUTs fall 6x to 8x today (#210); that cliff would repeat on every node, so #26 comes first.
+- The metadata segments replaced redb as the spill index in #26 stage 6 (decision 59). Past
+  100,000 objects PUTs fell 6x to 8x with redb (#210); whether the segments remove that cliff is
+  measured by #26's benchmark. Booting from their checkpoint is still to come.
 
 ## 3. How others do it
 

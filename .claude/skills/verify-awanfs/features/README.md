@@ -1,5 +1,7 @@
 # AwanFS feature map
 
+> **Source of truth:** the repository feature registry is [`features.toml`](../../../../features.toml) (status, owners, `ceph` s3-tests, `server_tests`, `drive` journeys, `fuzz` targets) and its generated report is [`FEATURES.md`](../../../../FEATURES.md). Run `python3 scripts/features.py check` to verify every journey and test reference stays in sync.
+
 | Feature | Journey | File |
 |---|---|---|
 | Buckets | `buckets` | [buckets.md](buckets.md) |
