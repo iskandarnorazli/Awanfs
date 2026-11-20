@@ -99,19 +99,23 @@ fn valid_header_str<'a>(val: &'a hyper::header::HeaderValue, key: &str) -> Resul
         .map_err(|_| bad_request("InvalidArgument", "Metadata header value must be valid UTF-8.", key))
 }
 
-/// A user metadata value as text, one character per byte (ISO-8859-1), so any bytes the
-/// client sent come back unchanged (`header_bytes`): Python's http.client sends Latin-1, other
-/// clients send UTF-8, and both round-trip. ASCII is unchanged. CR and LF stay refused.
+/// A user metadata value as text: its bytes as UTF-8 when they are UTF-8, else one character
+/// per byte (ISO-8859-1). ASCII is unchanged. CR and LF stay refused. botocore sends `\xe9` as
+/// UTF-8 (0xC3 0xA9) and reads response headers as ISO-8859-1, so ceph's
+/// `test_object_set_get_unicode_metadata` needs `header_bytes` to answer 0xE9.
 fn meta_value_text(val: &hyper::header::HeaderValue, key: &str) -> Result<String, Response<ResponseBody>> {
     let bytes = val.as_bytes();
     if bytes.iter().any(|&b| b == b'\r' || b == b'\n') {
         return Err(bad_request("InvalidArgument", "Metadata header value must not contain CR or LF.", key));
     }
-    Ok(bytes.iter().map(|&b| b as char).collect())
+    Ok(match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => bytes.iter().map(|&b| b as char).collect(),
+    })
 }
 
-/// The bytes `meta_value_text` read, from its text. A character above U+00FF cannot come from
-/// it; one written before it existed goes out as its UTF-8 bytes.
+/// A metadata value's bytes on the wire: ISO-8859-1 when every character fits (one byte each,
+/// how HTTP clients read header bytes), else UTF-8.
 fn header_bytes(text: &str) -> hyper::header::HeaderValue {
     let bytes: Vec<u8> = if text.chars().all(|c| (c as u32) <= 0xFF) {
         text.chars().map(|c| c as u32 as u8).collect()
