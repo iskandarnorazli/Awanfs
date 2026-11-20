@@ -1103,26 +1103,137 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 PHASE_JOIN_TIMEOUT_SEC = 120.0
+# Large 64 MiB parts can pause beyond 30s during Windows FlushFileBuffers + same-key relocation,
+# and 10 GiB across 160 parts can take longer than 120s total while making steady progress (#261).
+LARGE_PART_REQUEST_TIMEOUT_SEC = 120.0
+FIXED_VOLUME_MAX_WAIT_SEC = 1800.0
 # The warm-up is sequential, so it gets its own bound: a phase whose objects are not all
 # written is reported, not waited on.
 WARMUP_TIMEOUT_SEC = 120.0
 
 
-def join_all(threads: List[threading.Thread], label: str, timeout_sec: float = PHASE_JOIN_TIMEOUT_SEC) -> int:
+def join_all(threads: List[threading.Thread], label: str, timeout_sec: Optional[float] = None) -> int:
     """Waits for `threads` up to `timeout_sec` in total; returns how many are still running.
 
     A phase worker leaves its loop only between requests, so one stuck request used to hang the
     phase, the job and the whole run with nothing in the log (#135). Bounded here, and the
     threads are daemons, so a stuck one cannot keep the process alive either.
     """
-    deadline = time.perf_counter() + timeout_sec
+    bound = PHASE_JOIN_TIMEOUT_SEC if timeout_sec is None else timeout_sec
+    deadline = time.perf_counter() + bound
     for t in threads:
         t.join(timeout=max(0.0, deadline - time.perf_counter()))
     stuck = sum(1 for t in threads if t.is_alive())
     if stuck:
         print(f"    {label}: {stuck} of {len(threads)} workers still in a request "
-              f"{timeout_sec:.0f}s after the stop; this phase did not finish", flush=True)
+              f"{bound:.0f}s after the stop; this phase did not finish", flush=True)
     return stuck
+
+
+def wait_for_workers_with_progress(
+    threads: List[threading.Thread],
+    completed_fn,
+    stop_event: threading.Event,
+    stall_timeout_sec: Optional[float] = None,
+    max_wait_sec: float = FIXED_VOLUME_MAX_WAIT_SEC,
+) -> bool:
+    """Waits for fixed-volume workers as long as requests keep completing.
+
+    Returns True when stopped due to no completions for `stall_timeout_sec` or hitting `max_wait_sec`.
+    """
+    stall_bound = PHASE_JOIN_TIMEOUT_SEC if stall_timeout_sec is None else stall_timeout_sec
+    t_start = time.perf_counter()
+    last_progress = t_start
+    last_completed = completed_fn()
+    while any(t.is_alive() for t in threads):
+        now = time.perf_counter()
+        cur = completed_fn()
+        if cur > last_completed:
+            last_completed = cur
+            last_progress = now
+        if now - last_progress >= stall_bound or now - t_start >= max_wait_sec:
+            stop_event.set()
+            return True
+        time.sleep(min(0.1, max(0.01, stall_bound / 10.0)))
+    return False
+
+
+def format_phase_failure_note(
+    error_statuses: Dict[int, int],
+    exc_counts: Dict[str, int],
+    last_error: str,
+    stuck: int,
+    ok_parts: Optional[int] = None,
+    total_parts: Optional[int] = None,
+    stalled: bool = False,
+) -> str:
+    errors = sum(error_statuses.values()) + sum(exc_counts.values())
+    detail_parts = [f"HTTP {k} x{v}" for k, v in sorted(error_statuses.items())]
+    detail_parts.extend(f"{k} x{v}" for k, v in sorted(exc_counts.items()))
+    return ", ".join(
+        x for x in (
+            f"{errors} requests failed ({', '.join(detail_parts)})" if errors else "",
+            f"last error: {last_error}" if last_error else "",
+            f"{ok_parts} of {total_parts} parts succeeded" if (total_parts is not None and ok_parts is not None and ok_parts != total_parts) else "",
+            f"{stuck} workers did not finish their request" if stuck else "",
+            "stalled with no progress" if (stalled and not stuck) else "",
+        ) if x
+    )
+
+
+def _new_worker_state(worker_id: int) -> Dict[str, object]:
+    return {
+        "id": worker_id,
+        "completed": 0, "ok": 0, "errors": 0,
+        "last_part": None, "last_status": None, "last_dur_s": None,
+        "in_flight": None, "in_flight_started": None,
+    }
+
+
+def _record_worker_outcome(
+    ws: Dict[str, object],
+    item_id: int,
+    status_text: str,
+    dur_s: float,
+    ok: bool,
+) -> None:
+    ws["completed"] = int(ws["completed"]) + 1
+    ws["last_part"] = item_id
+    ws["last_status"] = status_text
+    ws["last_dur_s"] = dur_s
+    ws["in_flight"] = None
+    if ok:
+        ws["ok"] = int(ws["ok"]) + 1
+    else:
+        ws["errors"] = int(ws["errors"]) + 1
+
+
+def _reconnect_http(conn: http.client.HTTPConnection, host: str, port: int, timeout: float) -> http.client.HTTPConnection:
+    try:
+        conn.close()
+    except Exception:
+        pass
+    return http.client.HTTPConnection(host, port, timeout=timeout)
+
+
+def print_worker_diagnostics(label: str, worker_states: List[Dict[str, object]]) -> None:
+    now = time.perf_counter()
+    print(f"    {label}: worker summary:", flush=True)
+    for ws in worker_states:
+        in_flight = ws["in_flight"]
+        started = ws["in_flight_started"]
+        in_fl_str = (
+            f"part {in_flight} ({now - started:.1f}s)"
+            if in_flight is not None and started is not None
+            else "idle"
+        )
+        last_dur = f"{ws['last_dur_s']:.2f}s" if ws["last_dur_s"] is not None else "-"
+        print(
+            f"      worker {ws['id']}: completed={ws['completed']} ok={ws['ok']} "
+            f"err={ws['errors']} last=(part={ws['last_part']}, {ws['last_status']}, {last_dur}) "
+            f"in_flight={in_fl_str}",
+            flush=True,
+        )
 
 
 def object_key(
@@ -1517,72 +1628,125 @@ def run_large_multipart_object_phase(
     part_payload = os.urandom(part_size_bytes)
     phase_label = f"large multipart {total_size_bytes}B parts {part_size_bytes}B c={concurrency}"
     obj_path = f"/{bucket}/{key}"
+    req_timeout = LARGE_PART_REQUEST_TIMEOUT_SEC
 
     # --- Phase A: Multipart Upload ---
     t_up_start = time.perf_counter()
-    conn = http.client.HTTPConnection(host, port, timeout=30.0)
-    conn.request("POST", f"{obj_path}?uploads", headers={"Content-Length": "0"})
-    resp = conn.getresponse()
-    xml_data = resp.read().decode("utf-8", errors="ignore")
-    conn.close()
-    m = re.search(r"<UploadId>([^<]+)</UploadId>", xml_data)
-    upload_id = m.group(1) if m else "upload-1"
+    up_err_statuses: Dict[int, int] = {}
+    up_exc_counts: Dict[str, int] = {}
+    up_last_err = ""
+    upload_id = "upload-1"
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=req_timeout)
+        conn.request("POST", f"{obj_path}?uploads", headers={"Content-Length": "0"})
+        resp = conn.getresponse()
+        xml_data = resp.read().decode("utf-8", errors="ignore")
+        conn.close()
+        if resp.status != 200:
+            up_err_statuses[resp.status] = up_err_statuses.get(resp.status, 0) + 1
+            up_last_err = f"CreateMultipartUpload HTTP {resp.status}"
+        m = re.search(r"<UploadId>([^<]+)</UploadId>", xml_data)
+        upload_id = m.group(1) if m else "upload-1"
+    except Exception as e:
+        up_exc_counts[type(e).__name__] = up_exc_counts.get(type(e).__name__, 0) + 1
+        up_last_err = f"CreateMultipartUpload {type(e).__name__}: {e}"
 
     next_p = 1
     p_lock = threading.Lock()
     up_lats: List[float] = []
     etags: Dict[int, str] = {}
     up_bytes = 0
+    up_completed = 0
+    up_ok = 0
+    up_stop = threading.Event()
+    up_worker_states: List[Dict[str, object]] = []
 
     def upload_worker():
-        nonlocal next_p, up_bytes
-        w_conn = http.client.HTTPConnection(host, port, timeout=30.0)
-        while True:
+        nonlocal next_p, up_bytes, up_completed, up_ok, up_last_err
+        with p_lock:
+            ws = _new_worker_state(len(up_worker_states))
+            up_worker_states.append(ws)
+        w_conn = http.client.HTTPConnection(host, port, timeout=req_timeout)
+        while not up_stop.is_set():
             with p_lock:
                 if next_p > num_parts:
                     break
                 p_num = next_p
                 next_p += 1
+                ws["in_flight"] = p_num
+                ws["in_flight_started"] = time.perf_counter()
             t0 = time.perf_counter()
-            w_conn.request(
-                "PUT",
-                f"{obj_path}?partNumber={p_num}&uploadId={upload_id}",
-                body=part_payload,
-                headers={"Content-Length": str(part_size_bytes), "Connection": "keep-alive"},
-            )
-            r = w_conn.getresponse()
-            r.read()
-            etag = r.getheader("ETag", '"00000000000000000000000000000000"')
-            t1 = time.perf_counter()
-            with p_lock:
-                etags[p_num] = etag
-                up_lats.append((t1 - t0) * 1000.0)
-                if r.status == 200:
-                    up_bytes += part_size_bytes
-        w_conn.close()
+            try:
+                w_conn.request(
+                    "PUT",
+                    f"{obj_path}?partNumber={p_num}&uploadId={upload_id}",
+                    body=part_payload,
+                    headers={"Content-Length": str(part_size_bytes), "Connection": "keep-alive"},
+                )
+                r = w_conn.getresponse()
+                r.read()
+                etag = r.getheader("ETag", '"00000000000000000000000000000000"')
+                t1 = time.perf_counter()
+                ok = r.status == 200
+                with p_lock:
+                    _record_worker_outcome(ws, p_num, f"HTTP {r.status}", t1 - t0, ok)
+                    up_completed += 1
+                    if ok:
+                        etags[p_num] = etag
+                        up_lats.append((t1 - t0) * 1000.0)
+                        up_bytes += part_size_bytes
+                        up_ok += 1
+                    else:
+                        up_err_statuses[r.status] = up_err_statuses.get(r.status, 0) + 1
+                        up_last_err = f"part {p_num} HTTP {r.status}"
+            except Exception as e:
+                t1 = time.perf_counter()
+                with p_lock:
+                    _record_worker_outcome(ws, p_num, f"{type(e).__name__}: {e}", t1 - t0, False)
+                    up_completed += 1
+                    up_exc_counts[type(e).__name__] = up_exc_counts.get(type(e).__name__, 0) + 1
+                    up_last_err = f"part {p_num} {type(e).__name__}: {e}"
+                w_conn = _reconnect_http(w_conn, host, port, req_timeout)
+        try:
+            w_conn.close()
+        except Exception:
+            pass
 
     threads = [threading.Thread(target=upload_worker, daemon=True) for _ in range(concurrency)]
     with PeakRssSampler(server_pid) as up_rss_sampler:
         for t in threads:
             t.start()
+        up_stalled = wait_for_workers_with_progress(threads, lambda: up_completed, up_stop)
         stuck = join_all(threads, phase_label)
 
+    if len(etags) == num_parts:
         parts_xml = "".join(
             f"<Part><PartNumber>{p}</PartNumber><ETag>{etags[p]}</ETag></Part>"
             for p in sorted(etags.keys())
         )
         complete_body = f"<CompleteMultipartUpload>{parts_xml}</CompleteMultipartUpload>".encode("utf-8")
-        conn = http.client.HTTPConnection(host, port, timeout=30.0)
-        conn.request(
-            "POST",
-            f"{obj_path}?uploadId={upload_id}",
-            body=complete_body,
-            headers={"Content-Length": str(len(complete_body))},
-        )
-        conn.getresponse().read()
-        conn.close()
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=req_timeout)
+            conn.request(
+                "POST",
+                f"{obj_path}?uploadId={upload_id}",
+                body=complete_body,
+                headers={"Content-Length": str(len(complete_body))},
+            )
+            c_resp = conn.getresponse()
+            c_resp.read()
+            conn.close()
+            if c_resp.status != 200:
+                up_err_statuses[c_resp.status] = up_err_statuses.get(c_resp.status, 0) + 1
+                up_last_err = f"CompleteMultipartUpload HTTP {c_resp.status}"
+        except Exception as e:
+            up_exc_counts[type(e).__name__] = up_exc_counts.get(type(e).__name__, 0) + 1
+            up_last_err = f"CompleteMultipartUpload {type(e).__name__}: {e}"
     t_up_total = time.perf_counter() - t_up_start
 
+    up_errors = sum(up_err_statuses.values()) + sum(up_exc_counts.values())
+    if up_errors or stuck or up_stalled or up_ok != num_parts:
+        print_worker_diagnostics(f"{phase_label} put", up_worker_states)
     up_p50, up_p90, up_p99, up_p999 = calculate_percentiles(up_lats)
     put_metrics = BenchmarkMetrics(
         ops_per_sec=len(up_lats) / t_up_total if t_up_total > 0 else 0.0,
@@ -1592,49 +1756,84 @@ def run_large_multipart_object_phase(
         p99_ms=up_p99,
         p999_ms=up_p999,
         **_rss_split_fields(server_pid, up_rss_sampler),
-        measured=not stuck,
-        note=(f"{stuck} workers did not finish their request" if stuck else ""),
+        measured=not stuck and not up_stalled and up_errors == 0 and up_ok == num_parts,
+        note=format_phase_failure_note(up_err_statuses, up_exc_counts, up_last_err, stuck, up_ok, num_parts, up_stalled),
     )
 
     # --- Phase B: Parallel RFC 9110 Range GET over the 1 GiB Multipart Object ---
     next_r = 0
     down_lats: List[float] = []
     down_bytes = 0
+    down_completed = 0
+    down_ok = 0
+    down_err_statuses: Dict[int, int] = {}
+    down_exc_counts: Dict[str, int] = {}
+    down_last_err = ""
+    down_stop = threading.Event()
+    down_worker_states: List[Dict[str, object]] = []
 
     def range_get_worker():
-        nonlocal next_r, down_bytes
-        w_conn = http.client.HTTPConnection(host, port, timeout=30.0)
-        while True:
+        nonlocal next_r, down_bytes, down_completed, down_ok, down_last_err
+        with p_lock:
+            ws = _new_worker_state(len(down_worker_states))
+            down_worker_states.append(ws)
+        w_conn = http.client.HTTPConnection(host, port, timeout=req_timeout)
+        while not down_stop.is_set():
             with p_lock:
                 if next_r >= num_parts:
                     break
                 r_idx = next_r
                 next_r += 1
+                ws["in_flight"] = r_idx
+                ws["in_flight_started"] = time.perf_counter()
             start_b = r_idx * part_size_bytes
             end_b = start_b + part_size_bytes - 1
             t0 = time.perf_counter()
-            w_conn.request(
-                "GET",
-                obj_path,
-                headers={"Range": f"bytes={start_b}-{end_b}", "Connection": "keep-alive"},
-            )
-            r = w_conn.getresponse()
-            data = r.read()
-            t1 = time.perf_counter()
-            with p_lock:
-                down_lats.append((t1 - t0) * 1000.0)
-                if r.status in (200, 206):
-                    down_bytes += len(data)
-        w_conn.close()
+            try:
+                w_conn.request(
+                    "GET",
+                    obj_path,
+                    headers={"Range": f"bytes={start_b}-{end_b}", "Connection": "keep-alive"},
+                )
+                r = w_conn.getresponse()
+                data = r.read()
+                t1 = time.perf_counter()
+                ok = r.status in (200, 206)
+                with p_lock:
+                    _record_worker_outcome(ws, r_idx, f"HTTP {r.status}", t1 - t0, ok)
+                    down_completed += 1
+                    if ok:
+                        down_lats.append((t1 - t0) * 1000.0)
+                        down_bytes += len(data)
+                        down_ok += 1
+                    else:
+                        down_err_statuses[r.status] = down_err_statuses.get(r.status, 0) + 1
+                        down_last_err = f"range {r_idx} HTTP {r.status}"
+            except Exception as e:
+                t1 = time.perf_counter()
+                with p_lock:
+                    _record_worker_outcome(ws, r_idx, f"{type(e).__name__}: {e}", t1 - t0, False)
+                    down_completed += 1
+                    down_exc_counts[type(e).__name__] = down_exc_counts.get(type(e).__name__, 0) + 1
+                    down_last_err = f"range {r_idx} {type(e).__name__}: {e}"
+                w_conn = _reconnect_http(w_conn, host, port, req_timeout)
+        try:
+            w_conn.close()
+        except Exception:
+            pass
 
     with PeakRssSampler(server_pid) as down_rss_sampler:
         t_down_start = time.perf_counter()
         threads = [threading.Thread(target=range_get_worker, daemon=True) for _ in range(concurrency)]
         for t in threads:
             t.start()
+        down_stalled = wait_for_workers_with_progress(threads, lambda: down_completed, down_stop)
         stuck = join_all(threads, phase_label)
         t_down_total = time.perf_counter() - t_down_start
 
+    down_errors = sum(down_err_statuses.values()) + sum(down_exc_counts.values())
+    if down_errors or stuck or down_stalled or down_ok != num_parts:
+        print_worker_diagnostics(f"{phase_label} get", down_worker_states)
     d_p50, d_p90, d_p99, d_p999 = calculate_percentiles(down_lats)
     get_metrics = BenchmarkMetrics(
         ops_per_sec=len(down_lats) / t_down_total if t_down_total > 0 else 0.0,
@@ -1644,8 +1843,8 @@ def run_large_multipart_object_phase(
         p99_ms=d_p99,
         p999_ms=d_p999,
         **_rss_split_fields(server_pid, down_rss_sampler),
-        measured=not stuck,
-        note=(f"{stuck} workers did not finish their request" if stuck else ""),
+        measured=not stuck and not down_stalled and down_errors == 0 and down_ok == num_parts,
+        note=format_phase_failure_note(down_err_statuses, down_exc_counts, down_last_err, stuck, down_ok, num_parts, down_stalled),
     )
     return put_metrics, get_metrics
 
@@ -1665,27 +1864,44 @@ def run_fixed_volume_phase(
     payload = os.urandom(part_size_bytes)
     phase_label = f"fixed volume {total_volume_bytes}B parts {part_size_bytes}B c={concurrency}"
     total_parts = total_volume_bytes // part_size_bytes
+    req_timeout = LARGE_PART_REQUEST_TIMEOUT_SEC
     next_part_idx = 0
     idx_lock = threading.Lock()
     latencies: List[float] = []
     lat_lock = threading.Lock()
     total_bytes = 0
+    completed_parts = 0
+    ok_parts = 0
+    error_statuses: Dict[int, int] = {}
+    exc_counts: Dict[str, int] = {}
+    last_error = ""
     bytes_lock = threading.Lock()
+    stop_event = threading.Event()
+    worker_states: List[Dict[str, object]] = []
 
     def worker():
-        nonlocal next_part_idx, total_bytes
+        nonlocal next_part_idx, total_bytes, completed_parts, ok_parts, last_error
+        with idx_lock:
+            ws = _new_worker_state(len(worker_states))
+            worker_states.append(ws)
         local_lats: List[float] = []
         local_bytes = 0
-        conn = http.client.HTTPConnection(host, port, timeout=30.0)
+        local_ok = 0
+        local_err_statuses: Dict[int, int] = {}
+        local_exc_counts: Dict[str, int] = {}
+        local_last_err = ""
+        conn = http.client.HTTPConnection(host, port, timeout=req_timeout)
         put_headers = {"Content-Length": str(part_size_bytes), "Connection": "keep-alive"}
         get_headers = {"Connection": "keep-alive", "Range": f"bytes=0-{part_size_bytes - 1}"}
 
-        while True:
+        while not stop_event.is_set():
             with idx_lock:
                 my_idx = next_part_idx
                 if my_idx >= total_parts:
                     break
                 next_part_idx += 1
+                ws["in_flight"] = my_idx
+                ws["in_flight_started"] = time.perf_counter()
 
             slot = my_idx % key_modulus
             path = f"/{bucket}/large_part_{slot:04d}.dat"
@@ -1696,22 +1912,33 @@ def run_fixed_volume_phase(
                     conn.request("PUT", path, body=payload, headers=put_headers)
                     resp = conn.getresponse()
                     resp.read()
-                    if resp.status == 200:
+                    ok = resp.status == 200
+                    if ok:
                         local_bytes += part_size_bytes
                 else:
                     conn.request("GET", path, headers=get_headers)
                     resp = conn.getresponse()
                     data = resp.read()
-                    if resp.status in (200, 206):
+                    ok = resp.status in (200, 206)
+                    if ok:
                         local_bytes += len(data)
                 t1 = time.perf_counter()
-                local_lats.append((t1 - t0) * 1000.0)
-            except Exception:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                conn = http.client.HTTPConnection(host, port, timeout=30.0)
+                _record_worker_outcome(ws, my_idx, f"HTTP {resp.status}", t1 - t0, ok)
+                if ok:
+                    local_lats.append((t1 - t0) * 1000.0)
+                    local_ok += 1
+                else:
+                    local_err_statuses[resp.status] = local_err_statuses.get(resp.status, 0) + 1
+                    local_last_err = f"part {my_idx} HTTP {resp.status}"
+            except Exception as e:
+                t1 = time.perf_counter()
+                _record_worker_outcome(ws, my_idx, f"{type(e).__name__}: {e}", t1 - t0, False)
+                ename = type(e).__name__
+                local_exc_counts[ename] = local_exc_counts.get(ename, 0) + 1
+                local_last_err = f"part {my_idx} {ename}: {e}"
+                conn = _reconnect_http(conn, host, port, req_timeout)
+            with bytes_lock:
+                completed_parts += 1
 
         try:
             conn.close()
@@ -1722,14 +1949,26 @@ def run_fixed_volume_phase(
             latencies.extend(local_lats)
         with bytes_lock:
             total_bytes += local_bytes
+            ok_parts += local_ok
+            for st, n in local_err_statuses.items():
+                error_statuses[st] = error_statuses.get(st, 0) + n
+            for en, n in local_exc_counts.items():
+                exc_counts[en] = exc_counts.get(en, 0) + n
+            if local_last_err:
+                last_error = local_last_err
 
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(concurrency)]
     with PeakRssSampler(server_pid) as rss_sampler:
         t_start = time.perf_counter()
         for t in threads:
             t.start()
+        stalled = wait_for_workers_with_progress(threads, lambda: completed_parts, stop_event)
         stuck = join_all(threads, phase_label)
         t_total = time.perf_counter() - t_start
+
+    errors = sum(error_statuses.values()) + sum(exc_counts.values())
+    if errors or stuck or stalled or ok_parts != total_parts:
+        print_worker_diagnostics(f"{phase_label} {mode}", worker_states)
 
     ops = len(latencies)
     ops_per_sec = ops / t_total if t_total > 0 else 0.0
@@ -1744,8 +1983,8 @@ def run_fixed_volume_phase(
         p99_ms=p99,
         p999_ms=p999,
         **_rss_split_fields(server_pid, rss_sampler),
-        measured=not stuck,
-        note=(f"{stuck} workers did not finish their request" if stuck else ""),
+        measured=not stuck and not stalled and errors == 0 and ok_parts == total_parts,
+        note=format_phase_failure_note(error_statuses, exc_counts, last_error, stuck, ok_parts, total_parts, stalled),
     )
 
 
