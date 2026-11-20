@@ -13,6 +13,18 @@ on:
       - "server/examples/meta_index_bench.rs"
       - "benchmarks/meta_index_report.py"
       - ".github/workflows/bench-metaindex.yml"
+  # #26's peak RSS gate on every pull request that changes the metadata store: the `ceiling` job.
+  pull_request:
+    paths:
+      - "server/src/spill.rs"
+      - "server/src/segment.rs"
+      - "server/src/segment_set.rs"
+      - "server/src/meta_compaction.rs"
+      - "server/src/manifest.rs"
+      - "server/examples/meta_index_bench.rs"
+      - "benchmarks/meta_index_ceiling.py"
+      - "benchmarks/test_meta_index_ceiling.py"
+      - ".github/workflows/bench-metaindex.yml"
   workflow_dispatch:
     inputs:
       keys:
@@ -35,8 +47,48 @@ permissions:
   contents: read
 
 jobs:
+  # #26: the production store at 10M keys, a random 1% of them read and as many absent keys,
+  # stays under a peak RSS ceiling of 120 MiB, about twice the highest measured peak (60.3 MiB
+  # building on Windows, run 44550797419). Mapped segments would put every page a lookup touches
+  # in the RSS and break it.
+  ceiling:
+    name: RSS ceiling, 10M keys (${{ matrix.os }})
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Self-tests
+        run: python benchmarks/test_meta_index_ceiling.py
+      - name: Build the benchmark
+        run: cargo build --locked --release --example meta_index_bench --manifest-path server/Cargo.toml
+      - name: Build and query 10M keys, then check the ceiling
+        shell: bash
+        env:
+          DATA: ${{ runner.temp }}/meta-ceiling
+        run: |
+          set -euo pipefail
+          bin=server/target/release/examples/meta_index_bench
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          : > ceiling.jsonl
+          "$bin" build --store prod --dir "$DATA" --keys 10000000 | tee -a ceiling.jsonl
+          "$bin" query --store prod --dir "$DATA" --keys 10000000 --gets 100000 --scans 100 | tee -a ceiling.jsonl
+          set +e
+          python benchmarks/meta_index_ceiling.py ceiling.jsonl --ceiling-mib 120 | tee ceiling.txt
+          code=${PIPESTATUS[0]}
+          { echo "### Peak RSS ceiling, 10M keys ($RUNNER_OS)"; echo '```'; cat ceiling.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
   bench:
     name: meta index (${{ matrix.os }})
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 300
     strategy:

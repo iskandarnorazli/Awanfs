@@ -253,6 +253,52 @@ mod tests {
         assert_eq!(prefix_end(u32::MAX, b"\xff"), None);
     }
 
+    /// #26's gate, counted by the work counters through the memtable and the levels: a key in
+    /// the memtable costs no read; across flushed and compacted segments a present key costs at
+    /// most 1.1 block reads on average and an absent one at most 0.15 (the lines the 10M-key
+    /// benchmark checks, `measurements/2026-11-19-tiered-metadata.md`).
+    #[test]
+    fn lookups_cost_no_read_in_the_memtable_about_one_for_a_present_key_and_almost_none_for_an_absent_one() {
+        let d = dir("reads");
+        // A 64 KiB memtable: 60,000 rows flush and compact into several levels.
+        let s = SpillIndex::open_with_cache_size(&d, 256 << 10).unwrap();
+        let n = 60_000u64;
+        let key = |i: u64| format!("obj/{:08}", i).into_bytes();
+        for i in 0..n {
+            s.put(1, &key(i), &row(i)).unwrap();
+        }
+        s.flush().unwrap();
+        let work = s.work();
+        let reads = || work.snapshot().disk_reads;
+
+        let (before, mut present) = (reads(), 0u64);
+        for i in (0..n).step_by(7) {
+            assert_eq!(s.get(1, &key(i)).unwrap(), Some(row(i)));
+            present += 1;
+        }
+        let per_present = (reads() - before) as f64 / present as f64;
+        assert!((1.0..=1.1).contains(&per_present), "{:.3} reads per present lookup", per_present);
+
+        let before = reads();
+        for i in 0..n {
+            assert_eq!(s.get(1, format!("obj/~absent-{}", i).as_bytes()).unwrap(), None);
+        }
+        let per_absent = (reads() - before) as f64 / n as f64;
+        assert!(per_absent <= 0.15, "{:.3} reads per absent lookup", per_absent);
+        eprintln!("reads per present lookup {:.3}, per absent lookup {:.3}", per_present, per_absent);
+
+        // Rows still in the memtable are answered without a read.
+        for i in n..n + 100 {
+            s.put(1, &key(i), &row(i)).unwrap();
+        }
+        let before = reads();
+        for i in n..n + 100 {
+            assert_eq!(s.get(1, &key(i)).unwrap(), Some(row(i)));
+        }
+        assert_eq!(reads() - before, 0, "a memtable row costs no read");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// Random puts, deletes, flushes, scans and clears against a BTreeMap, with a memtable
     /// small enough that most rows sit in compacted segments.
     #[test]

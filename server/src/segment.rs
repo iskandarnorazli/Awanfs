@@ -876,4 +876,53 @@ mod tests {
         let fp = (0..100_000u32).filter(|i| bloom.may_contain(&sort_key(77, format!("no-{}", i).as_bytes()))).count();
         assert!(fp < 2_500, "false positives: {} of 100000", fp);
     }
+
+    /// #26's gate: the false-positive rate over 1,000,000 absent keys stays under a committed
+    /// bound. 10 bits a key and 7 probes give about 0.8% for a plain Bloom filter and a little
+    /// more for one in 512-bit blocks; the bound, 2%, is about twice that. The keys and the
+    /// hash are fixed, so the count is the same on every run; it is printed for the record.
+    #[test]
+    fn the_bloom_filter_false_positive_rate_over_a_million_absent_keys_is_under_two_percent() {
+        let es = entries(26, 100_000);
+        let mut bloom = Bloom::with_keys(es.len());
+        for e in &es {
+            bloom.insert(&e.key);
+        }
+        assert!(es.iter().all(|e| bloom.may_contain(&e.key)));
+        let fp = (0..1_000_000u32).filter(|i| bloom.may_contain(&sort_key(2, format!("~absent-{}", i).as_bytes()))).count();
+        eprintln!("bloom false positives: {} of 1000000 ({:.3}%)", fp, fp as f64 / 10_000.0);
+        assert!(fp < 20_000, "false positives: {} of 1000000", fp);
+    }
+
+    /// #26's gate, counted by the work counters: a lookup the Bloom filter rejects reads no
+    /// block, and one it passes reads exactly one, for present keys and false positives alike.
+    #[test]
+    fn a_lookup_reads_no_block_when_the_filter_rejects_it_and_one_when_it_passes() {
+        let es = entries(8, 20_000);
+        let fs = written(&es);
+        let work = Arc::new(WorkCounters::default());
+        let s = Segment::open(&fs, path()).unwrap().with_work(Arc::clone(&work));
+        let reads = || work.snapshot().disk_reads;
+        for e in es.iter().step_by(7) {
+            let before = reads();
+            assert!(s.get(&e.key).unwrap().is_some());
+            assert_eq!(reads() - before, 1, "a present key costs one block read");
+        }
+        let (mut rejected, mut passed) = (0u32, 0u32);
+        for i in 0..200_000u32 {
+            // Bucket 2 sorts after the first fence (bucket 1), so a filter hit reaches a block.
+            let k = sort_key(2, format!("~absent-{}", i).as_bytes());
+            let before = reads();
+            assert_eq!(s.get(&k).unwrap(), None);
+            let want = if s.bloom.may_contain(&k) {
+                passed += 1;
+                1
+            } else {
+                rejected += 1;
+                0
+            };
+            assert_eq!(reads() - before, want, "absent key {}: the filter {} it", i, if want == 1 { "passed" } else { "rejected" });
+        }
+        assert!(rejected > 190_000 && passed > 0, "rejected {} passed {}", rejected, passed);
+    }
 }
