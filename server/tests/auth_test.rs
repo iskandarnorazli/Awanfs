@@ -143,3 +143,73 @@ async fn a_put_whose_body_does_not_match_its_hash_is_refused() {
     assert!(res.text().await.unwrap().contains("XAmzContentSHA256Mismatch"));
     assert_eq!(c.get(format!("{}/hash-bkt/k", url)).send().await.unwrap().status(), StatusCode::NOT_FOUND, "nothing stored");
 }
+
+/// A SigV4 signature over `canonical_value` for one signed `x-amz-meta-meta1` header, computed
+/// here with hmac and sha2 rather than the server's signer.
+fn sign_meta(secret: &str, canonical_value: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+    let mac = |key: &[u8], data: &[u8]| {
+        let mut m = Hmac::<Sha256>::new_from_slice(key).unwrap();
+        m.update(data);
+        m.finalize().into_bytes().to_vec()
+    };
+    let hexs = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+    let payload = "UNSIGNED-PAYLOAD";
+    let canonical = format!(
+        "PUT\n/bucket/foo\n\nhost:examplebucket.s3.amazonaws.com\nx-amz-content-sha256:{}\nx-amz-date:20130524T000000Z\nx-amz-meta-meta1:{}\n\nhost;x-amz-content-sha256;x-amz-date;x-amz-meta-meta1\n{}",
+        payload, canonical_value, payload
+    );
+    let sts = format!(
+        "AWS4-HMAC-SHA256\n20130524T000000Z\n20130524/us-east-1/s3/aws4_request\n{}",
+        hexs(&Sha256::digest(canonical.as_bytes()))
+    );
+    let k = mac(format!("AWS4{}", secret).as_bytes(), b"20130524");
+    let k = mac(&k, b"us-east-1");
+    let k = mac(&k, b"s3");
+    let k = mac(&k, b"aws4_request");
+    hexs(&mac(&k, sts.as_bytes()))
+}
+
+fn meta_put_headers(wire_value: &[u8], signature: &str) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    h.insert("host", HeaderValue::from_static("examplebucket.s3.amazonaws.com"));
+    h.insert("x-amz-content-sha256", HeaderValue::from_static("UNSIGNED-PAYLOAD"));
+    h.insert("x-amz-date", HeaderValue::from_static("20130524T000000Z"));
+    h.insert("x-amz-meta-meta1", HeaderValue::from_bytes(wire_value).unwrap());
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={}/20130524/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-meta1,Signature={}",
+        AK, signature
+    );
+    h.insert("authorization", HeaderValue::from_str(&auth).unwrap());
+    h
+}
+
+/// ceph's `test_object_set_get_unicode_metadata`: botocore signs the text `Hello World\xe9` (the
+/// canonical request is hashed as UTF-8), and Python's http.client sends it as Latin-1, one byte
+/// 0xE9. A signed header value that is not ASCII used to vanish from the canonical request, so
+/// the request was refused as AuthorizationHeaderMalformed.
+#[test]
+fn a_signed_header_sent_as_latin1_bytes_verifies_against_its_text() {
+    let sig = sign_meta(SK, "Hello World\u{e9}");
+    let h = meta_put_headers(b"Hello World\xe9", &sig);
+    assert_eq!(authenticate(&keys(SK), &SigV4KeyCache::new(), "PUT", "/bucket/foo", "", &h, now()), Ok(()));
+}
+
+/// A client that sends the UTF-8 bytes it signed (0xC3 0xA9 for `\xe9`) verifies too.
+#[test]
+fn a_signed_header_sent_as_utf8_bytes_verifies() {
+    let sig = sign_meta(SK, "Hello World\u{e9}");
+    let h = meta_put_headers("Hello World\u{e9}".as_bytes(), &sig);
+    assert_eq!(authenticate(&keys(SK), &SigV4KeyCache::new(), "PUT", "/bucket/foo", "", &h, now()), Ok(()));
+}
+
+/// Reading the bytes two ways never accepts a signature over other bytes, or another secret.
+#[test]
+fn a_non_ascii_header_still_needs_the_right_value_and_secret() {
+    let cache = SigV4KeyCache::new();
+    let h = meta_put_headers(b"Hello World\xe9", &sign_meta(SK, "Hello World\u{e8}"));
+    assert_eq!(authenticate(&keys(SK), &cache, "PUT", "/bucket/foo", "", &h, now()), Err("SignatureDoesNotMatch"));
+    let h = meta_put_headers(b"Hello World\xe9", &sign_meta("another-secret", "Hello World\u{e9}"));
+    assert_eq!(authenticate(&keys(SK), &cache, "PUT", "/bucket/foo", "", &h, now()), Err("SignatureDoesNotMatch"));
+}
