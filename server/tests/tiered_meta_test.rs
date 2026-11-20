@@ -172,7 +172,9 @@ async fn the_segments_answer_as_the_in_memory_index_across_restarts_and_compacti
                     let body: Vec<u8> = (0..n).map(|i| (fill.rotate_left(i as u32 % 64) as u8) ^ i as u8).collect();
                     let mut res = Vec::new();
                     for s in [&a, &b] {
-                        let r = c.put(format!("{}/{}/{}", s.url, BUCKET, k)).body(body.clone()).send().await.unwrap();
+                        // Content-Length always: reqwest sends none for an empty body, and the
+                        // server answers 411 MissingContentLength to that (#160).
+                        let r = c.put(format!("{}/{}/{}", s.url, BUCKET, k)).header("content-length", body.len()).body(body.clone()).send().await.unwrap();
                         res.push((r.status(), r.headers().get("etag").map(|v| v.to_str().unwrap().to_string())));
                     }
                     assert_eq!(res[0], res[1], "PUT {}", ctx);
