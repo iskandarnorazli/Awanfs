@@ -202,7 +202,7 @@ j_checksums_extra() { local c64 cs256 id64 out e64_1 k64_1 e64_2 k64_2 full64 p6
   [ -n "$cs256" ] && [ "$cs256" != None ] &&
   S3 get-object --bucket verify-bkt --key ck256 --checksum-mode ENABLED "$EVID/ck256.out" --query ChecksumSHA256 --output text | grep -qxF "$cs256" &&
   same "$EVID/cke.bin" "$EVID/ck256.out" &&
-  head -c 6000 /dev/urandom >"$EVID/ckp1.bin" && head -c 1000 /dev/urandom >"$EVID/ckp2.bin" &&
+  head -c 5300000 /dev/urandom >"$EVID/ckp1.bin" && head -c 1000 /dev/urandom >"$EVID/ckp2.bin" &&
   id64=$(S3 create-multipart-upload --bucket verify-bkt --key mp-ck64 --checksum-algorithm CRC64NVME --checksum-type FULL_OBJECT --query UploadId --output text) &&
   out=$(S3 upload-part --bucket verify-bkt --key mp-ck64 --part-number 1 --upload-id "$id64" --body "$EVID/ckp1.bin" --checksum-algorithm CRC64NVME --query '[ETag, ChecksumCRC64NVME]' --output text) &&
   e64_1=${out%%$'\t'*} && k64_1=${out#*$'\t'} && [ -n "$k64_1" ] && [ "$k64_1" != None ] &&
