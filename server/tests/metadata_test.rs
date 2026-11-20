@@ -492,3 +492,33 @@ async fn prop_no_crlf_injection_and_exact_roundtrip_plus_aws_chunked_literal_enc
 
     handle.shutdown();
 }
+
+/// ceph's `test_object_set_get_unicode_metadata`: a metadata value carries whatever bytes the
+/// client sent, and GET and HEAD give the same bytes back. Python's http.client sends `\xe9` as
+/// one Latin-1 byte; a UTF-8 client sends 0xC3 0xA9. Both used to be refused with 400
+/// ("must be valid UTF-8") or, signed, with AuthorizationHeaderMalformed.
+#[tokio::test]
+async fn non_ascii_user_metadata_bytes_come_back_as_they_were_sent() {
+    let dir = temp_dir("unicode");
+    let (_s, url, _h) = start(&dir).await;
+    let c = reqwest::Client::new();
+    assert_eq!(c.put(format!("{}/meta-bucket", url)).send().await.unwrap().status(), StatusCode::OK);
+    let cases: [(&str, &[u8]); 3] = [
+        ("latin1", b"Hello World\xe9"),
+        ("utf8", "Hello World\u{e9} \u{4e16}\u{754c}".as_bytes()),
+        ("high", b"\xa0\xff\x80 mixed \xc3\xa9"),
+    ];
+    for (key, value) in cases {
+        let v = reqwest::header::HeaderValue::from_bytes(value).unwrap();
+        let res = c.put(format!("{}/meta-bucket/{}", url, key)).header("x-amz-meta-meta1", v).body("bar").send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "PUT {}", key);
+        for head in [false, true] {
+            let req = if head { c.head(format!("{}/meta-bucket/{}", url, key)) } else { c.get(format!("{}/meta-bucket/{}", url, key)) };
+            let res = req.send().await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{} {}", if head { "HEAD" } else { "GET" }, key);
+            let got = res.headers().get("x-amz-meta-meta1").map(|v| v.as_bytes().to_vec());
+            assert_eq!(got.as_deref(), Some(value), "{} {}: the bytes changed", if head { "HEAD" } else { "GET" }, key);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
