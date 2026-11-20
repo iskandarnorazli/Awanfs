@@ -38,7 +38,6 @@ serde_json = "1"
 toml = "0.9"
 zstd = { version = "0.13", default-features = false }
 parking_lot = "0.12"
-redb = "2.1"
 reed-solomon-erasure = "6.0"
 lru = "0.12"
 memmap2 = "0.9"
@@ -47,5 +46,7 @@ memmap2 = "0.9"
 libc = "0.2"
 
 [dev-dependencies]
+# The benchmark of #26 compares the segments with redb as the server used it before stage 6.
+redb = "2.1"
 proptest = "1.4"
 reqwest = { version = "0.12", features = ["stream"] }
