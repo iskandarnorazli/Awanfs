@@ -63,6 +63,14 @@ between them is a pure function in `server/src/fsm.rs` with a test over every
 (state, event) pair and a row in [`STATE_MACHINES.md`](STATE_MACHINES.md). Handlers call the
 function; they do not decide transitions.
 
+## Benchmarks run defaults only
+
+Every benchmark runs AwanFS, MinIO and RustFS once each, at their defaults (owner, 2026-11-20):
+no extra durability modes, environment settings, forks or second builds of a competitor in a
+scheduled or PR-triggered run. A comparison of modes or builds is an experiment. It runs once,
+on a branch that is not merged, and its result goes in `measurements/`. The nightly runs had grown
+too long.
+
 ## Traps this repository has hit
 
 - **Bucket names are 3 to 63 characters.** Tests with a two-character bucket fail for the wrong reason (it happened twice).

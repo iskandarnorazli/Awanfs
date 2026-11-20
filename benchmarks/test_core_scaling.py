@@ -974,7 +974,10 @@ class GarageAndSeaweedfsTests(unittest.TestCase):
         self.assertEqual(set(posix_rows.keys()), set(cs.SERVERS))
         self.assertEqual(posix_rows["AwanFS"][1], "Yes")
         self.assertEqual(posix_rows["MinIO"][1], "Yes")
-        self.assertEqual(posix_rows["RustFS"][1], "Yes")
+        # RustFS runs at its release defaults; `_start_rustfs` never set the strict mode the
+        # row used to claim, so its sync is not measured until #334.
+        self.assertEqual(posix_rows["RustFS"][1], "Not measured")
+        self.assertEqual(posix_rows["RustFS"][0], "release defaults")
         self.assertEqual(posix_rows["Garage"][1], "No")
         self.assertEqual(posix_rows["SeaweedFS"][1], "No")
         self.assertIn("metadata_fsync = false", posix_rows["Garage"][0])
@@ -1289,6 +1292,15 @@ class DurabilityAndAutoProfileTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 cs._start_awanfs(fake_bin, 4, tmpdir, durability="bogus")
+
+    def test_the_fast_mode_runs_only_when_asked_for_by_name(self):
+        # Every server at its defaults (owner, 2026-11-20): a 16-core run no longer adds an
+        # AwanFS --durability fast pass on its own.
+        a = type("A", (), {"durability": "group", "profile_threads_cores": "", "compare_fast": None})()
+        _, _, fast = cs._resolve_profile_config(a, [1, 2, 4, 8], 16)
+        self.assertFalse(fast)
+        a.compare_fast = True
+        self.assertTrue(cs._resolve_profile_config(a, [1, 2, 4, 8], 16)[2])
 
     def test_should_auto_profile_put_requires_16_plus_split_client_cores(self):
         self.assertTrue(cs.should_auto_profile_put(16, [1, 2, 4, 8]))
