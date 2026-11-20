@@ -1,5 +1,7 @@
 # Awan Storage Kernel I/O Reactor Specification (`io_uring` & IOCP)
 
+> **Background from before the PoC (written 2026-11-10/11, in part for awan-lang).** Kept for its reasoning; it is not the design and does not list what AwanFS does. Where it disagrees with [`ARCHITECTURE.md`](ARCHITECTURE.md), [`FORMAT.md`](FORMAT.md) or the code, those win.
+
 > **Substrate Internals: Thread-per-Core Architecture, Zero-Syscall Ring Polling, and Dual-Platform Parity**
 
 ---

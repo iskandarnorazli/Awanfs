@@ -1,5 +1,7 @@
 # S3 Storage Server (`s3-server`): Drop-In S3 Replacement Tutorial & Migration Guide
 
+> **Written before the PoC (2026-11-10/11) and not yet checked against the code (#280).** Where it disagrees with [`ARCHITECTURE.md`](ARCHITECTURE.md), [`FORMAT.md`](FORMAT.md) or the code, those win.
+
 `s3-server` is a high-performance, zero-GC, wire-compatible Amazon S3 object storage daemon implemented 100% in pure Rust. It is built on a 64-byte columnar Struct-of-Arrays (`ObjectMeta`) in-memory metadata index, 32 GiB sparse virtual volume pre-allocation, and 4096-byte sector-aligned WORM Needle volume slabs (`O_DIRECT` / `FILE_FLAG_NO_BUFFERING`).
 
 Because `s3-server` speaks the standard AWS S3 REST XML protocol (RFC 9110 byte ranges, Multipart Uploads, AWS Signature Version 4 `AWS4-HMAC-SHA256`, `aws-chunked` streaming, conditional `If-Match` / `If-None-Match: *` mutex headers, single and batch deletions, and lifecycle expiration rules), **you do not need to rewrite your application logic, adapt schemas, or install a proprietary SDK**. Any S3 client library or CLI tool can switch to `s3-server` by changing **one configuration line**: `endpoint_url`.
