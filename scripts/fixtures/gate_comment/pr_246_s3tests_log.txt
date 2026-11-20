@@ -1,0 +1,651 @@
+2026-11-19T03:38:08.5980939Z =========================== short test summary info ============================
+2026-11-19T03:38:08.5981288Z FAILED s3tests/functional/test_s3.py::test_account_usage - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the ListBuckets operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5981428Z FAILED s3tests/functional/test_s3.py::test_head_bucket_usage - KeyError: 'X-RGW-Object-Count'
+2026-11-19T03:38:08.5981589Z FAILED s3tests/functional/test_s3.py::test_bucket_list_unordered - AssertionError: ClientError not raised
+2026-11-19T03:38:08.5981749Z FAILED s3tests/functional/test_s3.py::test_bucket_listv2_unordered - AssertionError: ClientError not raised
+2026-11-19T03:38:08.5982102Z FAILED s3tests/functional/test_s3.py::test_bucket_list_return_data - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5982477Z FAILED s3tests/functional/test_s3.py::test_bucket_list_return_data_versioning - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5982841Z FAILED s3tests/functional/test_s3.py::test_bucket_list_objects_anonymous - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5983209Z FAILED s3tests/functional/test_s3.py::test_bucket_listv2_objects_anonymous - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5983355Z FAILED s3tests/functional/test_s3.py::test_bucket_concurrent_set_canned_acl - assert False == True
+2026-11-19T03:38:08.5983710Z FAILED s3tests/functional/test_s3.py::test_expected_bucket_owner - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5984265Z FAILED s3tests/functional/test_s3.py::test_object_set_get_unicode_metadata - botocore.exceptions.ClientError: An error occurred (AuthorizationHeaderMalformed) when calling the PutObject operation: Authentication failed
+2026-11-19T03:38:08.5984436Z FAILED s3tests/functional/test_s3.py::test_post_object_anonymous_request - assert 405 == 204
+2026-11-19T03:38:08.5984503Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5984645Z FAILED s3tests/functional/test_s3.py::test_post_object_authenticated_request - assert 405 == 204
+2026-11-19T03:38:08.5984704Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5984899Z FAILED s3tests/functional/test_s3.py::test_post_object_authenticated_no_content_type - assert 405 == 204
+2026-11-19T03:38:08.5984961Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5985195Z FAILED s3tests/functional/test_s3.py::test_post_object_authenticated_request_bad_access_key - assert 405 == 403
+2026-11-19T03:38:08.5985298Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5985433Z FAILED s3tests/functional/test_s3.py::test_post_object_set_success_code - assert 405 == 201
+2026-11-19T03:38:08.5985491Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5985637Z FAILED s3tests/functional/test_s3.py::test_post_object_set_invalid_success_code - assert 405 == 204
+2026-11-19T03:38:08.5985696Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5985853Z FAILED s3tests/functional/test_s3.py::test_post_object_upload_larger_than_chunk - assert 405 == 204
+2026-11-19T03:38:08.5985914Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5986053Z FAILED s3tests/functional/test_s3.py::test_post_object_set_key_from_filename - assert 405 == 204
+2026-11-19T03:38:08.5986110Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5986237Z FAILED s3tests/functional/test_s3.py::test_post_object_ignored_header - assert 405 == 204
+2026-11-19T03:38:08.5986297Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5986454Z FAILED s3tests/functional/test_s3.py::test_post_object_case_insensitive_condition_fields - assert 405 == 204
+2026-11-19T03:38:08.5986515Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5986653Z FAILED s3tests/functional/test_s3.py::test_post_object_escaped_field_values - assert 405 == 204
+2026-11-19T03:38:08.5986711Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5986853Z FAILED s3tests/functional/test_s3.py::test_post_object_success_redirect_action - assert 405 == 200
+2026-11-19T03:38:08.5986907Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5987042Z FAILED s3tests/functional/test_s3.py::test_post_object_invalid_signature - assert 405 == 403
+2026-11-19T03:38:08.5987104Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5987407Z FAILED s3tests/functional/test_s3.py::test_post_object_invalid_access_key - assert 405 == 403
+2026-11-19T03:38:08.5987468Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5987605Z FAILED s3tests/functional/test_s3.py::test_post_object_invalid_date_format - assert 405 == 400
+2026-11-19T03:38:08.5987660Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5987795Z FAILED s3tests/functional/test_s3.py::test_post_object_no_key_specified - assert 405 == 400
+2026-11-19T03:38:08.5987855Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5987982Z FAILED s3tests/functional/test_s3.py::test_post_object_missing_signature - assert 405 == 400
+2026-11-19T03:38:08.5988042Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5988186Z FAILED s3tests/functional/test_s3.py::test_post_object_missing_policy_condition - assert 405 == 403
+2026-11-19T03:38:08.5988243Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5988383Z FAILED s3tests/functional/test_s3.py::test_post_object_user_specified_header - assert 405 == 204
+2026-11-19T03:38:08.5988437Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5988637Z FAILED s3tests/functional/test_s3.py::test_post_object_request_missing_policy_specified_field - assert 405 == 403
+2026-11-19T03:38:08.5988699Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5988875Z FAILED s3tests/functional/test_s3.py::test_post_object_condition_is_case_sensitive - assert 405 == 400
+2026-11-19T03:38:08.5988932Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5989076Z FAILED s3tests/functional/test_s3.py::test_post_object_expires_is_case_sensitive - assert 405 == 400
+2026-11-19T03:38:08.5989130Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5989262Z FAILED s3tests/functional/test_s3.py::test_post_object_expired_policy - assert 405 == 403
+2026-11-19T03:38:08.5989349Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5989473Z FAILED s3tests/functional/test_s3.py::test_post_object_wrong_bucket - assert 405 == 403
+2026-11-19T03:38:08.5989532Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5989714Z FAILED s3tests/functional/test_s3.py::test_post_object_invalid_request_field_value - assert 405 == 403
+2026-11-19T03:38:08.5989770Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5989918Z FAILED s3tests/functional/test_s3.py::test_post_object_missing_expires_condition - assert 405 == 400
+2026-11-19T03:38:08.5989978Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5990114Z FAILED s3tests/functional/test_s3.py::test_post_object_missing_conditions_list - assert 405 == 400
+2026-11-19T03:38:08.5990176Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5990325Z FAILED s3tests/functional/test_s3.py::test_post_object_upload_size_limit_exceeded - assert 405 == 400
+2026-11-19T03:38:08.5990380Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5990539Z FAILED s3tests/functional/test_s3.py::test_post_object_missing_content_length_argument - assert 405 == 400
+2026-11-19T03:38:08.5990600Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5990754Z FAILED s3tests/functional/test_s3.py::test_post_object_invalid_content_length_argument - assert 405 == 400
+2026-11-19T03:38:08.5990814Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5990954Z FAILED s3tests/functional/test_s3.py::test_post_object_upload_size_below_minimum - assert 405 == 400
+2026-11-19T03:38:08.5991014Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5991168Z FAILED s3tests/functional/test_s3.py::test_post_object_upload_size_rgw_chunk_size_bug - assert 405 == 204
+2026-11-19T03:38:08.5991223Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5991354Z FAILED s3tests/functional/test_s3.py::test_post_object_empty_conditions - assert 405 == 400
+2026-11-19T03:38:08.5991416Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.5991575Z FAILED s3tests/functional/test_s3.py::test_put_object_ifmatch_failed - AssertionError: ClientError not raised
+2026-11-19T03:38:08.5991761Z FAILED s3tests/functional/test_s3.py::test_put_object_ifmatch_nonexisted_failed - AssertionError: ClientError not raised
+2026-11-19T03:38:08.5991930Z FAILED s3tests/functional/test_s3.py::test_put_object_ifnonmatch_failed - AssertionError: ClientError not raised
+2026-11-19T03:38:08.5992224Z FAILED s3tests/functional/test_s3.py::test_object_raw_get - botocore.errorfactory.AccessDenied: An error occurred (AccessDenied) when calling the GetObject operation: Authentication failed
+2026-11-19T03:38:08.5992353Z FAILED s3tests/functional/test_s3.py::test_object_raw_get_bucket_gone - assert 403 == 404
+2026-11-19T03:38:08.5992485Z FAILED s3tests/functional/test_s3.py::test_object_delete_key_bucket_gone - assert 403 == 404
+2026-11-19T03:38:08.5992607Z FAILED s3tests/functional/test_s3.py::test_object_raw_get_object_gone - assert 403 == 404
+2026-11-19T03:38:08.5992751Z FAILED s3tests/functional/test_s3.py::test_bucket_head_extended - KeyError: 'x-rgw-object-count'
+2026-11-19T03:38:08.5993093Z FAILED s3tests/functional/test_s3.py::test_object_raw_get_bucket_acl - botocore.errorfactory.AccessDenied: An error occurred (AccessDenied) when calling the GetObject operation: Authentication failed
+2026-11-19T03:38:08.5993440Z FAILED s3tests/functional/test_s3.py::test_object_put_acl_mtime - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5993626Z FAILED s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_range_zero - assert 200 == 403
+2026-11-19T03:38:08.5993781Z FAILED s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_max_range - assert 400 == 403
+2026-11-19T03:38:08.5993940Z FAILED s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_positive_range - assert 400 == 403
+2026-11-19T03:38:08.5994446Z FAILED s3tests/functional/test_s3.py::test_object_anon_put_write_access - botocore.errorfactory.AccessDenied: An error occurred (AccessDenied) when calling the PutObject operation: Authentication failed
+2026-11-19T03:38:08.5994661Z FAILED s3tests/functional/test_s3.py::test_object_raw_put_authenticated_expired - assert 400 == 403
+2026-11-19T03:38:08.5994832Z FAILED s3tests/functional/test_s3.py::test_bucket_recreate_overwrite_acl - AssertionError: ClientError not raised
+2026-11-19T03:38:08.5994990Z FAILED s3tests/functional/test_s3.py::test_bucket_recreate_new_acl - AssertionError: ClientError not raised
+2026-11-19T03:38:08.5995337Z FAILED s3tests/functional/test_s3.py::test_bucket_acl_default - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5995705Z FAILED s3tests/functional/test_s3.py::test_bucket_acl_canned_during_create - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5996045Z FAILED s3tests/functional/test_s3.py::test_bucket_acl_canned - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5996418Z FAILED s3tests/functional/test_s3.py::test_bucket_acl_canned_publicreadwrite - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5996795Z FAILED s3tests/functional/test_s3.py::test_bucket_acl_canned_authenticatedread - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5997160Z FAILED s3tests/functional/test_s3.py::test_put_bucket_acl_grant_group_read - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5997501Z FAILED s3tests/functional/test_s3.py::test_object_acl_default - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5997867Z FAILED s3tests/functional/test_s3.py::test_object_acl_canned_during_create - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5998209Z FAILED s3tests/functional/test_s3.py::test_object_acl_canned - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5998573Z FAILED s3tests/functional/test_s3.py::test_object_acl_canned_publicreadwrite - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5998984Z FAILED s3tests/functional/test_s3.py::test_object_acl_canned_authenticatedread - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5999351Z FAILED s3tests/functional/test_s3.py::test_object_acl_canned_bucketownerread - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.5999774Z FAILED s3tests/functional/test_s3.py::test_object_acl_canned_bucketownerfullcontrol - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6000172Z FAILED s3tests/functional/test_s3.py::test_object_acl_full_control_verify_owner - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6000581Z FAILED s3tests/functional/test_s3.py::test_object_acl_full_control_verify_attributes - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6000958Z FAILED s3tests/functional/test_s3.py::test_bucket_acl_canned_private_to_private - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6001288Z FAILED s3tests/functional/test_s3.py::test_object_acl - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6001624Z FAILED s3tests/functional/test_s3.py::test_object_acl_write - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6001973Z FAILED s3tests/functional/test_s3.py::test_object_acl_writeacp - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6002311Z FAILED s3tests/functional/test_s3.py::test_object_acl_read - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6002648Z FAILED s3tests/functional/test_s3.py::test_object_acl_readacp - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6003021Z FAILED s3tests/functional/test_s3.py::test_bucket_acl_grant_userid_fullcontrol - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6003378Z FAILED s3tests/functional/test_s3.py::test_bucket_acl_grant_userid_read - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6003742Z FAILED s3tests/functional/test_s3.py::test_bucket_acl_grant_userid_readacp - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6004175Z FAILED s3tests/functional/test_s3.py::test_bucket_acl_grant_userid_write - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6004544Z FAILED s3tests/functional/test_s3.py::test_bucket_acl_grant_userid_writeacp - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6004947Z FAILED s3tests/functional/test_s3.py::test_bucket_acl_grant_nonexist_user - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6005335Z FAILED s3tests/functional/test_s3.py::test_object_header_acl_grants - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6005684Z FAILED s3tests/functional/test_s3.py::test_bucket_header_acl_grants - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6006071Z FAILED s3tests/functional/test_s3.py::test_bucket_acl_grant_email - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6006472Z FAILED s3tests/functional/test_s3.py::test_bucket_acl_grant_email_not_exist - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6006814Z FAILED s3tests/functional/test_s3.py::test_bucket_acl_revoke_all - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6007189Z FAILED s3tests/functional/test_s3.py::test_access_bucket_private_object_private - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6007565Z FAILED s3tests/functional/test_s3.py::test_access_bucket_private_objectv2_private - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6007944Z FAILED s3tests/functional/test_s3.py::test_access_bucket_private_object_publicread - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6008324Z FAILED s3tests/functional/test_s3.py::test_access_bucket_private_objectv2_publicread - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6008715Z FAILED s3tests/functional/test_s3.py::test_access_bucket_private_object_publicreadwrite - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6009109Z FAILED s3tests/functional/test_s3.py::test_access_bucket_private_objectv2_publicreadwrite - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6009489Z FAILED s3tests/functional/test_s3.py::test_access_bucket_publicread_object_private - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6009868Z FAILED s3tests/functional/test_s3.py::test_access_bucket_publicread_object_publicread - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6010265Z FAILED s3tests/functional/test_s3.py::test_access_bucket_publicread_object_publicreadwrite - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6010683Z FAILED s3tests/functional/test_s3.py::test_access_bucket_publicreadwrite_object_private - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6011072Z FAILED s3tests/functional/test_s3.py::test_access_bucket_publicreadwrite_object_publicread - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6011505Z FAILED s3tests/functional/test_s3.py::test_access_bucket_publicreadwrite_object_publicreadwrite - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6011848Z FAILED s3tests/functional/test_s3.py::test_list_buckets_anonymous - botocore.errorfactory.AccessDenied: An error occurred (AccessDenied) when calling the ListBuckets operation: Authentication failed
+2026-11-19T03:38:08.6012216Z FAILED s3tests/functional/test_s3.py::test_bucket_create_special_key_names - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6012410Z FAILED s3tests/functional/test_s3.py::test_object_copy_not_owned_bucket - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6012783Z FAILED s3tests/functional/test_s3.py::test_object_copy_not_owned_object_bucket - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6012976Z FAILED s3tests/functional/test_s3.py::test_object_copy_versioning_multipart_upload - AssertionError: assert {'foo': 'bar'} == {}
+2026-11-19T03:38:08.6013024Z   
+2026-11-19T03:38:08.6013089Z   Left contains 1 more item:
+2026-11-19T03:38:08.6013140Z   {'foo': 'bar'}
+2026-11-19T03:38:08.6013181Z   
+2026-11-19T03:38:08.6013273Z   Full diff: (-: missing in left side, +: extra in left side)
+2026-11-19T03:38:08.6013324Z   - {}
+2026-11-19T03:38:08.6013367Z   + {
+2026-11-19T03:38:08.6013419Z   +     'foo': 'bar',
+2026-11-19T03:38:08.6013462Z   + }
+2026-11-19T03:38:08.6013656Z FAILED s3tests/functional/test_s3.py::test_multipart_upload - AssertionError: assert 'application/octet-stream' == 'text/bla'
+2026-11-19T03:38:08.6013704Z   
+2026-11-19T03:38:08.6013750Z   - text/bla
+2026-11-19T03:38:08.6013811Z   + application/octet-stream
+2026-11-19T03:38:08.6014146Z FAILED s3tests/functional/test_s3.py::test_multipart_upload_resend_part - AssertionError: assert 'application/octet-stream' == 'text/bla'
+2026-11-19T03:38:08.6014188Z   
+2026-11-19T03:38:08.6014237Z   - text/bla
+2026-11-19T03:38:08.6014291Z   + application/octet-stream
+2026-11-19T03:38:08.6014462Z FAILED s3tests/functional/test_s3.py::test_multipart_upload_size_too_small - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6014822Z FAILED s3tests/functional/test_s3.py::test_list_multipart_upload_owner - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6015162Z FAILED s3tests/functional/test_s3.py::test_100_continue - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6015283Z FAILED s3tests/functional/test_s3.py::test_cors_origin_response - assert 403 == 200
+2026-11-19T03:38:08.6015348Z  +  where 403 = <Response [403]>.status_code
+2026-11-19T03:38:08.6015470Z FAILED s3tests/functional/test_s3.py::test_cors_origin_wildcard - assert 403 == 200
+2026-11-19T03:38:08.6015528Z  +  where 403 = <Response [403]>.status_code
+2026-11-19T03:38:08.6015878Z FAILED s3tests/functional/test_s3.py::test_cors_presigned_get_object_v2 - botocore.exceptions.ClientError: An error occurred (AuthorizationHeaderMalformed) when calling the CreateBucket operation: Authentication failed
+2026-11-19T03:38:08.6016281Z FAILED s3tests/functional/test_s3.py::test_cors_presigned_get_object_tenant_v2 - botocore.exceptions.ClientError: An error occurred (AuthorizationHeaderMalformed) when calling the CreateBucket operation: Authentication failed
+2026-11-19T03:38:08.6016630Z FAILED s3tests/functional/test_s3.py::test_cors_presigned_put_object_v2 - botocore.exceptions.ClientError: An error occurred (AuthorizationHeaderMalformed) when calling the CreateBucket operation: Authentication failed
+2026-11-19T03:38:08.6017027Z FAILED s3tests/functional/test_s3.py::test_cors_presigned_put_object_tenant_v2 - botocore.exceptions.ClientError: An error occurred (AuthorizationHeaderMalformed) when calling the CreateBucket operation: Authentication failed
+2026-11-19T03:38:08.6017242Z FAILED s3tests/functional/test_s3.py::test_atomic_dual_conditional_write_1mb - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6017592Z FAILED s3tests/functional/test_s3.py::test_multipart_resend_first_finishes_last - botocore.exceptions.ClientError: An error occurred (InvalidPartOrder) when calling the CompleteMultipartUpload operation: InvalidPartOrder
+2026-11-19T03:38:08.6017977Z FAILED s3tests/functional/test_s3.py::test_versioned_object_acl - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6018359Z FAILED s3tests/functional/test_s3.py::test_versioned_object_acl_no_version_specified - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6018579Z FAILED s3tests/functional/test_s3.py::test_lifecycle_get - AssertionError: assert [{'Expiration...': 'Enabled'}] == [{'ID': 'test...': 'Enabled'}]
+2026-11-19T03:38:08.6018622Z   
+2026-11-19T03:38:08.6018886Z   At index 0 diff: {'Expiration': {'Days': 31}, 'ID': 'test1/', 'Filter': {'Prefix': 'test1/'}, 'Status': 'Enabled'} != {'ID': 'test1/', 'Expiration': {'Days': 31}, 'Prefix': 'test1/', 'Status': 'Enabled'}
+2026-11-19T03:38:08.6018933Z   
+2026-11-19T03:38:08.6019020Z   Full diff: (-: missing in left side, +: extra in left side)
+2026-11-19T03:38:08.6019067Z     [
+2026-11-19T03:38:08.6019111Z         {
+2026-11-19T03:38:08.6019166Z   -         'ID': 'test1/',
+2026-11-19T03:38:08.6019222Z             'Expiration': {
+2026-11-19T03:38:08.6019270Z                 'Days': 31,
+2026-11-19T03:38:08.6019320Z             },
+2026-11-19T03:38:08.6019376Z   -         'Prefix': 'test1/',
+2026-11-19T03:38:08.6019421Z   ?          ^^^^^^
+2026-11-19T03:38:08.6019473Z   +         'ID': 'test1/',
+2026-11-19T03:38:08.6019517Z   ?          ^^
+2026-11-19T03:38:08.6019569Z   +         'Filter': {
+2026-11-19T03:38:08.6019627Z   +             'Prefix': 'test1/',
+2026-11-19T03:38:08.6019670Z   +         },
+2026-11-19T03:38:08.6019727Z             'Status': 'Enabled',
+2026-11-19T03:38:08.6019773Z         },
+2026-11-19T03:38:08.6019815Z         {
+2026-11-19T03:38:08.6019865Z   -         'ID': 'test2/',
+2026-11-19T03:38:08.6019915Z             'Expiration': {
+2026-11-19T03:38:08.6019970Z                 'Days': 120,
+2026-11-19T03:38:08.6020016Z             },
+2026-11-19T03:38:08.6020067Z   -         'Prefix': 'test2/',
+2026-11-19T03:38:08.6020115Z   ?          ^^^^^^
+2026-11-19T03:38:08.6020167Z   +         'ID': 'test2/',
+2026-11-19T03:38:08.6020209Z   ?          ^^
+2026-11-19T03:38:08.6020259Z   +         'Filter': {
+2026-11-19T03:38:08.6020313Z   +             'Prefix': 'test2/',
+2026-11-19T03:38:08.6020356Z   +         },
+2026-11-19T03:38:08.6020409Z             'Status': 'Enabled',
+2026-11-19T03:38:08.6020451Z         },
+2026-11-19T03:38:08.6020502Z     ]
+2026-11-19T03:38:08.6020627Z FAILED s3tests/functional/test_s3.py::test_lifecycle_get_no_id - KeyError: 'Prefix'
+2026-11-19T03:38:08.6020797Z FAILED s3tests/functional/test_s3.py::test_lifecycle_expiration - Failed: Timeout (>60.0s) from pytest-timeout.
+2026-11-19T03:38:08.6020966Z FAILED s3tests/functional/test_s3.py::test_lifecyclev2_expiration - Failed: Timeout (>60.0s) from pytest-timeout.
+2026-11-19T03:38:08.6021093Z FAILED s3tests/functional/test_s3.py::test_lifecycle_expiration_tags2 - assert 2 == 1
+2026-11-19T03:38:08.6021464Z  +  where 2 = len([{'Key': 'days1/huck', 'LastModified': datetime.datetime(2026, 11, 19, 3, 28, 24, 298000, tzinfo=tzlocal()), 'ETag': '...time(2026, 11, 19, 3, 28, 24, 295000, tzinfo=tzlocal()), 'ETag': '"046c36f9d47a1ec6122710aca4c65ffc"', 'Size': 8, ...}])
+2026-11-19T03:38:08.6021637Z FAILED s3tests/functional/test_s3.py::test_lifecycle_expiration_versioned_tags2 - assert 2 == 1
+2026-11-19T03:38:08.6021968Z  +  where 2 = len([{'Key': 'days1/huck', 'LastModified': datetime.datetime(2026, 11, 19, 3, 28, 54, 547000, tzinfo=tzlocal()), 'ETag': '...time(2026, 11, 19, 3, 28, 54, 544000, tzinfo=tzlocal()), 'ETag': '"046c36f9d47a1ec6122710aca4c65ffc"', 'Size': 8, ...}])
+2026-11-19T03:38:08.6022182Z FAILED s3tests/functional/test_s3.py::test_lifecycle_expiration_noncur_tags1 - Failed: Timeout (>60.0s) from pytest-timeout.
+2026-11-19T03:38:08.6022356Z FAILED s3tests/functional/test_s3.py::test_lifecycle_expiration_newer_noncurrent - assert 10 == 6
+2026-11-19T03:38:08.6022535Z FAILED s3tests/functional/test_s3.py::test_lifecycle_expiration_size_gt - Failed: Timeout (>60.0s) from pytest-timeout.
+2026-11-19T03:38:08.6022660Z FAILED s3tests/functional/test_s3.py::test_lifecycle_expiration_size_lt - assert 2 == 1
+2026-11-19T03:38:08.6022996Z  +  where 2 = len([{'Key': 'myobject_big', 'LastModified': datetime.datetime(2026, 11, 19, 3, 31, 45, 518000, tzinfo=tzlocal()), 'ETag':...e(2026, 11, 19, 3, 31, 45, 516000, tzinfo=tzlocal()), 'ETag': '"c73c16de8912c313c06ac38b9961e806"', 'Size': 1000, ...}])
+2026-11-19T03:38:08.6023155Z FAILED s3tests/functional/test_s3.py::test_lifecycle_id_too_long - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6023304Z FAILED s3tests/functional/test_s3.py::test_lifecycle_same_id - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6023463Z FAILED s3tests/functional/test_s3.py::test_lifecycle_invalid_status - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6023634Z FAILED s3tests/functional/test_s3.py::test_lifecycle_set_invalid_date - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6023758Z FAILED s3tests/functional/test_s3.py::test_lifecycle_expiration_date - assert 2 == 1
+2026-11-19T03:38:08.6024228Z  +  where 2 = len([{'Key': 'future/bar', 'LastModified': datetime.datetime(2026, 11, 19, 3, 32, 6, 715000, tzinfo=tzlocal()), 'ETag': '"...etime(2026, 11, 19, 3, 32, 6, 713000, tzinfo=tzlocal()), 'ETag': '"500e55bc2e3b8cf36517f85b870e4388"', 'Size': 8, ...}])
+2026-11-19T03:38:08.6024412Z FAILED s3tests/functional/test_s3.py::test_lifecycle_expiration_days0 - AssertionError: assert '' == 'InvalidArgument'
+2026-11-19T03:38:08.6024461Z   
+2026-11-19T03:38:08.6024511Z   - InvalidArgument
+2026-11-19T03:38:08.6024646Z FAILED s3tests/functional/test_s3.py::test_lifecycle_expiration_header_put - assert False
+2026-11-19T03:38:08.6025164Z  +  where False = check_lifecycle_expiration_header({'ResponseMetadata': {'RequestId': '6AFE6BD500000000000025C1', 'HostId': '', 'HTTPStatusCode': 200, 'HTTPHeaders': {'e...00025C1', 'content-length': '0', ...}, ...}, 'ETag': '"37b51d194a7513e45b56f6524f2d51f2"', 'ChecksumCRC32': 'dv+Mqg=='}, datetime.datetime(2026, 11, 19, 3, 32, 37, 205930), 'rule1', 1)
+2026-11-19T03:38:08.6025325Z FAILED s3tests/functional/test_s3.py::test_lifecycle_expiration_header_head - AssertionError: assert False
+2026-11-19T03:38:08.6025839Z  +  where False = check_lifecycle_expiration_header({'ResponseMetadata': {'RequestId': '6AFE6BD500000000000025CF', 'HostId': '', 'HTTPStatusCode': 200, 'HTTPHeaders': {'c...tRanges': 'bytes', 'LastModified': datetime.datetime(2026, 11, 19, 3, 32, 37, tzinfo=tzutc()), 'ContentLength': 3, ...}, datetime.datetime(2026, 11, 19, 3, 32, 37, 431321), 'rule1', 1)
+2026-11-19T03:38:08.6026008Z FAILED s3tests/functional/test_s3.py::test_lifecycle_expiration_header_tags_head - AssertionError: assert False
+2026-11-19T03:38:08.6026551Z  +  where False = check_lifecycle_expiration_header({'ResponseMetadata': {'RequestId': '6AFE6BD500000000000025DE', 'HostId': '', 'HTTPStatusCode': 200, 'HTTPHeaders': {'c...Ranges': 'bytes', 'LastModified': datetime.datetime(2026, 11, 19, 3, 32, 37, tzinfo=tzutc()), 'ContentLength': 13, ...}, datetime.datetime(2026, 11, 19, 3, 32, 37, 674106), 'rule1', 1)
+2026-11-19T03:38:08.6026751Z  +    where datetime.datetime(2026, 11, 19, 3, 32, 37, 674106) = <built-in method now of type object at 0xaa9120>(None)
+2026-11-19T03:38:08.6026890Z  +      where <built-in method now of type object at 0xaa9120> = <class 'datetime.datetime'>.now
+2026-11-19T03:38:08.6027080Z  +        where <class 'datetime.datetime'> = datetime.datetime
+2026-11-19T03:38:08.6027205Z FAILED s3tests/functional/test_s3.py::test_lifecycle_noncur_expiration - assert 6 == 4
+2026-11-19T03:38:08.6027588Z  +  where 6 = len([{'ETag': '"610bd1fcc43e89895ec87162b65226c3"', 'Size': 9, 'StorageClass': 'STANDARD', 'Key': 'test1/a', ...}, {'ETag'..., ...}, {'ETag': '"8e689ba88b92e4020c6508e8a73e4ec1"', 'Size': 9, 'StorageClass': 'STANDARD', 'Key': 'test2/abc', ...}])
+2026-11-19T03:38:08.6027817Z FAILED s3tests/functional/test_s3.py::test_lifecycle_deletemarker_expiration - Failed: Timeout (>60.0s) from pytest-timeout.
+2026-11-19T03:38:08.6027973Z FAILED s3tests/functional/test_s3.py::test_lifecycle_deletemarker_expiration_with_days_tag - assert 1 == 0
+2026-11-19T03:38:08.6028148Z  +  where 1 = len([{'ETag': '"8e689ba88b92e4020c6508e8a73e4ec1"', 'Size': 9, 'StorageClass': 'STANDARD', 'Key': 'test1/a', ...}])
+2026-11-19T03:38:08.6028310Z FAILED s3tests/functional/test_s3.py::test_lifecycle_multipart_expiration - AssertionError: assert 2 == 1
+2026-11-19T03:38:08.6028656Z  +  where 2 = len([{'UploadId': 'upload-000000000000002f', 'Key': 'test1/a', 'Initiated': datetime.datetime(2026, 11, 19, 3, 34, 48, 872...', 'Initiated': datetime.datetime(2026, 11, 19, 3, 34, 48, 873000, tzinfo=tzlocal()), 'StorageClass': 'STANDARD', ...}])
+2026-11-19T03:38:08.6028841Z FAILED s3tests/functional/test_s3.py::test_lifecycle_transition_set_invalid_date - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6029010Z FAILED s3tests/functional/test_s3.py::test_encryption_sse_c_method_head - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6029166Z FAILED s3tests/functional/test_s3.py::test_encryption_sse_c_present - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6029333Z FAILED s3tests/functional/test_s3.py::test_encryption_sse_c_other_key - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6029498Z FAILED s3tests/functional/test_s3.py::test_encryption_sse_c_invalid_md5 - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6029651Z FAILED s3tests/functional/test_s3.py::test_encryption_sse_c_no_md5 - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6029809Z FAILED s3tests/functional/test_s3.py::test_encryption_sse_c_no_key - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6029966Z FAILED s3tests/functional/test_s3.py::test_encryption_key_no_sse_c - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6030146Z FAILED s3tests/functional/test_s3.py::test_encryption_sse_c_multipart_upload - AssertionError: assert {} == {'foo': 'bar'}
+2026-11-19T03:38:08.6030193Z   
+2026-11-19T03:38:08.6030256Z   Right contains 1 more item:
+2026-11-19T03:38:08.6030302Z   {'foo': 'bar'}
+2026-11-19T03:38:08.6030350Z   
+2026-11-19T03:38:08.6030441Z   Full diff: (-: missing in left side, +: extra in left side)
+2026-11-19T03:38:08.6030483Z   + {}
+2026-11-19T03:38:08.6030529Z   - {
+2026-11-19T03:38:08.6030578Z   -     'foo': 'bar',
+2026-11-19T03:38:08.6030626Z   - }
+2026-11-19T03:38:08.6030826Z FAILED s3tests/functional/test_s3.py::test_encryption_sse_c_unaligned_multipart_upload - AssertionError: assert {} == {'foo': 'bar'}
+2026-11-19T03:38:08.6030868Z   
+2026-11-19T03:38:08.6030927Z   Right contains 1 more item:
+2026-11-19T03:38:08.6030978Z   {'foo': 'bar'}
+2026-11-19T03:38:08.6031020Z   
+2026-11-19T03:38:08.6031104Z   Full diff: (-: missing in left side, +: extra in left side)
+2026-11-19T03:38:08.6031149Z   + {}
+2026-11-19T03:38:08.6031195Z   - {
+2026-11-19T03:38:08.6031246Z   -     'foo': 'bar',
+2026-11-19T03:38:08.6031287Z   - }
+2026-11-19T03:38:08.6031510Z FAILED s3tests/functional/test_s3.py::test_encryption_sse_c_multipart_invalid_chunks_1 - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6031744Z FAILED s3tests/functional/test_s3.py::test_encryption_sse_c_multipart_invalid_chunks_2 - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6031928Z FAILED s3tests/functional/test_s3.py::test_encryption_sse_c_multipart_bad_download - AssertionError: assert {} == {'foo': 'bar'}
+2026-11-19T03:38:08.6031977Z   
+2026-11-19T03:38:08.6032031Z   Right contains 1 more item:
+2026-11-19T03:38:08.6032076Z   {'foo': 'bar'}
+2026-11-19T03:38:08.6032122Z   
+2026-11-19T03:38:08.6032235Z   Full diff: (-: missing in left side, +: extra in left side)
+2026-11-19T03:38:08.6032280Z   + {}
+2026-11-19T03:38:08.6032327Z   - {
+2026-11-19T03:38:08.6032372Z   -     'foo': 'bar',
+2026-11-19T03:38:08.6032447Z   - }
+2026-11-19T03:38:08.6032617Z FAILED s3tests/functional/test_s3.py::test_encryption_sse_c_post_object_authenticated_request - assert 405 == 204
+2026-11-19T03:38:08.6032678Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.6033082Z FAILED s3tests/functional/test_s3.py::test_encryption_sse_c_enforced_with_bucket_policy - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6033483Z FAILED s3tests/functional/test_s3.py::test_encryption_sse_c_deny_algo_with_bucket_policy - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6033642Z FAILED s3tests/functional/test_s3.py::test_sse_kms_method_head - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6033787Z FAILED s3tests/functional/test_s3.py::test_sse_kms_no_key - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6033941Z FAILED s3tests/functional/test_s3.py::test_sse_kms_not_declared - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6034244Z FAILED s3tests/functional/test_s3.py::test_sse_kms_multipart_upload - AssertionError: assert {} == {'foo': 'bar'}
+2026-11-19T03:38:08.6034293Z   
+2026-11-19T03:38:08.6034348Z   Right contains 1 more item:
+2026-11-19T03:38:08.6034394Z   {'foo': 'bar'}
+2026-11-19T03:38:08.6034442Z   
+2026-11-19T03:38:08.6034530Z   Full diff: (-: missing in left side, +: extra in left side)
+2026-11-19T03:38:08.6034572Z   + {}
+2026-11-19T03:38:08.6034618Z   - {
+2026-11-19T03:38:08.6034665Z   -     'foo': 'bar',
+2026-11-19T03:38:08.6034712Z   - }
+2026-11-19T03:38:08.6034865Z FAILED s3tests/functional/test_s3.py::test_sse_kms_post_object_authenticated_request - assert 405 == 204
+2026-11-19T03:38:08.6034925Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.6035079Z FAILED s3tests/functional/test_s3.py::test_sse_kms_read_declare - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6035429Z FAILED s3tests/functional/test_s3.py::test_bucket_policy - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6035773Z FAILED s3tests/functional/test_s3.py::test_bucketv2_policy - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6036117Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_acl - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6036466Z FAILED s3tests/functional/test_s3.py::test_bucketv2_policy_acl - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6036883Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_different_tenant - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6037076Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_multipart - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6037445Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_tenanted_bucket - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6037884Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_another_bucket - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6038251Z FAILED s3tests/functional/test_s3.py::test_bucketv2_policy_another_bucket - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6038701Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_set_condition_operator_end_with_IfExists - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6039062Z FAILED s3tests/functional/test_s3.py::test_set_get_del_bucket_policy - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6039205Z FAILED s3tests/functional/test_s3.py::test_post_object_tags_anonymous_request - assert 405 == 204
+2026-11-19T03:38:08.6039265Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.6039413Z FAILED s3tests/functional/test_s3.py::test_post_object_tags_authenticated_request - assert 405 == 204
+2026-11-19T03:38:08.6039476Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.6039827Z FAILED s3tests/functional/test_s3.py::test_get_tags_acl_public - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6040178Z FAILED s3tests/functional/test_s3.py::test_put_tags_acl_public - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6040536Z FAILED s3tests/functional/test_s3.py::test_delete_tags_obj_public - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6041140Z FAILED s3tests/functional/test_s3.py::test_versioning_bucket_multipart_upload_return_version_id - AssertionError: assert not 'VersionId' in {'ResponseMetadata': {'RequestId': '6AFE6BD50000000000002A7E', 'HostId': '', 'HTTPStatusCode': 200, 'HTTPHeaders': {'c...on': 'http://127.0.0.1:9000/awanfs-vrwl43oxv066e73ztncl8j-481/foo', 'Bucket': 'awanfs-vrwl43oxv066e73ztncl8j-481', ...}
+2026-11-19T03:38:08.6041522Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_get_obj_existing_tag - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6041912Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_get_obj_tagging_existing_tag - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6042302Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_put_obj_tagging_existing_tag - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6042696Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_upload_part_copy - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6043096Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_put_obj_copy_source - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6043474Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_put_obj_copy_source_meta - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6043861Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_put_obj_acl - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6044383Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_put_obj_grant - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6044546Z FAILED s3tests/functional/test_s3.py::test_put_obj_enc_conflict_c_s3 - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6044708Z FAILED s3tests/functional/test_s3.py::test_put_obj_enc_conflict_c_kms - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6044866Z FAILED s3tests/functional/test_s3.py::test_put_obj_enc_conflict_s3_kms - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6045036Z FAILED s3tests/functional/test_s3.py::test_put_obj_enc_conflict_bad_enc_kms - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6045402Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_put_obj_s3_noenc - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6045794Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_put_obj_s3_incorrect_algo_sse_s3 - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6046158Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_put_obj_s3_kms - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6046529Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_put_obj_kms_noenc - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6046894Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_put_obj_kms_s3 - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6047269Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_put_obj_request_obj_tag - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6047650Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_get_obj_acl_existing_tag - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6048033Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_lock - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutObjectLockConfiguration operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6048186Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_invalid_bucket - assert 501 == 409
+2026-11-19T03:38:08.6048377Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_enable_after_create - assert 501 == 409
+2026-11-19T03:38:08.6048571Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_with_days_and_years - assert 501 == 400
+2026-11-19T03:38:08.6048718Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_invalid_days - assert 501 == 400
+2026-11-19T03:38:08.6048856Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_invalid_years - assert 501 == 400
+2026-11-19T03:38:08.6049002Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_invalid_mode - assert 501 == 400
+2026-11-19T03:38:08.6049185Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_invalid_status - assert 501 == 400
+2026-11-19T03:38:08.6049352Z FAILED s3tests/functional/test_s3.py::test_object_lock_suspend_versioning - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6049777Z FAILED s3tests/functional/test_s3.py::test_object_lock_get_obj_lock - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutObjectLockConfiguration operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6049923Z FAILED s3tests/functional/test_s3.py::test_object_lock_get_obj_lock_invalid_bucket - assert 501 == 404
+2026-11-19T03:38:08.6050061Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_retention - KeyError: 'VersionId'
+2026-11-19T03:38:08.6050217Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_invalid_bucket - assert 501 == 400
+2026-11-19T03:38:08.6050372Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_invalid_mode - assert 501 == 400
+2026-11-19T03:38:08.6050508Z FAILED s3tests/functional/test_s3.py::test_object_lock_get_obj_retention - KeyError: 'VersionId'
+2026-11-19T03:38:08.6050659Z FAILED s3tests/functional/test_s3.py::test_object_lock_get_obj_retention_iso8601 - KeyError: 'VersionId'
+2026-11-19T03:38:08.6050816Z FAILED s3tests/functional/test_s3.py::test_object_lock_get_obj_retention_invalid_bucket - assert 501 == 400
+2026-11-19T03:38:08.6050964Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_versionid - KeyError: 'VersionId'
+2026-11-19T03:38:08.6051406Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_override_default_retention - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutObjectLockConfiguration operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6051570Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_increase_period - KeyError: 'VersionId'
+2026-11-19T03:38:08.6051728Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_shorten_period - KeyError: 'VersionId'
+2026-11-19T03:38:08.6051903Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_shorten_period_bypass - KeyError: 'VersionId'
+2026-11-19T03:38:08.6052302Z FAILED s3tests/functional/test_s3.py::test_object_lock_delete_object_with_retention - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutObjectRetention operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6052472Z FAILED s3tests/functional/test_s3.py::test_object_lock_delete_multipart_object_with_retention - KeyError: 'VersionId'
+2026-11-19T03:38:08.6052885Z FAILED s3tests/functional/test_s3.py::test_object_lock_delete_object_with_retention_and_marker - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutObjectRetention operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6053051Z FAILED s3tests/functional/test_s3.py::test_object_lock_multi_delete_object_with_retention - KeyError: 'VersionId'
+2026-11-19T03:38:08.6053417Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_legal_hold - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutObjectLegalHold operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6053596Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_legal_hold_invalid_bucket - assert 501 == 400
+2026-11-19T03:38:08.6053774Z FAILED s3tests/functional/test_s3.py::test_object_lock_put_legal_hold_invalid_status - assert 501 == 400
+2026-11-19T03:38:08.6054207Z FAILED s3tests/functional/test_s3.py::test_object_lock_get_legal_hold - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutObjectLegalHold operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6054353Z FAILED s3tests/functional/test_s3.py::test_object_lock_get_legal_hold_invalid_bucket - assert 501 == 400
+2026-11-19T03:38:08.6054788Z FAILED s3tests/functional/test_s3.py::test_object_lock_delete_object_with_legal_hold_on - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutObjectLegalHold operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6055012Z FAILED s3tests/functional/test_s3.py::test_object_lock_delete_multipart_object_with_legal_hold_on - KeyError: 'VersionId'
+2026-11-19T03:38:08.6055407Z FAILED s3tests/functional/test_s3.py::test_object_lock_delete_object_with_legal_hold_off - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutObjectLegalHold operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6055785Z FAILED s3tests/functional/test_s3.py::test_object_lock_get_obj_metadata - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutObjectLegalHold operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6055929Z FAILED s3tests/functional/test_s3.py::test_object_lock_uploading_obj - KeyError: 'ObjectLockMode'
+2026-11-19T03:38:08.6056345Z FAILED s3tests/functional/test_s3.py::test_object_lock_changing_mode_from_governance_with_bypass - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutObjectRetention operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6056519Z FAILED s3tests/functional/test_s3.py::test_object_lock_changing_mode_from_governance_without_bypass - assert 501 == 403
+2026-11-19T03:38:08.6056670Z FAILED s3tests/functional/test_s3.py::test_object_lock_changing_mode_from_compliance - assert 501 == 403
+2026-11-19T03:38:08.6057043Z FAILED s3tests/functional/test_s3.py::test_get_bucket_policy_status - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketPolicyStatus operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6057410Z FAILED s3tests/functional/test_s3.py::test_get_public_acl_bucket_policy_status - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6057787Z FAILED s3tests/functional/test_s3.py::test_get_authpublic_acl_bucket_policy_status - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6058187Z FAILED s3tests/functional/test_s3.py::test_get_publicpolicy_acl_bucket_policy_status - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketPolicyStatus operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6058593Z FAILED s3tests/functional/test_s3.py::test_get_nonpublicpolicy_acl_bucket_policy_status - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketPolicyStatus operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6058996Z FAILED s3tests/functional/test_s3.py::test_get_nonpublicpolicy_principal_bucket_policy_status - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6059224Z FAILED s3tests/functional/test_s3.py::test_bucket_policy_allow_notprincipal - assert 501 == 400
+2026-11-19T03:38:08.6059605Z FAILED s3tests/functional/test_s3.py::test_get_undefined_public_block - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the DeletePublicAccessBlock operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6060028Z FAILED s3tests/functional/test_s3.py::test_get_public_block_deny_bucket_policy - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutPublicAccessBlock operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6060412Z FAILED s3tests/functional/test_s3.py::test_put_public_block - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutPublicAccessBlock operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6060788Z FAILED s3tests/functional/test_s3.py::test_block_public_put_bucket_acls - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutPublicAccessBlock operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6061198Z FAILED s3tests/functional/test_s3.py::test_block_public_object_canned_acls - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutPublicAccessBlock operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6061558Z FAILED s3tests/functional/test_s3.py::test_block_public_policy - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutPublicAccessBlock operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6061946Z FAILED s3tests/functional/test_s3.py::test_block_public_policy_with_principal - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutPublicAccessBlock operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6062344Z FAILED s3tests/functional/test_s3.py::test_block_public_restrict_public_buckets - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the DeletePublicAccessBlock operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6062691Z FAILED s3tests/functional/test_s3.py::test_ignore_public_acls - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6063061Z FAILED s3tests/functional/test_s3.py::test_put_get_delete_public_block - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutPublicAccessBlock operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6063447Z FAILED s3tests/functional/test_s3.py::test_multipart_upload_on_a_bucket_with_policy - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6063814Z FAILED s3tests/functional/test_s3.py::test_put_bucket_encryption_s3 - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6064304Z FAILED s3tests/functional/test_s3.py::test_put_bucket_encryption_kms - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6064530Z FAILED s3tests/functional/test_s3.py::test_get_bucket_encryption_s3 - AssertionError: assert 'NotImplemented' == 'ServerSideEn...NotFoundError'
+2026-11-19T03:38:08.6064579Z   
+2026-11-19T03:38:08.6064663Z   - ServerSideEncryptionConfigurationNotFoundError
+2026-11-19T03:38:08.6064717Z   + NotImplemented
+2026-11-19T03:38:08.6064941Z FAILED s3tests/functional/test_s3.py::test_get_bucket_encryption_kms - AssertionError: assert 'NotImplemented' == 'ServerSideEn...NotFoundError'
+2026-11-19T03:38:08.6064986Z   
+2026-11-19T03:38:08.6065070Z   - ServerSideEncryptionConfigurationNotFoundError
+2026-11-19T03:38:08.6065162Z   + NotImplemented
+2026-11-19T03:38:08.6065540Z FAILED s3tests/functional/test_s3.py::test_delete_bucket_encryption_s3 - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the DeleteBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6065959Z FAILED s3tests/functional/test_s3.py::test_delete_bucket_encryption_kms - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the DeleteBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6066363Z FAILED s3tests/functional/test_s3.py::test_sse_s3_default_upload_1b - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6066729Z FAILED s3tests/functional/test_s3.py::test_sse_s3_default_upload_1kb - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6067127Z FAILED s3tests/functional/test_s3.py::test_sse_s3_default_upload_1mb - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6067494Z FAILED s3tests/functional/test_s3.py::test_sse_s3_default_upload_8mb - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6067861Z FAILED s3tests/functional/test_s3.py::test_sse_kms_default_upload_1b - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6068229Z FAILED s3tests/functional/test_s3.py::test_sse_kms_default_upload_1kb - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6068598Z FAILED s3tests/functional/test_s3.py::test_sse_kms_default_upload_1mb - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6068965Z FAILED s3tests/functional/test_s3.py::test_sse_kms_default_upload_8mb - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6069332Z FAILED s3tests/functional/test_s3.py::test_sse_s3_default_method_head - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6069708Z FAILED s3tests/functional/test_s3.py::test_sse_s3_default_multipart_upload - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6070114Z FAILED s3tests/functional/test_s3.py::test_sse_s3_default_post_object_authenticated_request - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6070526Z FAILED s3tests/functional/test_s3.py::test_sse_kms_default_post_object_authenticated_request - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketEncryption operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6070696Z FAILED s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_1b - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6070866Z FAILED s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_1kb - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6071063Z FAILED s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_1mb - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6071259Z FAILED s3tests/functional/test_s3.py::test_sse_s3_encrypted_upload_8mb - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6071380Z FAILED s3tests/functional/test_s3.py::test_get_object_torrent - assert 501 == 404
+2026-11-19T03:38:08.6071512Z FAILED s3tests/functional/test_s3.py::test_post_object_upload_checksum - assert 405 == 204
+2026-11-19T03:38:08.6071576Z  +  where 405 = <Response [405]>.status_code
+2026-11-19T03:38:08.6071953Z FAILED s3tests/functional/test_s3.py::test_put_bucket_logging - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6072307Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_mtime - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6072705Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_simple_key - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6073070Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_partitioned_key - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6073444Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_bucket_auth_type - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6073804Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_request_id - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6074169Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_requester_assumed_role - botocore.exceptions.ClientError: An error occurred (Unknown) when calling the CreateRole operation: Unknown
+2026-11-19T03:38:08.6074543Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_bucket_acl_required - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6074917Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_object_acl_required - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6075114Z FAILED s3tests/functional/test_s3.py::test_put_bucket_logging_errors - AssertionError: assert 'NotImplemented' == 'NoSuchBucket'
+2026-11-19T03:38:08.6075156Z   
+2026-11-19T03:38:08.6075210Z   - NoSuchBucket
+2026-11-19T03:38:08.6075262Z   + NotImplemented
+2026-11-19T03:38:08.6075611Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_owner - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6075814Z FAILED s3tests/functional/test_s3.py::test_put_bucket_logging_permissions - AssertionError: assert 'NotImplemented' == 'AccessDenied'
+2026-11-19T03:38:08.6075859Z   
+2026-11-19T03:38:08.6075904Z   - AccessDenied
+2026-11-19T03:38:08.6075955Z   + NotImplemented
+2026-11-19T03:38:08.6076329Z FAILED s3tests/functional/test_s3.py::test_put_bucket_logging_policy_wildcard - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6076752Z FAILED s3tests/functional/test_s3.py::test_put_bucket_logging_policy_wildcard_objects - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6077167Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_permission_change_s - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6077527Z FAILED s3tests/functional/test_s3.py::test_put_bucket_logging_tenant_s - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6077922Z FAILED s3tests/functional/test_s3.py::test_put_bucket_logging_account_s - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6078316Z FAILED s3tests/functional/test_s3.py::test_rm_bucket_logging - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6078678Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_put_objects - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6079058Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_put_objects_versioned - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6079422Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_put_concurrency - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6079791Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_delete_objects - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6080177Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_delete_objects_versioned - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6080540Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_get_objects - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6080913Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_get_objects_versioned - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6081277Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_copy_objects - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6081658Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_copy_objects_versioned - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6082035Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_copy_objects_bucket - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6082460Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_copy_objects_bucket_versioned - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6082825Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_head_objects - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6083269Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_head_objects_versioned - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6083645Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_mpu_s - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6084155Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_mpu_versioned_s - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6084551Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_mpu_copy - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6084926Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_mpu_copy_versioned - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6085290Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_multi_delete - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6085677Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_multi_delete_versioned - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6086052Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_multiple_prefixes - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6086415Z FAILED s3tests/functional/test_s3.py::test_bucket_logging_single_prefix - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6086595Z FAILED s3tests/functional/test_s3.py::test_get_sse_c_encrypted_object_attributes - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6086768Z FAILED s3tests/functional/test_s3.py::test_delete_marker_expiration - Failed: Timeout (>60.0s) from pytest-timeout.
+2026-11-19T03:38:08.6086926Z FAILED s3tests/functional/test_s3.py::test_put_object_if_match - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6087088Z FAILED s3tests/functional/test_s3.py::test_multipart_put_object_if_match - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6087263Z FAILED s3tests/functional/test_s3.py::test_put_current_object_if_none_match - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6087452Z FAILED s3tests/functional/test_s3.py::test_multipart_put_current_object_if_none_match - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6087615Z FAILED s3tests/functional/test_s3.py::test_put_current_object_if_match - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6087796Z FAILED s3tests/functional/test_s3.py::test_multipart_put_current_object_if_match - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6087960Z FAILED s3tests/functional/test_s3.py::test_put_object_current_if_match - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6088153Z FAILED s3tests/functional/test_s3.py::test_delete_object_if_match - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6088321Z FAILED s3tests/functional/test_s3.py::test_delete_object_current_if_match - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6088525Z FAILED s3tests/functional/test_s3.py::test_delete_object_version_if_match - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6088707Z FAILED s3tests/functional/test_s3.py::test_delete_object_if_match_last_modified_time - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6088908Z FAILED s3tests/functional/test_s3.py::test_delete_object_current_if_match_last_modified_time - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6089141Z FAILED s3tests/functional/test_s3.py::test_delete_object_version_if_match_last_modified_time - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6089299Z FAILED s3tests/functional/test_s3.py::test_delete_object_if_match_size - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6089506Z FAILED s3tests/functional/test_s3.py::test_delete_object_current_if_match_size - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6089679Z FAILED s3tests/functional/test_s3.py::test_delete_object_version_if_match_size - AssertionError: ClientError not raised
+2026-11-19T03:38:08.6089974Z FAILED s3tests/functional/test_s3.py::test_delete_objects_if_match - botocore.exceptions.ClientError: An error occurred (MalformedXML) when calling the DeleteObjects operation: MalformedXML
+2026-11-19T03:38:08.6090282Z FAILED s3tests/functional/test_s3.py::test_delete_objects_current_if_match - botocore.exceptions.ClientError: An error occurred (MalformedXML) when calling the DeleteObjects operation: MalformedXML
+2026-11-19T03:38:08.6090589Z FAILED s3tests/functional/test_s3.py::test_delete_objects_version_if_match - botocore.exceptions.ClientError: An error occurred (MalformedXML) when calling the DeleteObjects operation: MalformedXML
+2026-11-19T03:38:08.6090914Z FAILED s3tests/functional/test_s3.py::test_delete_objects_if_match_last_modified_time - botocore.exceptions.ClientError: An error occurred (MalformedXML) when calling the DeleteObjects operation: MalformedXML
+2026-11-19T03:38:08.6091248Z FAILED s3tests/functional/test_s3.py::test_delete_objects_current_if_match_last_modified_time - botocore.exceptions.ClientError: An error occurred (MalformedXML) when calling the DeleteObjects operation: MalformedXML
+2026-11-19T03:38:08.6091585Z FAILED s3tests/functional/test_s3.py::test_delete_objects_version_if_match_last_modified_time - botocore.exceptions.ClientError: An error occurred (MalformedXML) when calling the DeleteObjects operation: MalformedXML
+2026-11-19T03:38:08.6091886Z FAILED s3tests/functional/test_s3.py::test_delete_objects_if_match_size - botocore.exceptions.ClientError: An error occurred (MalformedXML) when calling the DeleteObjects operation: MalformedXML
+2026-11-19T03:38:08.6092199Z FAILED s3tests/functional/test_s3.py::test_delete_objects_current_if_match_size - botocore.exceptions.ClientError: An error occurred (MalformedXML) when calling the DeleteObjects operation: MalformedXML
+2026-11-19T03:38:08.6092517Z FAILED s3tests/functional/test_s3.py::test_delete_objects_version_if_match_size - botocore.exceptions.ClientError: An error occurred (MalformedXML) when calling the DeleteObjects operation: MalformedXML
+2026-11-19T03:38:08.6092764Z FAILED s3tests/functional/test_s3.py::test_create_bucket_no_ownership_controls - AssertionError: assert (404, 'Owners...otFoundError') == (501, 'NotImplemented')
+2026-11-19T03:38:08.6092804Z   
+2026-11-19T03:38:08.6092862Z   At index 0 diff: 404 != 501
+2026-11-19T03:38:08.6092908Z   
+2026-11-19T03:38:08.6092994Z   Full diff: (-: missing in left side, +: extra in left side)
+2026-11-19T03:38:08.6093045Z     (
+2026-11-19T03:38:08.6093094Z   -     501,
+2026-11-19T03:38:08.6093137Z   ?     ^ ^
+2026-11-19T03:38:08.6093189Z   +     404,
+2026-11-19T03:38:08.6093234Z   ?     ^ ^
+2026-11-19T03:38:08.6093294Z   -     'NotImplemented',
+2026-11-19T03:38:08.6093364Z   +     'OwnershipControlsNotFoundError',
+2026-11-19T03:38:08.6093407Z     )
+2026-11-19T03:38:08.6093840Z FAILED s3tests/functional/test_s3.py::test_create_bucket_bucket_owner_enforced - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketOwnershipControls operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6094344Z FAILED s3tests/functional/test_s3.py::test_create_bucket_bucket_owner_preferred - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketOwnershipControls operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6094763Z FAILED s3tests/functional/test_s3.py::test_create_bucket_object_writer - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the GetBucketOwnershipControls operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6094922Z FAILED s3tests/functional/test_s3.py::test_put_bucket_ownership_bucket_owner_enforced - assert 501 == 400
+2026-11-19T03:38:08.6095379Z FAILED s3tests/functional/test_s3.py::test_put_bucket_ownership_bucket_owner_preferred - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketOwnershipControls operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6095779Z FAILED s3tests/functional/test_s3.py::test_put_bucket_ownership_object_writer - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketOwnershipControls operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6096179Z FAILED s3tests/functional/test_s3.py::test_bucket_create_delete_bucket_ownership - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketOwnershipControls operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6096556Z FAILED s3tests/functional/test_s3.py::test_head_object_404_with_policy_prefix - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutBucketPolicy operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:08.6096803Z FAILED s3tests/functional/test_s3.py::test_copy_part_enc[unencrypted-sse-s3-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6103100Z FAILED s3tests/functional/test_s3.py::test_copy_part_enc[unencrypted-sse-c-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption-customer-algorithm'
+2026-11-19T03:38:08.6103360Z FAILED s3tests/functional/test_s3.py::test_copy_part_enc[unencrypted-sse-kms-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6103597Z FAILED s3tests/functional/test_s3.py::test_copy_part_enc[sse-s3-unencrypted-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6103818Z FAILED s3tests/functional/test_s3.py::test_copy_part_enc[sse-s3-sse-s3-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6104192Z FAILED s3tests/functional/test_s3.py::test_copy_part_enc[sse-s3-sse-c-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6104416Z FAILED s3tests/functional/test_s3.py::test_copy_part_enc[sse-s3-sse-kms-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6104631Z FAILED s3tests/functional/test_s3.py::test_copy_part_enc[sse-c-sse-s3-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6104896Z FAILED s3tests/functional/test_s3.py::test_copy_part_enc[sse-c-sse-c-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption-customer-algorithm'
+2026-11-19T03:38:08.6105120Z FAILED s3tests/functional/test_s3.py::test_copy_part_enc[sse-c-sse-kms-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6105344Z FAILED s3tests/functional/test_s3.py::test_copy_part_enc[sse-kms-sse-s3-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6105668Z FAILED s3tests/functional/test_s3.py::test_copy_part_enc[sse-kms-sse-c-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption-customer-algorithm'
+2026-11-19T03:38:08.6105930Z FAILED s3tests/functional/test_s3.py::test_copy_part_enc[sse-kms-sse-kms-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6106148Z FAILED s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-s3-STANDARD-STANDARD-1] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6106363Z FAILED s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-s3-STANDARD-STANDARD-1024] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6106623Z FAILED s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-s3-STANDARD-STANDARD-1048576] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6106847Z FAILED s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-s3-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6107133Z FAILED s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-c-STANDARD-STANDARD-1] - KeyError: 'x-amz-server-side-encryption-customer-algorithm'
+2026-11-19T03:38:08.6107390Z FAILED s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-c-STANDARD-STANDARD-1024] - KeyError: 'x-amz-server-side-encryption-customer-algorithm'
+2026-11-19T03:38:08.6107654Z FAILED s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-c-STANDARD-STANDARD-1048576] - KeyError: 'x-amz-server-side-encryption-customer-algorithm'
+2026-11-19T03:38:08.6107915Z FAILED s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-c-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption-customer-algorithm'
+2026-11-19T03:38:08.6108136Z FAILED s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-kms-STANDARD-STANDARD-1] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6108361Z FAILED s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-kms-STANDARD-STANDARD-1024] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6108584Z FAILED s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-kms-STANDARD-STANDARD-1048576] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6108810Z FAILED s3tests/functional/test_s3.py::test_copy_enc[unencrypted-sse-kms-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6109025Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-unencrypted-STANDARD-STANDARD-1] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6109242Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-unencrypted-STANDARD-STANDARD-1024] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6109462Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-unencrypted-STANDARD-STANDARD-1048576] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6109683Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-unencrypted-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6109887Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-s3-STANDARD-STANDARD-1] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6110091Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-s3-STANDARD-STANDARD-1024] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6110300Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-s3-STANDARD-STANDARD-1048576] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6110507Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-s3-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6110704Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-c-STANDARD-STANDARD-1] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6110911Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-c-STANDARD-STANDARD-1024] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6111149Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-c-STANDARD-STANDARD-1048576] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6111352Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-c-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6111584Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-kms-STANDARD-STANDARD-1] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6111793Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-kms-STANDARD-STANDARD-1024] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6112027Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-kms-STANDARD-STANDARD-1048576] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6112239Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-s3-sse-kms-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6112465Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-c-sse-s3-STANDARD-STANDARD-1] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6112665Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-c-sse-s3-STANDARD-STANDARD-1024] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6112872Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-c-sse-s3-STANDARD-STANDARD-1048576] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6113076Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-c-sse-s3-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6113308Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-c-sse-c-STANDARD-STANDARD-1] - KeyError: 'x-amz-server-side-encryption-customer-algorithm'
+2026-11-19T03:38:08.6113552Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-c-sse-c-STANDARD-STANDARD-1024] - KeyError: 'x-amz-server-side-encryption-customer-algorithm'
+2026-11-19T03:38:08.6113808Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-c-sse-c-STANDARD-STANDARD-1048576] - KeyError: 'x-amz-server-side-encryption-customer-algorithm'
+2026-11-19T03:38:08.6114199Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-c-sse-c-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption-customer-algorithm'
+2026-11-19T03:38:08.6114400Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-c-sse-kms-STANDARD-STANDARD-1] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6114607Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-c-sse-kms-STANDARD-STANDARD-1024] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6114817Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-c-sse-kms-STANDARD-STANDARD-1048576] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6115026Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-c-sse-kms-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6115232Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-kms-sse-s3-STANDARD-STANDARD-1] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6115441Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-kms-sse-s3-STANDARD-STANDARD-1024] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6115650Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-kms-sse-s3-STANDARD-STANDARD-1048576] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6115866Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-kms-sse-s3-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6116109Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-kms-sse-c-STANDARD-STANDARD-1] - KeyError: 'x-amz-server-side-encryption-customer-algorithm'
+2026-11-19T03:38:08.6116355Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-kms-sse-c-STANDARD-STANDARD-1024] - KeyError: 'x-amz-server-side-encryption-customer-algorithm'
+2026-11-19T03:38:08.6116651Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-kms-sse-c-STANDARD-STANDARD-1048576] - KeyError: 'x-amz-server-side-encryption-customer-algorithm'
+2026-11-19T03:38:08.6116903Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-kms-sse-c-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption-customer-algorithm'
+2026-11-19T03:38:08.6117148Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-kms-sse-kms-STANDARD-STANDARD-1] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6117362Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-kms-sse-kms-STANDARD-STANDARD-1024] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6117578Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-kms-sse-kms-STANDARD-STANDARD-1048576] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6117828Z FAILED s3tests/functional/test_s3.py::test_copy_enc[sse-kms-sse-kms-STANDARD-STANDARD-8388608] - KeyError: 'x-amz-server-side-encryption'
+2026-11-19T03:38:08.6117928Z 427 failed, 317 passed, 94 skipped, 4 warnings in 843.48s (0:14:03)
+
+2026-11-19T03:38:10.6281814Z =========================== short test summary info ============================
+2026-11-19T03:38:10.6282068Z FAILED s3tests/functional/test_headers.py::test_object_create_bad_contentlength_none - AssertionError: ClientError not raised
+2026-11-19T03:38:10.6282267Z FAILED s3tests/functional/test_headers.py::test_object_create_bad_authorization_empty - AssertionError: ClientError not raised
+2026-11-19T03:38:10.6282666Z FAILED s3tests/functional/test_headers.py::test_object_create_date_and_amz_date - botocore.exceptions.ClientError: An error occurred (AuthorizationHeaderMalformed) when calling the PutObject operation: Authentication failed
+2026-11-19T03:38:10.6283030Z FAILED s3tests/functional/test_headers.py::test_object_create_amz_date_and_no_date - botocore.exceptions.ClientError: An error occurred (AuthorizationHeaderMalformed) when calling the PutObject operation: Authentication failed
+2026-11-19T03:38:10.6283222Z FAILED s3tests/functional/test_headers.py::test_object_create_bad_authorization_none - AssertionError: ClientError not raised
+2026-11-19T03:38:10.6283613Z FAILED s3tests/functional/test_headers.py::test_object_acl_create_contentlength_none - botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the PutObjectAcl operation: The requested sub-resource is not implemented.
+2026-11-19T03:38:10.6283751Z FAILED s3tests/functional/test_headers.py::test_bucket_put_bad_canned_acl - assert 501 == 400
+2026-11-19T03:38:10.6283943Z FAILED s3tests/functional/test_headers.py::test_bucket_create_bad_authorization_empty - AssertionError: ClientError not raised
+2026-11-19T03:38:10.6284269Z FAILED s3tests/functional/test_headers.py::test_bucket_create_bad_authorization_none - AssertionError: ClientError not raised
+2026-11-19T03:38:10.6284526Z FAILED s3tests/functional/test_headers.py::test_object_create_bad_md5_invalid_garbage_aws2 - AssertionError: assert 'AuthorizationHeaderMalformed' == 'InvalidDigest'
+2026-11-19T03:38:10.6284578Z   
+2026-11-19T03:38:10.6284632Z   - InvalidDigest
+2026-11-19T03:38:10.6284694Z   + AuthorizationHeaderMalformed
+2026-11-19T03:38:10.6284963Z FAILED s3tests/functional/test_headers.py::test_object_create_bad_contentlength_mismatch_below_aws2 - AssertionError: assert 'AuthorizationHeaderMalformed' == 'BadDigest'
+2026-11-19T03:38:10.6285010Z   
+2026-11-19T03:38:10.6285059Z   - BadDigest
+2026-11-19T03:38:10.6285121Z   + AuthorizationHeaderMalformed
+2026-11-19T03:38:10.6285294Z FAILED s3tests/functional/test_headers.py::test_object_create_bad_authorization_incorrect_aws2 - assert 400 == 403
+2026-11-19T03:38:10.6285553Z FAILED s3tests/functional/test_headers.py::test_object_create_bad_authorization_invalid_aws2 - AssertionError: assert 'AuthorizationHeaderMalformed' == 'InvalidArgument'
+2026-11-19T03:38:10.6285600Z   
+2026-11-19T03:38:10.6285649Z   - InvalidArgument
+2026-11-19T03:38:10.6285710Z   + AuthorizationHeaderMalformed
+2026-11-19T03:38:10.6286073Z FAILED s3tests/functional/test_headers.py::test_object_create_bad_ua_empty_aws2 - botocore.exceptions.ClientError: An error occurred (AuthorizationHeaderMalformed) when calling the PutObject operation: Authentication failed
+2026-11-19T03:38:10.6286424Z FAILED s3tests/functional/test_headers.py::test_object_create_bad_ua_none_aws2 - botocore.exceptions.ClientError: An error occurred (AuthorizationHeaderMalformed) when calling the PutObject operation: Authentication failed
+2026-11-19T03:38:10.6286582Z FAILED s3tests/functional/test_headers.py::test_object_create_bad_date_invalid_aws2 - assert 400 == 403
+2026-11-19T03:38:10.6286780Z FAILED s3tests/functional/test_headers.py::test_object_create_bad_date_empty_aws2 - assert 400 == 403
+2026-11-19T03:38:10.6286965Z FAILED s3tests/functional/test_headers.py::test_object_create_bad_date_none_aws2 - assert 400 == 403
+2026-11-19T03:38:10.6287121Z FAILED s3tests/functional/test_headers.py::test_object_create_bad_date_before_today_aws2 - assert 400 == 403
+2026-11-19T03:38:10.6287280Z FAILED s3tests/functional/test_headers.py::test_object_create_bad_date_before_epoch_aws2 - assert 400 == 403
+2026-11-19T03:38:10.6287436Z FAILED s3tests/functional/test_headers.py::test_object_create_bad_date_after_end_aws2 - assert 400 == 403
+2026-11-19T03:38:10.6287733Z FAILED s3tests/functional/test_headers.py::test_bucket_create_bad_authorization_invalid_aws2 - AssertionError: assert 'AuthorizationHeaderMalformed' == 'InvalidArgument'
+2026-11-19T03:38:10.6287815Z   
+2026-11-19T03:38:10.6287864Z   - InvalidArgument
+2026-11-19T03:38:10.6287927Z   + AuthorizationHeaderMalformed
+2026-11-19T03:38:10.6288290Z FAILED s3tests/functional/test_headers.py::test_bucket_create_bad_ua_empty_aws2 - botocore.exceptions.ClientError: An error occurred (AuthorizationHeaderMalformed) when calling the CreateBucket operation: Authentication failed
+2026-11-19T03:38:10.6288652Z FAILED s3tests/functional/test_headers.py::test_bucket_create_bad_ua_none_aws2 - botocore.exceptions.ClientError: An error occurred (AuthorizationHeaderMalformed) when calling the CreateBucket operation: Authentication failed
+2026-11-19T03:38:10.6288802Z FAILED s3tests/functional/test_headers.py::test_bucket_create_bad_date_invalid_aws2 - assert 400 == 403
+2026-11-19T03:38:10.6288951Z FAILED s3tests/functional/test_headers.py::test_bucket_create_bad_date_empty_aws2 - assert 400 == 403
+2026-11-19T03:38:10.6289096Z FAILED s3tests/functional/test_headers.py::test_bucket_create_bad_date_none_aws2 - assert 400 == 403
+2026-11-19T03:38:10.6289251Z FAILED s3tests/functional/test_headers.py::test_bucket_create_bad_date_before_today_aws2 - assert 400 == 403
+2026-11-19T03:38:10.6289411Z FAILED s3tests/functional/test_headers.py::test_bucket_create_bad_date_after_today_aws2 - assert 400 == 403
+2026-11-19T03:38:10.6289567Z FAILED s3tests/functional/test_headers.py::test_bucket_create_bad_date_before_epoch_aws2 - assert 400 == 403
+2026-11-19T03:38:10.6289625Z 30 failed, 18 passed in 1.75s
+2026-11-19T03:38:10.6793810Z ##[group]Run python3 tests/s3tests/ratchet.py /tmp/s3tests-results.xml /tmp/s3tests-headers-results.xml tests/s3tests/passing.txt --report /tmp/s3tests-report.md
+2026-11-19T03:38:10.6794255Z [36;1mpython3 tests/s3tests/ratchet.py /tmp/s3tests-results.xml /tmp/s3tests-headers-results.xml tests/s3tests/passing.txt --report /tmp/s3tests-report.md[0m
+2026-11-19T03:38:10.6832088Z shell: /usr/bin/bash -e {0}
+2026-11-19T03:38:10.6832134Z env:
+2026-11-19T03:38:10.6832196Z   CARGO_HOME: /home/runner/.cargo
+2026-11-19T03:38:10.6832254Z   CARGO_INCREMENTAL: 0
+2026-11-19T03:38:10.6832308Z   CARGO_TERM_COLOR: always
+2026-11-19T03:38:10.6832362Z   CACHE_ON_FAILURE: false
+2026-11-19T03:38:10.6832411Z ##[endgroup]
+2026-11-19T03:38:10.7212583Z # ceph s3-tests against AwanFS
+2026-11-19T03:38:10.7212608Z 
+2026-11-19T03:38:10.7212728Z 886 tests: 335 passed, 457 failed, 94 skipped.
+2026-11-19T03:38:10.7212911Z Ratchet: 335 listed, 0 of them no longer pass, 0 new passes not listed.

@@ -1,0 +1,4 @@
+2026-11-19T03:38:08.5980939Z =========================== short test summary info ============================
+2026-11-19T03:38:08.5981288Z FAILED s3tests/functional/test_s3.py::test_gamma_fails - AssertionError: assert 500 == 200
+2026-11-19T03:38:08.5982224Z FAILED s3tests/functional/test_s3.py::test_delta_moved - assert 403 == 200
+2026-11-19T03:38:08.6117928Z 2 failed, 3 passed, 0 skipped in 1.23s
