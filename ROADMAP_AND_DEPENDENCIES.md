@@ -8,7 +8,7 @@ Plan of record since 2026-11-12. The GitHub milestones Phase 1-4 hold the issues
 |---|---|---|
 | 1. Correctness and security | Acknowledged data is kept and readable; only authorised clients get in; failures are errors | #35 auth, #38 recovery gaps, #29 durability modes, #37 volume rollover, #36 streaming bodies and size limit, #39 DELETE errors, #40 index full, #14 safe compaction; closing #12, #17, #18, #19, #22, #24 after #33, and #23 after #36 |
 | 2. Production operations | What an operator needs to run it | #41 logs and request IDs, #42 `/metrics`, #43 tracing, #44 health, #45 Grafana and alerts, #46 access log, #47 s3-tests, #48 fuzzing, #49 packaging, #30 TLS, #53 IAM, #123 S3 conformance (#111-#122) |
-| 3. Scale and efficiency | Grow past one disk's worth of metadata and data without losing speed | #50 format version, #26 tiered metadata segments and Bloom filter (replacing redb: decision 59, go after #207's measurement at 10M keys), #51 compression, #28 compaction throttle, #104 copy-on-write cloning, #31 versioning |
+| 3. Scale and efficiency | Grow past one disk's worth of metadata and data without losing speed | #50 format version, #26 tiered metadata segments and Bloom filter (replacing redb: decision 59, go after #207's measurement at 10M keys), #51 compression, #28 compaction throttle, #104 copy-on-write cloning, #31 versioning, #322 a partitioned store across cores and disks (decision 69) |
 | 4. Multi-node (future) | High availability across machines | #52 clustering design, #27 multi-drive erasure coding, #15 erasure and heartbeat code |
 
 Since 2026-11-14 the conformance work has its own milestones, "Conformance 0: foundations" to
@@ -20,7 +20,7 @@ take which issue is in [`AGENTS.md`](AGENTS.md).
 
 - **Phase 1:** done except #57 (multipart throughput on Linux CI).
 - **Phase 2:** done except #58 (benchmark methodology for public claims) and S3 conformance: tracker #123, with area issues #111-#122 (335 of 886 ceph s3-tests pass, 2026-11-19). Closed: #113, #114, #115, #116, #117, #140, #152, #160. Open: #111 (multipart), #112 (conditional), #118 (lifecycle), #119 (POST object), #120 (object lock), #121 (encryption), #122 (policies, ACLs, anonymous access). A second suite (Mint, #278) and a feature registry (#277) are next.
-- **Phase 3:** done (#13, #28, #31, #50, #51) except #26 (measured by #207: decision 59) and #104 (`unmeasured`, decision 32).
+- **Phase 3:** done (#13, #28, #31, #50, #51) except #26 (its last gate tests in PR #343), #104 (`unmeasured`, decision 32) and #322 (decision 69: step 1 waits on #326 and #316; checkpoint boot moved here from #26).
 - **Phase 4:** design approved ([`CLUSTERING.md`](CLUSTERING.md), decision 64); no code before #26 lands.
 
 ## Order inside and across phases
@@ -53,11 +53,15 @@ flowchart LR
         I50 --> I51["#51 compression"]
         I50 --> I31["#31 versioning"]
         I28["#28 CoW compaction"]
+        I26 --> I322["#322 partitioned store"]
+        I326["#326 client not the cap"] --> I262["#262 PUT core cap"] --> I322
+        I316["#316 index P99"] --> I322
     end
     subgraph P4["Phase 4"]
         I52["#52 clustering design"] --> I27["#27 multi-drive EC"]
         I52 --> I15["#15 erasure code"]
     end
+    I322 --> I52
     I35 --> I46
     I35 --> I47
     I35 --> I53
