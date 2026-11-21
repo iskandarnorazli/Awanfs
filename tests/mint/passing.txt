@@ -1,0 +1,3 @@
+# MinIO Mint tests that pass against AwanFS (#278). The mint check fails when one of these
+# stops passing. Add tests from the job's "Passing but not listed" list; remove one only
+# with a row in tests/mint/RATCHET_LOG.md and an owner decision.
