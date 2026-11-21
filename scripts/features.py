@@ -228,6 +228,38 @@ def _validate_feature_schema(feats: List[dict]) -> Tuple[List[str], Dict[str, di
     return problems, by_id
 
 
+def _check_done_means_passing(feats: List[dict], ceph_tests: "OrderedDict[str, List[str]]", passing: Set[str]) -> List[str]:
+    problems: List[str] = []
+    status_of = {f.get("id"): f.get("status") for f in feats if isinstance(f.get("id"), str)}
+    for feat in feats:
+        fid = feat.get("id")
+        if not isinstance(fid, str):
+            continue
+        waits = feat.get("waits_on", {})
+        if not isinstance(waits, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in waits.items()):
+            problems.append(f"{fid}: waits_on must be a table of ceph test name = feature id")
+            continue
+        own = [t for t, marks in ceph_tests.items() if matcher_hits(feat.get("ceph", []), t, marks)]
+        for test, other in sorted(waits.items()):
+            if test not in own:
+                problems.append(f"{fid}: waits_on names {test!r}, which is not one of its tests")
+            elif test in passing:
+                problems.append(f"{fid}: waits_on lists {test!r}, which passes now: remove it")
+            if other not in status_of:
+                problems.append(f"{fid}: waits_on {test!r} names an unknown feature {other!r}")
+            elif status_of[other] == "done":
+                problems.append(f"{fid}: waits_on {test!r} names {other!r}, which is done")
+        if feat.get("status") != "done":
+            continue
+        for test in own:
+            if test not in passing and test not in waits:
+                problems.append(
+                    f"{fid}: marked done, but its ceph test {test!r} is not in passing.txt: "
+                    "make it pass, list it under waits_on with the feature it needs, or mark the feature partial"
+                )
+    return problems
+
+
 def _check_suite_coverage(
     suite_label: str,
     feats: List[dict],
@@ -341,6 +373,12 @@ def check_registry(
 
     if ceph_tests or verify_ceph_literals:
         problems.extend(_check_suite_coverage("ceph", feats, "ceph", ceph_tests, verify_ceph_literals))
+
+    # A feature is done only when its ceph tests pass, or each one that does not names, under
+    # `waits_on`, the unfinished feature it needs (owner, 2026-11-21). Checked when the whole
+    # suite is known, against passing.txt.
+    if verify_ceph_literals and passing_path.is_file():
+        problems.extend(_check_done_means_passing(feats, ceph_tests, set(parse_passing_file(passing_path, default_prefix="test_s3::"))))
 
     # Build mint test map if mint logs or tests/mint/passing.txt exist.
     mint_tests: "OrderedDict[str, List[str]]" = OrderedDict()
