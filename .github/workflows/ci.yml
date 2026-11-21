@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, windows-latest ]
+        os: [ ubuntu-latest, ubuntu-24.04-arm, windows-latest ]
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -26,6 +26,8 @@ jobs:
           workspaces: server
       - name: Build and test the server
         run: cargo test --locked --no-fail-fast --manifest-path server/Cargo.toml
+      - name: Print CRC32C implementation path
+        run: cargo test --locked --manifest-path server/Cargo.toml --test streaming_digest_test test_crc32c_implementation_path -- --nocapture
       - name: Spill index at 1.2M keys, peak RSS at most 200 MB (#13, Linux)
         if: runner.os == 'Linux'
         timeout-minutes: 15
