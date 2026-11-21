@@ -33,11 +33,75 @@ impl InflightGuard {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
+
+    fn resize(&mut self, new_bytes: u64) {
+        if new_bytes > self.bytes {
+            self.work.inflight_add(new_bytes - self.bytes);
+        } else if new_bytes < self.bytes {
+            self.work.inflight_sub(self.bytes - new_bytes);
+        }
+        self.bytes = new_bytes;
+    }
 }
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
         self.work.inflight_sub(self.bytes);
+    }
+}
+
+/// Heap buffer whose allocated capacity is counted in `WorkCounters::inflight_bytes`
+/// until dropped.
+#[derive(Debug, Default)]
+pub struct InflightBuf {
+    buf: Vec<u8>,
+    _guard: Option<InflightGuard>,
+}
+
+impl InflightBuf {
+    pub fn with_capacity(work: &Arc<WorkCounters>, cap: usize) -> Self {
+        let buf = Vec::with_capacity(cap);
+        let guard = work.hold_inflight(buf.capacity() as u64);
+        Self {
+            buf,
+            _guard: Some(guard),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+
+    pub fn extend_from_slice(&mut self, data: &[u8]) {
+        debug_assert!(self._guard.is_some() || data.is_empty(), "cannot extend released InflightBuf");
+        let old_cap = self.buf.capacity();
+        self.buf.extend_from_slice(data);
+        let new_cap = self.buf.capacity();
+        if new_cap != old_cap {
+            if let Some(g) = &mut self._guard {
+                g.resize(new_cap as u64);
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for InflightBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf
     }
 }
 
@@ -198,5 +262,64 @@ mod tests {
         let peak = work.peak_inflight_bytes();
         assert!(peak >= 8 * 1024, "peak {peak} must be at least the largest single guard");
         assert!(peak <= (1..=8u64).sum::<u64>() * 1024, "peak {peak} cannot exceed sum of all guards");
+    }
+
+    #[test]
+    fn inflight_buf_tracks_channel_recycle_and_release() {
+        let work = Arc::new(WorkCounters::default());
+        let cap = 1 << 20;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<InflightBuf>(2);
+        let (recycle_tx, mut recycle_rx) = tokio::sync::mpsc::channel::<InflightBuf>(2);
+
+        recycle_tx.try_send(InflightBuf::with_capacity(&work, cap)).unwrap();
+        let mut cur = InflightBuf::with_capacity(&work, cap);
+        assert_eq!(work.inflight_bytes(), (2 * cap) as u64);
+
+        cur.extend_from_slice(&vec![7u8; cap]);
+        let next = recycle_rx.try_recv().unwrap_or_else(|_| InflightBuf::with_capacity(&work, cap));
+        tx.try_send(std::mem::replace(&mut cur, next)).unwrap();
+        assert_eq!(work.inflight_bytes(), (2 * cap) as u64);
+
+        cur.extend_from_slice(&vec![8u8; cap]);
+        let next = recycle_rx.try_recv().unwrap_or_else(|_| InflightBuf::with_capacity(&work, cap));
+        tx.try_send(std::mem::replace(&mut cur, next)).unwrap();
+        assert_eq!(work.inflight_bytes(), (3 * cap) as u64);
+
+        let mut popped = rx.try_recv().unwrap();
+        popped.clear();
+        recycle_tx.try_send(popped).unwrap();
+        assert_eq!(work.inflight_bytes(), (3 * cap) as u64);
+
+        let extra = InflightBuf::with_capacity(&work, cap);
+        assert_eq!(work.inflight_bytes(), (4 * cap) as u64);
+        assert_eq!(work.peak_inflight_bytes(), (4 * cap) as u64);
+        drop(extra);
+        assert_eq!(work.inflight_bytes(), (3 * cap) as u64);
+
+        cur = InflightBuf::default();
+        assert_eq!(cur.capacity(), 0);
+        assert_eq!(work.inflight_bytes(), (2 * cap) as u64);
+
+        drop(tx);
+        drop(rx);
+        drop(recycle_tx);
+        drop(recycle_rx);
+        assert_eq!(work.inflight_bytes(), 0);
+        assert_eq!(work.peak_inflight_bytes(), (4 * cap) as u64);
+    }
+
+    #[test]
+    fn inflight_buf_updates_guard_if_capacity_grows() {
+        let work = Arc::new(WorkCounters::default());
+        let mut buf = InflightBuf::with_capacity(&work, 4);
+        let initial_cap = buf.capacity() as u64;
+        assert_eq!(work.inflight_bytes(), initial_cap);
+        buf.extend_from_slice(&[1u8; 64]);
+        let grown_cap = buf.capacity() as u64;
+        assert!(grown_cap >= 64);
+        assert_eq!(work.inflight_bytes(), grown_cap);
+        assert_eq!(work.peak_inflight_bytes(), grown_cap);
+        drop(buf);
+        assert_eq!(work.inflight_bytes(), 0);
     }
 }
