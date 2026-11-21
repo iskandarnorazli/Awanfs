@@ -94,8 +94,15 @@ def fetch_issue_comments(issue: str) -> list:
 
 
 def fetch_evidence_comment(issue: str) -> str:
-    comments = fetch_issue_comments(issue)
-    gate_comments = [c.get("body") or "" for c in comments if "Gate" in (c.get("body") or "")]
+    """Return the latest comment starting with '## Gate evidence', or fall back to the latest containing 'Gate'."""
+    bodies = [c.get("body") or "" for c in fetch_issue_comments(issue)]
+    evidence = [
+        b for b in bodies
+        if (b.splitlines() or [""])[0].lstrip().lower().startswith("## gate evidence")
+    ]
+    if evidence:
+        return evidence[-1]
+    gate_comments = [b for b in bodies if "Gate" in b]
     return gate_comments[-1] if gate_comments else ""
 
 

@@ -455,6 +455,66 @@ class CheckGateCommentTest(unittest.TestCase):
         self.assertIn("test_object_delete_key_bucket_gone", out)
         self.assertIn("assert 403 == 404", out)
 
+    def test_fetch_evidence_comment_prefers_gate_evidence_over_later_review(self):
+        with open(os.path.join(FIXTURES_DIR, "issue_133_body.md"), encoding="utf-8") as fh:
+            body_133 = fh.read()
+        with open(os.path.join(FIXTURES_DIR, "issue_133_comment.md"), encoding="utf-8") as fh:
+            evidence_133 = fh.read()
+        review_comment = (
+            "## Reviewed and merged (Claude, audit 2026-11-20)\n\n"
+            "- **Gate:** all 5 lines verified.\n"
+            "Quoted heading on non-first line:\n"
+            "## Gate evidence should not match when not on line 1\n"
+        )
+        comments = [
+            {"body": "Early note mentioning Gate"},
+            {"body": evidence_133},
+            {"body": review_comment},
+        ]
+        with mock.patch.object(c, "fetch_issue_comments", return_value=comments):
+            selected = c.fetch_evidence_comment("133")
+        self.assertEqual(selected, evidence_133)
+
+        def fake_gh_api(endpoint, allow_escape=False):
+            if endpoint == "repos/{owner}/{repo}/issues/133":
+                return json.dumps({"body": body_133})
+            if endpoint == "repos/{owner}/{repo}/issues/133/comments":
+                return json.dumps(comments)
+            raise AssertionError(f"Unexpected endpoint: {endpoint}")
+
+        buf = io.StringIO()
+        with mock.patch.object(c, "_gh_api", side_effect=fake_gh_api):
+            with mock.patch.object(c, "_gh_api_paginated", side_effect=lambda ep: json.loads(fake_gh_api(ep))):
+                with redirect_stdout(buf):
+                    rc = c.main(["133"])
+        out = buf.getvalue()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.count("| yes |"), 5, out)
+
+        earlier = "## Gate evidence for #266 (PR #285)\n- old"
+        latest = "## Gate Evidence (PR #286)\n- latest"
+        with mock.patch.object(
+            c,
+            "fetch_issue_comments",
+            return_value=[{"body": earlier}, {"body": latest}, {"body": review_comment}],
+        ):
+            self.assertEqual(c.fetch_evidence_comment("266"), latest)
+
+    def test_fetch_evidence_comment_falls_back_to_latest_gate_comment(self):
+        first = "### Gate verification\n- first attempt\n"
+        second = "Gate:\n- `pytest`: passed\n"
+        no_gate = "Unrelated follow-up note without the keyword.\n"
+        comments = [
+            {"body": first},
+            {"body": second},
+            {"body": no_gate},
+        ]
+        with mock.patch.object(c, "fetch_issue_comments", return_value=comments):
+            self.assertEqual(c.fetch_evidence_comment("187"), second)
+
+        with mock.patch.object(c, "fetch_issue_comments", return_value=[{"body": no_gate}]):
+            self.assertEqual(c.fetch_evidence_comment("187"), "")
+
 
 if __name__ == "__main__":
     unittest.main()
