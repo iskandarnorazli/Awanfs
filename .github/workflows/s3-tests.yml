@@ -194,3 +194,109 @@ jobs:
               --title "s3-tests: refresh CONFORMANCE_MAP.md (run $GITHUB_RUN_ID)" \
               --body "$BODY"
           fi
+
+  s3tests-arm:
+    name: s3tests (ubuntu-24.04-arm)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Does this change need the suite?
+        id: changes
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # A pull request is checked out as its merge commit: HEAD^1 is the base.
+          files=$(git diff --name-only HEAD^1 HEAD)
+          printf '%s\n' "$files"
+          if printf '%s\n' "$files" | grep -q -E '^(server/src/|server/Cargo\.(toml|lock)$|tests/s3tests/|\.github/workflows/s3-tests\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "s3-tests skipped: this pull request changes no server code, s3-tests file or this workflow." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.changes.outputs.run == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.changes.outputs.run == 'true'
+        with:
+          workspaces: server
+      - name: Build
+        if: steps.changes.outputs.run == 'true'
+        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Start AwanFS
+        if: steps.changes.outputs.run == 'true'
+        run: bash tests/s3tests/start_server.sh
+      - name: Get s3-tests
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          S3TESTS_COMMIT=$(sed -n 's/^[[:space:]]*S3TESTS_COMMIT=\([0-9a-f]\{40\}\).*/\1/p' .github/workflows/s3-tests.yml)
+          test -n "$S3TESTS_COMMIT"
+          git init -q /tmp/s3-tests && git -C /tmp/s3-tests fetch -q --depth 1 https://github.com/ceph/s3-tests "$S3TESTS_COMMIT" && git -C /tmp/s3-tests checkout -q FETCH_HEAD
+          echo "s3-tests commit: $(git -C /tmp/s3-tests rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q -r /tmp/s3-tests/requirements.txt pytest-timeout
+      - name: Run
+        id: run
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          cd /tmp/s3-tests
+          S3TEST_CONF=$GITHUB_WORKSPACE/tests/s3tests/s3tests.conf /tmp/venv/bin/pytest s3tests/functional/test_s3.py \
+            -p no:cacheprovider -q --timeout=60 --junitxml=/tmp/s3tests-results.xml -o junit_family=xunit1 || true
+          test -s /tmp/s3tests-results.xml
+          S3TEST_CONF=$GITHUB_WORKSPACE/tests/s3tests/s3tests.conf /tmp/venv/bin/pytest s3tests/functional/test_headers.py \
+            -p no:cacheprovider -q --timeout=60 --junitxml=/tmp/s3tests-headers-results.xml -o junit_family=xunit1 || true
+          test -s /tmp/s3tests-headers-results.xml
+      - name: Ratchet
+        id: ratchet
+        if: steps.changes.outputs.run == 'true'
+        run: python3 tests/s3tests/ratchet.py /tmp/s3tests-results.xml /tmp/s3tests-headers-results.xml tests/s3tests/passing.txt --report /tmp/s3tests-report.md
+      - name: Conformance map (every test has an owner; CONFORMANCE_DESIGN.md)
+        id: map
+        if: always() && steps.changes.outputs.run == 'true'
+        run: |
+          python3 tests/s3tests/test_conformance_map.py
+          python3 tests/s3tests/test_ratchet.py
+          python3 tests/s3tests/test_nightly_map_pr.py
+          python3 tests/s3tests/conformance_map.py /tmp/s3-tests/s3tests/functional/test_s3.py /tmp/s3-tests/s3tests/functional/test_headers.py tests/s3tests/passing.txt \
+            --junit /tmp/s3tests-results.xml --junit /tmp/s3tests-headers-results.xml \
+            --suite-ref "ceph/s3-tests $(git -C /tmp/s3-tests rev-parse --short HEAD), run $GITHUB_RUN_ID" \
+            --report /tmp/CONFORMANCE_MAP.md
+      - name: Feature registry report
+        if: always() && steps.changes.outputs.run == 'true'
+        run: |
+          python3 scripts/test_features.py
+          python3 scripts/features.py check --ceph-suite /tmp/s3-tests/s3tests/functional/test_s3.py /tmp/s3-tests/s3tests/functional/test_headers.py
+          python3 scripts/features.py report \
+            --ceph-junit /tmp/s3tests-results.xml /tmp/s3tests-headers-results.xml \
+            --ceph-suite /tmp/s3-tests/s3tests/functional/test_s3.py /tmp/s3-tests/s3tests/functional/test_headers.py \
+            --run-id "$GITHUB_RUN_ID" \
+            --output /tmp/FEATURES.md
+      - name: Triage report
+        if: always() && steps.changes.outputs.run == 'true'
+        run: |
+          python3 tests/s3tests/test_triage.py
+          python3 tests/s3tests/triage.py /tmp/s3tests-results.xml /tmp/CONFORMANCE_MAP.md --out /tmp/TRIAGE.md
+      - name: Summary
+        if: always() && steps.changes.outputs.run == 'true'
+        run: |
+          [ -f /tmp/s3tests-report.md ] && cat /tmp/s3tests-report.md >> "$GITHUB_STEP_SUMMARY"
+          [ -f /tmp/CONFORMANCE_MAP.md ] && sed -n '1,/^## /p' /tmp/CONFORMANCE_MAP.md | sed '$d' | tee -a "$GITHUB_STEP_SUMMARY"
+          [ -f /tmp/FEATURES.md ] && cat /tmp/FEATURES.md >> "$GITHUB_STEP_SUMMARY"
+          [ -f /tmp/TRIAGE.md ] && cat /tmp/TRIAGE.md >> "$GITHUB_STEP_SUMMARY"
+          tail -20 /tmp/awanfs.log || true
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.changes.outputs.run == 'true'
+        with:
+          name: s3tests-results-arm
+          path: |
+            /tmp/s3tests-results.xml
+            /tmp/s3tests-headers-results.xml
+            /tmp/s3tests-report.md
+            /tmp/CONFORMANCE_MAP.md
+            /tmp/FEATURES.md
+            /tmp/TRIAGE.md

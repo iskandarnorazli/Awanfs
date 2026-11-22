@@ -663,7 +663,7 @@ def format_markdown_report(
         f"- **Client Affinity Pin:** {hw_info.get('affinity_client', 'Cores 4..7 (Mask 0xF0)')}",
         f"- **Live MinIO Binary Status:** {hw_info.get('minio_status', 'not measured')}",
         f"- **Live RustFS Binary Status:** {hw_info.get('rustfs_status', 'not measured')}",
-        "- **Durability per PUT:** `s3-server` runs with its default, group commit (#29): a 200 means the bytes are on stable storage, and concurrent PUTs share one sync. " + minio_durability_note() + " RustFS's sync behaviour is not verified here.",
+        "- **Durability per PUT:** `s3-server` runs with its default, group commit (#29): a 200 means the bytes are on stable storage, and concurrent PUTs share one sync. " + minio_durability_note() + " RustFS (1.0.5, release defaults) is durable on Linux (3.09 sync calls/PUT, measurements/2026-11-21-durability-probe.md; Windows sync count is not probed).",
     ]
     if runs > 1:
         lines.append(f"- **Rounds per Server:** {runs} (values are medians; Peak RSS shows median and min..max spread)")

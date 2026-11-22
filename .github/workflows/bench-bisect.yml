@@ -1,0 +1,116 @@
+name: Bisect get_64k ratio (experiment)
+
+# #335 (owner decision 2026-11-20, comments 7038095334 and 7038098585):
+# Builds s3-server at each candidate commit in a git worktree under $RUNNER_TEMP and runs
+# ratio_check.py's get_64k workload (64 KiB GET, 128 objects, 16 workers) for 7 rounds in
+# rotating order against MinIO on one ubuntu-latest runner.
+# Triggers only on push to issue/335-* (for pre-merge measurement) and workflow_dispatch.
+
+on:
+  push:
+    branches:
+      - "issue/335-*"
+    paths:
+      - "benchmarks/bisect_ratio.py"
+      - "benchmarks/test_bisect_ratio.py"
+      - ".github/workflows/bench-bisect.yml"
+  workflow_dispatch:
+    inputs:
+      commits:
+        description: "Space- or comma-separated commits to build and measure"
+        default: "ffed2a9 e8290ef d73bbd2^ d73bbd2 528524a 2abdb39"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+
+jobs:
+  bisect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      - uses: actions/cache@v4
+        id: minio-cache
+        with:
+          path: .tmp/minio
+          key: minio-${{ env.MINIO_RELEASE }}-mc-v1-${{ runner.os }}
+      - uses: actions/setup-go@v5
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        with:
+          go-version: stable
+          cache: false
+      - name: Fetch MinIO and mc
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .tmp/minio
+          from_image() {
+            docker pull "$1" >/dev/null 2>&1 || return 1
+            id=$(docker create "$1") && docker cp "$id:$2" "$3" && docker rm "$id" >/dev/null
+          }
+          if ! from_image "quay.io/minio/minio:${MINIO_RELEASE}" /usr/bin/minio .tmp/minio/minio; then
+            git clone -q --depth 1 --branch "${MINIO_RELEASE}" https://github.com/minio/minio /tmp/minio-src
+            (cd /tmp/minio-src && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/minio" .)
+          fi
+          if ! from_image quay.io/minio/mc:latest /usr/bin/mc .tmp/minio/mc; then
+            git clone -q --depth 1 https://github.com/minio/mc /tmp/mc-src
+            (cd /tmp/mc-src && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/mc" .)
+          fi
+          chmod +x .tmp/minio/minio .tmp/minio/mc
+      - name: MinIO versions
+        run: .tmp/minio/minio --version && .tmp/minio/mc --version
+
+      - name: Install psutil
+        run: python -m pip install --disable-pip-version-check psutil==6.1.1
+
+      - name: Self-tests
+        run: python benchmarks/test_bisect_ratio.py && python benchmarks/test_ratio_check.py
+
+      - name: Run get_64k ratio bisect
+        id: bisect
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+          COMMITS: ${{ inputs.commits || 'ffed2a9 e8290ef d73bbd2^ d73bbd2 528524a 2abdb39' }}
+        run: |
+          set -euo pipefail
+          out_dir="$RUNNER_TEMP/bisect_ratio"
+          mkdir -p "$out_dir"
+          python -u benchmarks/bisect_ratio.py \
+            --commits "$COMMITS" \
+            --minio-bin .tmp/minio/minio \
+            --mc-bin .tmp/minio/mc \
+            --rounds 7 \
+            --duration 3 \
+            --work-dir "$out_dir/work" \
+            --results "$out_dir/results.json" \
+            --output $RUNNER_TEMP/bisect_ratio/report.md
+
+      - name: Report to job summary
+        if: always()
+        run: |
+          report="$RUNNER_TEMP/bisect_ratio/report.md"
+          if [ -s "$report" ]; then
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "This run produced no bisect report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bisect-ratio-report
+          path: |
+            ${{ runner.temp }}/bisect_ratio/report.md
+            ${{ runner.temp }}/bisect_ratio/results.json
+          if-no-files-found: warn

@@ -11,12 +11,15 @@ import ctypes
 import hashlib
 import hmac
 import http.client
+import http.server
+import json
 import math
 import os
 import platform
 import random
 import re
 import secrets
+import select
 import shutil
 import socket
 import statistics
@@ -131,10 +134,39 @@ class PointResult:
     mib_per_sec: Optional[float] = None
     thread_cpu: Optional[Tuple[ThreadCpuSample, ...]] = None
     wall_sec: Optional[float] = None
+    client_cpu_pct: Optional[float] = None
+    client_cores_given: Optional[int] = None
+    client_procs: Optional[int] = None
+    concurrency: Optional[int] = None
 
     @property
     def measured(self) -> bool:
         return self.ops_per_sec is not None
+
+
+@dataclass(frozen=True)
+class WorkerResult:
+    worker_index: int
+    concurrency: int
+    ops: int
+    total_bytes: int
+    latencies_ms: Tuple[float, ...]
+    errors: int = 0
+    error_notes: Tuple[Tuple[str, int], ...] = ()
+    stuck: int = 0
+    client_user_s: float = 0.0
+    client_sys_s: float = 0.0
+    wall_sec: float = 0.0
+
+
+@dataclass(frozen=True)
+class CeilingProbeRow:
+    workload: str
+    size_bytes: int
+    concurrency: int
+    client_procs: int
+    client_cores: int
+    result: PointResult
 
 
 @dataclass(frozen=True)
@@ -250,9 +282,9 @@ def server_durability_rows(os_name: Optional[str] = None) -> List[Tuple[str, str
         minio_row,
         (
             "RustFS",
-            "RUSTFS_DURABILITY_MODE=strict",
+            "release defaults (durable)",
             "Yes",
-            "Syncs data, xl.meta, and directories before 200 OK.",
+            "Measured on Linux (measurements/2026-11-21-durability-probe.md, #334): 3.09 sync calls/PUT (618 syncs / 200 PUTs).",
         ),
         (
             "Garage",
@@ -497,6 +529,8 @@ class PatternRequestSource:
         prefill_count: int,
         large_obj_size: int,
         rand_write_key_space: Optional[int] = None,
+        step_offset: int = 0,
+        step_stride: int = 1,
     ):
         self.pattern = pattern
         self.size = size
@@ -504,13 +538,14 @@ class PatternRequestSource:
         self.prefill_count = prefill_count
         self.large_obj_size = large_obj_size
         self.rand_write_key_space = rand_write_key_space
-        self._idx = 0
+        self._idx = int(step_offset)
+        self._stride = max(1, int(step_stride))
         self._lock = threading.Lock()
 
     def next_request(self) -> RequestSpec:
         with self._lock:
             idx = self._idx
-            self._idx += 1
+            self._idx += self._stride
             return build_request_spec(
                 pattern=self.pattern,
                 size=self.size,
@@ -617,6 +652,42 @@ def client_cores_for(n_cores: int, total_cores: int) -> Tuple[List[int], bool]:
     if total > n_cores:
         return list(range(n_cores, total)), False
     return list(range(total)), True
+
+
+def split_concurrency(concurrency: int, client_procs: int) -> List[int]:
+    """Splits `concurrency` evenly across `min(concurrency, client_procs)` active processes."""
+    if concurrency < 1:
+        raise ValueError(f"concurrency must be >= 1, got {concurrency}")
+    if client_procs < 1:
+        raise ValueError(f"client_procs must be >= 1, got {client_procs}")
+    active = min(concurrency, client_procs)
+    base, rem = divmod(concurrency, active)
+    return [base + (1 if i < rem else 0) for i in range(active)]
+
+
+def client_proc_cores(proc_idx: int, active_procs: int, cli_cores: Sequence[int]) -> List[int]:
+    """Assigns core affinity slice within `cli_cores` for client process `proc_idx`."""
+    cores = [int(c) for c in cli_cores]
+    if not cores or active_procs <= 1:
+        return cores
+    if len(cores) >= active_procs:
+        base, rem = divmod(len(cores), active_procs)
+        start = proc_idx * base + min(proc_idx, rem)
+        end = start + base + (1 if proc_idx < rem else 0)
+        return cores[start:end]
+    return cores
+
+
+def pinning_command_cores(
+    argv: Sequence[str],
+    cores: Sequence[int],
+    platform_name: str = sys.platform,
+) -> List[str]:
+    """Wraps `argv` with `taskset -c` for `cores` on Linux; leaves argv untouched on Windows."""
+    core_list = [int(c) for c in cores]
+    if platform_name.startswith("linux") and core_list:
+        return ["taskset", "-c", ",".join(str(c) for c in core_list), *argv]
+    return list(argv)
 
 
 def should_auto_profile_put(total_cores: int, cores: Sequence[int]) -> bool:
@@ -900,6 +971,17 @@ def process_cpu_times_total(pid: int) -> Tuple[float, float]:
         return 0.0, 0.0
 
 
+def sum_processes_cpu_times(pids: Sequence[int]) -> Tuple[float, float]:
+    """Sums `(user_s, system_s)` across distinct process IDs."""
+    total_user = 0.0
+    total_sys = 0.0
+    for pid in dict.fromkeys(int(p) for p in pids if p):
+        u, s = process_cpu_times_total(pid)
+        total_user += u
+        total_sys += s
+    return total_user, total_sys
+
+
 def cpu_percent(before: Tuple[float, float], after: Tuple[float, float], wall_sec: float) -> Optional[float]:
     """Server CPU % over `wall_sec`, where 100.0% = 1 full core busy."""
     if wall_sec <= 0:
@@ -925,7 +1007,16 @@ def aggregate_runs(run_points: Sequence[PointResult]) -> PointResult:
     if not measured:
         reason = next((p.reason for p in run_points if p.reason), "measurement failed")
         shares = any(p.shares_cores for p in run_points)
-        return PointResult(reason=reason, shares_cores=shares)
+        cli_cores_vals = [p.client_cores_given for p in run_points if p.client_cores_given is not None]
+        cli_procs_vals = [p.client_procs for p in run_points if p.client_procs is not None]
+        conc_vals = [p.concurrency for p in run_points if p.concurrency is not None]
+        return PointResult(
+            reason=reason,
+            shares_cores=shares,
+            client_cores_given=cli_cores_vals[0] if cli_cores_vals else None,
+            client_procs=cli_procs_vals[0] if cli_procs_vals else None,
+            concurrency=conc_vals[0] if conc_vals else None,
+        )
 
     ops_med = statistics.median(p.ops_per_sec for p in measured if p.ops_per_sec is not None)
     mib_vals = [p.mib_per_sec for p in measured if p.mib_per_sec is not None]
@@ -936,6 +1027,11 @@ def aggregate_runs(run_points: Sequence[PointResult]) -> PointResult:
     cpu_med = statistics.median(cpu_vals) if cpu_vals else None
     eff_vals = [p.ops_per_busy_core for p in measured if p.ops_per_busy_core is not None]
     eff_med = statistics.median(eff_vals) if eff_vals else ops_per_busy_core(ops_med, cpu_med)
+    cli_cpu_vals = [p.client_cpu_pct for p in measured if p.client_cpu_pct is not None]
+    cli_cpu_med = statistics.median(cli_cpu_vals) if cli_cpu_vals else None
+    cli_cores_vals = [p.client_cores_given for p in measured if p.client_cores_given is not None]
+    cli_procs_vals = [p.client_procs for p in measured if p.client_procs is not None]
+    conc_vals = [p.concurrency for p in measured if p.concurrency is not None]
 
     thread_candidates = [p for p in measured if p.thread_cpu]
     rep = min(
@@ -955,6 +1051,101 @@ def aggregate_runs(run_points: Sequence[PointResult]) -> PointResult:
         shares_cores=any(p.shares_cores for p in measured),
         thread_cpu=rep.thread_cpu if rep is not None else None,
         wall_sec=wall_rep,
+        client_cpu_pct=cli_cpu_med,
+        client_cores_given=cli_cores_vals[0] if cli_cores_vals else None,
+        client_procs=cli_procs_vals[0] if cli_procs_vals else None,
+        concurrency=conc_vals[0] if conc_vals else None,
+    )
+
+
+def aggregate_worker_results(
+    worker_results: Sequence[WorkerResult],
+    wall_sec: float,
+    server_cpu_before: Optional[Tuple[float, float]] = None,
+    server_cpu_after: Optional[Tuple[float, float]] = None,
+    client_cpu_before: Optional[Tuple[float, float]] = None,
+    client_cpu_after: Optional[Tuple[float, float]] = None,
+    shares_cores: bool = False,
+    client_cores_given: Optional[int] = None,
+    client_procs: Optional[int] = None,
+    concurrency: Optional[int] = None,
+    thread_cpu: Optional[Tuple[ThreadCpuSample, ...]] = None,
+) -> PointResult:
+    """Combines per-process `WorkerResult` records into one `PointResult`."""
+    total_ops = sum(w.ops for w in worker_results)
+    total_bytes = sum(w.total_bytes for w in worker_results)
+    total_errors = sum(w.errors for w in worker_results)
+    total_stuck = sum(w.stuck for w in worker_results)
+    merged_errors: Dict[str, int] = {}
+    for w in worker_results:
+        for msg, cnt in w.error_notes:
+            merged_errors[msg] = merged_errors.get(msg, 0) + cnt
+
+    procs_count = client_procs if client_procs is not None else len(worker_results)
+    total_conc = concurrency if concurrency is not None else sum(w.concurrency for w in worker_results)
+
+    if total_stuck > 0 or total_errors > 0 or total_ops == 0 or wall_sec <= 0:
+        reasons = []
+        if total_errors > 0:
+            summary = ", ".join(f"{k} x{v}" for k, v in sorted(merged_errors.items()))
+            reasons.append(f"{total_errors} failed ({summary})")
+        if total_stuck > 0:
+            reasons.append(f"{total_stuck} stuck workers")
+        if total_ops == 0 and not reasons:
+            reasons.append("no requests completed")
+        return PointResult(
+            reason="; ".join(reasons),
+            shares_cores=shares_cores,
+            client_cores_given=client_cores_given,
+            client_procs=procs_count,
+            concurrency=total_conc,
+        )
+
+    all_lats: List[float] = []
+    for w in worker_results:
+        all_lats.extend(w.latencies_ms)
+    if not all_lats:
+        return PointResult(
+            reason="no latency samples recorded",
+            shares_cores=shares_cores,
+            client_cores_given=client_cores_given,
+            client_procs=procs_count,
+            concurrency=total_conc,
+        )
+
+    ops_per_sec = total_ops / wall_sec
+    mib_per_sec = (total_bytes / float(MIB)) / wall_sec
+    p50, _p90, p99, _p999 = rwb.calculate_percentiles(all_lats)
+    srv_pct = (
+        cpu_percent(server_cpu_before, server_cpu_after, wall_sec)
+        if server_cpu_before is not None and server_cpu_after is not None
+        else None
+    )
+    eff = ops_per_busy_core(ops_per_sec, srv_pct)
+
+    worker_cli_s = sum(max(0.0, w.client_user_s + w.client_sys_s) for w in worker_results)
+    parent_cli_pct = (
+        cpu_percent(client_cpu_before, client_cpu_after, wall_sec)
+        if client_cpu_before is not None and client_cpu_after is not None
+        else None
+    )
+    worker_cli_pct = (worker_cli_s / wall_sec) * 100.0
+    cli_pct = parent_cli_pct if (parent_cli_pct is not None and parent_cli_pct > 0.0) else worker_cli_pct
+
+    return PointResult(
+        ops_per_sec=ops_per_sec,
+        mib_per_sec=mib_per_sec,
+        p50_ms=p50,
+        p99_ms=p99,
+        cpu_pct=srv_pct,
+        ops_per_busy_core=eff,
+        shares_cores=shares_cores,
+        thread_cpu=thread_cpu,
+        wall_sec=wall_sec,
+        client_cpu_pct=cli_pct,
+        client_cores_given=client_cores_given,
+        client_procs=procs_count,
+        concurrency=total_conc,
     )
 
 
@@ -1133,6 +1324,7 @@ def _start_rustfs(rustfs_bin: Optional[str], mc_bin: Optional[str], n_cores: int
     port = rwb.get_free_port()
     log_path = os.path.join(data_root, f"scaling_rustfs_{port}.log")
     env = dict(os.environ, RUSTFS_ACCESS_KEY="rustfsadmin", RUSTFS_SECRET_KEY="rustfsadmin")
+    env.pop("RUSTFS_DURABILITY_MODE", None)
     proc = _spawn_pinned(
         [rustfs_bin, "server", "--address", f"127.0.0.1:{port}", "--access-key", "rustfsadmin", "--secret-key", "rustfsadmin", data],
         n_cores,
@@ -1372,75 +1564,155 @@ def _make_headers(
     return signer.sign_headers(method, path, host_header, base_headers)
 
 
-def _run_signed_workload_phase(
+def _warmup_pool_objects(
     host: str,
     port: int,
     bucket: str,
     size: int,
     concurrency: int,
-    duration_sec: float,
-    mode: str,
-    server_pid: int,
-    shares_cores: bool,
-    auth: S3Auth,
-) -> PointResult:
-    """Equivalent to `rwb.run_workload_phase` for servers requiring SigV4 requests."""
-    signer = SigV4Signer(auth)
+    auth: Optional[S3Auth] = None,
+) -> Optional[str]:
+    """Uploads `concurrency * pool_keys` warm-up objects before timed GET phases."""
+    signer = SigV4Signer(auth) if auth is not None else None
     host_hdr = f"{host}:{port}"
     pool_keys_per_worker = 4 if size >= MIB else 8
     payload = deterministic_bytes(size, DEFAULT_SEED)
-    if mode == "get":
-        conn = http.client.HTTPConnection(host, port, timeout=10.0)
+    conn = http.client.HTTPConnection(host, port, timeout=15.0)
+    base_headers = {"Content-Length": str(size), "Connection": "keep-alive"}
+    try:
+        for w in range(concurrency):
+            for k in range(pool_keys_per_worker):
+                path = f"/{bucket}/worker_{w}_obj_{k}.dat"
+                hdrs = _make_headers(signer, "PUT", path, host_hdr, base_headers)
+                conn.request("PUT", path, body=payload, headers=hdrs)
+                resp = conn.getresponse()
+                resp.read()
+                if resp.status != 200:
+                    return f"warm-up PUT HTTP {resp.status}"
+        return None
+    except Exception as e:
+        return f"warm-up failed: {e}"
+    finally:
         try:
-            for w in range(concurrency):
-                for k in range(pool_keys_per_worker):
-                    path = f"/{bucket}/worker_{w}_obj_{k}.dat"
-                    hdrs = signer.sign_headers("PUT", path, host_hdr, {"Content-Length": str(size), "Connection": "keep-alive"})
-                    conn.request("PUT", path, body=payload, headers=hdrs)
-                    resp = conn.getresponse()
-                    resp.read()
-                    if resp.status != 200:
-                        return PointResult(reason=f"warm-up PUT HTTP {resp.status}", shares_cores=shares_cores)
-        except Exception as e:
-            return PointResult(reason=f"warm-up failed: {e}", shares_cores=shares_cores)
-        finally:
             conn.close()
+        except Exception:
+            pass
 
+
+def _run_http_threads(
+    host: str,
+    port: int,
+    concurrency: int,
+    duration_sec: float,
+    size: int,
+    request_fn: Callable[[int, int], RequestSpec],
+    payload: bytes = b"",
+    bucket: Optional[str] = BUCKET,
+    auth: Optional[S3Auth] = None,
+    validate_get_size: bool = True,
+    worker_index: int = 0,
+    ready_cb: Optional[Callable[[], None]] = None,
+    label: str = "phase",
+) -> WorkerResult:
+    """Runs `concurrency` keep-alive HTTP worker threads for `duration_sec`."""
+    signer = SigV4Signer(auth) if auth is not None else None
+    host_hdr = f"{host}:{port}"
     stop_event = threading.Event()
     latencies: List[float] = []
     lat_lock = threading.Lock()
+    total_bytes = 0
     errors = 0
     error_notes: Dict[str, int] = {}
     metrics_lock = threading.Lock()
+    ready_lock = threading.Lock()
+    threads_ready = 0
+    all_ready = threading.Event()
+    start_gate = threading.Event()
 
-    def worker(wid: int):
-        nonlocal errors
+    def thread_worker(local_idx: int) -> None:
+        nonlocal total_bytes, errors, threads_ready
         local_lats: List[float] = []
+        local_bytes = 0
         local_errs: Dict[str, int] = {}
-        conn = http.client.HTTPConnection(host, port, timeout=15.0)
+        put_headers = {"Content-Length": str(size), "Connection": "keep-alive"}
+        get_headers = {"Connection": "keep-alive"}
         req_count = 0
+
+        with ready_lock:
+            threads_ready += 1
+            if threads_ready >= concurrency:
+                all_ready.set()
+        start_gate.wait()
+        if stop_event.is_set():
+            return
+
+        conn = http.client.HTTPConnection(host, port, timeout=15.0)
         while not stop_event.is_set():
-            key = f"worker_{wid}_obj_{req_count % pool_keys_per_worker}.dat"
+            spec = request_fn(local_idx, req_count)
             req_count += 1
-            path = f"/{bucket}/{key}"
+            if bucket:
+                path = f"/{bucket}/{spec.key.lstrip('/')}"
+            else:
+                path = spec.key if spec.key.startswith("/") else f"/{spec.key}"
             t0 = time.perf_counter()
             try:
-                if mode == "put":
-                    hdrs = signer.sign_headers("PUT", path, host_hdr, {"Content-Length": str(size), "Connection": "keep-alive"})
-                    conn.request("PUT", path, body=payload, headers=hdrs)
+                if spec.method == "PUT":
+                    req_hdrs = _make_headers(signer, "PUT", path, host_hdr, put_headers)
+                    conn.request("PUT", path, body=payload, headers=req_hdrs)
                     resp = conn.getresponse()
                     resp.read()
+                    ok = resp.status == 200
+                    if ok:
+                        local_bytes += size
+                    else:
+                        msg = f"HTTP {resp.status}"
+                        local_errs[msg] = local_errs.get(msg, 0) + 1
+                elif spec.range_start is not None and spec.range_end is not None:
+                    req_hdrs = _make_headers(
+                        signer,
+                        "GET",
+                        path,
+                        host_hdr,
+                        {"Connection": "keep-alive", "Range": f"bytes={spec.range_start}-{spec.range_end}"},
+                    )
+                    conn.request("GET", path, headers=req_hdrs)
+                    resp = conn.getresponse()
+                    data = resp.read()
+                    want_len = spec.range_end - spec.range_start + 1
+                    if resp.status == 206 and len(data) == want_len:
+                        ok = True
+                        local_bytes += len(data)
+                    elif resp.status == 200:
+                        ok = False
+                        msg = "range GET unsupported (HTTP 200)"
+                        local_errs[msg] = local_errs.get(msg, 0) + 1
+                    elif resp.status == 206:
+                        ok = False
+                        msg = f"range GET short read ({len(data)}/{want_len})"
+                        local_errs[msg] = local_errs.get(msg, 0) + 1
+                    else:
+                        ok = False
+                        msg = f"HTTP {resp.status}"
+                        local_errs[msg] = local_errs.get(msg, 0) + 1
                 else:
-                    hdrs = signer.sign_headers("GET", path, host_hdr, {"Connection": "keep-alive"})
-                    conn.request("GET", path, headers=hdrs)
+                    req_hdrs = _make_headers(signer, "GET", path, host_hdr, get_headers)
+                    conn.request("GET", path, headers=req_hdrs)
                     resp = conn.getresponse()
-                    resp.read()
+                    data = resp.read()
+                    if resp.status == 200 and (not validate_get_size or len(data) == size):
+                        ok = True
+                        local_bytes += len(data)
+                    elif resp.status == 200:
+                        ok = False
+                        msg = f"GET size mismatch ({len(data)}/{size})"
+                        local_errs[msg] = local_errs.get(msg, 0) + 1
+                    else:
+                        ok = False
+                        msg = f"HTTP {resp.status}"
+                        local_errs[msg] = local_errs.get(msg, 0) + 1
                 t1 = time.perf_counter()
-                if resp.status == 200:
+                if ok:
                     local_lats.append((t1 - t0) * 1000.0)
-                else:
-                    msg = f"HTTP {resp.status}"
-                    local_errs[msg] = local_errs.get(msg, 0) + 1
             except Exception as e:
                 msg = type(e).__name__
                 local_errs[msg] = local_errs.get(msg, 0) + 1
@@ -1449,72 +1721,552 @@ def _run_signed_workload_phase(
                 except Exception:
                     pass
                 conn = http.client.HTTPConnection(host, port, timeout=15.0)
+
         try:
             conn.close()
         except Exception:
             pass
+
         with lat_lock:
             latencies.extend(local_lats)
         with metrics_lock:
+            total_bytes += local_bytes
             for m, cnt in local_errs.items():
                 errors += cnt
                 error_notes[m] = error_notes.get(m, 0) + cnt
 
-    threads = [threading.Thread(target=worker, args=(w,), daemon=True) for w in range(concurrency)]
-    cpu_0 = process_cpu_times_total(server_pid)
-    t_start = time.perf_counter()
+    threads = [threading.Thread(target=thread_worker, args=(i,), daemon=True) for i in range(concurrency)]
+    if concurrency <= 0:
+        all_ready.set()
     for t in threads:
         t.start()
-    time.sleep(duration_sec)
-    stop_event.set()
-    stuck = rwb.join_all(threads, f"{mode} {size}B c={concurrency}", timeout_sec=max(20.0, duration_sec * 10.0))
-    t_total = time.perf_counter() - t_start
-    cpu_1 = process_cpu_times_total(server_pid)
-    if stuck or errors > 0 or not latencies or t_total <= 0:
-        reasons = []
-        if errors > 0:
-            summary = ", ".join(f"{k} x{v}" for k, v in sorted(error_notes.items()))
-            reasons.append(f"{errors} failed ({summary})")
-        if stuck:
-            reasons.append(f"{stuck} stuck workers")
-        if not latencies and not reasons:
-            reasons.append("no requests completed")
-        return PointResult(reason="; ".join(reasons), shares_cores=shares_cores)
+    all_ready.wait(timeout=30.0)
+    try:
+        if ready_cb is not None:
+            ready_cb()
+        cli_0 = process_cpu_times_total(os.getpid())
+        t_start = time.perf_counter()
+        start_gate.set()
+        time.sleep(duration_sec)
+        stop_event.set()
+        stuck = rwb.join_all(threads, label, timeout_sec=max(20.0, duration_sec * 10.0))
+        t_total = time.perf_counter() - t_start
+        cli_1 = process_cpu_times_total(os.getpid())
+    finally:
+        stop_event.set()
+        start_gate.set()
 
-    ops_per_sec = len(latencies) / t_total
-    p50, _p90, p99, _p999 = rwb.calculate_percentiles(latencies)
-    pct = cpu_percent(cpu_0, cpu_1, t_total)
-    eff = ops_per_busy_core(ops_per_sec, pct)
-    return PointResult(
-        ops_per_sec=ops_per_sec,
-        p50_ms=p50,
-        p99_ms=p99,
-        cpu_pct=pct,
-        ops_per_busy_core=eff,
-        shares_cores=shares_cores,
+    return WorkerResult(
+        worker_index=worker_index,
+        concurrency=concurrency,
+        ops=len(latencies),
+        total_bytes=total_bytes,
+        latencies_ms=tuple(latencies),
+        errors=errors,
+        error_notes=tuple(sorted(error_notes.items())),
+        stuck=stuck,
+        client_user_s=max(0.0, cli_1[0] - cli_0[0]),
+        client_sys_s=max(0.0, cli_1[1] - cli_0[1]),
+        wall_sec=t_total,
     )
+
+
+def _recv_line(conn: socket.socket, timeout: float = 30.0) -> str:
+    conn.settimeout(timeout)
+    chunks: List[bytes] = []
+    while True:
+        data = conn.recv(1024)
+        if not data:
+            break
+        chunks.append(data)
+        if b"\n" in data:
+            break
+    return b"".join(chunks).decode("utf-8", errors="replace").strip()
+
+
+def _build_worker_request_fn(spec: dict) -> Tuple[Callable[[int, int], RequestSpec], bytes]:
+    kind = spec["kind"]
+    size = int(spec["size"])
+    if kind == "pattern":
+        source = PatternRequestSource(
+            pattern=spec["pattern"],
+            size=size,
+            seed=int(spec["seed"]),
+            prefill_count=int(spec["prefill_count"]),
+            large_obj_size=int(spec["large_obj_size"]),
+            step_offset=int(spec.get("step_offset", 0)),
+            step_stride=int(spec.get("step_stride", 1)),
+        )
+        payload = deterministic_bytes(size, int(spec["payload_seed"])) if spec["pattern"] in ("seq-write", "rand-write") else b""
+        return (lambda _wid, _rc: source.next_request()), payload
+
+    mode = spec["mode"]
+    method = "PUT" if mode == "put" else "GET"
+    payload = deterministic_bytes(size, int(spec.get("payload_seed", DEFAULT_SEED))) if mode == "put" else b""
+    req_path = spec.get("request_path")
+    if req_path:
+        return (lambda _wid, _rc, m=method, p=req_path: RequestSpec(m, p)), payload
+
+    wid_offset = int(spec.get("worker_id_offset", 0))
+    pool_keys = 4 if size >= MIB else 8
+    return (
+        lambda local_w, rc, m=method, off=wid_offset, pk=pool_keys: RequestSpec(m, f"worker_{off + local_w}_obj_{rc % pk}.dat")
+    ), payload
+
+
+def _client_worker_main(spec_path: str) -> int:
+    with open(spec_path, "r", encoding="utf-8") as fh:
+        spec = json.load(fh)
+
+    cores = spec.get("cores") or []
+    if cores:
+        pin_process(os.getpid(), cores)
+
+    auth_dict = spec.get("auth")
+    auth = S3Auth(**auth_dict) if auth_dict else None
+    request_fn, payload = _build_worker_request_fn(spec)
+
+    ctrl = socket.create_connection(("127.0.0.1", int(spec["ctrl_port"])), timeout=30.0)
+    try:
+        def wait_for_go() -> None:
+            ctrl.sendall(f"READY {spec['worker_index']}\n".encode("utf-8"))
+            cmd = _recv_line(ctrl, timeout=60.0)
+            if cmd != "GO":
+                raise RuntimeError(f"worker {spec['worker_index']} expected GO, got {cmd!r}")
+
+        res = _run_http_threads(
+            host=spec["host"],
+            port=int(spec["port"]),
+            concurrency=int(spec["concurrency"]),
+            duration_sec=float(spec["duration_sec"]),
+            size=int(spec["size"]),
+            request_fn=request_fn,
+            payload=payload,
+            bucket=spec.get("bucket"),
+            auth=auth,
+            validate_get_size=bool(spec.get("validate_get_size", True)),
+            worker_index=int(spec["worker_index"]),
+            ready_cb=wait_for_go,
+            label=spec.get("label", "worker"),
+        )
+        out_payload = {
+            "worker_index": res.worker_index,
+            "concurrency": res.concurrency,
+            "ops": res.ops,
+            "total_bytes": res.total_bytes,
+            "latencies_ms": [round(x, 4) for x in res.latencies_ms],
+            "errors": res.errors,
+            "error_notes": [list(pair) for pair in res.error_notes],
+            "stuck": res.stuck,
+            "client_user_s": res.client_user_s,
+            "client_sys_s": res.client_sys_s,
+            "wall_sec": res.wall_sec,
+        }
+        with open(spec["result_path"], "w", encoding="utf-8") as fh:
+            json.dump(out_payload, fh)
+        ctrl.sendall(b"DONE\n")
+        _recv_line(ctrl, timeout=30.0)
+    finally:
+        try:
+            ctrl.close()
+        except Exception:
+            pass
+    return 0
+
+
+def _run_multiprocess_phase(
+    shares: Sequence[int],
+    cli_cores: Sequence[int],
+    worker_spec_builder: Callable[[int, int, int], dict],
+    duration_sec: float,
+    server_pid: Optional[int],
+    shares_cores: bool,
+    profile_threads: bool = False,
+    client_procs_requested: Optional[int] = None,
+    concurrency: Optional[int] = None,
+    data_root: Optional[str] = None,
+    done_timeout_sec: Optional[float] = None,
+) -> PointResult:
+    """Coordinates `len(shares)` worker subprocesses via TCP barrier and aggregates results."""
+    n_workers = len(shares)
+    n_cli_cores = max(1, len(cli_cores)) if cli_cores else None
+    req_procs = client_procs_requested if client_procs_requested is not None else n_workers
+    total_conc = concurrency if concurrency is not None else sum(shares)
+    work_dir = tempfile.mkdtemp(prefix="scaling_cli_", dir=data_root)
+    ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    procs: List[subprocess.Popen] = []
+    conns: List[socket.socket] = []
+    conn_to_idx: Dict[socket.socket, int] = {}
+    thread_sampler = ThreadCpuSampler(server_pid) if (profile_threads and server_pid) else None
+
+    try:
+        ctrl_sock.bind(("127.0.0.1", 0))
+        ctrl_sock.listen(max(8, n_workers))
+        ctrl_sock.settimeout(0.2)
+        ctrl_port = ctrl_sock.getsockname()[1]
+
+        offsets: List[int] = []
+        running_off = 0
+        for c in shares:
+            offsets.append(running_off)
+            running_off += c
+
+        for i, conc_i in enumerate(shares):
+            p_cores = client_proc_cores(i, n_workers, cli_cores)
+            spec = worker_spec_builder(i, conc_i, offsets[i])
+            spec["worker_index"] = i
+            spec["concurrency"] = conc_i
+            spec["cores"] = p_cores
+            spec["ctrl_port"] = ctrl_port
+            spec["result_path"] = os.path.join(work_dir, f"result_{i}.json")
+            spec_path = os.path.join(work_dir, f"spec_{i}.json")
+            with open(spec_path, "w", encoding="utf-8") as fh:
+                json.dump(spec, fh)
+
+            base_argv = [sys.executable, os.path.abspath(__file__), "--client-worker", spec_path]
+            cmd = pinning_command_cores(base_argv, p_cores)
+            use_taskset = sys.platform.startswith("linux") and cmd[0] == "taskset" and shutil.which("taskset") is not None
+            launch_argv = cmd if use_taskset else base_argv
+            log_path = os.path.join(work_dir, f"worker_{i}.log")
+            log_fh = open(log_path, "ab")
+            try:
+                proc = subprocess.Popen(launch_argv, stdout=log_fh, stderr=subprocess.STDOUT)
+            finally:
+                log_fh.close()
+            if p_cores:
+                pin_process(proc.pid, p_cores)
+            procs.append(proc)
+
+        ready_deadline = time.perf_counter() + max(30.0, duration_sec + 20.0)
+        while len(conns) < n_workers:
+            if time.perf_counter() > ready_deadline:
+                return PointResult(
+                    reason=f"client workers did not become ready ({len(conns)}/{n_workers})",
+                    shares_cores=shares_cores,
+                    client_cores_given=n_cli_cores,
+                    client_procs=req_procs,
+                    concurrency=total_conc,
+                )
+            for idx, p in enumerate(procs):
+                code = p.poll()
+                if code is not None and code != 0:
+                    tail = _tail_log(os.path.join(work_dir, f"worker_{idx}.log"))
+                    return PointResult(
+                        reason=f"client worker {idx} exited with code {code}" + (f": {tail}" if tail else ""),
+                        shares_cores=shares_cores,
+                        client_cores_given=n_cli_cores,
+                        client_procs=req_procs,
+                        concurrency=total_conc,
+                    )
+            try:
+                conn, _ = ctrl_sock.accept()
+            except socket.timeout:
+                continue
+            try:
+                line = _recv_line(conn, timeout=15.0)
+            except OSError as e:
+                conn.close()
+                return PointResult(
+                    reason=f"worker handshake failed: {e}",
+                    shares_cores=shares_cores,
+                    client_cores_given=n_cli_cores,
+                    client_procs=req_procs,
+                    concurrency=total_conc,
+                )
+            if not line.startswith("READY "):
+                conn.close()
+                return PointResult(
+                    reason=f"unexpected worker handshake: {line!r}",
+                    shares_cores=shares_cores,
+                    client_cores_given=n_cli_cores,
+                    client_procs=req_procs,
+                    concurrency=total_conc,
+                )
+            try:
+                conn_to_idx[conn] = int(line.split()[1])
+            except (IndexError, ValueError):
+                conn_to_idx[conn] = len(conns)
+            conns.append(conn)
+
+        if thread_sampler is not None:
+            thread_sampler.__enter__()
+        srv_cpu_0 = process_cpu_times_total(server_pid) if server_pid else None
+        cli_pids = [p.pid for p in procs]
+        cli_cpu_0 = sum_processes_cpu_times(cli_pids)
+        t_start = time.perf_counter()
+        for conn in conns:
+            conn.sendall(b"GO\n")
+
+        wait_sec = done_timeout_sec if done_timeout_sec is not None else max(40.0, duration_sec * 10.0 + 30.0)
+        done_deadline = time.perf_counter() + wait_sec
+        pending = list(conns)
+        bufs: Dict[socket.socket, bytes] = {c: b"" for c in conns}
+        while pending:
+            rem = done_deadline - time.perf_counter()
+            if rem <= 0:
+                pending_idxs = [conn_to_idx.get(c, -1) for c in pending]
+                tails = []
+                for idx in pending_idxs:
+                    if idx >= 0:
+                        t = _tail_log(os.path.join(work_dir, f"worker_{idx}.log"))
+                        if t:
+                            tails.append(f"w{idx}: {t}")
+                detail = f" ({'; '.join(tails)})" if tails else ""
+                return PointResult(
+                    reason=f"client workers timed out waiting for DONE ({len(pending)}/{n_workers} pending){detail}",
+                    shares_cores=shares_cores,
+                    client_cores_given=n_cli_cores,
+                    client_procs=req_procs,
+                    concurrency=total_conc,
+                )
+            readable, _, _ = select.select(pending, [], [], min(0.25, rem))
+            for conn in readable:
+                try:
+                    chunk = conn.recv(1024)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    pending.remove(conn)
+                    idx = conn_to_idx.get(conn)
+                    if idx is not None:
+                        code = procs[idx].poll()
+                        tail = _tail_log(os.path.join(work_dir, f"worker_{idx}.log"))
+                        return PointResult(
+                            reason=f"client worker {idx} closed control channel before DONE (code={code})"
+                            + (f": {tail}" if tail else ""),
+                            shares_cores=shares_cores,
+                            client_cores_given=n_cli_cores,
+                            client_procs=req_procs,
+                            concurrency=total_conc,
+                        )
+                    continue
+                bufs[conn] += chunk
+                if b"\n" in bufs[conn]:
+                    msg = bufs[conn].split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
+                    pending.remove(conn)
+                    if msg != "DONE":
+                        idx = conn_to_idx.get(conn, -1)
+                        return PointResult(
+                            reason=f"client worker {idx} sent unexpected message {msg!r}",
+                            shares_cores=shares_cores,
+                            client_cores_given=n_cli_cores,
+                            client_procs=req_procs,
+                            concurrency=total_conc,
+                        )
+            if pending:
+                for idx, p in enumerate(procs):
+                    code = p.poll()
+                    if code not in (None, 0):
+                        tail = _tail_log(os.path.join(work_dir, f"worker_{idx}.log"))
+                        return PointResult(
+                            reason=f"client worker {idx} exited early ({code})" + (f": {tail}" if tail else ""),
+                            shares_cores=shares_cores,
+                            client_cores_given=n_cli_cores,
+                            client_procs=req_procs,
+                            concurrency=total_conc,
+                        )
+
+        t_total = time.perf_counter() - t_start
+        srv_cpu_1 = process_cpu_times_total(server_pid) if server_pid else None
+        cli_cpu_1 = sum_processes_cpu_times(cli_pids)
+        if thread_sampler is not None:
+            thread_sampler.__exit__(None, None, None)
+
+        for conn in conns:
+            try:
+                conn.sendall(b"EXIT\n")
+            except OSError:
+                pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+        conns.clear()
+
+        for p in procs:
+            try:
+                p.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                _stop_proc(p)
+
+        worker_results: List[WorkerResult] = []
+        for i in range(n_workers):
+            res_path = os.path.join(work_dir, f"result_{i}.json")
+            if not os.path.isfile(res_path):
+                tail = _tail_log(os.path.join(work_dir, f"worker_{i}.log"))
+                return PointResult(
+                    reason=f"client worker {i} wrote no result" + (f": {tail}" if tail else ""),
+                    shares_cores=shares_cores,
+                    client_cores_given=n_cli_cores,
+                    client_procs=req_procs,
+                    concurrency=total_conc,
+                )
+            with open(res_path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            worker_results.append(
+                WorkerResult(
+                    worker_index=int(raw["worker_index"]),
+                    concurrency=int(raw["concurrency"]),
+                    ops=int(raw["ops"]),
+                    total_bytes=int(raw["total_bytes"]),
+                    latencies_ms=tuple(float(x) for x in raw["latencies_ms"]),
+                    errors=int(raw.get("errors", 0)),
+                    error_notes=tuple((str(k), int(v)) for k, v in raw.get("error_notes", ())),
+                    stuck=int(raw.get("stuck", 0)),
+                    client_user_s=float(raw.get("client_user_s", 0.0)),
+                    client_sys_s=float(raw.get("client_sys_s", 0.0)),
+                    wall_sec=float(raw.get("wall_sec", t_total)),
+                )
+            )
+
+        return aggregate_worker_results(
+            worker_results,
+            wall_sec=t_total,
+            server_cpu_before=srv_cpu_0,
+            server_cpu_after=srv_cpu_1,
+            client_cpu_before=cli_cpu_0,
+            client_cpu_after=cli_cpu_1,
+            shares_cores=shares_cores,
+            client_cores_given=n_cli_cores,
+            client_procs=req_procs,
+            concurrency=total_conc,
+            thread_cpu=thread_sampler.samples() if thread_sampler is not None else None,
+        )
+    finally:
+        for conn in conns:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        try:
+            ctrl_sock.close()
+        except OSError:
+            pass
+        for p in procs:
+            _stop_proc(p)
+        if thread_sampler is not None and thread_sampler._thread is not None and thread_sampler._thread.is_alive():
+            thread_sampler.__exit__(None, None, None)
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _run_phase_with_cpu(
     host: str,
     port: int,
-    bucket: str,
+    bucket: Optional[str],
     size: int,
     concurrency: int,
     duration_sec: float,
     mode: str,
-    server_pid: int,
+    server_pid: Optional[int],
     shares_cores: bool,
     profile_threads: bool = False,
     auth: Optional[S3Auth] = None,
+    client_procs: int = 1,
+    cli_cores: Optional[Sequence[int]] = None,
+    request_path: Optional[str] = None,
+    force_subprocess: bool = False,
+    data_root: Optional[str] = None,
 ) -> PointResult:
-    """Runs `run_workload_phase` (or signed equivalent) and measures server CPU time over its timed window."""
-    if auth is not None:
-        return _run_signed_workload_phase(
-            host, port, bucket, size, concurrency, duration_sec, mode, server_pid, shares_cores, auth
+    """Runs one workload phase across `client_procs` and measures server + client CPU."""
+    shares = split_concurrency(concurrency, client_procs)
+    n_cli_cores = len(cli_cores) if cli_cores else None
+    if len(shares) > 1 or force_subprocess:
+        if mode == "get" and not request_path and bucket:
+            warm_err = _warmup_pool_objects(host, port, bucket, size, concurrency, auth=auth)
+            if warm_err:
+                return PointResult(
+                    reason=warm_err,
+                    shares_cores=shares_cores,
+                    client_cores_given=n_cli_cores,
+                    client_procs=client_procs,
+                    concurrency=concurrency,
+                )
+
+        auth_dict = (
+            {"access_key": auth.access_key, "secret_key": auth.secret_key, "region": auth.region, "service": auth.service}
+            if auth is not None else None
         )
+        return _run_multiprocess_phase(
+            shares=shares,
+            cli_cores=cli_cores or [],
+            worker_spec_builder=lambda i, conc_i, offset: {
+                "kind": "workload",
+                "host": host,
+                "port": port,
+                "bucket": bucket,
+                "size": size,
+                "duration_sec": duration_sec,
+                "mode": mode,
+                "worker_id_offset": offset,
+                "payload_seed": DEFAULT_SEED,
+                "request_path": request_path,
+                "validate_get_size": True,
+                "auth": auth_dict,
+                "label": f"{mode} {size}B c={concurrency} p={i}",
+            },
+            duration_sec=duration_sec,
+            server_pid=server_pid,
+            shares_cores=shares_cores,
+            profile_threads=profile_threads,
+            client_procs_requested=client_procs,
+            concurrency=concurrency,
+            data_root=data_root,
+        )
+
+    if auth is not None or request_path is not None:
+        if mode == "get" and not request_path and bucket:
+            warm_err = _warmup_pool_objects(host, port, bucket, size, concurrency, auth=auth)
+            if warm_err:
+                return PointResult(
+                    reason=warm_err,
+                    shares_cores=shares_cores,
+                    client_cores_given=n_cli_cores,
+                    client_procs=client_procs,
+                    concurrency=concurrency,
+                )
+        method = "PUT" if mode == "put" else "GET"
+        payload = deterministic_bytes(size, DEFAULT_SEED) if mode == "put" else b""
+        pool_keys = 4 if size >= MIB else 8
+        req_fn = (
+            (lambda _w, _rc, m=method, p=request_path: RequestSpec(m, p))
+            if request_path
+            else (lambda wid, rc, m=method, pk=pool_keys: RequestSpec(m, f"worker_{wid}_obj_{rc % pk}.dat"))
+        )
+        thread_sampler = ThreadCpuSampler(server_pid) if (profile_threads and server_pid) else None
+        if thread_sampler is not None:
+            thread_sampler.__enter__()
+        srv_0 = process_cpu_times_total(server_pid) if server_pid else None
+        res = _run_http_threads(
+            host=host,
+            port=port,
+            concurrency=concurrency,
+            duration_sec=duration_sec,
+            size=size,
+            request_fn=req_fn,
+            payload=payload,
+            bucket=bucket,
+            auth=auth,
+            validate_get_size=True,
+            worker_index=0,
+            label=f"{mode} {size}B c={concurrency}",
+        )
+        srv_1 = process_cpu_times_total(server_pid) if server_pid else None
+        if thread_sampler is not None:
+            thread_sampler.__exit__(None, None, None)
+        return aggregate_worker_results(
+            [res],
+            wall_sec=res.wall_sec,
+            server_cpu_before=srv_0,
+            server_cpu_after=srv_1,
+            shares_cores=shares_cores,
+            client_cores_given=n_cli_cores,
+            client_procs=1,
+            concurrency=concurrency,
+            thread_cpu=thread_sampler.samples() if thread_sampler is not None else None,
+        )
+
     samples: List[Tuple[float, Tuple[float, float]]] = []
-    thread_sampler = ThreadCpuSampler(server_pid) if profile_threads else None
+    thread_sampler = ThreadCpuSampler(server_pid) if (profile_threads and server_pid) else None
     orig_cpu_fn = rwb.get_process_cpu_times
 
     def hooked_cpu(pid: int) -> Tuple[float, float]:
@@ -1533,7 +2285,13 @@ def _run_phase_with_cpu(
         rwb.get_process_cpu_times = orig_cpu_fn
 
     if not metrics.measured:
-        return PointResult(reason=metrics.note or "phase did not complete", shares_cores=shares_cores)
+        return PointResult(
+            reason=metrics.note or "phase did not complete",
+            shares_cores=shares_cores,
+            client_cores_given=n_cli_cores,
+            client_procs=1,
+            concurrency=concurrency,
+        )
 
     if len(samples) >= 2:
         t0, cpu0 = samples[0]
@@ -1544,8 +2302,8 @@ def _run_phase_with_cpu(
         wall_sec = duration_sec if duration_sec > 0 else None
         pct = (metrics.server_cpu_s / duration_sec) * 100.0 if duration_sec > 0 else None
 
+    cli_pct = ((metrics.client_cpu_s / wall_sec) * 100.0) if (wall_sec and wall_sec > 0 and metrics.client_cpu_s >= 0) else metrics.client_cpu_pct
     thread_cpu = thread_sampler.samples() if thread_sampler is not None else None
-
     eff = ops_per_busy_core(metrics.ops_per_sec, pct)
     return PointResult(
         ops_per_sec=metrics.ops_per_sec,
@@ -1556,6 +2314,10 @@ def _run_phase_with_cpu(
         shares_cores=shares_cores,
         thread_cpu=thread_cpu,
         wall_sec=wall_sec,
+        client_cpu_pct=cli_pct,
+        client_cores_given=n_cli_cores,
+        client_procs=1,
+        concurrency=concurrency,
     )
 
 
@@ -1584,24 +2346,36 @@ def measure_server_for_cores(
     workloads: Sequence[Tuple[str, str, str, int]] = WORKLOADS,
     profile_threads: bool = False,
     profile_workload: str = "put_4k",
+    client_procs: int = 1,
+    data_root: Optional[str] = None,
 ) -> Dict[str, PointResult]:
     """Starts one server, pins the load generator to `cli_cores`, runs all workloads, cleans up."""
+    concurrency = 16 * n_cores
+    n_cli_cores = len(cli_cores) if cli_cores else None
     try:
         proc, port, data_dir, log_path, auth = _unpack_starter_result(starter())
     except Exception as e:
         reason = str(e).strip() or f"{server_name} failed to start"
-        return {wkey: PointResult(reason=reason, shares_cores=shares_cores) for wkey, *_ in workloads}
+        return {
+            wkey: PointResult(
+                reason=reason,
+                shares_cores=shares_cores,
+                client_cores_given=n_cli_cores,
+                client_procs=client_procs,
+                concurrency=concurrency,
+            )
+            for wkey, *_ in workloads
+        }
 
-    concurrency = 16 * n_cores
     out: Dict[str, PointResult] = {}
     try:
         pin_process(os.getpid(), cli_cores)
         for wkey, label, mode, size in workloads:
-            print(f"    {server_name} N={n_cores} (c={concurrency}): {label}...", flush=True)
+            print(f"    {server_name} N={n_cores} (c={concurrency}, procs={client_procs}): {label}...", flush=True)
             sample_here = profile_threads and wkey == profile_workload
             pt = _run_phase_with_cpu(
                 "127.0.0.1", port, BUCKET, size, concurrency, duration_sec, mode, proc.pid, shares_cores,
-                profile_threads=sample_here, auth=auth,
+                profile_threads=sample_here, auth=auth, client_procs=client_procs, cli_cores=cli_cores, data_root=data_root,
             )
             out[wkey] = pt
             if sample_here and pt.thread_cpu:
@@ -1781,6 +2555,61 @@ def _durability_label(durability: str) -> str:
     return "AwanFS group commit (#29)"
 
 
+def client_cap_info(
+    pt: Optional[PointResult],
+    n_cores: int,
+    total_cores: int,
+    default_client_procs: int = 1,
+    concurrency: Optional[int] = None,
+) -> Tuple[int, Optional[float], str]:
+    """Evaluates `pt.client_cpu_pct` against `client_cores_given` and active process ceiling."""
+    if pt is not None and pt.client_cores_given is not None:
+        cli_cores_given = max(1, int(pt.client_cores_given))
+    else:
+        default_cli, _ = client_cores_for(n_cores, total_cores)
+        cli_cores_given = max(1, len(default_cli))
+
+    if pt is None or not pt.measured or pt.client_cpu_pct is None:
+        return cli_cores_given, None, "-"
+
+    util_pct = (pt.client_cpu_pct / (cli_cores_given * 100.0)) * 100.0
+    req_procs = max(1, int(pt.client_procs or default_client_procs))
+    conc_val = concurrency if concurrency is not None else pt.concurrency
+    procs_used = max(1, min(req_procs, conc_val)) if conc_val is not None else req_procs
+    effective_cap_pct = min(cli_cores_given, procs_used) * 100.0
+
+    if pt.client_cpu_pct >= 0.80 * effective_cap_pct:
+        if pt.shares_cores and pt.cpu_pct is not None and pt.cpu_pct > pt.client_cpu_pct:
+            return cli_cores_given, util_pct, "no (server-heavy on shared cores)"
+        if not pt.shares_cores and pt.cpu_pct is not None and pt.cpu_pct >= 0.85 * n_cores * 100.0:
+            return cli_cores_given, util_pct, "no (server also >=85%)"
+        if cli_cores_given <= procs_used:
+            return cli_cores_given, util_pct, "yes (saturated client cores)"
+        return cli_cores_given, util_pct, "yes (saturated client procs)"
+
+    if (
+        pt.shares_cores
+        and pt.cpu_pct is not None
+        and (pt.client_cpu_pct + pt.cpu_pct) >= 0.85 * cli_cores_given * 100.0
+        and pt.client_cpu_pct > pt.cpu_pct * 1.5
+    ):
+        return cli_cores_given, util_pct, "yes (shared cores, client-heavy)"
+
+    return cli_cores_given, util_pct, "no"
+
+
+def _client_cap_summary_line(entries: Sequence[Tuple[str, str]]) -> str:
+    measured_caps = [(label, cap) for label, cap in entries if cap != "-"]
+    if not measured_caps:
+        return "Client cap check: client CPU not measured."
+    capped = [f"{label} ({cap})" for label, cap in measured_caps if cap.startswith("yes")]
+    if not capped:
+        return f"Client cap check: none of {len(measured_caps)} measured phases were client-capped."
+    shown = ", ".join(capped[:8])
+    extra = f" (+{len(capped) - 8} more)" if len(capped) > 8 else ""
+    return f"Client cap check: {len(capped)} of {len(measured_caps)} measured phases were client-capped: {shown}{extra}."
+
+
 def render_report(
     cmd: str,
     cores: Sequence[int],
@@ -1792,6 +2621,7 @@ def render_report(
     chart_paths: Optional[Sequence[str]] = None,
     fast_results: Optional[Dict[int, PointResult]] = None,
     durability: str = "group",
+    client_procs: int = 1,
 ) -> str:
     max_n = max(cores)
     shared_ns = [n for n in cores if n >= total_cores]
@@ -1822,9 +2652,9 @@ def render_report(
         f"# Core Scaling Benchmark: AwanFS vs MinIO vs RustFS vs Garage vs SeaweedFS ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
         "",
         f"- **Machine:** {platform.node()} ({platform.platform()}, {total_cores} logical cores, {rwb.host_ram_gb()} GB RAM, CPU: {rwb.cpu_model()})",
-        f"- **Methodology:** `cores = {', '.join(str(n) for n in cores)}`, `concurrency = 16 × N`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase.",
+        f"- **Methodology:** `cores = {', '.join(str(n) for n in cores)}`, `concurrency = 16 × N`, `client_procs = {client_procs}`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase.",
         f"- **Core pinning:** {sharing_note}",
-        f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()} RustFS strict fsync (`RUSTFS_DURABILITY_MODE=strict`). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default. {probe_note}",
+        f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()} RustFS release defaults (durable, 3.09 syncs/PUT; measurements/2026-11-21-durability-probe.md, #334). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default. {probe_note}",
         "",
     ]
     lines.extend(_durability_section_lines())
@@ -1886,6 +2716,48 @@ def render_report(
             lines.append(_cpu_row(wlabel, size_label, srv, pts))
             if wkey == "put_4k" and srv == "AwanFS" and fast_results is not None:
                 lines.append(_cpu_row(wlabel, size_label, "AwanFS (--durability fast)", fast_results))
+
+    cap_entries: List[Tuple[str, str]] = []
+    cli_rows: List[str] = []
+
+    def _client_cpu_row(wlabel: str, size_label: str, srv_label: str, pts: Dict[int, PointResult]) -> str:
+        cells = []
+        for n in cores:
+            pt = pts.get(n)
+            if pt and pt.measured:
+                cli_cores_g, util_pct, cap_lbl = client_cap_info(
+                    pt, n_cores=n, total_cores=total_cores, default_client_procs=client_procs, concurrency=16 * n
+                )
+                core_lbl = "core" if cli_cores_g == 1 else "cores"
+                if pt.client_cpu_pct is not None and util_pct is not None:
+                    shared_tag = "shared, " if pt.shares_cores else ""
+                    cells.append(f"{pt.client_cpu_pct:.1f}% / {cli_cores_g} {core_lbl} ({util_pct:.0f}%, {shared_tag}{cap_lbl})")
+                    cap_entries.append((f"{srv_label} {wlabel} {n}c", cap_lbl))
+                else:
+                    cells.append(f"- / {cli_cores_g} {core_lbl}")
+            else:
+                reason = pt.reason if pt and pt.reason else "not measured"
+                cells.append(f"not measured ({reason})")
+        return f"| {wlabel} | {size_label} | {srv_label} | " + " | ".join(cells) + " |"
+
+    for wkey, wlabel, _mode, size in WORKLOADS:
+        size_label = f"{size // KIB} KiB"
+        for srv in SERVERS:
+            pts = results.get(wkey, {}).get(srv, {})
+            cli_rows.append(_client_cpu_row(wlabel, size_label, srv, pts))
+            if wkey == "put_4k" and srv == "AwanFS" and fast_results is not None:
+                cli_rows.append(_client_cpu_row(wlabel, size_label, "AwanFS (--durability fast)", fast_results))
+
+    lines.extend([
+        "",
+        "## Client CPU Usage (`CPU %` where 100% = 1 core busy, against client cores given)",
+        "",
+        _client_cap_summary_line(cap_entries),
+        "",
+        "| Workload | Size | Server | " + " | ".join(core_headers) + " |",
+        "|---|---|---|" + "|".join(["---"] * len(core_headers)) + "|",
+        *cli_rows,
+    ])
 
     thread_entries: List[Tuple[str, int, int, PointResult]] = []
     awan_put4k = results.get("put_4k", {}).get("AwanFS", {})
@@ -2074,9 +2946,50 @@ def _run_pattern_phase_with_cpu(
     shares_cores: bool,
     profile_threads: bool = False,
     auth: Optional[S3Auth] = None,
+    client_procs: int = 1,
+    cli_cores: Optional[Sequence[int]] = None,
+    data_root: Optional[str] = None,
 ) -> PointResult:
-    """Runs one `(pattern, size, concurrency)` phase and measures server CPU % over its timed window."""
+    """Runs one `(pattern, size, concurrency)` phase across `client_procs` and measures server + client CPU."""
     prefill_count = prefill_count_for(prefill_bytes, size)
+    shares = split_concurrency(concurrency, client_procs)
+    n_cli_cores = len(cli_cores) if cli_cores else None
+    if len(shares) > 1:
+        auth_dict = (
+            {"access_key": auth.access_key, "secret_key": auth.secret_key, "region": auth.region, "service": auth.service}
+            if auth is not None else None
+        )
+        active = len(shares)
+        return _run_multiprocess_phase(
+            shares=shares,
+            cli_cores=cli_cores or [],
+            worker_spec_builder=lambda i, _conc_i, _off: {
+                "kind": "pattern",
+                "host": host,
+                "port": port,
+                "bucket": bucket,
+                "pattern": pattern,
+                "size": size,
+                "duration_sec": duration_sec,
+                "seed": seed + i,
+                "payload_seed": seed + 3,
+                "prefill_count": prefill_count,
+                "large_obj_size": prefill_bytes,
+                "step_offset": i,
+                "step_stride": active,
+                "validate_get_size": True,
+                "auth": auth_dict,
+                "label": f"{pattern} {format_size(size)} c={concurrency} p={i}",
+            },
+            duration_sec=duration_sec,
+            server_pid=server_pid,
+            shares_cores=shares_cores,
+            profile_threads=profile_threads,
+            client_procs_requested=client_procs,
+            concurrency=concurrency,
+            data_root=data_root,
+        )
+
     source = PatternRequestSource(
         pattern=pattern,
         size=size,
@@ -2085,151 +2998,38 @@ def _run_pattern_phase_with_cpu(
         large_obj_size=prefill_bytes,
     )
     put_payload = deterministic_bytes(size, seed + 3) if pattern in ("seq-write", "rand-write") else b""
-    stop_event = threading.Event()
-    latencies: List[float] = []
-    lat_lock = threading.Lock()
-    total_bytes = 0
-    errors = 0
-    error_notes: Dict[str, int] = {}
-    metrics_lock = threading.Lock()
-    signer = SigV4Signer(auth) if auth is not None else None
-    host_hdr = f"{host}:{port}"
-
-    def worker():
-        nonlocal total_bytes, errors
-        local_lats: List[float] = []
-        local_bytes = 0
-        local_errs: Dict[str, int] = {}
-        conn = http.client.HTTPConnection(host, port, timeout=15.0)
-        put_headers = {"Content-Length": str(size), "Connection": "keep-alive"}
-        get_headers = {"Connection": "keep-alive"}
-
-        while not stop_event.is_set():
-            spec = source.next_request()
-            path = f"/{bucket}/{spec.key}"
-            t0 = time.perf_counter()
-            try:
-                if spec.method == "PUT":
-                    req_hdrs = _make_headers(signer, "PUT", path, host_hdr, put_headers)
-                    conn.request("PUT", path, body=put_payload, headers=req_hdrs)
-                    resp = conn.getresponse()
-                    resp.read()
-                    ok = resp.status == 200
-                    if ok:
-                        local_bytes += size
-                    else:
-                        msg = f"HTTP {resp.status}"
-                        local_errs[msg] = local_errs.get(msg, 0) + 1
-                elif spec.range_start is not None and spec.range_end is not None:
-                    hdrs = _make_headers(
-                        signer,
-                        "GET",
-                        path,
-                        host_hdr,
-                        {"Connection": "keep-alive", "Range": f"bytes={spec.range_start}-{spec.range_end}"},
-                    )
-                    conn.request("GET", path, headers=hdrs)
-                    resp = conn.getresponse()
-                    data = resp.read()
-                    want_len = spec.range_end - spec.range_start + 1
-                    if resp.status == 206 and len(data) == want_len:
-                        ok = True
-                        local_bytes += len(data)
-                    elif resp.status == 200:
-                        ok = False
-                        msg = "range GET unsupported (HTTP 200)"
-                        local_errs[msg] = local_errs.get(msg, 0) + 1
-                    elif resp.status == 206:
-                        ok = False
-                        msg = f"range GET short read ({len(data)}/{want_len})"
-                        local_errs[msg] = local_errs.get(msg, 0) + 1
-                    else:
-                        ok = False
-                        msg = f"HTTP {resp.status}"
-                        local_errs[msg] = local_errs.get(msg, 0) + 1
-                else:
-                    req_hdrs = _make_headers(signer, "GET", path, host_hdr, get_headers)
-                    conn.request("GET", path, headers=req_hdrs)
-                    resp = conn.getresponse()
-                    data = resp.read()
-                    if resp.status == 200 and len(data) == size:
-                        ok = True
-                        local_bytes += len(data)
-                    elif resp.status == 200:
-                        ok = False
-                        msg = f"GET size mismatch ({len(data)}/{size})"
-                        local_errs[msg] = local_errs.get(msg, 0) + 1
-                    else:
-                        ok = False
-                        msg = f"HTTP {resp.status}"
-                        local_errs[msg] = local_errs.get(msg, 0) + 1
-                t1 = time.perf_counter()
-                if ok:
-                    local_lats.append((t1 - t0) * 1000.0)
-            except Exception as e:
-                msg = type(e).__name__
-                local_errs[msg] = local_errs.get(msg, 0) + 1
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                conn = http.client.HTTPConnection(host, port, timeout=15.0)
-
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-        with lat_lock:
-            latencies.extend(local_lats)
-        with metrics_lock:
-            total_bytes += local_bytes
-            for m, cnt in local_errs.items():
-                errors += cnt
-                error_notes[m] = error_notes.get(m, 0) + cnt
-
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(concurrency)]
     thread_sampler = ThreadCpuSampler(server_pid) if profile_threads else None
     if thread_sampler is not None:
         thread_sampler.__enter__()
     cpu_0 = process_cpu_times_total(server_pid)
-    t_start = time.perf_counter()
-    for t in threads:
-        t.start()
-    time.sleep(duration_sec)
-    stop_event.set()
-    stuck = rwb.join_all(threads, f"{pattern} {format_size(size)} c={concurrency}", timeout_sec=max(20.0, duration_sec * 10.0))
-    t_total = time.perf_counter() - t_start
+    res = _run_http_threads(
+        host=host,
+        port=port,
+        concurrency=concurrency,
+        duration_sec=duration_sec,
+        size=size,
+        request_fn=lambda _wid, _rc: source.next_request(),
+        payload=put_payload,
+        bucket=bucket,
+        auth=auth,
+        validate_get_size=True,
+        worker_index=0,
+        label=f"{pattern} {format_size(size)} c={concurrency}",
+    )
     cpu_1 = process_cpu_times_total(server_pid)
     if thread_sampler is not None:
         thread_sampler.__exit__(None, None, None)
 
-    if stuck or errors > 0 or not latencies or t_total <= 0:
-        reasons = []
-        if errors > 0:
-            summary = ", ".join(f"{k} x{v}" for k, v in sorted(error_notes.items()))
-            reasons.append(f"{errors} failed ({summary})")
-        if stuck:
-            reasons.append(f"{stuck} stuck workers")
-        if not latencies and not reasons:
-            reasons.append("no requests completed")
-        return PointResult(reason="; ".join(reasons), shares_cores=shares_cores)
-
-    ops_per_sec = len(latencies) / t_total
-    mib_per_sec = (total_bytes / float(MIB)) / t_total
-    p50, _p90, p99, _p999 = rwb.calculate_percentiles(latencies)
-    pct = cpu_percent(cpu_0, cpu_1, t_total)
-    eff = ops_per_busy_core(ops_per_sec, pct)
-    return PointResult(
-        ops_per_sec=ops_per_sec,
-        mib_per_sec=mib_per_sec,
-        p50_ms=p50,
-        p99_ms=p99,
-        cpu_pct=pct,
-        ops_per_busy_core=eff,
+    return aggregate_worker_results(
+        [res],
+        wall_sec=res.wall_sec,
+        server_cpu_before=cpu_0,
+        server_cpu_after=cpu_1,
         shares_cores=shares_cores,
+        client_cores_given=n_cli_cores,
+        client_procs=1,
+        concurrency=concurrency,
         thread_cpu=thread_sampler.samples() if thread_sampler is not None else None,
-        wall_sec=t_total,
     )
 
 
@@ -2246,14 +3046,26 @@ def measure_server_matrix_for_cores(
     seed: int,
     prefill_bytes: int,
     profile_threads_points: Optional[Sequence[Tuple[str, int, int]]] = None,
+    client_procs: int = 1,
+    data_root: Optional[str] = None,
 ) -> Dict[Tuple[str, int, int], PointResult]:
     """Starts one server, prefills reads once, runs the `(pattern, size, concurrency)` sweep, cleans up."""
     all_keys = [(pat, sz, c) for pat in patterns for sz in sizes for c in concurrencies]
+    n_cli_cores = len(cli_cores) if cli_cores else None
     try:
         proc, port, data_dir, log_path, auth = _unpack_starter_result(starter())
     except Exception as e:
         reason = str(e).strip() or f"{server_name} failed to start"
-        return {k: PointResult(reason=reason, shares_cores=shares_cores) for k in all_keys}
+        return {
+            (pat, sz, c): PointResult(
+                reason=reason,
+                shares_cores=shares_cores,
+                client_cores_given=n_cli_cores,
+                client_procs=client_procs,
+                concurrency=c,
+            )
+            for pat, sz, c in all_keys
+        }
 
     profile_set = set(profile_threads_points or ())
     out: Dict[Tuple[str, int, int], PointResult] = {}
@@ -2263,14 +3075,20 @@ def measure_server_matrix_for_cores(
         prefill_err = _prefill_server("127.0.0.1", port, BUCKET, seed, prefill_bytes, patterns, sizes, auth=auth)
         if prefill_err:
             print(f"    {server_name} N={n_cores}: prefill failed: {prefill_err}", flush=True)
-            for k in all_keys:
-                out[k] = PointResult(reason=prefill_err, shares_cores=shares_cores)
+            for pat, sz, c in all_keys:
+                out[(pat, sz, c)] = PointResult(
+                    reason=prefill_err,
+                    shares_cores=shares_cores,
+                    client_cores_given=n_cli_cores,
+                    client_procs=client_procs,
+                    concurrency=c,
+                )
             return out
 
         for pat in patterns:
             for sz in sizes:
                 for c in concurrencies:
-                    print(f"    {server_name} N={n_cores} {pat} {format_size(sz)} c={c}...", flush=True)
+                    print(f"    {server_name} N={n_cores} {pat} {format_size(sz)} c={c} (procs={client_procs})...", flush=True)
                     sample_here = (pat, sz, c) in profile_set
                     pt = _run_pattern_phase_with_cpu(
                         "127.0.0.1",
@@ -2286,6 +3104,9 @@ def measure_server_matrix_for_cores(
                         shares_cores,
                         profile_threads=sample_here,
                         auth=auth,
+                        client_procs=client_procs,
+                        cli_cores=cli_cores,
+                        data_root=data_root,
                     )
                     out[(pat, sz, c)] = pt
                     if sample_here and pt.thread_cpu:
@@ -2544,6 +3365,7 @@ def render_matrix_report(
     chart_paths: Optional[Sequence[str]] = None,
     fast_results: Optional[Dict[int, Dict[int, PointResult]]] = None,
     durability: str = "group",
+    client_procs: int = 1,
 ) -> str:
     budget_bytes = parse_size(memory_budget)
     cache_bytes = stated_cache_bytes(budget_bytes)
@@ -2565,10 +3387,10 @@ def render_matrix_report(
         f"# Pattern & Concurrency Scaling Benchmark: AwanFS vs MinIO vs RustFS vs Garage vs SeaweedFS ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
         "",
         f"- **Machine:** {platform.node()} ({platform.platform()}, {total_cores} logical cores, {rwb.host_ram_gb()} GB RAM, CPU: {rwb.cpu_model()})",
-        f"- **Methodology:** `patterns = {', '.join(patterns)}`, `sizes = {', '.join(format_size(s) for s in sizes)}`, `cores = {', '.join(str(n) for n in cores)}`, `concurrencies = {', '.join(str(c) for c in concurrencies)}`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase, seed = `{seed}`.",
+        f"- **Methodology:** `patterns = {', '.join(patterns)}`, `sizes = {', '.join(format_size(s) for s in sizes)}`, `cores = {', '.join(str(n) for n in cores)}`, `concurrencies = {', '.join(str(c) for c in concurrencies)}`, `client_procs = {client_procs}`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase, seed = `{seed}`.",
         f"- **Cache & Prefill:** AwanFS `--memory-budget {format_size(budget_bytes)}` (stated cache half = {format_size(cache_bytes)}). Read prefill size = {format_size(prefill_bytes)} ({describe_prefill_sets(prefill_bytes, patterns, sizes)}), identical deterministic bytes for every server, written before timing.",
         f"- **Core pinning:** {sharing_note}",
-        f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()} RustFS strict fsync (`RUSTFS_DURABILITY_MODE=strict`). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default.",
+        f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()} RustFS release defaults (durable, 3.09 syncs/PUT; measurements/2026-11-21-durability-probe.md, #334). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default.",
         "",
     ]
     lines.extend(_durability_section_lines())
@@ -2588,6 +3410,23 @@ def render_matrix_report(
         return f"| {srv_label} | {pat} | {sz_lbl} | {n} | {c} | not measured ({reason}) | - | - | - | - |"
 
     put_pat = "seq-write" if "seq-write" in patterns else ("rand-write" if "rand-write" in patterns else patterns[0])
+    cli_rows: List[str] = []
+    cap_entries: List[Tuple[str, str]] = []
+
+    def _matrix_client_row(srv_label: str, pat: str, sz_lbl: str, n: int, c: int, pt: Optional[PointResult]) -> str:
+        cli_cores_g, util_pct, cap_lbl = client_cap_info(
+            pt, n_cores=n, total_cores=total_cores, default_client_procs=client_procs, concurrency=c
+        )
+        procs_shown = min(pt.client_procs or client_procs, c) if pt else min(client_procs, c)
+        cores_cell = f"{cli_cores_g} (shared)" if (pt and pt.shares_cores) else str(cli_cores_g)
+        if pt and pt.measured:
+            if pt.client_cpu_pct is not None and util_pct is not None:
+                cap_entries.append((f"{srv_label} {pat} {sz_lbl} {n}c c={c}", cap_lbl))
+                return f"| {srv_label} | {pat} | {sz_lbl} | {n} | {c} | {procs_shown} | {cores_cell} | {pt.client_cpu_pct:.1f}% | {util_pct:.1f}% | {cap_lbl} |"
+            return f"| {srv_label} | {pat} | {sz_lbl} | {n} | {c} | {procs_shown} | {cores_cell} | - | - | - |"
+        reason = pt.reason if pt and pt.reason else "unknown"
+        return f"| {srv_label} | {pat} | {sz_lbl} | {n} | {c} | {procs_shown} | {cores_cell} | not measured ({reason}) | - | - |"
+
     for srv in SERVERS:
         for pat in patterns:
             for sz in sizes:
@@ -2596,10 +3435,24 @@ def render_matrix_report(
                     for c in concurrencies:
                         pt = results.get(pat, {}).get(sz, {}).get(srv, {}).get(n, {}).get(c)
                         lines.append(_matrix_row(srv, pat, sz_lbl, n, c, pt))
+                        cli_rows.append(_matrix_client_row(srv, pat, sz_lbl, n, c, pt))
         if srv == "AwanFS" and fast_results is not None and (4 * KIB) in sizes:
             for n in cores:
                 for c in sorted(fast_results.get(n, {})):
-                    lines.append(_matrix_row("AwanFS (--durability fast)", put_pat, "4 KiB", n, c, fast_results[n][c]))
+                    pt = fast_results[n][c]
+                    lines.append(_matrix_row("AwanFS (--durability fast)", put_pat, "4 KiB", n, c, pt))
+                    cli_rows.append(_matrix_client_row("AwanFS (--durability fast)", put_pat, "4 KiB", n, c, pt))
+
+    lines.extend([
+        "",
+        "## Client CPU Usage (`CPU %` where 100% = 1 core busy, against client cores given)",
+        "",
+        _client_cap_summary_line(cap_entries),
+        "",
+        "| Server | Pattern | Size | Cores | Concurrency | Client Procs | Client Cores | Client CPU % | Client Core Util | Client-Capped? |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+        *cli_rows,
+    ])
 
     thread_entries: List[Tuple[str, int, int, PointResult]] = []
     if (4 * KIB) in sizes:
@@ -2621,6 +3474,419 @@ def render_matrix_report(
         lines.extend(["", "## Charts", ""])
         for p in chart_paths:
             lines.append(f"- `{os.path.basename(p)}`")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+_TRIVIAL_HTTP_RS = r"""use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::thread;
+
+fn find_header_end(buf: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        if i + 3 < buf.len() && &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some((i, i + 4));
+        }
+        if &buf[i..i + 2] == b"\n\n" {
+            return Some((i, i + 2));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn trim_ascii(mut s: &[u8]) -> &[u8] {
+    while let Some(&b) = s.first() {
+        if b == b' ' || b == b'\t' || b == b'\r' {
+            s = &s[1..];
+        } else {
+            break;
+        }
+    }
+    while let Some(&b) = s.last() {
+        if b == b' ' || b == b'\t' || b == b'\r' {
+            s = &s[..s.len() - 1];
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+fn parse_usize_ascii(s: &[u8]) -> usize {
+    let mut v = 0usize;
+    for &b in trim_ascii(s) {
+        if b.is_ascii_digit() {
+            v = v.saturating_mul(10).saturating_add((b - b'0') as usize);
+        } else {
+            break;
+        }
+    }
+    v
+}
+
+fn contains_ascii_ci(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.len() > hay.len() {
+        return false;
+    }
+    hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+fn handle(mut stream: TcpStream, get_resp: Arc<Vec<u8>>) {
+    let _ = stream.set_nodelay(true);
+    let mut buf = vec![0u8; 65536];
+    let mut start: usize = 0;
+    let mut end: usize = 0;
+
+    loop {
+        while start < end && (buf[start] == b'\r' || buf[start] == b'\n') {
+            start += 1;
+        }
+        let (hdr_len, hdr_consume) = loop {
+            if let Some(pos) = find_header_end(&buf[start..end]) {
+                break pos;
+            }
+            if start > 0 {
+                buf.copy_within(start..end, 0);
+                end -= start;
+                start = 0;
+            }
+            if end == buf.len() {
+                return;
+            }
+            match stream.read(&mut buf[end..]) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    end += n;
+                    while start < end && (buf[start] == b'\r' || buf[start] == b'\n') {
+                        start += 1;
+                    }
+                }
+            }
+        };
+
+        let hdr_bytes = &buf[start..start + hdr_len];
+        let mut lines = hdr_bytes.split(|&b| b == b'\n');
+        let first = lines.next().unwrap_or(b"");
+        let is_get = first.starts_with(b"GET ");
+        let mut content_len: usize = 0;
+        let mut close = false;
+        for line in lines {
+            if let Some(colon) = line.iter().position(|&b| b == b':') {
+                let name = trim_ascii(&line[..colon]);
+                let val = &line[colon + 1..];
+                if name.eq_ignore_ascii_case(b"content-length") {
+                    content_len = parse_usize_ascii(val);
+                } else if name.eq_ignore_ascii_case(b"connection") && contains_ascii_ci(val, b"close") {
+                    close = true;
+                }
+            }
+        }
+
+        start += hdr_consume;
+        let avail = end - start;
+        if avail >= content_len {
+            start += content_len;
+        } else {
+            let mut rem = content_len - avail;
+            start = 0;
+            end = 0;
+            while rem > 0 {
+                let to_read = rem.min(buf.len());
+                match stream.read(&mut buf[..to_read]) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => rem -= n,
+                }
+            }
+        }
+        if start == end {
+            start = 0;
+            end = 0;
+        }
+
+        let reply: &[u8] = if is_get {
+            &get_resp
+        } else {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+        };
+        if stream.write_all(reply).is_err() {
+            return;
+        }
+        if close {
+            return;
+        }
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let port_file = &args[1];
+    let body_size: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let tmp_file = format!("{}.tmp", port_file);
+    std::fs::write(&tmp_file, port.to_string()).expect("write port");
+    std::fs::rename(&tmp_file, port_file).expect("rename port");
+
+    let hdr = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body_size);
+    let mut get_resp = Vec::with_capacity(hdr.len() + body_size);
+    get_resp.extend_from_slice(hdr.as_bytes());
+    get_resp.resize(hdr.len() + body_size, b'a');
+    let get_resp = Arc::new(get_resp);
+
+    for stream in listener.incoming() {
+        if let Ok(s) = stream {
+            let r = Arc::clone(&get_resp);
+            thread::spawn(move || handle(s, r));
+        }
+    }
+}
+"""
+
+
+def _find_rustc() -> Optional[str]:
+    found = shutil.which("rustc")
+    if found:
+        return found
+    exe = ".exe" if sys.platform == "win32" else ""
+    candidate = os.path.join(os.path.expanduser("~"), ".cargo", "bin", f"rustc{exe}")
+    return candidate if os.path.isfile(candidate) else None
+
+
+def _trivial_http_server_main(port_file: str, body_size: int) -> int:
+    payload = b"a" * body_size
+
+    class TrivialHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, format, *args):
+            pass
+
+        def do_PUT(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > 0:
+                self.rfile.read(length)
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(body_size))
+            self.end_headers()
+            if body_size > 0:
+                self.wfile.write(payload)
+
+    httpd = rwb.ThreadedHTTPServer(("127.0.0.1", 0), TrivialHandler)
+    port = httpd.server_address[1]
+    tmp_file = f"{port_file}.tmp"
+    with open(tmp_file, "w", encoding="utf-8") as fh:
+        fh.write(str(port))
+    os.replace(tmp_file, port_file)
+    try:
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()
+    return 0
+
+
+def start_trivial_http_server(
+    data_root: str,
+    get_size: int = 4 * KIB,
+) -> Tuple[subprocess.Popen, int, str]:
+    """Starts a local non-S3 HTTP/1.1 keep-alive server for client ceiling probes."""
+    os.makedirs(data_root, exist_ok=True)
+    exe = ".exe" if sys.platform == "win32" else ""
+    rustc = _find_rustc()
+    work = tempfile.mkdtemp(prefix="trivial_http_", dir=data_root)
+    port_file = os.path.join(work, "port.txt")
+    log_path = os.path.join(work, "server.log")
+
+    launch_argv: List[str]
+    if rustc:
+        cached_bin = os.path.join(data_root, f"trivial_http_srv_v2{exe}")
+        if not os.path.isfile(cached_bin):
+            src_path = os.path.join(work, "trivial_http.rs")
+            tmp_bin = os.path.join(work, f"trivial_http_srv{exe}")
+            with open(src_path, "w", encoding="utf-8") as fh:
+                fh.write(_TRIVIAL_HTTP_RS)
+            subprocess.run([rustc, "-O", src_path, "-o", tmp_bin], check=True)
+            os.replace(tmp_bin, cached_bin)
+        launch_argv = [cached_bin, port_file, str(get_size)]
+    else:
+        launch_argv = [sys.executable, os.path.abspath(__file__), "--trivial-http-server", port_file, str(get_size)]
+
+    log_fh = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(launch_argv, stdout=log_fh, stderr=subprocess.STDOUT)
+    finally:
+        log_fh.close()
+
+    deadline = time.time() + 20.0
+    port: Optional[int] = None
+    while time.time() < deadline:
+        code = proc.poll()
+        if code is not None:
+            tail = _tail_log(log_path)
+            raise RuntimeError(f"trivial http server exited with code {code}" + (f": {tail}" if tail else ""))
+        if os.path.isfile(port_file):
+            try:
+                with open(port_file, "r", encoding="utf-8") as fh:
+                    raw = fh.read().strip()
+                if raw:
+                    port = int(raw)
+                    break
+            except (OSError, ValueError):
+                pass
+        time.sleep(0.05)
+    if port is None:
+        _stop_proc(proc)
+        raise RuntimeError("trivial http server did not publish its listening port")
+    err = _wait_port(proc, port, timeout=10.0)
+    if err:
+        _stop_proc(proc)
+        tail = _tail_log(log_path)
+        raise RuntimeError(f"trivial http server {err}" + (f": {tail}" if tail else ""))
+    return proc, port, log_path
+
+
+def run_ceiling_probe(
+    data_root: str,
+    procs_list: Sequence[int] = (1, 4),
+    concurrency: int = 32,
+    duration_sec: float = 2.0,
+    runs: int = 2,
+    size: int = 4 * KIB,
+) -> List[CeilingProbeRow]:
+    """Measures `procs_list` client processes against a trivial local HTTP server."""
+    total_cores = os.cpu_count() or 1
+    cli_cores = list(range(total_cores))
+    workloads = [
+        ("put_4k", f"PUT {format_size(size)}", "put", size),
+        ("get_4k", f"GET {format_size(size)}", "get", size),
+    ]
+    proc, port, log_path = start_trivial_http_server(data_root=data_root, get_size=size)
+    raw: Dict[Tuple[str, int], List[PointResult]] = {
+        (wkey, k): [] for wkey, *_ in workloads for k in procs_list
+    }
+    try:
+        for wkey, wlabel, mode, sz in workloads:
+            for run_idx in range(runs):
+                order = list(procs_list) if run_idx % 2 == 0 else list(reversed(procs_list))
+                for k in order:
+                    print(
+                        f"  [ceiling run {run_idx + 1}/{runs}] {wlabel} client_procs={k} c={concurrency}...",
+                        flush=True,
+                    )
+                    pt = _run_phase_with_cpu(
+                        "127.0.0.1",
+                        port,
+                        None,
+                        sz,
+                        concurrency,
+                        duration_sec,
+                        mode,
+                        proc.pid,
+                        shares_cores=True,
+                        client_procs=k,
+                        cli_cores=cli_cores,
+                        request_path="/obj",
+                        force_subprocess=True,
+                        data_root=data_root,
+                    )
+                    raw[(wkey, k)].append(pt)
+    finally:
+        _stop_proc(proc)
+        work_dir = os.path.dirname(log_path)
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    rows: List[CeilingProbeRow] = []
+    for wkey, wlabel, _mode, sz in workloads:
+        for k in procs_list:
+            rows.append(
+                CeilingProbeRow(
+                    workload=wlabel,
+                    size_bytes=sz,
+                    concurrency=concurrency,
+                    client_procs=k,
+                    client_cores=len(cli_cores),
+                    result=aggregate_runs(raw[(wkey, k)]),
+                )
+            )
+    return rows
+
+
+def render_ceiling_report(
+    cmd: str,
+    rows: Sequence[CeilingProbeRow],
+    procs_list: Sequence[int],
+    concurrency: int,
+    duration_sec: float,
+    runs: int,
+    total_cores: int,
+    size: int = 4 * KIB,
+) -> str:
+    server_kind = "Rust std::net HTTP/1.1 keep-alive (benchmarks/, no S3)" if _find_rustc() else "Python HTTP/1.1 keep-alive (benchmarks/, no S3)"
+    base_k = 1 if 1 in procs_list else min(procs_list)
+    by_wl_k: Dict[str, Dict[int, PointResult]] = {}
+    workload_order: List[str] = []
+    for row in rows:
+        if row.workload not in by_wl_k:
+            by_wl_k[row.workload] = {}
+            workload_order.append(row.workload)
+        by_wl_k[row.workload][row.client_procs] = row.result
+
+    lines = [
+        f"Command: `{cmd}`",
+        "",
+        f"# Client Ceiling Probe: Trivial Local HTTP Server ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
+        "",
+        f"- **Machine:** {platform.node()} ({platform.platform()}, {total_cores} logical cores, {rwb.host_ram_gb()} GB RAM, CPU: {rwb.cpu_model()})",
+        f"- **Server:** {server_kind}",
+        f"- **Methodology:** `client_procs = {', '.join(str(k) for k in procs_list)}`, `concurrency = {concurrency}`, size = {format_size(size)}, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase, client cores given = {total_cores}.",
+        "",
+        "## Client Process Scaling (`100%` CPU = 1 core busy)",
+        "",
+        "| Workload | Concurrency | Client Procs | Client Cores | ops/s | MiB/s | P50 (ms) | P99 (ms) | Client CPU % | Server CPU % | Speedup vs 1 proc |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+
+    verdicts: List[str] = []
+    for row in rows:
+        pt = row.result
+        base_pt = by_wl_k[row.workload].get(base_k)
+        if pt.measured:
+            mib_s = f"{pt.mib_per_sec:.2f}" if pt.mib_per_sec is not None else "-"
+            cli_s = f"{pt.client_cpu_pct:.1f}% ({(pt.client_cpu_pct / (row.client_cores * 100.0)) * 100.0:.0f}%)" if pt.client_cpu_pct is not None else "-"
+            srv_s = f"{pt.cpu_pct:.1f}%" if pt.cpu_pct is not None else "-"
+            if row.client_procs == base_k:
+                sp_s = "1.00x"
+            elif base_pt and base_pt.measured and base_pt.ops_per_sec and base_pt.ops_per_sec > 0:
+                sp_s = f"{pt.ops_per_sec / base_pt.ops_per_sec:.2f}x"
+            else:
+                sp_s = "-"
+            lines.append(
+                f"| {row.workload} | {row.concurrency} | {row.client_procs} | {row.client_cores} | "
+                f"{pt.ops_per_sec:,.0f} | {mib_s} | {pt.p50_ms:.2f} | {pt.p99_ms:.2f} | {cli_s} | {srv_s} | {sp_s} |"
+            )
+        else:
+            lines.append(
+                f"| {row.workload} | {row.concurrency} | {row.client_procs} | {row.client_cores} | "
+                f"not measured ({pt.reason or 'unknown'}) | - | - | - | - | - | - |"
+            )
+
+    max_k = max(procs_list)
+    for wl in workload_order:
+        b = by_wl_k[wl].get(base_k)
+        t = by_wl_k[wl].get(max_k)
+        if b and t and b.measured and t.measured and b.ops_per_sec and b.ops_per_sec > 0:
+            ratio = t.ops_per_sec / b.ops_per_sec
+            verdicts.append(f"{wl}: {ratio:.2f}x ({b.ops_per_sec:,.0f} -> {t.ops_per_sec:,.0f} ops/s)")
+    if verdicts:
+        lines.extend(["", f"- **Scaling ({max_k}/{base_k} client procs):** " + "; ".join(verdicts) + "."])
 
     lines.append("")
     return "\n".join(lines)
@@ -2770,6 +4036,8 @@ def _run_matrix_mode(
                         seed=a.seed,
                         prefill_bytes=prefill_bytes,
                         profile_threads_points=srv_prof,
+                        client_procs=a.client_procs,
+                        data_root=data_root,
                     )
                     for (pat, sz, c), pt in phase_map.items():
                         raw_runs[pat][sz][srv][n][c].append(pt)
@@ -2798,6 +4066,8 @@ def _run_matrix_mode(
                         seed=a.seed,
                         prefill_bytes=prefill_bytes,
                         profile_threads_points=fast_prof,
+                        client_procs=a.client_procs,
+                        data_root=data_root,
                     )
                     for (_pat, _sz, c), pt in fast_map.items():
                         fast_raw[n][c].append(pt)
@@ -2847,6 +4117,7 @@ def _run_matrix_mode(
         chart_paths=chart_paths,
         fast_results=fast_results,
         durability=durability,
+        client_procs=a.client_procs,
     )
     out_abs = os.path.abspath(a.output)
     os.makedirs(os.path.dirname(out_abs), exist_ok=True)
@@ -2862,6 +4133,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--cores", default="", help="Comma-separated core counts (e.g. 1,2,4). Default: powers of 2 up to CPU count")
     ap.add_argument("--runs", type=int, default=2, help="Alternating rounds per core count (default: 2)")
     ap.add_argument("--duration", type=float, default=3.0, help="Seconds per workload phase (default: 3.0)")
+    ap.add_argument("--client-procs", type=int, default=4, help="Client worker processes used to drive load (default: 4)")
+    ap.add_argument("--ceiling-probe", action="store_true", help="Run local trivial HTTP server ceiling probe (1 vs 4 client procs)")
+    ap.add_argument("--ceiling-procs", default="1,4", help="Comma-separated client process counts for --ceiling-probe (default: 1,4)")
+    ap.add_argument("--ceiling-concurrency", type=int, default=32, help="Total concurrency for --ceiling-probe (default: 32)")
+    ap.add_argument("--client-worker", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--trivial-http-server", nargs=2, metavar=("PORT_FILE", "BODY_SIZE"), help=argparse.SUPPRESS)
     ap.add_argument("--matrix", action="store_true", help="Run pattern x size x concurrency x cores matrix (#251)")
     ap.add_argument("--pattern", default="", help="Comma-separated patterns: seq-write,rand-write,seq-read,rand-read")
     ap.add_argument("--sizes", default="", help="Comma-separated object sizes (e.g. 4KiB,1MiB or 4096,1048576)")
@@ -2889,14 +4166,51 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="Markdown report path (PNG and SVG charts are written alongside it)")
     a = ap.parse_args(argv)
 
+    if a.client_worker:
+        return _client_worker_main(a.client_worker)
+    if a.trivial_http_server:
+        return _trivial_http_server_main(a.trivial_http_server[0], int(a.trivial_http_server[1]))
+    if a.client_procs < 1:
+        ap.error("--client-procs must be >= 1")
+    if a.ceiling_concurrency < 1:
+        ap.error("--ceiling-concurrency must be >= 1")
+
     raw_args = list(argv) if argv is not None else sys.argv[1:]
     cmd = "python benchmarks/core_scaling.py" + (" " + " ".join(raw_args) if raw_args else "")
 
     total_cores = os.cpu_count() or 1
-    cores = parse_cores(a.cores, total_cores)
     data_root = os.path.abspath(a.data_dir) if a.data_dir else tempfile.gettempdir()
     os.makedirs(data_root, exist_ok=True)
 
+    if a.ceiling_probe:
+        procs_list = parse_cores(a.ceiling_procs, total_cores=1024)
+        rows = run_ceiling_probe(
+            data_root=data_root,
+            procs_list=procs_list,
+            concurrency=a.ceiling_concurrency,
+            duration_sec=a.duration,
+            runs=a.runs,
+            size=4 * KIB,
+        )
+        report = render_ceiling_report(
+            cmd=cmd,
+            rows=rows,
+            procs_list=procs_list,
+            concurrency=a.ceiling_concurrency,
+            duration_sec=a.duration,
+            runs=a.runs,
+            total_cores=total_cores,
+            size=4 * KIB,
+        )
+        out_abs = os.path.abspath(a.output)
+        os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+        with open(out_abs, "w", encoding="utf-8") as fh:
+            fh.write(report)
+        print(report)
+        print(f"Report written to {out_abs}")
+        return 0
+
+    cores = parse_cores(a.cores, total_cores)
     awanfs_bin = a.server_bin or _default_awanfs_bin()
     auto_minio, auto_mc = rwb.find_minio_binaries()
     minio_bin = a.minio_bin or auto_minio
@@ -2953,7 +4267,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for run_idx in range(a.runs):
                 order = server_order_for_run(run_idx, SERVERS)
                 for srv in order:
-                    print(f"[N={n}, run {run_idx + 1}/{a.runs}] Starting {srv} (client cores={cli_cores}, shares={shares})...", flush=True)
+                    print(f"[N={n}, run {run_idx + 1}/{a.runs}] Starting {srv} (client cores={cli_cores}, shares={shares}, client_procs={a.client_procs})...", flush=True)
                     starter = _starter_for(
                         srv, n, data_root, awanfs_bin, minio_bin, mc_bin, rustfs_bin,
                         garage_bin, seaweedfs_bin, durability=durability,
@@ -2963,13 +4277,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     phase_map = measure_server_for_cores(
                         srv, starter, n, cli_cores, shares, a.duration,
                         profile_threads=sample_srv_threads,
+                        client_procs=a.client_procs,
+                        data_root=data_root,
                     )
                     for wkey, pt in phase_map.items():
                         raw_runs[wkey][srv][n].append(pt)
 
             if raw_fast_runs is not None:
                 for run_idx in range(a.runs):
-                    print(f"[N={n}, run {run_idx + 1}/{a.runs}] Starting AwanFS (--durability fast) (client cores={cli_cores}, shares={shares})...", flush=True)
+                    print(f"[N={n}, run {run_idx + 1}/{a.runs}] Starting AwanFS (--durability fast) (client cores={cli_cores}, shares={shares}, client_procs={a.client_procs})...", flush=True)
                     fast_map = measure_server_for_cores(
                         "AwanFS (--durability fast)",
                         lambda n=n: _start_awanfs(awanfs_bin, n, data_root, durability="fast"),
@@ -2979,6 +4295,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         a.duration,
                         workloads=[WORKLOADS[0]],
                         profile_threads=(n in profile_cores),
+                        client_procs=a.client_procs,
+                        data_root=data_root,
                     )
                     raw_fast_runs[n].append(fast_map["put_4k"])
     finally:
@@ -3013,6 +4331,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         chart_paths=chart_paths,
         fast_results=fast_results,
         durability=durability,
+        client_procs=a.client_procs,
     )
     out_abs = os.path.abspath(a.output)
     os.makedirs(os.path.dirname(out_abs), exist_ok=True)

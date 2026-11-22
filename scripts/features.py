@@ -20,6 +20,8 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 VALID_STATUSES = ("done", "partial", "planned", "out-of-scope")
 J_FN_RE = re.compile(r"^\s*(?:function\s+)?(j_[A-Za-z0-9_]+|doctor)\s*\(\s*\)", re.MULTILINE)
+MINT_AWSCLI_BUCKET_RE = re.compile(r"awscli-mint-test-bucket-\d+")
+MINT_JSON_ARRAY_START_RE = re.compile(r"^\[\s*(?:\{|\]|\d|\"|true\b|false\b|null\b)")
 
 
 def load_registry(path: Path) -> List[dict]:
@@ -54,15 +56,17 @@ def suite_tests(paths: Sequence[Path]) -> "OrderedDict[str, List[str]]":
 
 
 def parse_passing_file(path: Path, default_prefix: str = "") -> Set[str]:
-    """Read test function names (stripping `[param]` suffixes) from a passing.txt file."""
+    """Read test names from a passing.txt file, stripping `[param]` only for pytest names."""
     out: Set[str] = set()
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        base = line.split("[")[0]
+        base = line
         if default_prefix and "::" not in base:
             base = f"{default_prefix}{base}"
+        if base.startswith(("test_s3::", "test_headers::")):
+            base = base.split("[")[0]
         out.add(base)
     return out
 
@@ -95,43 +99,106 @@ def parse_ceph_junit(paths: Sequence[Path]) -> Dict[str, Tuple[str, str]]:
     return out
 
 
-def parse_mint_log(paths: Sequence[Path]) -> Dict[str, Tuple[str, str]]:
-    """Return `{sdk::function: (status, message)}` from Mint JSON lines or JSON arrays."""
-    rank = {"pass": 0, "skip": 1, "fail": 2}
-    status_map = {
-        "PASS": "pass",
-        "PASSED": "pass",
-        "OK": "pass",
-        "FAIL": "fail",
-        "FAILED": "fail",
-        "ERROR": "fail",
-        "NA": "skip",
-        "SKIP": "skip",
-        "SKIPPED": "skip",
-    }
-    out: Dict[str, Tuple[str, str]] = {}
-    for path in paths:
-        text = path.read_text(encoding="utf-8").strip()
-        if not text:
+def decode_mint_entries(text: str, source: Optional[Path] = None) -> List[dict]:
+    """Decode Mint log entries, skipping non-JSON stdout banners while failing on malformed JSON."""
+    stripped = text.strip()
+    if not stripped:
+        return []
+    label = str(source or "<mint-log>")
+    if MINT_JSON_ARRAY_START_RE.match(stripped):
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{label}: invalid Mint JSON array: {exc}") from exc
+        if not isinstance(data, list) or not all(isinstance(x, dict) for x in data):
+            raise ValueError(f"{label}: expected JSON array of objects")
+        return data
+
+    decoder = json.JSONDecoder()
+    entries: List[dict] = []
+    idx = 0
+    n = len(text)
+    while idx < n:
+        while idx < n and text[idx].isspace():
+            idx += 1
+        if idx >= n:
+            break
+        if text[idx] == "{":
+            try:
+                obj, next_idx = decoder.raw_decode(text, idx)
+            except json.JSONDecodeError as exc:
+                line = text.count("\n", 0, idx) + 1
+                raise ValueError(f"{label}:{line}: invalid Mint JSON log: {exc}") from exc
+            if not isinstance(obj, dict):
+                line = text.count("\n", 0, idx) + 1
+                raise ValueError(f"{label}:{line}: expected JSON object, got {type(obj).__name__}")
+            entries.append(obj)
+            idx = next_idx
             continue
-        if text.startswith("["):
-            entries = json.loads(text)
-        else:
-            entries = [json.loads(line) for line in text.splitlines() if line.strip()]
+        line_start = text.rfind("\n", 0, idx) + 1
+        if text[line_start:idx].strip() == "":
+            next_nl = text.find("\n", idx)
+            idx = next_nl + 1 if next_nl != -1 else n
+            continue
+        line = text.count("\n", 0, idx) + 1
+        raise ValueError(f"{label}:{line}: unexpected trailing content in Mint JSON log")
+    return entries
+
+
+def normalize_mint_key(item: dict) -> Tuple[str, str]:
+    """Return `(sdk_label, canonical_key)` for a Mint JSON test entry."""
+    sdk = str(item.get("name") or item.get("sdk") or "").strip()
+    fn = str(item.get("function") or item.get("test") or "").strip()
+    if sdk == "awscli":
+        fn = MINT_AWSCLI_BUCKET_RE.sub("awscli-mint-test-bucket", fn)
+    key = f"{sdk}::{fn}" if (sdk and fn) else (sdk or fn)
+    sdk_label = sdk.split(":", 1)[0].strip() if sdk else "unknown"
+    if not sdk_label:
+        sdk_label = "unknown"
+    return sdk_label, key
+
+
+def collect_mint_results(
+    paths: Sequence[Path],
+    status_names: Optional[Dict[str, str]] = None,
+) -> "OrderedDict[str, Tuple[str, str, str]]":
+    """Return `{canonical_key: (sdk_label, status, detail)}` from Mint JSON logs."""
+    names = status_names or {"pass": "pass", "skip": "skip", "fail": "fail"}
+    rank = {names["pass"]: 0, names["skip"]: 1, names["fail"]: 2}
+    status_map = {
+        "PASS": names["pass"],
+        "PASSED": names["pass"],
+        "OK": names["pass"],
+        "FAIL": names["fail"],
+        "FAILED": names["fail"],
+        "ERROR": names["fail"],
+        "NA": names["skip"],
+        "SKIP": names["skip"],
+        "SKIPPED": names["skip"],
+    }
+    out: "OrderedDict[str, Tuple[str, str, str]]" = OrderedDict()
+    for path in paths:
+        entries = decode_mint_entries(path.read_text(encoding="utf-8"), source=path)
         for item in entries:
-            sdk = item.get("name") or item.get("sdk") or ""
-            fn = item.get("function") or item.get("test") or ""
-            if sdk and fn:
-                key = f"{sdk}::{fn}"
-            else:
-                key = str(sdk or fn)
+            sdk_label, key = normalize_mint_key(item)
             if not key:
                 continue
             raw_status = str(item.get("status", "")).strip().upper()
-            status = status_map.get(raw_status, "fail")
-            why = str(item.get("message") or item.get("error") or "").strip().splitlines()[0][:160] if (item.get("message") or item.get("error")) else ""
-            if key not in out or rank[status] > rank[out[key][0]]:
-                out[key] = (status, why)
+            status = status_map.get(raw_status, names["fail"])
+            raw_detail = str(item.get("error") or item.get("alert") or item.get("message") or "").strip()
+            detail = raw_detail.splitlines()[0][:160] if raw_detail else ""
+            if key not in out or rank[status] > rank[out[key][1]]:
+                out[key] = (sdk_label, status, detail)
+            elif status == out[key][1] and not out[key][2] and detail:
+                out[key] = (sdk_label, status, detail)
+    return out
+
+
+def parse_mint_log(paths: Sequence[Path]) -> Dict[str, Tuple[str, str]]:
+    """Return `{sdk::function: (status, message)}` from Mint JSON lines or JSON arrays."""
+    out = {k: (st, why) for k, (_, st, why) in collect_mint_results(paths).items()}
+    if not out:
+        raise ValueError("Mint log produced 0 test entries")
     return out
 
 
@@ -384,9 +451,12 @@ def check_registry(
     mint_tests: "OrderedDict[str, List[str]]" = OrderedDict()
     verify_mint_literals = False
     if mint_logs:
-        for key in parse_mint_log(mint_logs):
-            mint_tests.setdefault(key, [])
-        verify_mint_literals = True
+        try:
+            for key in parse_mint_log(mint_logs):
+                mint_tests.setdefault(key, [])
+            verify_mint_literals = True
+        except ValueError as exc:
+            problems.append(f"failed to parse mint log: {exc}")
 
     mint_pass_path = mint_passing if mint_passing is not None else (root / "tests" / "mint" / "passing.txt")
     if mint_pass_path.is_file():

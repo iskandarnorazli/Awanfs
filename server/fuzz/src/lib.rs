@@ -4,6 +4,9 @@
 use http_body_util::BodyExt;
 use hyper::header::{HeaderMap, HeaderValue};
 use hyper::StatusCode;
+use s3_server::bucket_config::{
+    base64_decode as bucket_base64_decode, base64_encode as bucket_base64_encode,
+};
 use s3_server::checksum::{base64_decode, requested_checksum, ChecksumAlgorithm};
 use s3_server::ops::service::list_buckets;
 use s3_server::{
@@ -50,16 +53,30 @@ fn check_single_checksum_header(header_name: &'static str, expected_alg: Checksu
 }
 
 /// Oracle for `checksum_headers`:
-/// - `requested_checksum` and `base64_decode` never panic on arbitrary bytes.
-/// - Decoding a valid base64 checksum and encoding it again gives the input.
-/// - Valid 8-byte (CRC64NVME) and 32-byte (SHA256) base64 digests round-trip through `requested_checksum`.
+/// - `requested_checksum`, `checksum::base64_decode`, and `bucket_config::base64_decode` never panic on arbitrary bytes.
+/// - Decoding valid base64 through either decoder and encoding it again gives the input.
+/// - Valid 8-byte (CRC64NVME), 16-byte (Content-MD5), and 32-byte (SHA256) base64 digests round-trip.
 pub fn check_checksum_headers(data: &[u8]) {
     if let Ok(s) = std::str::from_utf8(data) {
         if let Some(raw) = base64_decode(s) {
             assert_eq!(
                 base64_encode(&raw),
                 s,
-                "base64_decode accepted non-canonical input {:?}",
+                "checksum::base64_decode accepted non-canonical input {:?}",
+                s
+            );
+        }
+        if let Ok(raw) = bucket_base64_decode(s) {
+            assert_eq!(
+                base64_encode(&raw),
+                s,
+                "bucket_config::base64_decode accepted non-canonical input {:?}",
+                s
+            );
+            assert_eq!(
+                bucket_base64_encode(&raw),
+                s,
+                "bucket_config::base64_encode round-trip mismatch for {:?}",
                 s
             );
         }
@@ -126,6 +143,16 @@ pub fn check_checksum_headers(data: &[u8]) {
         Ok(Some((ChecksumAlgorithm::Sha256, Some(b64_32.clone()))))
     );
     assert_eq!(base64_decode(&b64_32).as_deref(), Some(&d32[..]));
+
+    let mut d16 = [0u8; 16];
+    if !data.is_empty() {
+        for (i, slot) in d16.iter_mut().enumerate() {
+            *slot = data[i % data.len()];
+        }
+    }
+    let b64_16 = base64_encode(&d16);
+    assert_eq!(bucket_base64_encode(&d16), b64_16);
+    assert_eq!(bucket_base64_decode(&b64_16).as_deref(), Ok(&d16[..]));
 }
 
 fn list_buckets_runtime() -> &'static tokio::runtime::Runtime {
@@ -366,6 +393,8 @@ mod tests {
             b"arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0=".as_slice(),
             b"rosUhgp5mIg=".as_slice(),
             b"FeKw08M4keuw8e9gnsQZQgwg4yDOlMZfvIwzEkSOsiU=".as_slice(),
+            b"1B2M2Y8AsgTpgAmY7PhCfg==".as_slice(),
+            b"XUFAKrxLKna5cZ2REBfFkg==".as_slice(),
             b"bad!".as_slice(),
             b"AAAA".as_slice(),
             b"".as_slice(),
@@ -379,6 +408,24 @@ mod tests {
     fn checksum_headers_rejects_non_canonical_pad_bits_round_trip() {
         check_checksum_headers(b"Qeh8oXvGiSp=");
         check_checksum_headers(b"arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+1=");
+        check_checksum_headers(b"rpIg5gm=");
+        check_checksum_headers(b"1B2M2Y8AsgTpgAmY7PhCfh==");
+        check_checksum_headers(b"XUFAKrxLKna5cZ2REBfFkh==");
+    }
+
+    #[test]
+    fn checksum_headers_corpus_seeds_hold_oracle() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/checksum_headers");
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read checksum_headers corpus dir")
+            .map(|e| e.expect("corpus dir entry").path())
+            .collect();
+        entries.sort();
+        assert!(!entries.is_empty());
+        for path in entries {
+            let bytes = std::fs::read(&path).expect("read corpus seed");
+            check_checksum_headers(&bytes);
+        }
     }
 
     #[test]

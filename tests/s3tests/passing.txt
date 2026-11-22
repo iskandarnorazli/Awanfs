@@ -177,6 +177,8 @@ test_s3::test_encrypted_transfer_13b
 test_s3::test_encrypted_transfer_1MB
 test_s3::test_encrypted_transfer_1b
 test_s3::test_encrypted_transfer_1kb
+test_s3::test_encryption_sse_c_multipart_upload
+test_s3::test_encryption_sse_c_unaligned_multipart_upload
 test_s3::test_get_checksum_object_attributes
 test_s3::test_get_multipart_checksum_object_attributes
 test_s3::test_get_multipart_object_attributes
@@ -315,6 +317,7 @@ test_s3::test_set_cors
 test_s3::test_set_multipart_tagging
 test_s3::test_sse_kms_multipart_invalid_chunks_1
 test_s3::test_sse_kms_multipart_invalid_chunks_2
+test_s3::test_sse_kms_multipart_upload
 test_s3::test_sse_kms_present
 test_s3::test_sse_kms_transfer_13b
 test_s3::test_sse_kms_transfer_1MB

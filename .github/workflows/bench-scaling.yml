@@ -32,6 +32,9 @@ on:
       seed:
         description: "RNG seed for random patterns and prefill"
         default: "42"
+      client_procs:
+        description: "Client load-generator worker processes"
+        default: "4"
       include_self_hosted:
         description: "Also run on the self-hosted bench runner"
         type: boolean
@@ -168,16 +171,37 @@ jobs:
             --cores "$cores_arg" \
             --runs "${{ inputs.runs || '2' }}" \
             --duration "${{ inputs.duration || '2' }}" \
+            --client-procs "${{ inputs.client_procs || '4' }}" \
             --data-dir "$RUNNER_TEMP" \
             --output $RUNNER_TEMP/core_scaling/report.md \
             "${extra_args[@]}"
 
+      - name: Run client ceiling probe (local HTTP)
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/core_scaling"
+          python -u benchmarks/core_scaling.py \
+            --ceiling-probe \
+            --runs "${{ inputs.runs || '2' }}" \
+            --duration "${{ inputs.duration || '2' }}" \
+            --data-dir "$RUNNER_TEMP" \
+            --output $RUNNER_TEMP/core_scaling/client_ceiling.md
+
       - name: Report to the job summary
         if: always()
         run: |
-          if [ -s "$RUNNER_TEMP/core_scaling/report.md" ]; then
-            cat "$RUNNER_TEMP/core_scaling/report.md" >> "$GITHUB_STEP_SUMMARY"
-          else
+          wrote=0
+          for f in "$RUNNER_TEMP/core_scaling/report.md" "$RUNNER_TEMP/core_scaling/client_ceiling.md"; do
+            if [ -s "$f" ]; then
+              cat "$f" >> "$GITHUB_STEP_SUMMARY"
+              printf "\n" >> "$GITHUB_STEP_SUMMARY"
+              wrote=1
+            fi
+          done
+          if [ "$wrote" -eq 0 ]; then
             echo "This run produced no core scaling report." | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -223,6 +247,7 @@ jobs:
               sys.executable, "-u", "benchmarks/core_scaling.py",
               "--runs", "${{ inputs.runs || '2' }}",
               "--duration", "${{ inputs.duration || '2' }}",
+              "--client-procs", "${{ inputs.client_procs || '4' }}",
               "--data-dir", os.environ["RUNNER_TEMP"],
               "--output", os.path.join(out_dir, "report.md"),
           ]

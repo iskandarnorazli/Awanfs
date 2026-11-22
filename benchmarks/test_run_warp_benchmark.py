@@ -72,6 +72,14 @@ class TestRunWarpBenchmark(unittest.TestCase):
         self.assertIn("does not flush", minio_durability_note("nt"))
         self.assertIn("not like for like", minio_durability_note("nt"))
 
+    def test_report_cites_rustfs_durability_probe_and_label(self):
+        report = format_markdown_report("cmd", {}, {}, {})
+        dur_line = next(ln for ln in report.splitlines() if ln.startswith("- **Durability per PUT:**"))
+        self.assertNotIn("RustFS's sync behaviour is not verified here", dur_line)
+        self.assertIn("measurements/2026-11-21-durability-probe.md", dur_line)
+        self.assertIn("durable", dur_line)
+        self.assertIn("RustFS", dur_line)
+
     def test_report_has_no_unsourced_reference_ranges(self):
         report = format_markdown_report("cmd", {}, {}, {})
         self.assertNotIn("Published Ref", report)

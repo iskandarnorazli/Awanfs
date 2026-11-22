@@ -402,3 +402,41 @@ proptest! {
         prop_assert!((compacted.manifest_stats().live_ratio() - 1.0).abs() < 1e-9);
     }
 }
+
+#[test]
+fn base64_decode_refuses_bits_under_the_padding() {
+    use s3_server::bucket_config::{base64_decode, base64_encode};
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    assert_eq!(base64_decode(""), Ok(Vec::new()));
+    for bad in ["A", "AA", "AAA", "AQ==AQID", "AQA=AQID", "bad!"] {
+        assert_eq!(base64_decode(bad), Err(()), "malformed {:?}", bad);
+    }
+
+    for len in 0..40usize {
+        let bytes: Vec<u8> = (0..len).map(|i| (i * 37 + len * 11) as u8).collect();
+        let enc = base64_encode(&bytes);
+        assert_eq!(base64_decode(&enc), Ok(bytes.clone()), "canonical {:?}", enc);
+        let pads = enc.bytes().rev().take_while(|&b| b == b'=').count();
+        if pads == 0 {
+            continue;
+        }
+        let at = enc.len() - pads - 1;
+        let unused = if pads == 1 { 0b11 } else { 0b1111 };
+        let v = ALPHABET.iter().position(|&c| c == enc.as_bytes()[at]).unwrap();
+        for low in 1..=unused {
+            let mut alt = enc.clone().into_bytes();
+            alt[at] = ALPHABET[(v & !unused) | low];
+            let alt = String::from_utf8(alt).unwrap();
+            assert_eq!(base64_decode(&alt), Err(()), "{:?} is a non-canonical form of {:?}", alt, enc);
+        }
+    }
+
+    assert_eq!(base64_decode("rpIg5gm="), Err(()));
+    assert_eq!(base64_decode("rpIg5gk=").map(|b| base64_encode(&b)), Ok("rpIg5gk=".to_string()));
+    assert_eq!(base64_decode("XUFAKrxLKna5cZ2REBfFkh=="), Err(()));
+    assert_eq!(
+        base64_decode("XUFAKrxLKna5cZ2REBfFkg==").map(|b| base64_encode(&b)),
+        Ok("XUFAKrxLKna5cZ2REBfFkg==".to_string())
+    );
+}

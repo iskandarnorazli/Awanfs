@@ -1,0 +1,7 @@
+{"name": "aws-sdk-go-v2", "function": "testBasicObjectOperations", "duration": 142, "status": "PASS"}
+{"name": "aws-sdk-go-v2", "function": "testObjectTagging", "duration": 98, "status": "PASS"}
+{"name": "aws-sdk-go-v2", "function": "testSelectObject", "duration": 210, "status": "FAIL", "error": "NotImplemented: S3 Select is not supported"}
+{"name": "awscli", "function": "test_create_bucket", "duration": 410, "status": "PASS"}
+{"name": "awscli", "function": "test_bucket_lifecycle", "duration": 315, "status": "FAIL", "alert": "PutBucketLifecycleConfiguration failed", "error": "An error occurred (MalformedXML)"}
+{"name": "minio-py", "function": "stat_object", "duration": 75, "status": "PASS"}
+{"name": "minio-py", "function": "set_bucket_encryption", "duration": 20, "status": "NA", "message": "Encryption requires HTTPS"}

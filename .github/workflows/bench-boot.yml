@@ -45,7 +45,8 @@ jobs:
       - name: Fill, then boot twice
         shell: bash
         env:
-          OBJECTS: ${{ inputs.objects || (github.event_name == 'pull_request' && '1000000') || '10000000' }}
+          # PRs use 1M so follow-up pushes finish fast (#330); dispatches keep the 10M default.
+          OBJECTS: ${{ (github.event_name == 'pull_request' && '1000000') || inputs.objects || '10000000' }}
           SIZE: ${{ inputs.size || '64' }}
           # The runner's temp directory: on Windows it is on the fast disk (D:), see AGENTS.md.
           DATA: ${{ runner.temp }}/boot
