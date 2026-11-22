@@ -3,6 +3,7 @@
     python3 tests/s3tests/test_conformance_map.py
 """
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -187,6 +188,23 @@ def test_headers_missing_host():
             self.assertIn("## request-headers: 1 not passing", text)
             self.assertIn("- `test_headers::test_headers_missing_host` (fail): 400 != 403", text)
             self.assertNotIn("test_headers::test_put_obj_bad_content_length", text)
+
+    def test_negative_fixture_does_not_leak_to_process_output(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                os.path.abspath(__file__),
+                "Map.test_a_test_no_rule_matches_fails_the_run",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn("test_zzz", combined)
+        self.assertNotIn("unassigned test(s)", combined)
 
 
 if __name__ == "__main__":

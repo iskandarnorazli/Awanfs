@@ -3,6 +3,7 @@
     python3 tests/s3tests/test_ratchet.py
 """
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -73,6 +74,31 @@ class RatchetTest(unittest.TestCase):
             text = fh.read()
         self.assertIn("Ratchet: 3 listed, 1 of them no longer pass, 3 new passes not listed.", text)
         self.assertIn("- `test_headers::test_dup` (failed)", text)
+
+    def test_synthetic_fixtures_do_not_leak_to_process_output(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                os.path.abspath(__file__),
+                "RatchetTest.test_single_junit_all_listed_pass",
+                "RatchetTest.test_multiple_junits_combined_ratchet_and_new_passes",
+                "RatchetTest.test_regression_in_second_junit_fails",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        combined = proc.stdout + proc.stderr
+        for marker in (
+            "new passes not listed",
+            "Listed tests that no longer pass",
+            "test_headers::test_unlisted_header",
+            "test_s3::test_unlisted_s3",
+            "test_headers::test_dup",
+        ):
+            self.assertNotIn(marker, combined)
 
 
 if __name__ == "__main__":
