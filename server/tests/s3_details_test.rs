@@ -444,3 +444,103 @@ async fn put_object_without_content_length_returns_411() {
 
     handle.shutdown();
 }
+
+#[tokio::test]
+async fn content_md5_rejects_non_canonical_base64() {
+    let (base_url, addr, state, handle) = spawn_with_region("us-east-1", AuthConfig::open()).await;
+    state.engine.write().create_bucket("md5-bkt").unwrap();
+    let client = reqwest::Client::new();
+
+    for (key, body, canon, non_canon) in [
+        ("hello", b"hello".as_slice(), "XUFAKrxLKna5cZ2REBfFkg==", "XUFAKrxLKna5cZ2REBfFkh=="),
+        ("empty", b"".as_slice(), "1B2M2Y8AsgTpgAmY7PhCfg==", "1B2M2Y8AsgTpgAmY7PhCfh=="),
+    ] {
+        let bad = client
+            .put(format!("{}/md5-bkt/{}-bad", base_url, key))
+            .header("content-length", body.len())
+            .header("Content-MD5", non_canon)
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "non-canonical {} must return 400", non_canon);
+        let bad_xml = bad.text().await.unwrap();
+        assert!(bad_xml.contains("<Code>InvalidDigest</Code>"), "expected InvalidDigest for {}, got: {}", non_canon, bad_xml);
+        assert_eq!(
+            client.get(format!("{}/md5-bkt/{}-bad", base_url, key)).send().await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let ok = client
+            .put(format!("{}/md5-bkt/{}-ok", base_url, key))
+            .header("content-length", body.len())
+            .header("Content-MD5", canon)
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK, "canonical {} must return 200", canon);
+        let got = client.get(format!("{}/md5-bkt/{}-ok", base_url, key)).send().await.unwrap().bytes().await.unwrap();
+        assert_eq!(got.as_ref(), body);
+    }
+
+    let mismatch = client
+        .put(format!("{}/md5-bkt/mismatch", base_url))
+        .header("Content-MD5", "1B2M2Y8AsgTpgAmY7PhCfg==")
+        .body("hello")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+    let mismatch_xml = mismatch.text().await.unwrap();
+    assert!(mismatch_xml.contains("<Code>BadDigest</Code>"), "got: {}", mismatch_xml);
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "PUT /md5-bkt/cont-noncanon HTTP/1.1\r\nHost: {}\r\nContent-Length: 5\r\nContent-MD5: XUFAKrxLKna5cZ2REBfFkh==\r\nExpect: 100-continue\r\n\r\n",
+        addr
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = [0u8; 1024];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .expect("timed out waiting for 400")
+        .unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.starts_with("HTTP/1.1 400"), "expected 400 without 100 Continue, got: {:?}", resp);
+    assert!(resp.contains("<Code>InvalidDigest</Code>"), "got: {:?}", resp);
+
+    let mut raw_stream = TcpStream::connect(addr).await.unwrap();
+    let mut raw_req = format!(
+        "PUT /md5-bkt/non-ascii-md5 HTTP/1.1\r\nHost: {}\r\nContent-Length: 5\r\nContent-MD5: ",
+        addr
+    )
+    .into_bytes();
+    raw_req.extend_from_slice(b"1B2M2Y8AsgTpgAmY7PhCf\xff==\r\nConnection: close\r\n\r\nhello");
+    raw_stream.write_all(&raw_req).await.unwrap();
+    let mut raw_resp = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), raw_stream.read_to_end(&mut raw_resp))
+        .await
+        .expect("timed out waiting for 400 on non-ASCII Content-MD5")
+        .unwrap();
+    let raw_resp_str = String::from_utf8_lossy(&raw_resp);
+    assert!(raw_resp_str.starts_with("HTTP/1.1 400"), "non-ASCII Content-MD5 must return 400, got: {:?}", raw_resp_str);
+    assert!(raw_resp_str.contains("<Code>InvalidDigest</Code>"), "got: {:?}", raw_resp_str);
+
+    let mut dup_stream = TcpStream::connect(addr).await.unwrap();
+    let dup_req = format!(
+        "PUT /md5-bkt/dup-md5 HTTP/1.1\r\nHost: {}\r\nContent-Length: 5\r\nContent-MD5: XUFAKrxLKna5cZ2REBfFkg==\r\nContent-MD5: XUFAKrxLKna5cZ2REBfFkh==\r\nConnection: close\r\n\r\nhello",
+        addr
+    );
+    dup_stream.write_all(dup_req.as_bytes()).await.unwrap();
+    let mut dup_resp = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), dup_stream.read_to_end(&mut dup_resp))
+        .await
+        .expect("timed out waiting for 400 on duplicate Content-MD5")
+        .unwrap();
+    let dup_resp_str = String::from_utf8_lossy(&dup_resp);
+    assert!(dup_resp_str.starts_with("HTTP/1.1 400"), "duplicate Content-MD5 must return 400, got: {:?}", dup_resp_str);
+    assert!(dup_resp_str.contains("<Code>InvalidDigest</Code>"), "got: {:?}", dup_resp_str);
+
+    handle.shutdown();
+}

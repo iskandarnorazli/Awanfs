@@ -1,7 +1,7 @@
 #![no_main]
-//! Checksum header decoders (`x-amz-checksum-crc64nvme`, `x-amz-checksum-sha256`,
-//! `base64_decode`): never panic, and decoding a valid base64 checksum and
-//! re-encoding it returns the input.
+//! Checksum and Content-MD5 base64 decoders (`x-amz-checksum-crc64nvme`,
+//! `x-amz-checksum-sha256`, `checksum::base64_decode`, `bucket_config::base64_decode`):
+//! never panic, and decoding valid base64 and re-encoding it returns the input.
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

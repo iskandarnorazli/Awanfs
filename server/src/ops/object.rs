@@ -1076,17 +1076,27 @@ pub async fn put_object(
             .body(full_body(Bytes::from(xml)))
             .unwrap());
     }
-    let content_md5_hdr = headers.get("content-md5").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
-    if let Some(ref content_md5) = content_md5_hdr {
-        if !crate::bucket_config::base64_decode(content_md5).is_ok_and(|b| b.len() == 16) {
-            let xml = s3_error_xml("InvalidDigest", "The Content-MD5 you specified was invalid.", key, "req-bad-digest");
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header(CONTENT_TYPE, "application/xml")
-                .body(full_body(Bytes::from(xml)))
-                .unwrap());
+    let mut md5_values = headers.get_all("content-md5").iter();
+    let content_md5_hdr = match md5_values.next() {
+        Some(v) => {
+            let valid = md5_values
+                .next()
+                .is_none()
+                .then(|| v.to_str().ok().map(str::trim))
+                .flatten()
+                .filter(|s| crate::bucket_config::base64_decode(s).is_ok_and(|b| b.len() == 16));
+            let Some(valid_md5) = valid else {
+                let xml = s3_error_xml("InvalidDigest", "The Content-MD5 you specified was invalid.", key, "req-bad-digest");
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(full_body(Bytes::from(xml)))
+                    .unwrap());
+            };
+            Some(valid_md5.to_string())
         }
-    }
+        None => None,
+    };
     let signed_headers = headers.clone();
     let req_checksum = match crate::checksum::requested_checksum(&signed_headers) {
         Ok(c) => c,
