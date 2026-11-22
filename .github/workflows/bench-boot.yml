@@ -41,10 +41,10 @@ jobs:
       - name: Build the benchmark
         run: cargo build --locked --release --example boot_bench --manifest-path server/Cargo.toml
 
-      - name: Fill, then boot twice
+      - name: Fill, scan, then boot
         shell: bash
         env:
-          OBJECTS: ${{ inputs.objects || '10000000' }}
+          OBJECTS: ${{ inputs.objects || (github.event_name == 'pull_request' && '1000000') || '10000000' }}
           SIZE: ${{ inputs.size || '64' }}
           # The runner's temp directory: on Windows it is on the fast disk (D:), see AGENTS.md.
           DATA: ${{ runner.temp }}/boot
@@ -55,6 +55,7 @@ jobs:
           out=boot.jsonl
           : > "$out"
           "$bin" fill --dir "$DATA" --objects "$OBJECTS" --size "$SIZE" | tee -a "$out"
+          "$bin" scan --dir "$DATA" | tee -a "$out"
           if [ "$RUNNER_OS" = "Linux" ]; then
             # A cold boot: nothing of the volumes in the page cache.
             sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
