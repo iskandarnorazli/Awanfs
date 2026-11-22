@@ -161,6 +161,81 @@ class MintRatchetTest(unittest.TestCase):
         )
         self.assertEqual(ratchet.check_removals("main", passing, rlog, cwd=repo), [])
 
+    def test_banner_lines_skipped_while_malformed_and_banner_only_fail(self):
+        log_with_banner = self._tmp(
+            '{"name": "mc", "function": "test_make_bucket", "status": "PASS"}\n'
+            'Dependency validation complete\n'
+            '{"name": "mc", "function": "test_rb", "status": "PASS"}\n',
+            ".json",
+        )
+        passing = self._tmp("mc::test_make_bucket\nmc::test_rb\n", ".txt")
+        rc, out = self._run([log_with_banner, passing, "--report", self.report])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("2 tests: 2 passed, 0 failed, 0 skipped.", out)
+
+        malformed = self._tmp('{"name": "mc", "function": "test_rb"\n', ".json")
+        with self.assertRaises(ValueError):
+            ratchet.parse_mint_logs([Path(malformed)])
+
+        banner_only = self._tmp("Dependency validation complete\n", ".json")
+        rc, out = self._run([banner_only, passing, "--report", self.report])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("0 test results", out)
+
+    def test_awscli_bucket_id_and_newline_normalized(self):
+        log = self._tmp(
+            '{"name": "awscli", "function": "make_bucket\\n", "status": "PASS"}\n'
+            '{"name": "awscli", "function": "aws --endpoint-url http://127.0.0.1:9000 s3api get-object --bucket awscli-mint-test-bucket-10312 --key awscli-mint-test-bucket-10312-object /tmp/datafile-0-b\\n", "status": "PASS"}\n',
+            ".json",
+        )
+        passing = self._tmp(
+            "awscli::make_bucket\n"
+            "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api get-object --bucket awscli-mint-test-bucket --key awscli-mint-test-bucket-object /tmp/datafile-0-b\n",
+            ".txt",
+        )
+        rc, out = self._run([log, passing, "--report", self.report])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Ratchet: 2 listed, 0 of them no longer pass, 0 new passes not listed.", out)
+
+    def test_brackets_in_mint_key_preserved(self):
+        log = self._tmp(
+            '{"name": "aws-sdk-php", "function": "getBucketLocation ( array $params = [] )", "status": "PASS"}\n',
+            ".json",
+        )
+        passing = self._tmp("aws-sdk-php::getBucketLocation ( array $params = [] )\n", ".txt")
+        rc, out = self._run([log, passing, "--report", self.report])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Ratchet: 1 listed, 0 of them no longer pass, 0 new passes not listed.", out)
+
+    def test_sdk_prefix_empty_function_and_repeated_fail_wins(self):
+        log = self._tmp(
+            '{"name": "minio-py:test_put_object", "function": "", "status": "PASS"}\n'
+            '{"name": "minio-py:test_set_get_bucket_versioning", "function": "", "status": "FAIL", "error": "MalformedXML"}\n'
+            '{"name": "minio-go: testCorsSetGetDelete", "function": "SetBucketCors(bucketName, cors)", "status": "PASS"}\n'
+            '{"name": "minio-go: testComposeMultipleSources", "function": "ComposeObject(destination, sourceList)", "status": "FAIL", "error": "Authentication failed"}\n'
+            '{"name": "minio-go: testComposeMultipleSources", "function": "ComposeObject(destination, sourceList)", "status": "PASS"}\n'
+            '{"name": "minio-java", "function": "putObject()", "status": "PASS"}\n'
+            '{"name": "minio-java", "function": "putObject()", "status": "FAIL", "error": "AuthorizationHeaderMalformed"}\n'
+            '{"name": "minio-java", "function": "putObject()", "status": "PASS"}\n',
+            ".json",
+        )
+        passing = self._tmp(
+            "minio-py:test_put_object\n"
+            "minio-go: testCorsSetGetDelete::SetBucketCors(bucketName, cors)\n"
+            "minio-java::putObject()\n",
+            ".txt",
+        )
+        rc, out = self._run([log, passing, "--report", self.report])
+        self.assertEqual(rc, 1, out)
+        text = Path(self.report).read_text(encoding="utf-8")
+        self.assertIn("| minio-go | 1 | 1 | 0 | 2 |", text)
+        self.assertIn("| minio-py | 1 | 1 | 0 | 2 |", text)
+        self.assertIn("| minio-java | 0 | 1 | 0 | 1 |", text)
+        self.assertIn("- `minio-java::putObject()` (failed): AuthorizationHeaderMalformed", text)
+        self.assertNotIn("## Passing but not listed", text)
+        results = ratchet.parse_mint_logs([Path(log)])
+        self.assertEqual(results["minio-go: testComposeMultipleSources::ComposeObject(destination, sourceList)"][1], "failed")
+
 
 if __name__ == "__main__":
     unittest.main()

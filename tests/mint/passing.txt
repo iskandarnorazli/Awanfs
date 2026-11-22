@@ -1,3 +1,276 @@
 # MinIO Mint tests that pass against AwanFS (#278). The mint check fails when one of these
 # stops passing. Add tests from the job's "Passing but not listed" list; remove one only
 # with a row in tests/mint/RATCHET_LOG.md and an owner decision.
+aws-sdk-go-v2::testBasicObjectOperations
+aws-sdk-go-v2::testGetObjectRange
+aws-sdk-go-v2::testObjectMetadata
+aws-sdk-php::copyObject ( array $params = [] )
+aws-sdk-php::createMultipartUpload ( array $params = [] )
+aws-sdk-php::deleteObjects (array $params = [] )
+aws-sdk-php::getBucketLocation ( array $params = [] )
+aws-sdk-php::getObject ( array $params = [] )
+aws-sdk-php::headBucket ( array $params = [] )
+aws-sdk-php::headObject ( array $params = [] )
+aws-sdk-php::listBuckets ( array $params = [] )
+aws-sdk-php::listMultipartUploads ( array $params = [] )
+aws-sdk-php::listObjects ( array $params = [] )
+aws-sdk-php::uploadPart ( array $params = [] )
+aws-sdk-ruby::bucketExists?(bucket_name)
+aws-sdk-ruby::copyObject(source_bucket_name,target_bucket_name,source_file_name,target_file_name)
+aws-sdk-ruby::getObject(bucket_name,file,destination)
+aws-sdk-ruby::listBuckets()
+aws-sdk-ruby::listObjects(bucket_name)
+aws-sdk-ruby::makeBucket(bucket_name)
+aws-sdk-ruby::presignedGet(bucket_name,file_name)
+aws-sdk-ruby::presignedPut(bucket_name,file_name)
+aws-sdk-ruby::putObject(bucket_name,file)
+aws-sdk-ruby::removeBucket(bucket_name)
+aws-sdk-ruby::removeObject(bucket_name,file)
+awscli::aws --endpoint-url http://127.0.0.1:9000 s3api copy-object --bucket awscli-mint-test-bucket --key datafile-1-kB-copy --copy-source awscli-mint-test-bucket/datafile-1-kB
+awscli::aws --endpoint-url http://127.0.0.1:9000 s3api create-multipart-upload --bucket awscli-mint-test-bucket --key awscli-mint-test-bucket-object
+awscli::aws --endpoint-url http://127.0.0.1:9000 s3api get-object --bucket awscli-mint-test-bucket --key awscli-mint-test-bucket-object /tmp/datafile-0-b
+awscli::aws --endpoint-url http://127.0.0.1:9000 s3api get-object --bucket awscli-mint-test-bucket --key datafile-1-kB /tmp/datafile-1-kB
+awscli::aws --endpoint-url http://127.0.0.1:9000 s3api head-object --bucket awscli-mint-test-bucket --key prefix/directory/datafile-1-kB
+awscli::aws --endpoint-url http://127.0.0.1:9000 s3api list-objects --bucket awscli-mint-test-bucket --prefix datafile-1-kB
+awscli::aws --endpoint-url http://127.0.0.1:9000 s3api list-objects-v2 --bucket awscli-mint-test-bucket --max-keys 1
+awscli::make_bucket
+mc::test_list_dir
+mc::test_make_bucket
+mc::test_make_bucket_error
+mc::test_put_object
+mc::test_put_object_0byte
+mc::test_put_object_error
+mc::test_put_object_with_storage_class
+mc::test_rb
+minio-go: testComposeObjectWithVersioning::ComposeObject()
+minio-go: testConcurrentCopyObjectWithVersioning::CopyObject()
+minio-go: testCopyObject::CopyObject(dst, src)
+minio-go: testCopyObjectWithVersioning::CopyObject()
+minio-go: testCorsSetGetDelete::SetBucketCors(bucketName, cors)
+minio-go: testFGetObjectContext::FGetObject(ctx, bucketName, objectName, fileName)
+minio-go: testFPutObject::StatObject(bucketName, objectName, opts)
+minio-go: testFPutObjectContext::FPutObject(bucketName, objectName, fileName, opts)
+minio-go: testGetBucketTagging::GetBucketTagging(bucketName)
+minio-go: testGetObjectAttributesErrorCases::GetObjectAttributes(ctx, bucketName, objectName, opts)
+minio-go: testGetObjectClosedTwice::GetObject(bucketName, objectName)
+minio-go: testGetObjectContext::GetObject(ctx, bucketName, objectName)
+minio-go: testGetObjectModified::GetObject(bucketName, objectName)
+minio-go: testGetObjectRanges::GetObject(ctx, bucketName, objectName, fileName)
+minio-go: testGetObjectReadAtFunctional::GetObject(bucketName, objectName)
+minio-go: testGetObjectReadAtWhenEOFWasReached::GetObject(bucketName, objectName)
+minio-go: testGetObjectReadSeekFunctional::GetObject(bucketName, objectName)
+minio-go: testGetObjectSeekEnd::GetObject(bucketName, objectName)
+minio-go: testGetObjectWithVersioning::GetObject()
+minio-go: testListObjectVersions::ListObjectVersions(bucketName, prefix, recursive)
+minio-go: testObjectTaggingWithVersioning::{Get,Set,Remove}ObjectTagging()
+minio-go: testPutObjectContext::PutObject(ctx, bucketName, objectName, fileName, opts)
+minio-go: testPutObjectReadAt::PutObject(bucketName, objectName, reader, opts)
+minio-go: testPutObjectStreaming::PutObject(bucketName, objectName, reader,size,opts)
+minio-go: testPutObjectUploadSeekedObject::PutObject(bucketName, objectName, fileToUpload, contentType)
+minio-go: testPutObjectWithChecksums::PutObject(bucketName, objectName, reader, size, opts)
+minio-go: testPutObjectWithContentLanguage::PutObject(bucketName, objectName, reader, size, opts)
+minio-go: testPutObjectWithMetadata::PutObject(bucketName, objectName, reader,size, opts)
+minio-go: testPutObjectWithTrailingChecksums::GetObjectAttributes(...)
+minio-go: testPutObjectWithVersioning::GetObject()
+minio-go: testRemoveBucketTagging::RemoveBucketTagging(bucketName)
+minio-go: testRemoveMultipleObjects::RemoveObjects(bucketName, objectsCh)
+minio-go: testRemoveMultipleObjectsIter::RemoveObjects(bucketName, objectsCh)
+minio-go: testRemoveObjectWithVersioning::DeleteObject()
+minio-go: testRemoveObjectsWithVersioning::DeleteObjects()
+minio-go: testSSES3EncryptedGetObjectReadAtFunctional::GetObject(bucketName, objectName)
+minio-go: testSSES3EncryptedGetObjectReadSeekFunctional::GetObject(bucketName, objectName)
+minio-go: testSSES3EncryptedToSSES3CopyObjectPart::CopyObjectPart(destination, source)
+minio-go: testSSES3EncryptedToUnencryptedCopyPart::CopyObjectPart(destination, source)
+minio-go: testSSES3EncryptionFPut::FPutEncryptedObject(bucketName, objectName, filePath, contentType, sse)
+minio-go: testSSES3EncryptionPutGet::PutEncryptedObject(bucketName, objectName, reader, sse)
+minio-go: testSetBucketTagging::SetBucketTagging(bucketName, tags)
+minio-go: testStatObjectWithVersioning::StatObject
+minio-go: testStorageClassMetadataCopyObject::testStorageClassMetadataCopyObject()
+minio-go: testStorageClassMetadataPutObject::testStorageClassMetadataPutObject()
+minio-go: testTrailingChecksums::PutObject(bucketName, objectName, reader,size, opts)
+minio-go: testUnencryptedToSSES3CopyObject::CopyObject(destination, source)
+minio-go: testUnencryptedToSSES3CopyObjectPart::CopyObjectPart(destination, source)
+minio-go: testUserMetadataCopyingWrapper::ComposeObject(destination, sources)
+minio-java::bucketExists()
+minio-java::composeObject()
+minio-java::deleteBucketCors()
+minio-java::deleteBucketLifecycle()
+minio-java::deleteBucketTags()
+minio-java::deleteObjectTags()
+minio-java::downloadObject()
+minio-java::getBucketCors()
+minio-java::getBucketLifecycle()
+minio-java::getBucketTags()
+minio-java::getBucketVersioning()
+minio-java::getObject()
+minio-java::getObjectTags()
+minio-java::getPresignedObjectUrl()
+minio-java::listBuckets()
+minio-java::listObjects()
+minio-java::removeObjects()
+minio-java::setBucketCors()
+minio-java::setBucketLifecycle()
+minio-java::setBucketTags()
+minio-java::setBucketVersioning()
+minio-java::setObjectTags()
+minio-java::uploadObject()
+minio-js::Check if bucket can be deleted:
+minio-js::Check if bucket with object lock can be created:
+minio-js::Check if versioning is Suspended on a bucket
+minio-js::Check if versioning is enabled on a bucket
+minio-js::Clean up temp directory part files
+minio-js::Create a local file of 100 MB and split
+minio-js::Enable Versioning on Bucket: setBucketVersioning(bucketName,versioningConfig)
+minio-js::Enable versioning  on a bucket
+minio-js::Get and verify lock config on a bucket after reset/update:
+minio-js::Get encryption of a bucket:
+minio-js::Get encryption on a bucket:
+minio-js::Get lock config on a bucket:
+minio-js::Get tags on an object
+minio-js::Put an object to check for default encryption bucket:
+minio-js::Remove Composed target Object::
+minio-js::Remove Object Parts from Bucket::
+minio-js::Remove encryption on a bucket:
+minio-js::Remove lifecycle config of a bucket
+minio-js::Remove object on a bucket:
+minio-js::Set Encryption on a bucket:
+minio-js::Set lifecycle config of a bucket
+minio-js::Set lifecycle config on a bucket:
+minio-js::Set lock config on a bucket:
+minio-js::Set tags on an object
+minio-js::Stat of an object to check for default encryption applied on a bucket:
+minio-js::Suspend versioning  on a bucket
+minio-js::Update or replace lock config on a bucket:
+minio-js::Upload parts to Bucket
+minio-js::bucketExists(bucketName)
+minio-js::bucketExists(bucketName, cb)
+minio-js::composeObject(destObjConfig, sourceObjList, cb)::
+minio-js::copyObject(bucketName, objectName, srcObject)
+minio-js::copyObject(bucketName, objectName, srcObject, cb)
+minio-js::copyObject(bucketName, objectName, srcObject, conditions, cb)
+minio-js::fGetObject(bucketName, objectName, filePath)
+minio-js::fGetObject(bucketName, objectName, filePath, callback)
+minio-js::fGetObject(bucketName, objectName, filePath, getOpts={})
+minio-js::fPutObject(bucketName, objectName, filePath, callback)
+minio-js::fPutObject(bucketName, objectName, filePath, metaData)
+minio-js::fPutObject(bucketName, objectName, filePath, metaData, callback)
+minio-js::getBucketPolicy(bucketName, cb)
+minio-js::getObject(bucketName, objectName)
+minio-js::getObject(bucketName, objectName, callback)
+minio-js::getObject(bucketName, objectName, cb)
+minio-js::getObject(bucketName, objectName, getOpts)
+minio-js::getObjectLegalHold(bucketName, objectName, setOpts={})
+minio-js::getObjectTagging  object
+minio-js::getPartialObject(bucketName, objectName, offset, length, cb)
+minio-js::getPartialObject(bucketName, objectName, offset, length, getOpts)
+minio-js::initiateNewMultipartUpload(bucketName, objectName, metaData, cb)
+minio-js::listBuckets()
+minio-js::listBuckets(cb)
+minio-js::listIncompleteUploads(bucketName, prefix, recursive)
+minio-js::listObjects(bucketName, '', true, {IncludeVersion: true}, cb)
+minio-js::listObjectsV2(bucketName, prefix, recursive)
+minio-js::makeBucket(bucketName, region)
+minio-js::makeBucket(bucketName, region, cb)
+minio-js::presignedGetObject(bucketName, objectName, 1000, respHeaders, requestDate, cb)
+minio-js::presignedGetObject(bucketName, objectName, cb)
+minio-js::presignedGetObject(bucketName, objectName, expires)
+minio-js::presignedGetObject(bucketName, objectName, expires, cb)
+minio-js::presignedGetObject(bucketName, objectName, expires, respHeaders, cb)
+minio-js::presignedGetObject(bucketName, objectName, respHeaders, cb)
+minio-js::presignedPutObject(bucketName, objectName)
+minio-js::presignedPutObject(bucketName, objectName, expires)
+minio-js::presignedPutObject(bucketName, objectName, expires, cb)
+minio-js::presignedPutObject(bucketName, objectName, expires=1000, cb)
+minio-js::presignedUrl(httpMethod, bucketName, objectName, expires, cb)
+minio-js::putObject(bucketName, objectName, 0byte)
+minio-js::putObject(bucketName, objectName, stream)
+minio-js::putObject(bucketName, objectName, stream, callback)
+minio-js::putObject(bucketName, objectName, stream, metaData)
+minio-js::putObject(bucketName, objectName, stream, metaData, cb)
+minio-js::putObject(bucketName, objectName, stream, metadata, cb)
+minio-js::putObject(bucketName, objectName, stream, size, contentType, callback)
+minio-js::putObject(bucketName, objectName, stream, size, metaData, callback)
+minio-js::remove Tags on an object
+minio-js::removeBucket(bucketName)
+minio-js::removeBucket(bucketName, )
+minio-js::removeBucket(bucketName, cb)
+minio-js::removeIncompleteUploads(bucketName, prefix)
+minio-js::removeObject object
+minio-js::removeObject(0byte, objectName)
+minio-js::removeObject(bucketName, objectList, removeOpts)
+minio-js::removeObject(bucketName, objectName)
+minio-js::removeObject(bucketName, objectName, callback)
+minio-js::removeObject(bucketName, objectName, cb)
+minio-js::removeObject(bucketName, objectName, filePath, callback)
+minio-js::removeObject(bucketName, objectName, removeOpts)
+minio-js::removeObject(bucketName, objectName, stream)
+minio-js::removeObjectTagging on an object
+minio-js::removeObjects with non latin characters
+minio-js::removeObjects(bucketName, objectList, removeOpts)
+minio-js::removeObjects(bucketName, objectsList)
+minio-js::setBucketPolicy(bucketName, bucketPolicy, cb)
+minio-js::setBucketVersioning(bucketName, versionConfig):
+minio-js::setObjectLegalHold(bucketName, objectName, setOpts={})
+minio-js::setObjectTagging  object
+minio-js::statObject(bucketName, objectName)
+minio-js::statObject(bucketName, objectName, cb)
+minio-js::statObject(bucketName, objectName, cb)::
+minio-js::statObject(bucketName, objectName, statOpts)
+minio-py:test_copy_object_etag_match
+minio-py:test_copy_object_modified_since
+minio-py:test_copy_object_negative_etag_match
+minio-py:test_copy_object_no_copy_condition
+minio-py:test_copy_object_unmodified_since
+minio-py:test_copy_object_with_metadata
+minio-py:test_fget_object
+minio-py:test_fget_object_version
+minio-py:test_fput_object_large_file
+minio-py:test_fput_object_small_file
+minio-py:test_fput_object_with_content_type
+minio-py:test_get_object
+minio-py:test_get_object_version
+minio-py:test_get_object_with_default_length
+minio-py:test_get_partial_object
+minio-py:test_list_buckets::remove_bucket(bucket_name)
+minio-py:test_list_object_v1_versions
+minio-py:test_list_object_versions
+minio-py:test_list_objects
+minio-py:test_list_objects_v1
+minio-py:test_list_objects_with_1001_files
+minio-py:test_list_objects_with_prefix
+minio-py:test_make_bucket_default_region::make_bucket(bucket_name, location, object_lock)
+minio-py:test_make_bucket_with_region
+minio-py:test_negative_make_bucket_invalid_name::make_bucket(bucket_name, location, object_lock)
+minio-py:test_negative_put_object_with_path_segment
+minio-py:test_presigned_get_object_default_expiry
+minio-py:test_presigned_get_object_expiry
+minio-py:test_presigned_get_object_response_headers
+minio-py:test_presigned_get_object_version
+minio-py:test_presigned_post_policy
+minio-py:test_presigned_put_object_default_expiry
+minio-py:test_presigned_put_object_expiry
+minio-py:test_put_object
+minio-py:test_stat_object
+minio-py:test_stat_object_version
+minio-py:test_thread_safe
+s3cmd::test_get_object
+s3cmd::test_get_object_multipart
+s3cmd::test_make_bucket
+s3cmd::test_make_bucket_error
+s3cmd::test_put_object
+s3cmd::test_put_object_error
+s3cmd::test_put_object_multipart
+s3cmd::test_sync_list_objects
+versioning::testCreateVersioningBucket
+versioning::testDeleteObject
+versioning::testDeleteObjects
+versioning::testGetObject
+versioning::testListObjectKeysContinuation
+versioning::testListObjectVersionIDContinuation
+versioning::testListObjectVersionsSimple
+versioning::testListObjectVersionsWithPrefixAndDelimiter
+versioning::testListObjectsVersionsWithEmptyDirObject
+versioning::testPutObject
+versioning::testPutObjectWithTaggingAndMetadata
+versioning::testStatObject
+versioning::testTagging

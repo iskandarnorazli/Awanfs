@@ -8,81 +8,23 @@ Exits 1 when a test listed in passing.txt did not pass or when 0 tests were pars
 otherwise 0. Prints per-SDK pass/fail/skip counts and unlisted passing tests.
 """
 import argparse
-import json
 import subprocess
 import sys
 from collections import Counter, OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-STATUS_RANK = {"passed": 0, "skipped": 1, "failed": 2}
-STATUS_MAP = {
-    "PASS": "passed",
-    "PASSED": "passed",
-    "OK": "passed",
-    "FAIL": "failed",
-    "FAILED": "failed",
-    "ERROR": "failed",
-    "NA": "skipped",
-    "SKIP": "skipped",
-    "SKIPPED": "skipped",
-}
+SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+from features import collect_mint_results, decode_mint_entries  # noqa: E402
 
-
-def decode_mint_entries(text: str, source: Optional[Path] = None) -> List[dict]:
-    """Decode Mint log content from NDJSON, concatenated JSON objects, or a JSON array."""
-    stripped = text.strip()
-    if not stripped:
-        return []
-    if stripped.startswith("["):
-        data = json.loads(stripped)
-        if not isinstance(data, list) or not all(isinstance(x, dict) for x in data):
-            raise ValueError(f"{source or '<mint-log>'}: expected JSON array of objects")
-        return data
-
-    decoder = json.JSONDecoder()
-    entries: List[dict] = []
-    idx = 0
-    n = len(text)
-    while idx < n:
-        while idx < n and text[idx].isspace():
-            idx += 1
-        if idx >= n:
-            break
-        try:
-            obj, next_idx = decoder.raw_decode(text, idx)
-        except json.JSONDecodeError as exc:
-            line = text.count("\n", 0, idx) + 1
-            raise ValueError(f"{source or '<mint-log>'}:{line}: invalid Mint JSON log: {exc}") from exc
-        if not isinstance(obj, dict):
-            line = text.count("\n", 0, idx) + 1
-            raise ValueError(f"{source or '<mint-log>'}:{line}: expected JSON object, got {type(obj).__name__}")
-        entries.append(obj)
-        idx = next_idx
-    return entries
+MINT_STATUS_NAMES = {"pass": "passed", "skip": "skipped", "fail": "failed"}
 
 
 def parse_mint_logs(paths: Sequence[Path]) -> "OrderedDict[str, Tuple[str, str, str]]":
     """Return `{sdk::function: (sdk, status, detail)}` from one or more Mint JSON logs."""
-    out: "OrderedDict[str, Tuple[str, str, str]]" = OrderedDict()
-    for path in paths:
-        entries = decode_mint_entries(path.read_text(encoding="utf-8"), source=path)
-        for item in entries:
-            sdk = str(item.get("name") or item.get("sdk") or "").strip()
-            fn = str(item.get("function") or item.get("test") or "").strip()
-            key = f"{sdk}::{fn}" if (sdk and fn) else (sdk or fn)
-            if not key:
-                continue
-            sdk_label = sdk or "unknown"
-            raw_status = str(item.get("status", "")).strip().upper()
-            status = STATUS_MAP.get(raw_status, "failed")
-            raw_detail = str(item.get("error") or item.get("alert") or item.get("message") or "").strip()
-            detail = raw_detail.splitlines()[0][:160] if raw_detail else ""
-            if key not in out or STATUS_RANK[status] > STATUS_RANK[out[key][1]]:
-                out[key] = (sdk_label, status, detail)
-            elif status == out[key][1] and not out[key][2] and detail:
-                out[key] = (sdk_label, status, detail)
-    return out
+    return collect_mint_results(paths, status_names=MINT_STATUS_NAMES)
 
 
 def parse_passing_list(text: str) -> List[str]:
