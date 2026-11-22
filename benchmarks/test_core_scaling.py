@@ -1290,6 +1290,79 @@ class DurabilityAndAutoProfileTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 cs._start_awanfs(fake_bin, 4, tmpdir, durability="bogus")
 
+    def test_start_rustfs_env_matches_durability_labels(self):
+        spawned_envs = []
+
+        class FakeProc:
+            pid = 4343
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_rustfs = os.path.join(tmpdir, "rustfs")
+            fake_mc = os.path.join(tmpdir, "mc")
+            for p in (fake_rustfs, fake_mc):
+                with open(p, "wb") as fh:
+                    fh.write(b"bin")
+            with mock.patch.dict(os.environ, {"RUSTFS_DURABILITY_MODE": "strict"}, clear=False), \
+                 mock.patch.object(cs, "_spawn_pinned", side_effect=lambda argv, n, lp, env=None: spawned_envs.append(dict(env or {})) or FakeProc()), \
+                 mock.patch.object(cs, "_wait_port", return_value=None), \
+                 mock.patch.object(cs, "_setup_mc_bucket"), \
+                 mock.patch.object(cs.rwb, "anonymous_put_ok", return_value=True):
+                _proc, _port, data_dir, _log = cs._start_rustfs(fake_rustfs, fake_mc, 1, tmpdir)
+                cs.shutil.rmtree(data_dir, ignore_errors=True)
+
+        self.assertEqual(len(spawned_envs), 1)
+        env = spawned_envs[0]
+        posix_rows = {srv: (cfg, waits, note) for srv, cfg, waits, note in cs.server_durability_rows("posix")}
+        rustfs_cfg, rustfs_waits, rustfs_note = posix_rows["RustFS"]
+
+        cores, results = _sample_results()
+        core_md = cs.render_report(
+            cmd="python benchmarks/core_scaling.py",
+            cores=cores,
+            results=results,
+            total_cores=4,
+            runs=2,
+            duration_sec=2.0,
+        )
+        patterns, sizes, m_cores, concs, m_results = _sample_matrix_results()
+        matrix_md = cs.render_matrix_report(
+            cmd="python benchmarks/core_scaling.py --matrix",
+            patterns=patterns,
+            sizes=sizes,
+            cores=m_cores,
+            concurrencies=concs,
+            results=m_results,
+            total_cores=4,
+            runs=2,
+            duration_sec=2.0,
+            seed=42,
+            memory_budget="32MiB",
+            prefill_bytes=48 * cs.MIB,
+        )
+        core_dur = next(ln for ln in core_md.splitlines() if ln.startswith("- **Durability:**"))
+        matrix_dur = next(ln for ln in matrix_md.splitlines() if ln.startswith("- **Durability:**"))
+
+        self.assertIsNone(env.get("RUSTFS_DURABILITY_MODE"))
+        self.assertEqual(rustfs_waits, "Yes")
+        self.assertIn("release defaults", rustfs_cfg)
+        self.assertIn("durable", rustfs_cfg)
+        self.assertIn("2026-11-21-durability-probe.md", rustfs_note)
+        for text in (rustfs_cfg, core_dur, matrix_dur):
+            self.assertNotIn("RUSTFS_DURABILITY_MODE=strict", text)
+            self.assertIn("release defaults", text)
+            self.assertIn("durable", text)
+            if text is not rustfs_cfg:
+                self.assertIn("2026-11-21-durability-probe.md", text)
+
     def test_should_auto_profile_put_requires_16_plus_split_client_cores(self):
         self.assertTrue(cs.should_auto_profile_put(16, [1, 2, 4, 8]))
         self.assertFalse(cs.should_auto_profile_put(4, [1, 2, 4]))

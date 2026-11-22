@@ -282,9 +282,9 @@ def server_durability_rows(os_name: Optional[str] = None) -> List[Tuple[str, str
         minio_row,
         (
             "RustFS",
-            "RUSTFS_DURABILITY_MODE=strict",
+            "release defaults (durable)",
             "Yes",
-            "Syncs data, xl.meta, and directories before 200 OK.",
+            "Measured on Linux (measurements/2026-11-21-durability-probe.md, #334): 3.09 sync calls/PUT (618 syncs / 200 PUTs).",
         ),
         (
             "Garage",
@@ -1324,6 +1324,7 @@ def _start_rustfs(rustfs_bin: Optional[str], mc_bin: Optional[str], n_cores: int
     port = rwb.get_free_port()
     log_path = os.path.join(data_root, f"scaling_rustfs_{port}.log")
     env = dict(os.environ, RUSTFS_ACCESS_KEY="rustfsadmin", RUSTFS_SECRET_KEY="rustfsadmin")
+    env.pop("RUSTFS_DURABILITY_MODE", None)
     proc = _spawn_pinned(
         [rustfs_bin, "server", "--address", f"127.0.0.1:{port}", "--access-key", "rustfsadmin", "--secret-key", "rustfsadmin", data],
         n_cores,
@@ -2653,7 +2654,7 @@ def render_report(
         f"- **Machine:** {platform.node()} ({platform.platform()}, {total_cores} logical cores, {rwb.host_ram_gb()} GB RAM, CPU: {rwb.cpu_model()})",
         f"- **Methodology:** `cores = {', '.join(str(n) for n in cores)}`, `concurrency = 16 × N`, `client_procs = {client_procs}`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase.",
         f"- **Core pinning:** {sharing_note}",
-        f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()} RustFS strict fsync (`RUSTFS_DURABILITY_MODE=strict`). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default. {probe_note}",
+        f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()} RustFS release defaults (durable, 3.09 syncs/PUT; measurements/2026-11-21-durability-probe.md, #334). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default. {probe_note}",
         "",
     ]
     lines.extend(_durability_section_lines())
@@ -3389,7 +3390,7 @@ def render_matrix_report(
         f"- **Methodology:** `patterns = {', '.join(patterns)}`, `sizes = {', '.join(format_size(s) for s in sizes)}`, `cores = {', '.join(str(n) for n in cores)}`, `concurrencies = {', '.join(str(c) for c in concurrencies)}`, `client_procs = {client_procs}`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase, seed = `{seed}`.",
         f"- **Cache & Prefill:** AwanFS `--memory-budget {format_size(budget_bytes)}` (stated cache half = {format_size(cache_bytes)}). Read prefill size = {format_size(prefill_bytes)} ({describe_prefill_sets(prefill_bytes, patterns, sizes)}), identical deterministic bytes for every server, written before timing.",
         f"- **Core pinning:** {sharing_note}",
-        f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()} RustFS strict fsync (`RUSTFS_DURABILITY_MODE=strict`). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default.",
+        f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()} RustFS release defaults (durable, 3.09 syncs/PUT; measurements/2026-11-21-durability-probe.md, #334). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default.",
         "",
     ]
     lines.extend(_durability_section_lines())
