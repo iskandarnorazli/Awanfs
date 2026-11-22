@@ -78,6 +78,14 @@ server_tests = ["server/tests/health_test.rs"]
 """
 
 
+def cors_waits_on(other):
+    """VALID_TOML with cors's failing test listed as waiting on `other`."""
+    return VALID_TOML.replace(
+        'fuzz = ["cors_xml"]\n',
+        'fuzz = ["cors_xml"]\n\n[feature.waits_on]\n"test_s3::test_cors_header_option" = "%s"\n' % other,
+    )
+
+
 class FeaturesTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -93,7 +101,7 @@ class FeaturesTest(unittest.TestCase):
         (self.root / "server" / "fuzz" / "Cargo.toml").write_text(MINIMAL_FUZZ_CARGO, encoding="utf-8")
         (self.root / "server" / "fuzz" / "fuzz_targets" / "cors_xml.rs").write_text("", encoding="utf-8")
         (self.root / "tests" / "s3tests" / "passing.txt").write_text(
-            "test_s3::test_set_cors\n", encoding="utf-8"
+            "test_s3::test_set_cors\ntest_s3::test_cors_header_option\n", encoding="utf-8"
         )
 
         self.suite = self.root / "test_s3.py"
@@ -115,6 +123,47 @@ class FeaturesTest(unittest.TestCase):
 
     def test_valid_registry_passes(self):
         self.assertEqual(self._run_check(), 0)
+
+    # A feature is done only when its ceph tests pass, or each one that does not names the
+    # unfinished feature it waits on (owner, 2026-11-21).
+    def _passing(self, *names):
+        (self.root / "tests" / "s3tests" / "passing.txt").write_text("".join(n + "\n" for n in names), encoding="utf-8")
+
+    def _probs(self):
+        return features.check_registry(root=self.root, registry_path=self.registry, ceph_suites=[self.suite])
+
+    def test_a_done_feature_with_a_failing_ceph_test_fails(self):
+        self._passing("test_s3::test_set_cors")
+        probs = self._probs()
+        self.assertTrue(any("cors" in p and "test_s3::test_cors_header_option" in p and "done" in p for p in probs), probs)
+        self.assertEqual(self._run_check(), 1)
+
+    def test_a_failing_test_listed_under_waits_on_an_unfinished_feature_passes(self):
+        self._passing("test_s3::test_set_cors")
+        self.registry.write_text(cors_waits_on("sigv2"), encoding="utf-8")
+        self.assertEqual(self._probs(), [])
+
+    def test_waits_on_an_unknown_or_done_feature_fails(self):
+        self._passing("test_s3::test_set_cors")
+        for other, word in (("nosuch", "unknown"), ("health", "done")):
+            self.registry.write_text(cors_waits_on(other), encoding="utf-8")
+            probs = self._probs()
+            self.assertTrue(any("waits_on" in p and other in p and word in p for p in probs), (other, probs))
+
+    def test_a_waits_on_entry_for_a_passing_test_is_stale_and_fails(self):
+        self.registry.write_text(cors_waits_on("sigv2"), encoding="utf-8")
+        probs = self._probs()
+        self.assertTrue(any("waits_on" in p and "test_cors_header_option" in p and "passes" in p for p in probs), probs)
+
+    def test_a_waits_on_entry_for_another_features_test_fails(self):
+        self._passing("test_s3::test_set_cors")
+        self.registry.write_text(
+            VALID_TOML.replace('server_tests = ["server/tests/health_test.rs"]',
+                               'server_tests = ["server/tests/health_test.rs"]\n\n[feature.waits_on]\n"test_s3::test_cors_header_option" = "sigv2"'),
+            encoding="utf-8",
+        )
+        probs = self._probs()
+        self.assertTrue(any("health" in p and "waits_on" in p and "not one of its tests" in p for p in probs), probs)
 
     def test_test_in_no_feature_fails(self):
         self.suite.write_text(

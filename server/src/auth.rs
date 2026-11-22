@@ -95,13 +95,43 @@ fn canonical_query(pairs: &[(String, String)], skip: Option<&str>) -> String {
     enc.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&")
 }
 
-fn canonical_headers(headers: &HeaderMap, signed: &[&str]) -> Result<String, &'static str> {
+/// How a signed header value's bytes become text in the canonical request. Clients sign text and
+/// may send its bytes as Latin-1 (Python's http.client: `\xe9` is one byte, 0xE9) or as UTF-8.
+/// ASCII reads the same either way.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum HeaderText {
+    Latin1,
+    Utf8,
+}
+
+fn header_text(bytes: &[u8], how: HeaderText) -> Option<String> {
+    match how {
+        HeaderText::Latin1 => Some(bytes.iter().map(|&b| b as char).collect()),
+        HeaderText::Utf8 => std::str::from_utf8(bytes).ok().map(str::to_string),
+    }
+}
+
+/// The readings to try for these signed headers: Latin-1, then UTF-8 when it reads some value
+/// differently. Each still needs the secret to match.
+fn header_readings(headers: &HeaderMap, signed: &[&str]) -> Vec<HeaderText> {
+    let mut out = vec![HeaderText::Latin1];
+    let differs = signed.iter().flat_map(|n| headers.get_all(*n).iter()).any(|v| {
+        let b = v.as_bytes();
+        !b.is_ascii() && std::str::from_utf8(b).is_ok()
+    });
+    if differs {
+        out.push(HeaderText::Utf8);
+    }
+    out
+}
+
+fn canonical_headers(headers: &HeaderMap, signed: &[&str], how: HeaderText) -> Result<String, &'static str> {
     let mut out = String::new();
     for name in signed {
         let values: Vec<String> = headers
             .get_all(*name)
             .iter()
-            .filter_map(|v| v.to_str().ok())
+            .filter_map(|v| header_text(v.as_bytes(), how))
             .map(|v| v.split_whitespace().collect::<Vec<_>>().join(" "))
             .collect();
         if values.is_empty() {
@@ -256,28 +286,30 @@ pub fn authenticate_with(
     };
 
     let (principal, secret) = secret_for(cfg, iam, p.access_key).ok_or("InvalidAccessKeyId")?;
-    let canonical_request = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}",
-        method,
-        if raw_path.is_empty() { "/" } else { raw_path },
-        canonical_query(&pairs, skip),
-        canonical_headers(headers, &p.signed_headers)?,
-        p.signed_headers.join(";"),
-        payload_hash
-    );
     let scope = format!("{}/{}/{}/aws4_request", p.date8, p.region, p.service);
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        amz_date,
-        scope,
-        sha256_hex(canonical_request.as_bytes())
-    );
-    let expected = compute_sigv4_signature(cache, secret, p.date8, p.region, p.service, &string_to_sign);
-    if constant_time_eq(&expected, &p.signature.to_ascii_lowercase()) {
-        Ok(principal)
-    } else {
-        Err("SignatureDoesNotMatch")
+    let signature = p.signature.to_ascii_lowercase();
+    for how in header_readings(headers, &p.signed_headers) {
+        let canonical_request = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            method,
+            if raw_path.is_empty() { "/" } else { raw_path },
+            canonical_query(&pairs, skip),
+            canonical_headers(headers, &p.signed_headers, how)?,
+            p.signed_headers.join(";"),
+            payload_hash
+        );
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+            amz_date,
+            scope,
+            sha256_hex(canonical_request.as_bytes())
+        );
+        let expected = compute_sigv4_signature(cache, secret, p.date8, p.region, p.service, &string_to_sign);
+        if constant_time_eq(&expected, &signature) {
+            return Ok(principal);
+        }
     }
+    Err("SignatureDoesNotMatch")
 }
 
 /// For a signed request whose `x-amz-content-sha256` is a hex digest: does the body match it?
