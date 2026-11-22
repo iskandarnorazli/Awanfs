@@ -2,6 +2,8 @@
 
     python3 tests/s3tests/test_conformance_map.py
 """
+import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -101,9 +103,13 @@ class Map(unittest.TestCase):
     def test_a_test_no_rule_matches_fails_the_run(self):
         suite = tmp("def test_zzz():\n    pass\n", ".py")
         out = tmp("", ".md")
-        self.assertEqual(cm.main([suite, self.passing, "--report", out]), 1)
-        self.assertIn("Unassigned", open(out, encoding="utf-8").read())
-        self.assertEqual(cm.main([self.suite, self.passing, "--report", out]), 0)
+        stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+            self.assertEqual(cm.main([suite, self.passing, "--report", out]), 1)
+            with open(out, encoding="utf-8") as fh:
+                self.assertIn("Unassigned", fh.read())
+            self.assertEqual(cm.main([self.suite, self.passing, "--report", out]), 0)
+        self.assertIn("1 unassigned test(s): test_zzz", stderr_buf.getvalue())
 
     def test_report_table(self):
         rows, unassigned = self.rows()
