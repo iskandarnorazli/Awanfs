@@ -324,6 +324,96 @@ class FeaturesTest(unittest.TestCase):
         )
         self.assertTrue(any("aws-sdk-go::MissingTest" in p for p in probs), probs)
 
+    def test_mint_log_skips_banner_lines_and_fails_on_malformed_or_empty(self):
+        good = self.root / "mint_banner.json"
+        good.write_text(
+            '{"name": "mc", "function": "test_make_bucket", "status": "PASS"}\n'
+            'Dependency validation complete\n'
+            '{"name": "mc", "function": "test_rb", "status": "PASS"}\n',
+            encoding="utf-8",
+        )
+        parsed = features.parse_mint_log([good])
+        self.assertEqual(
+            parsed,
+            {"mc::test_make_bucket": ("pass", ""), "mc::test_rb": ("pass", "")},
+        )
+
+        malformed = self.root / "mint_bad.json"
+        malformed.write_text('{"name": "mc", "function": "test_rb"\n', encoding="utf-8")
+        with self.assertRaises(ValueError):
+            features.parse_mint_log([malformed])
+        probs = features.check_registry(
+            root=self.root, registry_path=self.registry, ceph_suites=[self.suite], mint_logs=[malformed]
+        )
+        self.assertTrue(probs)
+
+        for name, text in (("mint_empty.json", "\n"), ("mint_only_banner.json", "Dependency validation complete\n")):
+            empty = self.root / name
+            empty.write_text(text, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                features.parse_mint_log([empty])
+            probs = features.check_registry(
+                root=self.root, registry_path=self.registry, ceph_suites=[self.suite], mint_logs=[empty]
+            )
+            self.assertTrue(probs, name)
+
+    def test_mint_log_normalizes_awscli_and_strips_newlines(self):
+        mint_log = self.root / "mint_awscli.json"
+        mint_log.write_text(
+            '{"name": "awscli", "function": "make_bucket\\n", "status": "PASS"}\n'
+            '{"name": "awscli", "function": "aws --endpoint-url http://127.0.0.1:9000 s3api create-multipart-upload --bucket awscli-mint-test-bucket-2170 --key awscli-mint-test-bucket-2170-object\\r\\n", "status": "PASS"}\n',
+            encoding="utf-8",
+        )
+        parsed = features.parse_mint_log([mint_log])
+        self.assertEqual(
+            sorted(parsed),
+            [
+                "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api create-multipart-upload --bucket awscli-mint-test-bucket --key awscli-mint-test-bucket-object",
+                "awscli::make_bucket",
+            ],
+        )
+
+    def test_parse_passing_file_preserves_brackets_in_mint_keys(self):
+        ceph_p = self.root / "ceph_passing.txt"
+        ceph_p.write_text(
+            "test_copy_enc[sse-c]\n"
+            "test_s3::test_other[1]\n"
+            "test_headers::test_bad_header[x]\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            features.parse_passing_file(ceph_p, default_prefix="test_s3::"),
+            {"test_s3::test_copy_enc", "test_s3::test_other", "test_headers::test_bad_header"},
+        )
+
+        mint_p = self.root / "mint_passing.txt"
+        mint_p.write_text(
+            "aws-sdk-php::getBucketLocation ( array $params = [] )\n"
+            "minio-js::setObjectLegalHold(bucketName, objectName, setOpts={})\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            features.parse_passing_file(mint_p),
+            {
+                "aws-sdk-php::getBucketLocation ( array $params = [] )",
+                "minio-js::setObjectLegalHold(bucketName, objectName, setOpts={})",
+            },
+        )
+
+    def test_mint_log_empty_function_and_repeated_fail_wins(self):
+        mint_log = self.root / "mint_rep.json"
+        mint_log.write_text(
+            '{"name": "minio-py:test_put_object", "function": "", "status": "PASS"}\n'
+            '{"name": "minio-java", "function": "putObject()", "status": "PASS"}\n'
+            '{"name": "minio-java", "function": "putObject()", "status": "FAIL", "error": "AuthorizationHeaderMalformed"}\n'
+            '{"name": "minio-java", "function": "putObject()", "status": "NA"}\n'
+            '{"name": "minio-java", "function": "putObject()", "status": "PASS"}\n',
+            encoding="utf-8",
+        )
+        parsed = features.parse_mint_log([mint_log])
+        self.assertEqual(parsed["minio-py:test_put_object"], ("pass", ""))
+        self.assertEqual(parsed["minio-java::putObject()"], ("fail", "AuthorizationHeaderMalformed"))
+
     def test_report_writes_features_md_with_status_counts_and_gaps(self):
         mint_log = self.root / "mint.json"
         mint_log.write_text(

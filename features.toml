@@ -20,6 +20,27 @@ ceph = [
   "test_s3::test_cors_presigned_put_object_v2",
   "test_s3::test_cors_presigned_put_object_tenant_v2",
 ]
+mint = [
+  "minio-go: testComposeMultipleSources::ComposeObject(destination, sourceList)",
+  "minio-go: testComposeObjectErrorCasesWrapper::ComposeObject(destination, sourceList)",
+  "minio-go: testCopyObjectV2::CopyObject(destination, source)",
+  "minio-go: testFGetObjectContextV2::FGetObject(ctx, bucketName, objectName,fileName)",
+  "minio-go: testFPutObjectContextV2::FPutObjectContext(ctx, bucketName, objectName, fileName, opts)",
+  "minio-go: testFPutObjectV2::FPutObject(bucketName, objectName, fileName, opts)",
+  "minio-go: testFunctionalV2::MakeBucket(bucketName, location)",
+  "minio-go: testGetObjectClosedTwiceV2::MakeBucket(bucketName, region)",
+  "minio-go: testGetObjectContextV2::GetObject(ctx, bucketName, objectName)",
+  "minio-go: testGetObjectReadAtFunctionalV2::GetObject(bucketName, objectName)",
+  "minio-go: testGetObjectReadSeekFunctionalV2::GetObject(bucketName, objectName)",
+  "minio-go: testMakeBucketErrorV2::MakeBucket(bucketName, region)",
+  "minio-go: testMakeBucketRegionsV2::MakeBucket(bucketName, region)",
+  "minio-go: testPutObject0ByteV2::PutObject(bucketName, objectName, reader, size, opts)",
+  "minio-go: testPutObjectContextV2::PutObject(ctx, bucketName, objectName, reader, size, opts)",
+  "minio-go: testPutObjectMetadataNonUSASCIIV2::PutObject(bucketName, objectName, reader, size, opts)",
+  "minio-go: testPutObjectNoLengthV2::PutObject(bucketName, objectName, reader, size, opts)",
+  "minio-go: testPutObjectsUnknownV2::PutObject(bucketName, objectName, reader,size,opts)",
+  "minio-go: testUserMetadataCopyingWrapper::CopyObject(destination, source)",
+]
 
 [[feature]]
 id = "request-headers-unsendable"
@@ -129,6 +150,14 @@ ceph = [
   "test_s3::test_list_object_versions_restore_status",
   "test_s3::test_lifecycle_transition_encrypted",
 ]
+mint = [
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api head-object --bucket awscli-mint-test-bucket --key datafile-1-kB-copy",
+  "mc::test_put_object_with_storage_class",
+  "mc::test_put_object_with_storage_class_error",
+  "minio-go: testStorageClassInvalidMetadataPutObject::testStorageClassInvalidMetadataPutObject()",
+  "minio-go: testStorageClassMetadataCopyObject::testStorageClassMetadataCopyObject()",
+  "minio-go: testStorageClassMetadataPutObject::testStorageClassMetadataPutObject()",
+]
 
 [[feature]]
 id = "encryption"
@@ -146,6 +175,27 @@ operations = [
   "DeleteBucketEncryption",
 ]
 ceph = ["re:^test_s3::(?!.*transition).*(sse|encrypt|kms|_enc_|_enc$|noenc)"]
+mint = [
+  "minio-go: testEncryptedSSES3ToSSES3CopyObject::CopyObject(destination, source)",
+  "minio-go: testEncryptedSSES3ToUnencryptedCopyObject::CopyObject(destination, source)",
+  "minio-go: testSSES3EncryptedGetObjectReadAtFunctional::GetObject(bucketName, objectName)",
+  "minio-go: testSSES3EncryptedGetObjectReadSeekFunctional::GetObject(bucketName, objectName)",
+  "minio-go: testSSES3EncryptedToSSES3CopyObjectPart::CopyObjectPart(destination, source)",
+  "minio-go: testSSES3EncryptedToUnencryptedCopyPart::CopyObjectPart(destination, source)",
+  "minio-go: testSSES3EncryptionFPut::FPutEncryptedObject(bucketName, objectName, filePath, contentType, sse)",
+  "minio-go: testSSES3EncryptionPutGet::PutEncryptedObject(bucketName, objectName, reader, sse)",
+  "minio-go: testUnencryptedToSSES3CopyObject::CopyObject(destination, source)",
+  "minio-go: testUnencryptedToSSES3CopyObjectPart::CopyObjectPart(destination, source)",
+  "minio-java::deleteBucketEncryption()",
+  "minio-java::getBucketEncryption()",
+  "minio-java::setBucketEncryption()",
+  "minio-js::Get encryption of a bucket:",
+  "minio-js::Get encryption on a bucket:",
+  "minio-js::Put an object to check for default encryption bucket:",
+  "minio-js::Remove encryption on a bucket:",
+  "minio-js::Set Encryption on a bucket:",
+  "minio-js::Stat of an object to check for default encryption applied on a bucket:",
+]
 
 [[feature]]
 id = "lifecycle"
@@ -156,6 +206,14 @@ area = "lifecycle"
 design_section = "8.3"
 operations = ["PutBucketLifecycleConfiguration", "GetBucketLifecycleConfiguration", "DeleteBucketLifecycle"]
 ceph = ["re:^test_s3::test_lifecycle_(?!.*(transition|cloud))", "test_s3::test_lifecyclev2_expiration", "test_s3::test_delete_marker_expiration"]
+mint = [
+  "minio-java::deleteBucketLifecycle()",
+  "minio-java::getBucketLifecycle()",
+  "minio-java::setBucketLifecycle()",
+  "minio-js::Remove lifecycle config of a bucket",
+  "minio-js::Set lifecycle config of a bucket",
+  "minio-js::Set lifecycle config on a bucket:",
+]
 server_tests = ["server/tests/lifecycle_test.rs", "server/tests/scheduler_test.rs", "server/tests/clock_and_dates_test.rs"]
 fuzz = ["lifecycle_xml", "lifecycle_config_xml"]
 
@@ -175,6 +233,25 @@ operations = [
   "GetObjectLegalHold",
 ]
 ceph = ["re:^test_s3::test_object_lock_"]
+mint = [
+  "minio-java::disableObjectLegalHold()",
+  "minio-java::enableObjectLegalHold()",
+  "minio-java::getObjectLockConfiguration()",
+  "minio-java::getObjectRetention()",
+  "minio-java::isObjectLegalHoldEnabled()",
+  "minio-java::setObjectLockConfiguration()",
+  "minio-java::setObjectRetention()",
+  "minio-js::Check if bucket with object lock can be created:",
+  "minio-js::Get and verify lock config on a bucket after reset/update:",
+  "minio-js::Get lock config on a bucket:",
+  "minio-js::Set lock config on a bucket:",
+  "minio-js::Update or replace lock config on a bucket:",
+  "minio-js::getObjectLegalHold(bucketName, objectName, setOpts={})",
+  "minio-js::putObjectRetention(bucketName, objectName, putOpts)",
+  "minio-js::setObjectLegalHold(bucketName, objectName, setOpts={})",
+  "minio-py:test_make_bucket_default_region::make_bucket(bucket_name, location, object_lock)",
+  "minio-py:test_negative_make_bucket_invalid_name::make_bucket(bucket_name, location, object_lock)",
+]
 fuzz = ["object_lock_xml"]
 
 [[feature]]
@@ -186,6 +263,15 @@ area = "post-object"
 design_section = "7.3"
 operations = ["PostObject"]
 ceph = ["re:^test_s3::test_post_object_"]
+mint = [
+  "aws-sdk-ruby::presignedPost(bucket_name,file_name,expires_in_sec,max_byte_size)",
+  "minio-go: testPresignedPostPolicy::PresignedPostPolicy(policy)",
+  "minio-go: testPresignedPostPolicyEmptyFileName::PresignedPostPolicy(policy)",
+  "minio-go: testPresignedPostPolicyWrongFile::PresignedPostPolicy(policy)",
+  "minio-java::getPresignedPostFormData()",
+  "minio-js::presignedPostPolicy(postPolicy, cb)",
+  "minio-py:test_presigned_post_policy",
+]
 fuzz = ["form_upload"]
 
 [[feature]]
@@ -208,6 +294,13 @@ ceph = [
   "test_s3::test_cors_presigned_put_object",
   "test_s3::test_cors_presigned_put_object_with_acl",
   "test_s3::test_cors_presigned_put_object_tenant_with_acl",
+]
+mint = [
+  "minio-go: testCors::SetBucketCors(bucketName, cors)",
+  "minio-go: testCorsSetGetDelete::SetBucketCors(bucketName, cors)",
+  "minio-java::deleteBucketCors()",
+  "minio-java::getBucketCors()",
+  "minio-java::setBucketCors()",
 ]
 server_tests = ["server/tests/cors_test.rs"]
 drive = ["cors"]
@@ -244,6 +337,12 @@ ceph = [
   "test_s3::test_get_multipart_checksum_object_attributes",
   "test_s3::test_get_checksum_object_attributes",
 ]
+mint = [
+  "minio-go: testPutMultipartObjectWithChecksums::PutObject(bucketName, objectName, reader,size, opts)",
+  "minio-go: testPutObjectWithAutomaticChecksums::PutObject(bucketName, objectName, reader,size, opts)",
+  "minio-go: testPutObjectWithChecksums::PutObject(bucketName, objectName, reader, size, opts)",
+  "minio-go: testTrailingChecksums::PutObject(bucketName, objectName, reader,size, opts)",
+]
 server_tests = ["server/tests/checksum_test.rs", "server/tests/streaming_digest_test.rs"]
 drive = ["checksums"]
 fuzz = ["attrs_values"]
@@ -262,6 +361,12 @@ ceph = [
   "test_s3::test_get_single_multipart_object_attributes",
   "test_s3::test_get_versioned_object_attributes",
   "test_s3::test_get_object_attributes",
+]
+mint = [
+  "minio-go: testGetObjectAttributes::GetObjectAttributes(ctx, bucketName, objectName, opts)",
+  "minio-go: testGetObjectAttributesErrorCases::GetObjectAttributes(ctx, bucketName, objectName, opts)",
+  "minio-go: testPutObjectWithTrailingChecksums::GetObjectAttributes(...)",
+  "minio-java::getObjectAttributes()",
 ]
 server_tests = ["server/tests/checksum_test.rs", "server/tests/attributes_test.rs"]
 drive = ["checksums"]
@@ -305,6 +410,27 @@ ceph = [
   "test_s3::test_bucket_policy_put_obj_acl",
   "test_s3::test_bucket_policy_put_obj_request_obj_tag",
   "test_s3::test_bucket_policy_get_obj_acl_existing_tag",
+]
+mint = [
+  "minio-go: testGetBucketTagging::GetBucketTagging(bucketName)",
+  "minio-go: testObjectTaggingWithVersioning::{Get,Set,Remove}ObjectTagging()",
+  "minio-go: testRemoveBucketTagging::RemoveBucketTagging(bucketName)",
+  "minio-go: testSetBucketTagging::SetBucketTagging(bucketName, tags)",
+  "minio-java::deleteBucketTags()",
+  "minio-java::deleteObjectTags()",
+  "minio-java::getBucketTags()",
+  "minio-java::getObjectTags()",
+  "minio-java::setBucketTags()",
+  "minio-java::setObjectTags()",
+  "minio-js::Get tags on an object",
+  "minio-js::Set tags on a bucket",
+  "minio-js::Set tags on an object",
+  "minio-js::getObjectTagging  object",
+  "minio-js::remove Tags on an object",
+  "minio-js::removeObjectTagging on an object",
+  "minio-js::setObjectTagging  object",
+  "versioning::testPutObjectWithTaggingAndMetadata",
+  "versioning::testTagging",
 ]
 server_tests = ["server/tests/tagging_test.rs"]
 drive = ["tagging"]
@@ -374,6 +500,14 @@ ceph = [
   "test_s3::test_put_get_delete_public_block",
   "test_s3::test_multipart_upload_on_a_bucket_with_policy",
   "test_s3::test_head_object_404_with_policy_prefix",
+]
+mint = [
+  "minio-go: testFunctional::GetBucketPolicy(ctx, bucketName)",
+  "minio-java::deleteBucketPolicy()",
+  "minio-java::getBucketPolicy()",
+  "minio-java::setBucketPolicy()",
+  "minio-js::getBucketPolicy(bucketName, cb)",
+  "minio-js::setBucketPolicy(bucketName, bucketPolicy, cb)",
 ]
 
 [[feature]]
@@ -466,6 +600,10 @@ ceph = [
   "test_s3::test_put_bucket_ownership_object_writer",
   "test_s3::test_bucket_create_delete_bucket_ownership",
 ]
+mint = [
+  "minio-go: testGetObjectACLContext::GetObjectACL(ctx, bucketName, objectName)",
+  "minio-java::getObjectAcl()",
+]
 
 [[feature]]
 id = "conditional"
@@ -530,6 +668,14 @@ ceph = [
   "test_s3::test_delete_objects_current_if_match_size",
   "test_s3::test_delete_objects_version_if_match_size",
 ]
+mint = [
+  "minio-go: testGetObjectModified::GetObject(bucketName, objectName)",
+  "minio-js::copyObject(bucketName, objectName, srcObject, conditions, cb)",
+  "minio-py:test_copy_object_etag_match",
+  "minio-py:test_copy_object_modified_since",
+  "minio-py:test_copy_object_negative_etag_match",
+  "minio-py:test_copy_object_unmodified_since",
+]
 server_tests = ["server/tests/precondition_test.rs", "server/tests/edge_cases_test.rs"]
 drive = ["objects"]
 
@@ -581,6 +727,24 @@ ceph = [
   "test_s3::test_versioning_bucket_multipart_upload_return_version_id",
   "test_s3::test_upload_part_copy_percent_encoded_key",
 ]
+mint = [
+  "aws-sdk-php::createMultipartUpload ( array $params = [] )",
+  "aws-sdk-php::listMultipartUploads ( array $params = [] )",
+  "aws-sdk-php::uploadPart ( array $params = [] )",
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api create-multipart-upload --bucket awscli-mint-test-bucket --key awscli-mint-test-bucket-object",
+  "minio-go: testFPutObjectMultipart::FPutObject(bucketName, objectName, fileName, opts)",
+  "minio-java::composeObject()",
+  "minio-js::Clean up temp directory part files",
+  "minio-js::Create a local file of 100 MB and split",
+  "minio-js::Remove Composed target Object::",
+  "minio-js::Remove Object Parts from Bucket::",
+  "minio-js::Upload parts to Bucket",
+  "minio-js::composeObject(destObjConfig, sourceObjList, cb)::",
+  "minio-js::listIncompleteUploads(bucketName, prefix, recursive)",
+  "minio-js::removeIncompleteUploads(bucketName, prefix)",
+  "s3cmd::test_get_object_multipart",
+  "s3cmd::test_put_object_multipart",
+]
 server_tests = [
   "server/tests/multipart_complete_test.rs",
   "server/tests/multipart_conformance_test.rs",
@@ -624,6 +788,21 @@ ceph = [
   "test_s3::test_object_copy_retaining_metadata",
   "test_s3::test_object_copy_replacing_metadata",
 ]
+mint = [
+  "aws-sdk-go-v2::testObjectMetadata",
+  "minio-go: testPutObjectWithContentLanguage::PutObject(bucketName, objectName, reader, size, opts)",
+  "minio-go: testPutObjectWithMetadata::PutObject(bucketName, objectName, reader,size, opts)",
+  "minio-go: testUserMetadataCopyingWrapper::ComposeObject(destination, sources)",
+  "minio-js::fPutObject(bucketName, objectName, filePath, metaData)",
+  "minio-js::fPutObject(bucketName, objectName, filePath, metaData, callback)",
+  "minio-js::initiateNewMultipartUpload(bucketName, objectName, metaData, cb)",
+  "minio-js::putObject(bucketName, objectName, stream, metaData)",
+  "minio-js::putObject(bucketName, objectName, stream, metaData, cb)",
+  "minio-js::putObject(bucketName, objectName, stream, metadata, cb)",
+  "minio-js::putObject(bucketName, objectName, stream, size, metaData, callback)",
+  "minio-py:test_copy_object_with_metadata",
+  "minio-py:test_fput_object_with_content_type",
+]
 server_tests = ["server/tests/metadata_test.rs", "server/tests/attributes_test.rs"]
 drive = ["metadata"]
 fuzz = ["attrs_block", "attrs_values", "iso8601"]
@@ -657,6 +836,29 @@ ceph = [
   "test_s3::test_object_raw_put_authenticated_expired",
   "test_s3::test_list_buckets_anonymous",
 ]
+mint = [
+  "aws-sdk-go-v2::PresignedPut",
+  "aws-sdk-ruby::presignedGet(bucket_name,file_name)",
+  "aws-sdk-ruby::presignedPut(bucket_name,file_name)",
+  "minio-java::getPresignedObjectUrl()",
+  "minio-js::presignedGetObject(bucketName, objectName, 1000, respHeaders, requestDate, cb)",
+  "minio-js::presignedGetObject(bucketName, objectName, cb)",
+  "minio-js::presignedGetObject(bucketName, objectName, expires)",
+  "minio-js::presignedGetObject(bucketName, objectName, expires, cb)",
+  "minio-js::presignedGetObject(bucketName, objectName, expires, respHeaders, cb)",
+  "minio-js::presignedGetObject(bucketName, objectName, respHeaders, cb)",
+  "minio-js::presignedPutObject(bucketName, objectName)",
+  "minio-js::presignedPutObject(bucketName, objectName, expires)",
+  "minio-js::presignedPutObject(bucketName, objectName, expires, cb)",
+  "minio-js::presignedPutObject(bucketName, objectName, expires=1000, cb)",
+  "minio-js::presignedUrl(httpMethod, bucketName, objectName, expires, cb)",
+  "minio-py:test_presigned_get_object_default_expiry",
+  "minio-py:test_presigned_get_object_expiry",
+  "minio-py:test_presigned_get_object_response_headers",
+  "minio-py:test_presigned_get_object_version",
+  "minio-py:test_presigned_put_object_default_expiry",
+  "minio-py:test_presigned_put_object_expiry",
+]
 server_tests = ["server/tests/multipart_sigv4_test.rs"]
 fuzz = ["sigv4"]
 
@@ -680,6 +882,16 @@ ceph = [
   "test_s3::test_object_copy_versioned_url_encoding",
   "test_s3::test_versioning_obj_suspended_copy",
   "test_s3::test_versioning_copy_obj_version",
+]
+mint = [
+  "aws-sdk-php::copyObject ( array $params = [] )",
+  "aws-sdk-ruby::copyObject(source_bucket_name,target_bucket_name,source_file_name,target_file_name)",
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api copy-object --bucket awscli-mint-test-bucket --key datafile-1-kB-copy --copy-source awscli-mint-test-bucket/datafile-1-kB",
+  "minio-go: testCopyObject::CopyObject(dst, src)",
+  "minio-java::copyObject()",
+  "minio-js::copyObject(bucketName, objectName, srcObject)",
+  "minio-js::copyObject(bucketName, objectName, srcObject, cb)",
+  "minio-py:test_copy_object_no_copy_condition",
 ]
 server_tests = [
   "server/tests/copy_version_test.rs",
@@ -726,6 +938,44 @@ ceph = [
   "test_s3::test_delete_marker_nonversioned",
   "test_s3::test_delete_marker_versioned",
   "test_s3::test_delete_marker_suspended",
+]
+mint = [
+  "minio-go: testComposeObjectWithVersioning::ComposeObject()",
+  "minio-go: testConcurrentCopyObjectWithVersioning::CopyObject()",
+  "minio-go: testCopyObjectWithVersioning::CopyObject()",
+  "minio-go: testGetObjectWithVersioning::GetObject()",
+  "minio-go: testListObjectVersions::ListObjectVersions(bucketName, prefix, recursive)",
+  "minio-go: testPutObjectWithVersioning::GetObject()",
+  "minio-go: testRemoveObjectWithVersioning::DeleteObject()",
+  "minio-go: testRemoveObjectsWithVersioning::DeleteObjects()",
+  "minio-go: testStatObjectWithVersioning::StatObject",
+  "minio-java::getBucketVersioning()",
+  "minio-java::setBucketVersioning()",
+  'minio-js::"after all" hook in "Force Deletion of objects with versions"',
+  'minio-js::"after all" hook in "Force Deletion of prefix with versions"',
+  "minio-js::Check if versioning is Suspended on a bucket",
+  "minio-js::Check if versioning is enabled on a bucket",
+  "minio-js::Enable Versioning on Bucket: setBucketVersioning(bucketName,versioningConfig)",
+  "minio-js::Enable versioning  on a bucket",
+  "minio-js::Suspend versioning  on a bucket",
+  "minio-js::listObjects(bucketName, '', true, {IncludeVersion: true}, cb)",
+  "minio-js::setBucketVersioning(bucketName, versionConfig):",
+  "minio-py:test_fget_object_version",
+  "minio-py:test_get_object_version",
+  "minio-py:test_list_object_v1_versions",
+  "minio-py:test_list_object_versions",
+  "minio-py:test_stat_object_version",
+  "versioning::testCreateVersioningBucket",
+  "versioning::testDeleteObject",
+  "versioning::testDeleteObjects",
+  "versioning::testGetObject",
+  "versioning::testListObjectKeysContinuation",
+  "versioning::testListObjectVersionIDContinuation",
+  "versioning::testListObjectVersionsSimple",
+  "versioning::testListObjectVersionsWithPrefixAndDelimiter",
+  "versioning::testListObjectsVersionsWithEmptyDirObject",
+  "versioning::testPutObject",
+  "versioning::testStatObject",
 ]
 server_tests = [
   "server/tests/versioning_test.rs",
@@ -832,6 +1082,28 @@ ceph = [
   "test_s3::test_list_buckets_paginated",
   "test_s3::test_bucket_list_special_prefix",
 ]
+mint = [
+  "aws-sdk-php::listBuckets ( array $params = [] )",
+  "aws-sdk-php::listObjects ( array $params = [] )",
+  "aws-sdk-ruby::listBuckets()",
+  "aws-sdk-ruby::listObjects(bucket_name)",
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api list-objects --bucket awscli-mint-test-bucket --prefix datafile-1-kB",
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api list-objects-v2 --bucket awscli-mint-test-bucket --max-keys 1",
+  "mc::test_list_dir",
+  "minio-go: testListObjects::ListObjects(bucketName, objectPrefix, recursive, doneCh)",
+  "minio-java::listBuckets()",
+  "minio-java::listObjects()",
+  "minio-js::listBuckets()",
+  "minio-js::listBuckets(cb)",
+  "minio-js::listObjects(bucketName, prefix, recursive)",
+  "minio-js::listObjectsV2(bucketName, prefix, recursive)",
+  "minio-py:test_list_buckets::remove_bucket(bucket_name)",
+  "minio-py:test_list_objects",
+  "minio-py:test_list_objects_v1",
+  "minio-py:test_list_objects_with_1001_files",
+  "minio-py:test_list_objects_with_prefix",
+  "s3cmd::test_sync_list_objects",
+]
 server_tests = [
   "server/tests/list_objects_test.rs",
   "server/tests/listing_test.rs",
@@ -889,6 +1161,34 @@ ceph = [
   "test_s3::test_bucket_create_special_key_names",
   "test_s3::test_atomic_write_bucket_gone",
 ]
+mint = [
+  "aws-sdk-php::getBucketLocation ( array $params = [] )",
+  "aws-sdk-php::headBucket ( array $params = [] )",
+  "aws-sdk-ruby::bucketExists?(bucket_name)",
+  "aws-sdk-ruby::makeBucket(bucket_name)",
+  "aws-sdk-ruby::removeBucket(bucket_name)",
+  "awscli::make_bucket",
+  "mc::test_make_bucket",
+  "mc::test_make_bucket_error",
+  "mc::test_rb",
+  "minio-go: testMakeBucketError::MakeBucket(bucketName, region)",
+  "minio-go: testMakeBucketRegions::MakeBucket(bucketName, region)",
+  "minio-java::bucketExists()",
+  "minio-java::makeBucket()",
+  "minio-java::removeBucket()",
+  'minio-js::"after all" hook in "functional tests"',
+  "minio-js::Check if bucket can be deleted:",
+  "minio-js::bucketExists(bucketName)",
+  "minio-js::bucketExists(bucketName, cb)",
+  "minio-js::makeBucket(bucketName, region)",
+  "minio-js::makeBucket(bucketName, region, cb)",
+  "minio-js::removeBucket(bucketName)",
+  "minio-js::removeBucket(bucketName, )",
+  "minio-js::removeBucket(bucketName, cb)",
+  "minio-py:test_make_bucket_with_region",
+  "s3cmd::test_make_bucket",
+  "s3cmd::test_make_bucket_error",
+]
 server_tests = [
   "server/tests/s3_details_test.rs",
   "server/tests/bucket_config_test.rs",
@@ -915,6 +1215,18 @@ area = "object-basics"
 design_section = "6.7"
 operations = ["GetObject (Range)"]
 ceph = ["re:^test_s3::test_ranged_"]
+mint = [
+  "aws-sdk-go-v2::testGetObjectRange",
+  "minio-go: testGetObjectRanges::GetObject(ctx, bucketName, objectName, fileName)",
+  "minio-go: testGetObjectReadAtFunctional::GetObject(bucketName, objectName)",
+  "minio-go: testGetObjectReadAtWhenEOFWasReached::GetObject(bucketName, objectName)",
+  "minio-go: testGetObjectReadSeekFunctional::GetObject(bucketName, objectName)",
+  "minio-go: testGetObjectSeekEnd::GetObject(bucketName, objectName)",
+  "minio-go: testPutObjectReadAt::PutObject(bucketName, objectName, reader, opts)",
+  "minio-js::getPartialObject(bucketName, objectName, offset, length, cb)",
+  "minio-js::getPartialObject(bucketName, objectName, offset, length, getOpts)",
+  "minio-py:test_get_partial_object",
+]
 server_tests = [
   "server/tests/mmap_slice_test.rs",
   "server/tests/large_get_test.rs",
@@ -965,6 +1277,83 @@ ceph = [
   "test_s3::test_atomic_dual_write_4mb",
   "test_s3::test_atomic_dual_write_8mb",
   "test_s3::test_object_read_unreadable",
+]
+mint = [
+  "aws-sdk-go-v2::testBasicObjectOperations",
+  "aws-sdk-php::deleteObjects (array $params = [] )",
+  "aws-sdk-php::getObject ( array $params = [] )",
+  "aws-sdk-php::headObject ( array $params = [] )",
+  "aws-sdk-ruby::getObject(bucket_name,file,destination)",
+  "aws-sdk-ruby::putObject(bucket_name,file)",
+  "aws-sdk-ruby::removeObject(bucket_name,file)",
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api get-object --bucket awscli-mint-test-bucket --key awscli-mint-test-bucket-object /tmp/datafile-0-b",
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api get-object --bucket awscli-mint-test-bucket --key datafile-1-kB /tmp/datafile-1-kB",
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api head-object --bucket awscli-mint-test-bucket --key prefix/directory/datafile-1-kB",
+  "mc::test_put_object",
+  "mc::test_put_object_0byte",
+  "mc::test_put_object_error",
+  "minio-go: testFGetObjectContext::FGetObject(ctx, bucketName, objectName, fileName)",
+  "minio-go: testFPutObject::StatObject(bucketName, objectName, opts)",
+  "minio-go: testFPutObjectContext::FPutObject(bucketName, objectName, fileName, opts)",
+  "minio-go: testGetObjectClosedTwice::GetObject(bucketName, objectName)",
+  "minio-go: testGetObjectContext::GetObject(ctx, bucketName, objectName)",
+  "minio-go: testPutObjectContext::PutObject(ctx, bucketName, objectName, fileName, opts)",
+  "minio-go: testPutObjectStreaming::PutObject(bucketName, objectName, reader,size,opts)",
+  "minio-go: testPutObjectUploadSeekedObject::PutObject(bucketName, objectName, fileToUpload, contentType)",
+  "minio-go: testRemoveMultipleObjects::RemoveObjects(bucketName, objectsCh)",
+  "minio-go: testRemoveMultipleObjectsIter::RemoveObjects(bucketName, objectsCh)",
+  "minio-go: testRemoveMultipleObjectsWithResult::RemoveObjects(bucketName, objectsCh)",
+  "minio-go: testRemoveObjects::RemoveObjects(bucketName, objectsCh, opts)",
+  "minio-go: testRemoveObjectsIter::RemoveObjects(bucketName, objectsCh, opts)",
+  "minio-java::downloadObject()",
+  "minio-java::getObject()",
+  "minio-java::putObject()",
+  "minio-java::removeObject()",
+  "minio-java::removeObjects()",
+  "minio-java::statObject()",
+  "minio-java::uploadObject()",
+  'minio-js::"after all" hook in "Force Deletion of prefix"',
+  "minio-js::Remove object on a bucket:",
+  "minio-js::fGetObject(bucketName, objectName, filePath)",
+  "minio-js::fGetObject(bucketName, objectName, filePath, callback)",
+  "minio-js::fGetObject(bucketName, objectName, filePath, getOpts={})",
+  "minio-js::fPutObject(bucketName, objectName, filePath, callback)",
+  "minio-js::getObject(bucketName, objectName)",
+  "minio-js::getObject(bucketName, objectName, callback)",
+  "minio-js::getObject(bucketName, objectName, cb)",
+  "minio-js::getObject(bucketName, objectName, getOpts)",
+  "minio-js::putObject(bucketName, objectName, 0byte)",
+  "minio-js::putObject(bucketName, objectName, stream)",
+  "minio-js::putObject(bucketName, objectName, stream, callback)",
+  "minio-js::putObject(bucketName, objectName, stream, size, contentType, callback)",
+  "minio-js::removeObject object",
+  "minio-js::removeObject(0byte, objectName)",
+  "minio-js::removeObject(bucketName, objectList, removeOpts)",
+  "minio-js::removeObject(bucketName, objectName)",
+  "minio-js::removeObject(bucketName, objectName, callback)",
+  "minio-js::removeObject(bucketName, objectName, cb)",
+  "minio-js::removeObject(bucketName, objectName, filePath, callback)",
+  "minio-js::removeObject(bucketName, objectName, removeOpts)",
+  "minio-js::removeObject(bucketName, objectName, stream)",
+  "minio-js::removeObjects with non latin characters",
+  "minio-js::removeObjects(bucketName, objectList, removeOpts)",
+  "minio-js::removeObjects(bucketName, objectsList)",
+  "minio-js::statObject(bucketName, objectName)",
+  "minio-js::statObject(bucketName, objectName, cb)",
+  "minio-js::statObject(bucketName, objectName, cb)::",
+  "minio-js::statObject(bucketName, objectName, statOpts)",
+  "minio-py:test_fget_object",
+  "minio-py:test_fput_object_large_file",
+  "minio-py:test_fput_object_small_file",
+  "minio-py:test_get_object",
+  "minio-py:test_get_object_with_default_length",
+  "minio-py:test_negative_put_object_with_path_segment",
+  "minio-py:test_put_object",
+  "minio-py:test_stat_object",
+  "minio-py:test_thread_safe",
+  "s3cmd::test_get_object",
+  "s3cmd::test_put_object",
+  "s3cmd::test_put_object_error",
 ]
 server_tests = [
   "server/tests/delete_objects_test.rs",
@@ -1165,3 +1554,89 @@ status = "planned"
 issue = "#52"
 user_visible = false
 server_tests = ["server/tests/erasure_coding_test.rs"]
+
+[[feature]]
+id = "mint-vs-aws"
+name = "Mint tests whose assertions disagree with AWS S3 docs and ceph s3-tests"
+status = "out-of-scope"
+issue = "out of scope"
+area = "mint-vs-aws"
+design_section = "9"
+decision = "https://github.com/iskandarnorazli/Awanfs/issues/278#issuecomment-7073548866"
+mint = [
+  "aws-sdk-php::abortMultipartupload ( array $params = [] )",
+  "minio-go: testListMultipartUpload::GetObject()",
+]
+
+[[feature]]
+id = "minio-only"
+name = "MinIO-specific health, admin, and S3 extension APIs"
+status = "out-of-scope"
+issue = "out of scope"
+area = "minio-only"
+design_section = "9"
+decision = "https://github.com/iskandarnorazli/Awanfs/issues/278#issuecomment-7073548866"
+mint = [
+  "healthcheck::testLivenessEndpoint",
+  "minio-go: testBucketVersioningExcludedPrefixes::GetBucketVersioning/SetBucketVersioning",
+  "minio-go: testGetObjectS3Zip::GetObject(bucketName, objectName)",
+  "minio-java::addCannedPolicy()",
+  "minio-java::addUser()",
+  "minio-java::deleteUser()",
+  "minio-java::getUserInfo()",
+  "minio-java::listCannedPolicies()",
+  "minio-java::listUsers()",
+  "minio-java::putObjectFanOut()",
+  "minio-java::removeCannedPolicy()",
+  "minio-java::setPolicy()",
+  "minio-java::uploadSnowballObjects()",
+  "minio-js::extensions.listObjectsV2WithMetadata(bucketName, prefix, recursive)",
+  "minio-py:test_set_get_bucket_versioning",
+]
+
+# Decision 47 on #164: https://github.com/iskandarnorazli/Awanfs/issues/164#issuecomment-6871114933
+[[feature]]
+id = "s3-select"
+name = "S3 Select SQL object content queries (SelectObjectContent)"
+status = "out-of-scope"
+issue = "#164"
+area = "s3-select"
+design_section = "9"
+decision = "https://github.com/iskandarnorazli/Awanfs/issues/278#issuecomment-7073548866"
+mint = [
+  "minio-java::selectObjectContent()",
+  'minio-js::"after all" hook for "Remove Object post select of content:',
+  "minio-js::selectObjectContent(bucketName, objectName, selectOpts)",
+  "s3select:test_csv_input_quote_char::select_object_content(bucket_name, object_name, request)",
+]
+
+[[feature]]
+id = "bucket-notifications"
+name = "Bucket event notifications (Put/Get/Delete/ListenBucketNotification)"
+status = "out-of-scope"
+issue = "out of scope"
+area = "bucket-notifications"
+design_section = "9"
+decision = "https://github.com/iskandarnorazli/Awanfs/issues/278#issuecomment-7073548866"
+mint = [
+  "minio-go: testBucketNotification::SetBucketNotification(bucketName)",
+  "minio-java::deleteBucketNotification()",
+  "minio-java::getBucketNotification()",
+  "minio-java::listenBucketNotification()",
+  "minio-java::setBucketNotification()",
+  "minio-js::listenBucketNotification(bucketName, prefix, suffix, events)",
+]
+
+[[feature]]
+id = "bucket-replication"
+name = "Bucket replication configuration (Put/Get/DeleteBucketReplication)"
+status = "out-of-scope"
+issue = "out of scope"
+area = "bucket-replication"
+design_section = "9"
+decision = "https://github.com/iskandarnorazli/Awanfs/issues/278#issuecomment-7073548866"
+mint = [
+  "minio-java::deleteBucketReplication()",
+  "minio-java::getBucketReplication()",
+  "minio-java::setBucketReplication()",
+]
