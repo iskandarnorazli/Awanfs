@@ -2,7 +2,10 @@
 
     python3 tests/s3tests/test_conformance_map.py
 """
+import contextlib
+import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -100,9 +103,13 @@ class Map(unittest.TestCase):
     def test_a_test_no_rule_matches_fails_the_run(self):
         suite = tmp("def test_zzz():\n    pass\n", ".py")
         out = tmp("", ".md")
-        self.assertEqual(cm.main([suite, self.passing, "--report", out]), 1)
-        self.assertIn("Unassigned", open(out, encoding="utf-8").read())
-        self.assertEqual(cm.main([self.suite, self.passing, "--report", out]), 0)
+        stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+            self.assertEqual(cm.main([suite, self.passing, "--report", out]), 1)
+            with open(out, encoding="utf-8") as fh:
+                self.assertIn("Unassigned", fh.read())
+            self.assertEqual(cm.main([self.suite, self.passing, "--report", out]), 0)
+        self.assertIn("1 unassigned test(s): test_zzz", stderr_buf.getvalue())
 
     def test_report_table(self):
         rows, unassigned = self.rows()
@@ -187,6 +194,23 @@ def test_headers_missing_host():
             self.assertIn("## request-headers: 1 not passing", text)
             self.assertIn("- `test_headers::test_headers_missing_host` (fail): 400 != 403", text)
             self.assertNotIn("test_headers::test_put_obj_bad_content_length", text)
+
+    def test_negative_fixture_does_not_leak_to_process_output(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                os.path.abspath(__file__),
+                "Map.test_a_test_no_rule_matches_fails_the_run",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn("test_zzz", combined)
+        self.assertNotIn("unassigned test(s)", combined)
 
 
 if __name__ == "__main__":
