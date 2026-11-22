@@ -1635,6 +1635,64 @@ class MultiProcWorkerAggregationTests(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
 
+    def test_multiprocess_phase_returns_error_point_on_worker_done_timeout(self):
+        import socket
+        import time
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(8)
+        port = sock.getsockname()[1]
+        try:
+            t0 = time.perf_counter()
+            pt = cs._run_multiprocess_phase(
+                shares=[1, 1],
+                cli_cores=list(range(max(1, os.cpu_count() or 1))),
+                worker_spec_builder=lambda i, _c, _off: {
+                    "kind": "fixed",
+                    "mode": "get",
+                    "host": "127.0.0.1",
+                    "port": port,
+                    "bucket": cs.BUCKET,
+                    "size": 4 * cs.KIB,
+                    "duration_sec": 3.0,
+                    "validate_get_size": False,
+                    "label": f"timeout_test_{i}",
+                },
+                duration_sec=3.0,
+                server_pid=None,
+                shares_cores=False,
+                done_timeout_sec=0.3,
+            )
+            elapsed = time.perf_counter() - t0
+            self.assertFalse(pt.measured)
+            self.assertIn("timed out", (pt.reason or "").lower())
+            self.assertLess(elapsed, 15.0)
+        finally:
+            sock.close()
+
+    def test_http_threads_start_gate_limits_thread_spawn_skew(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proc, port, _backend = cs.start_trivial_http_server(data_root=tmpdir, get_size=4 * cs.KIB)
+            try:
+                res = cs._run_http_threads(
+                    host="127.0.0.1",
+                    port=port,
+                    concurrency=256,
+                    duration_sec=0.3,
+                    size=4 * cs.KIB,
+                    request_fn=lambda _wid, _rc: cs.RequestSpec("GET", "/obj"),
+                    bucket=None,
+                    validate_get_size=False,
+                    label="gate_skew",
+                )
+                self.assertEqual(res.errors, 0, res.error_notes)
+                self.assertEqual(res.stuck, 0)
+                self.assertGreater(res.ops, 0)
+                self.assertLess(res.wall_sec, 1.5)
+            finally:
+                cs._stop_proc(proc)
+
 
 class ClientCpuReportAndCapTests(unittest.TestCase):
     def test_client_cap_info_flags_proc_cap_and_core_cap(self):

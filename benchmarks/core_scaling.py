@@ -19,6 +19,7 @@ import platform
 import random
 import re
 import secrets
+import select
 import shutil
 import socket
 import statistics
@@ -1622,17 +1623,29 @@ def _run_http_threads(
     errors = 0
     error_notes: Dict[str, int] = {}
     metrics_lock = threading.Lock()
+    ready_lock = threading.Lock()
+    threads_ready = 0
+    all_ready = threading.Event()
+    start_gate = threading.Event()
 
     def thread_worker(local_idx: int) -> None:
-        nonlocal total_bytes, errors
+        nonlocal total_bytes, errors, threads_ready
         local_lats: List[float] = []
         local_bytes = 0
         local_errs: Dict[str, int] = {}
-        conn = http.client.HTTPConnection(host, port, timeout=15.0)
         put_headers = {"Content-Length": str(size), "Connection": "keep-alive"}
         get_headers = {"Connection": "keep-alive"}
         req_count = 0
 
+        with ready_lock:
+            threads_ready += 1
+            if threads_ready >= concurrency:
+                all_ready.set()
+        start_gate.wait()
+        if stop_event.is_set():
+            return
+
+        conn = http.client.HTTPConnection(host, port, timeout=15.0)
         while not stop_event.is_set():
             spec = request_fn(local_idx, req_count)
             req_count += 1
@@ -1722,17 +1735,25 @@ def _run_http_threads(
                 error_notes[m] = error_notes.get(m, 0) + cnt
 
     threads = [threading.Thread(target=thread_worker, args=(i,), daemon=True) for i in range(concurrency)]
-    if ready_cb is not None:
-        ready_cb()
-    cli_0 = process_cpu_times_total(os.getpid())
-    t_start = time.perf_counter()
+    if concurrency <= 0:
+        all_ready.set()
     for t in threads:
         t.start()
-    time.sleep(duration_sec)
-    stop_event.set()
-    stuck = rwb.join_all(threads, label, timeout_sec=max(20.0, duration_sec * 10.0))
-    t_total = time.perf_counter() - t_start
-    cli_1 = process_cpu_times_total(os.getpid())
+    all_ready.wait(timeout=30.0)
+    try:
+        if ready_cb is not None:
+            ready_cb()
+        cli_0 = process_cpu_times_total(os.getpid())
+        t_start = time.perf_counter()
+        start_gate.set()
+        time.sleep(duration_sec)
+        stop_event.set()
+        stuck = rwb.join_all(threads, label, timeout_sec=max(20.0, duration_sec * 10.0))
+        t_total = time.perf_counter() - t_start
+        cli_1 = process_cpu_times_total(os.getpid())
+    finally:
+        stop_event.set()
+        start_gate.set()
 
     return WorkerResult(
         worker_index=worker_index,
@@ -1863,6 +1884,7 @@ def _run_multiprocess_phase(
     client_procs_requested: Optional[int] = None,
     concurrency: Optional[int] = None,
     data_root: Optional[str] = None,
+    done_timeout_sec: Optional[float] = None,
 ) -> PointResult:
     """Coordinates `len(shares)` worker subprocesses via TCP barrier and aggregates results."""
     n_workers = len(shares)
@@ -1873,6 +1895,7 @@ def _run_multiprocess_phase(
     ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     procs: List[subprocess.Popen] = []
     conns: List[socket.socket] = []
+    conn_to_idx: Dict[socket.socket, int] = {}
     thread_sampler = ThreadCpuSampler(server_pid) if (profile_threads and server_pid) else None
 
     try:
@@ -1938,7 +1961,17 @@ def _run_multiprocess_phase(
                 conn, _ = ctrl_sock.accept()
             except socket.timeout:
                 continue
-            line = _recv_line(conn, timeout=15.0)
+            try:
+                line = _recv_line(conn, timeout=15.0)
+            except OSError as e:
+                conn.close()
+                return PointResult(
+                    reason=f"worker handshake failed: {e}",
+                    shares_cores=shares_cores,
+                    client_cores_given=n_cli_cores,
+                    client_procs=req_procs,
+                    concurrency=total_conc,
+                )
             if not line.startswith("READY "):
                 conn.close()
                 return PointResult(
@@ -1948,6 +1981,10 @@ def _run_multiprocess_phase(
                     client_procs=req_procs,
                     concurrency=total_conc,
                 )
+            try:
+                conn_to_idx[conn] = int(line.split()[1])
+            except (IndexError, ValueError):
+                conn_to_idx[conn] = len(conns)
             conns.append(conn)
 
         if thread_sampler is not None:
@@ -1959,34 +1996,74 @@ def _run_multiprocess_phase(
         for conn in conns:
             conn.sendall(b"GO\n")
 
-        done_deadline = time.perf_counter() + max(30.0, duration_sec * 10.0 + 25.0)
+        wait_sec = done_timeout_sec if done_timeout_sec is not None else max(40.0, duration_sec * 10.0 + 30.0)
+        done_deadline = time.perf_counter() + wait_sec
         pending = list(conns)
+        bufs: Dict[socket.socket, bytes] = {c: b"" for c in conns}
         while pending:
-            if time.perf_counter() > done_deadline:
+            rem = done_deadline - time.perf_counter()
+            if rem <= 0:
+                pending_idxs = [conn_to_idx.get(c, -1) for c in pending]
+                tails = []
+                for idx in pending_idxs:
+                    if idx >= 0:
+                        t = _tail_log(os.path.join(work_dir, f"worker_{idx}.log"))
+                        if t:
+                            tails.append(f"w{idx}: {t}")
+                detail = f" ({'; '.join(tails)})" if tails else ""
                 return PointResult(
-                    reason="client workers timed out waiting for DONE",
+                    reason=f"client workers timed out waiting for DONE ({len(pending)}/{n_workers} pending){detail}",
                     shares_cores=shares_cores,
                     client_cores_given=n_cli_cores,
                     client_procs=req_procs,
                     concurrency=total_conc,
                 )
-            still_waiting: List[socket.socket] = []
-            for conn in pending:
-                msg = _recv_line(conn, timeout=max(1.0, done_deadline - time.perf_counter()))
-                if msg != "DONE":
-                    still_waiting.append(conn)
-            if still_waiting:
-                for idx, p in enumerate(procs):
-                    if p.poll() not in (None, 0):
+            readable, _, _ = select.select(pending, [], [], min(0.25, rem))
+            for conn in readable:
+                try:
+                    chunk = conn.recv(1024)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    pending.remove(conn)
+                    idx = conn_to_idx.get(conn)
+                    if idx is not None:
+                        code = procs[idx].poll()
                         tail = _tail_log(os.path.join(work_dir, f"worker_{idx}.log"))
                         return PointResult(
-                            reason=f"client worker {idx} exited early ({p.returncode})" + (f": {tail}" if tail else ""),
+                            reason=f"client worker {idx} closed control channel before DONE (code={code})"
+                            + (f": {tail}" if tail else ""),
                             shares_cores=shares_cores,
                             client_cores_given=n_cli_cores,
                             client_procs=req_procs,
                             concurrency=total_conc,
                         )
-            pending = still_waiting
+                    continue
+                bufs[conn] += chunk
+                if b"\n" in bufs[conn]:
+                    msg = bufs[conn].split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
+                    pending.remove(conn)
+                    if msg != "DONE":
+                        idx = conn_to_idx.get(conn, -1)
+                        return PointResult(
+                            reason=f"client worker {idx} sent unexpected message {msg!r}",
+                            shares_cores=shares_cores,
+                            client_cores_given=n_cli_cores,
+                            client_procs=req_procs,
+                            concurrency=total_conc,
+                        )
+            if pending:
+                for idx, p in enumerate(procs):
+                    code = p.poll()
+                    if code not in (None, 0):
+                        tail = _tail_log(os.path.join(work_dir, f"worker_{idx}.log"))
+                        return PointResult(
+                            reason=f"client worker {idx} exited early ({code})" + (f": {tail}" if tail else ""),
+                            shares_cores=shares_cores,
+                            client_cores_given=n_cli_cores,
+                            client_procs=req_procs,
+                            concurrency=total_conc,
+                        )
 
         t_total = time.perf_counter() - t_start
         srv_cpu_1 = process_cpu_times_total(server_pid) if server_pid else None
@@ -3401,67 +3478,140 @@ def render_matrix_report(
     return "\n".join(lines)
 
 
-_TRIVIAL_HTTP_RS = r"""use std::io::{BufRead, BufReader, Read, Write};
+_TRIVIAL_HTTP_RS = r"""use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
-fn handle(stream: TcpStream, get_resp: Arc<Vec<u8>>) {
+fn find_header_end(buf: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        if i + 3 < buf.len() && &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some((i, i + 4));
+        }
+        if &buf[i..i + 2] == b"\n\n" {
+            return Some((i, i + 2));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn trim_ascii(mut s: &[u8]) -> &[u8] {
+    while let Some(&b) = s.first() {
+        if b == b' ' || b == b'\t' || b == b'\r' {
+            s = &s[1..];
+        } else {
+            break;
+        }
+    }
+    while let Some(&b) = s.last() {
+        if b == b' ' || b == b'\t' || b == b'\r' {
+            s = &s[..s.len() - 1];
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+fn parse_usize_ascii(s: &[u8]) -> usize {
+    let mut v = 0usize;
+    for &b in trim_ascii(s) {
+        if b.is_ascii_digit() {
+            v = v.saturating_mul(10).saturating_add((b - b'0') as usize);
+        } else {
+            break;
+        }
+    }
+    v
+}
+
+fn contains_ascii_ci(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.len() > hay.len() {
+        return false;
+    }
+    hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+fn handle(mut stream: TcpStream, get_resp: Arc<Vec<u8>>) {
     let _ = stream.set_nodelay(true);
-    let mut writer = match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let mut reader = BufReader::with_capacity(65536, stream);
-    let mut line = String::new();
-    let mut discard = vec![0u8; 65536];
+    let mut buf = vec![0u8; 65536];
+    let mut start: usize = 0;
+    let mut end: usize = 0;
 
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
+        while start < end && (buf[start] == b'\r' || buf[start] == b'\n') {
+            start += 1;
         }
-        while line == "\r\n" || line == "\n" {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
+        let (hdr_len, hdr_consume) = loop {
+            if let Some(pos) = find_header_end(&buf[start..end]) {
+                break pos;
             }
-        }
-        let is_get = line.starts_with("GET ");
-        let mut content_len: usize = 0;
-        let mut close = false;
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
+            if start > 0 {
+                buf.copy_within(start..end, 0);
+                end -= start;
+                start = 0;
             }
-            if line == "\r\n" || line == "\n" {
-                break;
-            }
-            let lower = line.to_ascii_lowercase();
-            if let Some(rest) = lower.strip_prefix("content-length:") {
-                content_len = rest.trim().parse().unwrap_or(0);
-            } else if lower.starts_with("connection:") && lower.contains("close") {
-                close = true;
-            }
-        }
-        let mut rem = content_len;
-        while rem > 0 {
-            let chunk = rem.min(discard.len());
-            if reader.read_exact(&mut discard[..chunk]).is_err() {
+            if end == buf.len() {
                 return;
             }
-            rem -= chunk;
+            match stream.read(&mut buf[end..]) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    end += n;
+                    while start < end && (buf[start] == b'\r' || buf[start] == b'\n') {
+                        start += 1;
+                    }
+                }
+            }
+        };
+
+        let hdr_bytes = &buf[start..start + hdr_len];
+        let mut lines = hdr_bytes.split(|&b| b == b'\n');
+        let first = lines.next().unwrap_or(b"");
+        let is_get = first.starts_with(b"GET ");
+        let mut content_len: usize = 0;
+        let mut close = false;
+        for line in lines {
+            if let Some(colon) = line.iter().position(|&b| b == b':') {
+                let name = trim_ascii(&line[..colon]);
+                let val = &line[colon + 1..];
+                if name.eq_ignore_ascii_case(b"content-length") {
+                    content_len = parse_usize_ascii(val);
+                } else if name.eq_ignore_ascii_case(b"connection") && contains_ascii_ci(val, b"close") {
+                    close = true;
+                }
+            }
         }
+
+        start += hdr_consume;
+        let avail = end - start;
+        if avail >= content_len {
+            start += content_len;
+        } else {
+            let mut rem = content_len - avail;
+            start = 0;
+            end = 0;
+            while rem > 0 {
+                let to_read = rem.min(buf.len());
+                match stream.read(&mut buf[..to_read]) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => rem -= n,
+                }
+            }
+        }
+        if start == end {
+            start = 0;
+            end = 0;
+        }
+
         let reply: &[u8] = if is_get {
             &get_resp
         } else {
             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
         };
-        if writer.write_all(reply).is_err() {
+        if stream.write_all(reply).is_err() {
             return;
         }
         if close {
@@ -3556,7 +3706,7 @@ def start_trivial_http_server(
 
     launch_argv: List[str]
     if rustc:
-        cached_bin = os.path.join(data_root, f"trivial_http_srv_v1{exe}")
+        cached_bin = os.path.join(data_root, f"trivial_http_srv_v2{exe}")
         if not os.path.isfile(cached_bin):
             src_path = os.path.join(work, "trivial_http.rs")
             tmp_bin = os.path.join(work, f"trivial_http_srv{exe}")
