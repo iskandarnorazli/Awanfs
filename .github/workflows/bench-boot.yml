@@ -1,8 +1,9 @@
 name: Boot from a full replay (experiment)
 
 # #26 (owner decision 2026-11-20, option 3): time to boot a data directory of N objects from a
-# full replay of its volumes, and the boot's peak RSS. Dispatched by hand: a 10M-object fill takes a
-# while. Each phase prints a JSON line; the summary carries them. Also on a PR that changes it.
+# full replay of its volumes, and the boot's peak heap and RSS. Dispatched by hand (10M default):
+# a 10M-object fill takes a while. Each phase prints a JSON line; the summary carries them. PRs
+# run 1M objects.
 
 on:
   # On a PR that changes the benchmark or this workflow, so the change runs before it merges.
@@ -13,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       objects:
-        description: "Objects to write before booting"
+        description: "Objects to write before booting (or comma-separated list)"
         default: "10000000"
       size:
         description: "Bytes per object"
@@ -44,7 +45,7 @@ jobs:
       - name: Fill, then boot twice
         shell: bash
         env:
-          OBJECTS: ${{ inputs.objects || '10000000' }}
+          OBJECTS: ${{ inputs.objects || (github.event_name == 'pull_request' && '1000000') || '10000000' }}
           SIZE: ${{ inputs.size || '64' }}
           # The runner's temp directory: on Windows it is on the fast disk (D:), see AGENTS.md.
           DATA: ${{ runner.temp }}/boot
@@ -54,13 +55,19 @@ jobs:
           [ -f "$bin.exe" ] && bin="$bin.exe"
           out=boot.jsonl
           : > "$out"
-          "$bin" fill --dir "$DATA" --objects "$OBJECTS" --size "$SIZE" | tee -a "$out"
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            # A cold boot: nothing of the volumes in the page cache.
-            sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
-            "$bin" boot --dir "$DATA" --objects "$OBJECTS" --size "$SIZE" | sed 's/"phase":"boot"/"phase":"boot_cold"/' | tee -a "$out"
-          fi
-          "$bin" boot --dir "$DATA" --objects "$OBJECTS" --size "$SIZE" | tee -a "$out"
+          for n in ${OBJECTS//,/ }; do
+            [ -n "$n" ] || continue
+            dir="${DATA}_${n}"
+            rm -rf "$dir"
+            "$bin" fill --dir "$dir" --objects "$n" --size "$SIZE" | tee -a "$out"
+            if [ "$RUNNER_OS" = "Linux" ]; then
+              # A cold boot: nothing of the volumes in the page cache.
+              sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+              "$bin" boot --dir "$dir" --objects "$n" --size "$SIZE" | sed 's/"phase":"boot"/"phase":"boot_cold"/' | tee -a "$out"
+            fi
+            "$bin" boot --dir "$dir" --objects "$n" --size "$SIZE" | tee -a "$out"
+            rm -rf "$dir"
+          done
           { echo "## Boot from a full replay ($RUNNER_OS)"; echo; echo '```'; cat "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
