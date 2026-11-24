@@ -559,33 +559,58 @@ fn percentile(sorted: &[u64], p: f64) -> f64 {
     sorted[((sorted.len() - 1) as f64 * p) as usize] as f64 / 1000.0
 }
 
-/// `writers` threads insert keys `t, t + writers, ...` below `keys` at once. Each thread's
-/// vector holds its elapsed time in ns first, then each put's latency in ns.
-fn run_writers(writers: u64, keys: u64, put: impl Fn(&[u8], &ObjectMeta) + Sync) -> Vec<Vec<u64>> {
+#[derive(Clone, Copy, Default)]
+struct PutRecord {
+    total_ns: u64,
+    lock_wait_ns: u64,
+    lock_hold_ns: u64,
+    flush_ns: u64,
+    compact_ns: u64,
+    flushes: usize,
+    compactions: usize,
+}
+
+/// `writers` threads insert keys `t, t + writers, ...` below `keys` at once. Returns each
+/// thread's elapsed wall time in ns and its per-put records.
+fn run_writers(writers: u64, keys: u64, put: impl Fn(&[u8], &ObjectMeta) -> s3_server::spill::PutSample + Sync) -> (Vec<u64>, Vec<Vec<PutRecord>>) {
     let start = std::sync::Barrier::new(writers as usize);
     std::thread::scope(|sc| {
         let hs: Vec<_> = (0..writers)
             .map(|t| {
                 let (put, start) = (&put, &start);
                 sc.spawn(move || {
-                    let mut out = Vec::with_capacity((keys / writers + 2) as usize);
-                    out.push(0);
+                    let mut out = Vec::with_capacity((keys / writers + 1) as usize);
                     start.wait();
                     let t0 = Instant::now();
                     let mut i = t;
                     while i < keys {
                         let (k, r) = (key(i), row(i));
                         let p = Instant::now();
-                        put(&k, &r);
-                        out.push(p.elapsed().as_nanos() as u64);
+                        let s = put(&k, &r);
+                        let total_ns = p.elapsed().as_nanos() as u64;
+                        out.push(PutRecord {
+                            total_ns,
+                            lock_wait_ns: s.lock_wait_ns,
+                            lock_hold_ns: s.lock_hold_ns,
+                            flush_ns: s.flush_ns,
+                            compact_ns: s.compact_ns,
+                            flushes: s.flushes,
+                            compactions: s.compactions,
+                        });
                         i += writers;
                     }
-                    out[0] = t0.elapsed().as_nanos() as u64;
-                    out
+                    (t0.elapsed().as_nanos() as u64, out)
                 })
             })
             .collect();
-        hs.into_iter().map(|h| h.join().expect("writer")).collect()
+        let mut elapsed = Vec::with_capacity(writers as usize);
+        let mut records = Vec::with_capacity(writers as usize);
+        for h in hs {
+            let (e, r) = h.join().expect("writer");
+            elapsed.push(e);
+            records.push(r);
+        }
+        (elapsed, records)
     })
 }
 
@@ -616,31 +641,91 @@ struct WriterStats {
     put_p50_us: f64,
     put_p99_us: f64,
     put_p999_us: f64,
+    lock_wait_p50_us: Option<f64>,
+    lock_wait_p99_us: Option<f64>,
+    lock_wait_p999_us: Option<f64>,
+    lock_hold_p50_us: Option<f64>,
+    lock_hold_p99_us: Option<f64>,
+    lock_hold_p999_us: Option<f64>,
+    non_flush_p99_us: f64,
+    flush_puts: usize,
+    flush_put_time_ms: f64,
+    flush_time_ms: Option<f64>,
+    compact_time_ms: Option<f64>,
     flushes: usize,
+    flush_count: usize,
+    compaction_count: usize,
 }
 
 impl WriterStats {
-    fn from_latencies(writers: u64, lat: Vec<Vec<u64>>, flushes: usize) -> Self {
-        let secs = lat.iter().map(|l| l[0]).max().unwrap_or(0) as f64 / 1e9;
-        let mut all: Vec<u64> = lat.iter().flat_map(|l| l[1..].iter().copied()).collect();
-        all.sort_unstable();
-        let keys = all.len();
+    fn from_records(writers: u64, elapsed_ns: Vec<u64>, records: Vec<Vec<PutRecord>>, flushes: usize, has_lock_stats: bool) -> Self {
+        let secs = elapsed_ns.into_iter().max().unwrap_or(0) as f64 / 1e9;
+        let flat: Vec<PutRecord> = records.into_iter().flatten().collect();
+        let keys = flat.len();
+        let mut all_ns: Vec<u64> = flat.iter().map(|r| r.total_ns).collect();
+        all_ns.sort_unstable();
+        let mut non_flush_ns: Vec<u64> = flat.iter().filter(|r| r.flushes == 0).map(|r| r.total_ns).collect();
+        non_flush_ns.sort_unstable();
+        let flush_puts = flat.iter().filter(|r| r.flushes > 0).count();
+        let flush_put_time_ms = flat.iter().filter(|r| r.flushes > 0).map(|r| r.total_ns as u128).sum::<u128>() as f64 / 1e6;
+        let flush_count: usize = flat.iter().map(|r| r.flushes).sum();
+        let compaction_count: usize = flat.iter().map(|r| r.compactions).sum();
+        let (lock_wait_p50_us, lock_wait_p99_us, lock_wait_p999_us, lock_hold_p50_us, lock_hold_p99_us, lock_hold_p999_us, flush_time_ms, compact_time_ms) = if has_lock_stats {
+            let mut waits: Vec<u64> = flat.iter().map(|r| r.lock_wait_ns).collect();
+            let mut holds: Vec<u64> = flat.iter().map(|r| r.lock_hold_ns).collect();
+            waits.sort_unstable();
+            holds.sort_unstable();
+            let ft = flat.iter().map(|r| r.flush_ns as u128).sum::<u128>() as f64 / 1e6;
+            let ct = flat.iter().map(|r| r.compact_ns as u128).sum::<u128>() as f64 / 1e6;
+            (
+                Some(percentile(&waits, 0.50)),
+                Some(percentile(&waits, 0.99)),
+                Some(percentile(&waits, 0.999)),
+                Some(percentile(&holds, 0.50)),
+                Some(percentile(&holds, 0.99)),
+                Some(percentile(&holds, 0.999)),
+                Some(ft),
+                Some(ct),
+            )
+        } else {
+            (None, None, None, None, None, None, None, None)
+        };
         let puts_per_s = if secs > 0.0 { keys as f64 / secs } else { 0.0 };
         Self {
             writers,
             keys,
             secs,
             puts_per_s,
-            put_p50_us: percentile(&all, 0.50),
-            put_p99_us: percentile(&all, 0.99),
-            put_p999_us: percentile(&all, 0.999),
+            put_p50_us: percentile(&all_ns, 0.50),
+            put_p99_us: percentile(&all_ns, 0.99),
+            put_p999_us: percentile(&all_ns, 0.999),
+            lock_wait_p50_us,
+            lock_wait_p99_us,
+            lock_wait_p999_us,
+            lock_hold_p50_us,
+            lock_hold_p99_us,
+            lock_hold_p999_us,
+            non_flush_p99_us: percentile(&non_flush_ns, 0.99),
+            flush_puts,
+            flush_put_time_ms,
+            flush_time_ms,
+            compact_time_ms,
             flushes,
+            flush_count,
+            compaction_count,
         }
     }
 
     fn json_line(&self, store: &str) -> String {
         format!(
-            "{{\"store\":\"{}\",\"phase\":\"writers\",\"writers\":{},\"keys\":{},\"secs\":{:.3},\"puts_per_s\":{:.0},\"put_p50_us\":{:.2},\"put_p99_us\":{:.2},\"put_p999_us\":{:.2},\"flushes\":{}}}",
+            concat!(
+                "{{\"store\":\"{}\",\"phase\":\"writers\",\"writers\":{},\"keys\":{},\"secs\":{:.3},\"puts_per_s\":{:.0},",
+                "\"put_p50_us\":{:.2},\"put_p99_us\":{:.2},\"put_p999_us\":{:.2},",
+                "\"lock_wait_p50_us\":{},\"lock_wait_p99_us\":{},\"lock_wait_p999_us\":{},",
+                "\"lock_hold_p50_us\":{},\"lock_hold_p99_us\":{},\"lock_hold_p999_us\":{},",
+                "\"non_flush_p99_us\":{:.2},\"flush_puts\":{},\"flush_put_time_ms\":{:.3},",
+                "\"flush_time_ms\":{},\"compact_time_ms\":{},\"flushes\":{},\"flush_count\":{},\"compaction_count\":{}}}"
+            ),
             store,
             self.writers,
             self.keys,
@@ -649,7 +734,20 @@ impl WriterStats {
             self.put_p50_us,
             self.put_p99_us,
             self.put_p999_us,
-            self.flushes
+            json_num(self.lock_wait_p50_us),
+            json_num(self.lock_wait_p99_us),
+            json_num(self.lock_wait_p999_us),
+            json_num(self.lock_hold_p50_us),
+            json_num(self.lock_hold_p99_us),
+            json_num(self.lock_hold_p999_us),
+            self.non_flush_p99_us,
+            self.flush_puts,
+            self.flush_put_time_ms,
+            json_num(self.flush_time_ms),
+            json_num(self.compact_time_ms),
+            self.flushes,
+            self.flush_count,
+            self.compaction_count
         )
     }
 }
@@ -657,22 +755,27 @@ impl WriterStats {
 fn run_writers_once(kind: &str, dir: &Path, writers: u64, keys: u64, prod_cache_bytes: Option<usize>) -> WriterStats {
     std::fs::create_dir_all(dir).unwrap();
     let before = meta_segments(dir);
-    let lat: Vec<Vec<u64>> = match kind {
+    let (elapsed_ns, records, has_lock_stats) = match kind {
         "redb" => {
             let db = redb_spill::RedbSpill::open(&dir.join("metadata.db")).expect("open redb");
-            run_writers(writers, keys, |k, r| db.put(BUCKET, k, r).expect("redb put"))
+            let (e, r) = run_writers(writers, keys, |k, r| {
+                db.put(BUCKET, k, r).expect("redb put");
+                s3_server::spill::PutSample::default()
+            });
+            (e, r, false)
         }
         "prod" => {
             let ix = match prod_cache_bytes {
                 Some(bytes) => s3_server::spill::SpillIndex::open_with_cache_size(dir, bytes).expect("open prod"),
                 None => s3_server::spill::SpillIndex::open(dir).expect("open prod"),
             };
-            run_writers(writers, keys, |k, r| ix.put(BUCKET, k, r).expect("prod put"))
+            let (e, r) = run_writers(writers, keys, |k, r| ix.put_measured(BUCKET, k, r).expect("prod put"));
+            (e, r, true)
         }
         other => panic!("writers: --store redb|prod, not {}", other),
     };
     let flushes = meta_segments(dir).saturating_sub(before);
-    WriterStats::from_latencies(writers, lat, flushes)
+    WriterStats::from_records(writers, elapsed_ns, records, flushes, has_lock_stats)
 }
 
 fn open_store(kind: &str, dir: &Path) -> Box<dyn Store> {
@@ -1074,6 +1177,69 @@ mod tests {
         let line = stats.json_line("redb");
         assert!(line.contains("\"put_p999_us\":"), "json line missing put_p999_us: {}", line);
         assert!(line.contains("\"flushes\":0"), "json line missing flushes: {}", line);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn writers_non_flush_p99_excludes_flushing_puts_and_emits_breakdown() {
+        let mut records = Vec::with_capacity(1_000);
+        for i in 1..=999u64 {
+            records.push(PutRecord {
+                total_ns: i * 1_000,
+                lock_wait_ns: i * 200,
+                lock_hold_ns: i * 800,
+                flush_ns: 0,
+                compact_ns: 0,
+                flushes: 0,
+                compactions: 0,
+            });
+        }
+        records.push(PutRecord {
+            total_ns: 50_000_000,
+            lock_wait_ns: 100_000,
+            lock_hold_ns: 49_900_000,
+            flush_ns: 30_000_000,
+            compact_ns: 19_000_000,
+            flushes: 1,
+            compactions: 2,
+        });
+        let stats = WriterStats::from_records(4, vec![100_000_000], vec![records], 1, true);
+        assert_eq!(stats.keys, 1_000);
+        assert_eq!(stats.flush_puts, 1);
+        assert_eq!(stats.flush_count, 1);
+        assert_eq!(stats.compaction_count, 2);
+        assert!((stats.non_flush_p99_us - 989.0).abs() < 1e-6, "got {}", stats.non_flush_p99_us);
+        assert!(stats.put_p99_us > stats.non_flush_p99_us);
+        assert!((stats.flush_time_ms.unwrap() - 30.0).abs() < 1e-6);
+        assert!((stats.compact_time_ms.unwrap() - 19.0).abs() < 1e-6);
+        let line = stats.json_line("prod");
+        for field in [
+            "\"lock_wait_p50_us\":",
+            "\"lock_wait_p99_us\":",
+            "\"lock_hold_p50_us\":",
+            "\"lock_hold_p99_us\":",
+            "\"non_flush_p99_us\":",
+            "\"flush_puts\":1",
+            "\"flush_time_ms\":",
+            "\"compact_time_ms\":",
+            "\"flush_count\":1",
+            "\"compaction_count\":2",
+        ] {
+            assert!(line.contains(field), "json line missing {}: {}", field, line);
+        }
+    }
+
+    #[test]
+    fn writers_prod_run_records_flush_and_lock_breakdown() {
+        let d = test_dir("prod_breakdown");
+        let stats = run_writers_once("prod", &d, 4, 1_500, Some(256 << 10));
+        assert_eq!(stats.keys, 1_500);
+        assert!(stats.flush_puts >= 1);
+        assert_eq!(stats.flush_puts, stats.flush_count);
+        assert!(stats.lock_wait_p99_us.is_some());
+        assert!(stats.lock_hold_p99_us.is_some());
+        assert!(stats.flush_time_ms.unwrap() > 0.0);
+        assert!(stats.flush_put_time_ms > 0.0);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
