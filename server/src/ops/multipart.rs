@@ -859,9 +859,10 @@ pub async fn complete_multipart_upload(
             let hi = u64::from_str_radix(hex_prefix.get(0..16).unwrap_or("0"), 16).unwrap_or(0);
             let lo = u64::from_str_radix(hex_prefix.get(16..32).unwrap_or("0"), 16).unwrap_or(0);
             let _key_guard = state.lock_key(b_id, key).await;
-            if let Err(code) = state.engine.read().has_room_for(b_id, key.as_bytes()) {
-                return Ok(engine_error_response(code, key));
-            }
+            let reservation = match crate::meta_index::CapacityReservation::acquire(&state.engine, b_id, key.as_bytes()) {
+                Ok(r) => r,
+                Err(code) => return Ok(engine_error_response(code, key)),
+            };
             let manifest = Bytes::from(encode_extents_manifest(&state.multipart.staging_dir, total_size, &extents));
             let stamp = state.version_stamp(b_id, key);
             let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
@@ -891,7 +892,7 @@ pub async fn complete_multipart_upload(
             }
             let mut version_id = None;
             if let Some((extra, ts)) = stamp {
-                match finish_version_put(&state, b_id, key, ts, mp_flags, manifest_offset, total_size, hi, lo, extents.len() as u16) {
+                match finish_version_put(&state, b_id, key, ts, mp_flags, manifest_offset, total_size, hi, lo, extents.len() as u16, reservation) {
                     Ok(v) => {
                         if extra & crate::meta_index::FLAG_NULL_ID == 0 {
                             version_id = Some(v);
@@ -900,8 +901,8 @@ pub async fn complete_multipart_upload(
                     Err(r) => return Ok(r),
                 }
             } else {
-                let mut engine = state.engine.write();
-                if let Err(code) = engine.put_object_at(
+                if let Err(code) = reservation.commit_put_at(
+                    &state.engine,
                     b_id,
                     key.as_bytes(),
                     manifest_offset,

@@ -6,7 +6,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::panic::catch_unwind;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
+use parking_lot::RwLock;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 use crate::spill::SpillIndex;
 
@@ -194,6 +196,150 @@ pub struct StorageEngine {
     pub hash_slots: HashMap<(u32, u64), Vec<usize>>,
     pub slab_bytes: usize,
     pub spill_index: Option<SpillIndex>,
+    /// Active upfront slot reservations for unindexed keys (`spill_index.is_none()`), keyed by
+    /// `(bucket_id, key) -> refcount`.
+    reserved_keys: HashMap<(u32, Vec<u8>), usize>,
+}
+
+/// RAII capacity guard holding a slot in `StorageEngine::reserved_keys` until committed or dropped.
+pub struct CapacityReservation {
+    engine: Option<Arc<RwLock<StorageEngine>>>,
+    bucket_id: u32,
+    key: Vec<u8>,
+    reserved: bool,
+}
+
+impl std::fmt::Debug for CapacityReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapacityReservation")
+            .field("bucket_id", &self.bucket_id)
+            .field("key_len", &self.key.len())
+            .field("reserved", &self.reserved)
+            .finish()
+    }
+}
+
+impl CapacityReservation {
+    /// Reserves capacity for `(bucket_id, key)` when the engine is bounded (`spill_index.is_none()`)
+    /// and the key is not already indexed in memory.
+    pub fn acquire(
+        engine: &Arc<RwLock<StorageEngine>>,
+        bucket_id: u32,
+        key: &[u8],
+    ) -> Result<Self, i32> {
+        {
+            let guard = engine.read();
+            if key.is_empty() || key.len() > 1024 {
+                return Err(ERR_INVALID_ARG);
+            }
+            let bucket = guard.buckets.get(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
+            if guard.spill_index.is_some() || bucket.key_index.contains_key(key) {
+                return Ok(Self {
+                    engine: None,
+                    bucket_id,
+                    key: Vec::new(),
+                    reserved: false,
+                });
+            }
+        }
+        let reserved = engine.write().try_reserve_slot(bucket_id, key)?;
+        Ok(Self {
+            engine: reserved.then(|| Arc::clone(engine)),
+            bucket_id,
+            key: if reserved { key.to_vec() } else { Vec::new() },
+            reserved,
+        })
+    }
+
+    /// Re-verifies capacity (or acquires a reservation if an existing key was deleted while
+    /// streaming without `lock_key`) before committing a streamed needle.
+    pub fn ensure_room(
+        &mut self,
+        engine: &Arc<RwLock<StorageEngine>>,
+        bucket_id: u32,
+        key: &[u8],
+    ) -> Result<(), i32> {
+        if self.reserved {
+            let res = engine.read().has_room_with_reserved(bucket_id, key);
+            if res.is_ok() {
+                return Ok(());
+            }
+            if let Some(eng) = self.engine.take() {
+                eng.write().release_slot(self.bucket_id, &self.key);
+            }
+            self.reserved = false;
+            return res;
+        }
+        {
+            let guard = engine.read();
+            let bucket = guard.buckets.get(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
+            if guard.spill_index.is_some() || bucket.key_index.contains_key(key) {
+                return Ok(());
+            }
+        }
+        let reserved = engine.write().try_reserve_slot(bucket_id, key)?;
+        if reserved {
+            self.engine = Some(Arc::clone(engine));
+            self.bucket_id = bucket_id;
+            self.key = key.to_vec();
+            self.reserved = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_reserved_for(&self, bucket_id: u32, key: &[u8]) -> bool {
+        self.reserved && self.bucket_id == bucket_id && self.key.as_slice() == key
+    }
+
+    /// Releases this reservation while the caller already holds `&mut StorageEngine`.
+    pub(crate) fn release_in(&mut self, engine: &mut StorageEngine) {
+        if self.reserved {
+            engine.release_slot(self.bucket_id, &self.key);
+            self.engine = None;
+            self.reserved = false;
+        }
+    }
+
+    /// Consumes this reservation and inserts the object atomically under one `engine.write()`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_put_at(
+        mut self,
+        engine: &Arc<RwLock<StorageEngine>>,
+        bucket_id: u32,
+        key: &[u8],
+        vol_offset: u64,
+        size: u64,
+        etag_hi: u64,
+        etag_lo: u64,
+        part_count: u16,
+        flags: u16,
+        created_at_ms: u64,
+    ) -> Result<(), i32> {
+        let mut guard = engine.write();
+        self.release_in(&mut guard);
+        guard.put_object_at(
+            bucket_id,
+            key,
+            vol_offset,
+            size,
+            etag_hi,
+            etag_lo,
+            part_count,
+            flags,
+            created_at_ms,
+        )
+    }
+}
+
+impl Drop for CapacityReservation {
+    fn drop(&mut self) {
+        if self.reserved {
+            if let Some(engine) = self.engine.take() {
+                engine.write().release_slot(self.bucket_id, &self.key);
+            }
+            self.reserved = false;
+        }
+    }
 }
 
 pub type AwanStorageEngine = StorageEngine;
@@ -217,6 +363,7 @@ impl StorageEngine {
             hash_slots: HashMap::with_capacity(max_objects.min(1_000_000)),
             slab_bytes,
             spill_index: None,
+            reserved_keys: HashMap::new(),
         }
     }
 
@@ -288,13 +435,77 @@ impl StorageEngine {
         Err(ERR_NOT_FOUND)
     }
 
+    fn reserved_slots_in_use(&self) -> usize {
+        self.reserved_keys
+            .keys()
+            .filter(|(b_id, key)| {
+                self.buckets
+                    .get(b_id)
+                    .is_some_and(|b| !b.key_index.contains_key(key.as_slice()))
+            })
+            .count()
+    }
+
+    pub fn try_reserve_slot(&mut self, bucket_id: u32, key: &[u8]) -> Result<bool, i32> {
+        if key.is_empty() || key.len() > 1024 {
+            return Err(ERR_INVALID_ARG);
+        }
+        let bucket = self.buckets.get(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
+        if self.spill_index.is_some() || bucket.key_index.contains_key(key) {
+            return Ok(false);
+        }
+        let map_key = (bucket_id, key.to_vec());
+        if let Some(count) = self.reserved_keys.get_mut(&map_key) {
+            *count += 1;
+            return Ok(true);
+        }
+        if self.table.key_hashes.len() + self.reserved_slots_in_use() >= self.max_objects {
+            return Err(ERR_CAPACITY);
+        }
+        self.reserved_keys.insert(map_key, 1);
+        Ok(true)
+    }
+
+    pub fn release_slot(&mut self, bucket_id: u32, key: &[u8]) {
+        if self.reserved_keys.is_empty() {
+            return;
+        }
+        let map_key = (bucket_id, key.to_vec());
+        if let Some(count) = self.reserved_keys.get_mut(&map_key) {
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                self.reserved_keys.remove(&map_key);
+            }
+        }
+    }
+
+    pub(crate) fn has_room_with_reserved(&self, bucket_id: u32, key: &[u8]) -> Result<(), i32> {
+        let bucket = self.buckets.get(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
+        if bucket.key_index.contains_key(key)
+            || self.spill_index.is_some()
+            || (self.table.key_hashes.len() < self.max_objects
+                && self.table.key_hashes.len() + self.reserved_slots_in_use() <= self.max_objects)
+        {
+            Ok(())
+        } else {
+            Err(ERR_CAPACITY)
+        }
+    }
+
     /// Would `put_object` find room for this key? An existing key or a spill index always
-    /// has room. Callers check before logging a write, so a full index answers 503 before
-    /// anything reaches the volume (#40). Two new keys can still race for the last row; the
-    /// loser's `put_object` returns `ERR_CAPACITY`.
+    /// has room. Accounts for upfront `reserved_keys` slots so concurrent writers cannot steal
+    /// the last row (#40, #356).
     pub fn has_room_for(&self, bucket_id: u32, key: &[u8]) -> Result<(), i32> {
         let bucket = self.buckets.get(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
-        if bucket.key_index.contains_key(key) || self.spill_index.is_some() || self.table.key_hashes.len() < self.max_objects {
+        if bucket.key_index.contains_key(key) || self.spill_index.is_some() {
+            return Ok(());
+        }
+        if self.table.key_hashes.len() + self.reserved_slots_in_use() < self.max_objects
+            || (self.table.key_hashes.len() < self.max_objects
+                && !self.reserved_keys.is_empty()
+                && self.reserved_keys.keys().any(|(b, k)| *b == bucket_id && k.as_slice() == key))
+        {
             Ok(())
         } else {
             Err(ERR_CAPACITY)
@@ -363,13 +574,15 @@ impl StorageEngine {
         if key.is_empty() || key.len() > 1024 {
             return Err(ERR_INVALID_ARG);
         }
-        let bucket = self.buckets.get_mut(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
-
+        let existing_row = {
+            let bucket = self.buckets.get(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
+            bucket.key_index.get(key).copied()
+        };
 
         let active_flags = flags | FLAG_ACTIVE;
         let bucket_flags = pack_bucket_flags(bucket_id, part_count, active_flags);
 
-        if let Some(&row_idx) = bucket.key_index.get(key) {
+        if let Some(row_idx) = existing_row {
             let old_key_slice = self.table.key_slices[row_idx];
             let meta = ObjectMeta {
                 key_hash,
@@ -410,6 +623,16 @@ impl StorageEngine {
         if self.table.key_hashes.len() >= self.max_objects {
             return Err(ERR_CAPACITY);
         }
+        if !self.reserved_keys.is_empty() {
+            let reserved = self.reserved_slots_in_use();
+            let key_reserved = self
+                .reserved_keys
+                .keys()
+                .any(|(b, k)| *b == bucket_id && k.as_slice() == key);
+            if self.table.key_hashes.len() + reserved + usize::from(!key_reserved) > self.max_objects {
+                return Err(ERR_CAPACITY);
+            }
+        }
 
         let arena_offset = self.key_arena.len();
         self.key_arena.extend_from_slice(key);
@@ -427,7 +650,7 @@ impl StorageEngine {
         };
 
         let row_idx = self.table.push(&meta);
-        bucket.key_index.insert(key.to_vec(), row_idx);
+        self.buckets.get_mut(&bucket_id).expect("bucket checked").key_index.insert(key.to_vec(), row_idx);
         self.hash_slots.entry((bucket_id, key_hash)).or_default().push(row_idx);
         Ok(())
     }
@@ -886,4 +1109,47 @@ pub unsafe extern "C" fn awan_storage_index_delete(engine: *mut std::ffi::c_void
 #[no_mangle]
 pub unsafe extern "C" fn awan_storage_index_scan(engine: *mut std::ffi::c_void, bucket_id: u32, prefix_ptr: *const u8, prefix_len: u16, start_after_ptr: *const u8, start_after_len: u16, max_keys: u32, out_records: *mut ObjectMeta) -> i64 {
     s3_storage_index_scan(engine, bucket_id, prefix_ptr, prefix_len, start_after_ptr, start_after_len, max_keys, out_records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_reservation_blocks_other_keys_shares_same_key_and_releases_on_drop() {
+        let engine = Arc::new(RwLock::new(StorageEngine::new(2, 4096, 4096)));
+        let b_id = engine.write().create_bucket("bkt").unwrap();
+        engine.write().put_object_at(b_id, b"k0", 4096, 1, 0, 0, 0, 0, 1).unwrap();
+
+        let r1 = CapacityReservation::acquire(&engine, b_id, b"k1").unwrap();
+        assert_eq!(CapacityReservation::acquire(&engine, b_id, b"k2").unwrap_err(), ERR_CAPACITY);
+        assert_eq!(engine.read().has_room_for(b_id, b"k2").unwrap_err(), ERR_CAPACITY);
+        assert_eq!(engine.write().put_object_at(b_id, b"k2", 8192, 1, 0, 0, 0, 0, 1).unwrap_err(), ERR_CAPACITY);
+
+        // Concurrent writer on the same key shares the reserved slot, then drops without leaking.
+        let r1_dup = CapacityReservation::acquire(&engine, b_id, b"k1").unwrap();
+        r1_dup.commit_put_at(&engine, b_id, b"k1", 8192, 2, 0, 0, 0, 0, 2).unwrap();
+        assert_eq!(engine.read().reserved_slots_in_use(), 0);
+
+        // Existing key still fits for r1, and dropping r1 clears reserved_keys.
+        let mut r1 = r1;
+        r1.ensure_room(&engine, b_id, b"k1").unwrap();
+        drop(r1);
+        assert!(engine.read().reserved_keys.is_empty());
+    }
+
+    #[test]
+    fn capacity_reservation_ensure_room_detects_midstream_commit_and_delete() {
+        let engine = Arc::new(RwLock::new(StorageEngine::new(2, 4096, 4096)));
+        let b_id = engine.write().create_bucket("bkt").unwrap();
+        engine.write().put_object_at(b_id, b"k0", 4096, 1, 0, 0, 0, 0, 1).unwrap();
+
+        let mut r_stream = CapacityReservation::acquire(&engine, b_id, b"k1").unwrap();
+        let r_buf = CapacityReservation::acquire(&engine, b_id, b"k1").unwrap();
+        r_buf.commit_put_at(&engine, b_id, b"k1", 8192, 2, 0, 0, 0, 0, 2).unwrap();
+        engine.write().delete_object(b_id, b"k1").unwrap();
+
+        assert_eq!(r_stream.ensure_room(&engine, b_id, b"k1").unwrap_err(), ERR_CAPACITY);
+        assert!(engine.read().reserved_keys.is_empty());
+    }
 }
