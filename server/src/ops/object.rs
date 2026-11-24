@@ -728,7 +728,7 @@ pub async fn copy_object(
         (src_b_id, src_meta)
     };
 
-    let mut src_view: Result<crate::attrs::Attrs, VolumeError> = Ok(crate::attrs::Attrs::new());
+    let src_view: Result<crate::attrs::Attrs, VolumeError>;
     let read = match (&src_vid, &src_meta) {
         (Some(vid), _) => {
             let Some(id) = crate::versions::parse_id(vid) else {
@@ -1751,7 +1751,6 @@ pub async fn get_or_head_object(
 
     let etag_val = format_object_etag(meta.etag_hi, meta.etag_lo, is_multipart, unpack_part_count(meta.bucket_flags));
     let lm_secs = last_modified_secs_from_ms(meta.created_at);
-    let lm_str = format_http_date(lm_secs);
     let facts = ObjectFacts {
         etag: etag_val.clone(),
         last_modified_secs: lm_secs,
