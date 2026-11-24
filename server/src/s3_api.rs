@@ -53,10 +53,22 @@ pub(crate) fn internal_error_response(resource: &str, detail: &str) -> Response<
         .unwrap()
 }
 
-/// The answer for an index error from `put_object` or `has_room_for`.
+/// Single S3 `503 SlowDown` response builder so every path carries `Retry-After`.
+pub(crate) fn slow_down_with_req_id(resource: &str, msg: &str, req_id: &str) -> Response<ResponseBody> {
+    let xml = s3_error_xml("SlowDown", msg, resource, req_id);
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(CONTENT_TYPE, "application/xml")
+        .header("retry-after", crate::memory::RETRY_AFTER_SECS.to_string())
+        .header("connection", "close")
+        .body(full_body(Bytes::from(xml)))
+        .unwrap()
+}
+
+/// The answer for an index error from `put_object`, `has_room_for`, or `CapacityReservation`.
 pub(crate) fn engine_error_response(code: i32, resource: &str) -> Response<ResponseBody> {
     let (status, s3_code, msg) = match code {
-        ERR_CAPACITY => (StatusCode::SERVICE_UNAVAILABLE, "SlowDown", "The object index is full."),
+        ERR_CAPACITY => return slow_down_with_req_id(resource, "The object index is full.", "req-index"),
         ERR_BUCKET_NOT_FOUND => (StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist."),
         ERR_INVALID_ARG => (StatusCode::BAD_REQUEST, "KeyTooLongError", "The key is empty or longer than 1024 bytes."),
         _ => return internal_error_response(resource, &format!("index error {}", code)),
@@ -150,13 +162,7 @@ pub(crate) fn request_timeout_response(resource: &str) -> Response<ResponseBody>
 }
 
 pub(crate) fn slow_down_response(resource: &str, msg: &str) -> Response<ResponseBody> {
-    let xml = s3_error_xml("SlowDown", msg, resource, "req-mem");
-    Response::builder()
-        .status(StatusCode::SERVICE_UNAVAILABLE)
-        .header(CONTENT_TYPE, "application/xml")
-        .header("connection", "close")
-        .body(full_body(Bytes::from(xml)))
-        .unwrap()
+    slow_down_with_req_id(resource, msg, "req-mem")
 }
 
 /// Acquires against `budget` before buffering `body`, returning the `AdmissionGuard` and
@@ -1200,7 +1206,7 @@ impl S3ServiceState {
     pub async fn delete_version(&self, b_id: u32, key: &str, id: u64) -> Result<Option<crate::versions::Version>, String> {
         let _key_guard = self.lock_key(b_id, key).await;
         let before = self.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| null_version_of(&m));
-        let target = {
+        let (target, uncovers_object) = {
             let mut vs = self.versions.write();
             if !vs.has(b_id, key) {
                 // The object of a key with no history is its null version.
@@ -1209,12 +1215,22 @@ impl S3ServiceState {
                 }
                 vs.start(b_id, key, before);
             }
-            vs.find(b_id, key, id)
+            let target = vs.find(b_id, key, id);
+            let uncovers = vs
+                .versions(b_id, key)
+                .and_then(|l| l.iter().find(|x| x.id() != id))
+                .is_some_and(|next| !next.marker);
+            (target, uncovers)
         };
         let Some(target) = target else {
             self.versions.write().tidy(b_id, key);
             return Ok(None);
         };
+        if uncovers_object {
+            if let Err(code) = self.engine.read().has_room_for(b_id, key.as_bytes()) {
+                return Err(format!("index error {} before deleting a version", code));
+            }
+        }
         let flags = AWAN_FLAG_TOMBSTONE | crate::meta_index::FLAG_VERSION_DELETE;
         // A record whole in the volume is replayed by recovery: the version goes here too, and
         // the request still answers an error (#184, owner decision 4B).
@@ -1254,34 +1270,92 @@ impl S3ServiceState {
     /// Records a durable version event: updates the history, drops the needles it made
     /// unreachable, and points the index row at the current version (#31).
     pub fn record_version(&self, b_id: u32, key: &str, ev: crate::versions::Event) -> Result<(), i32> {
-        let before = self.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| null_version_of(&m));
-        let (dead, current) = {
+        self.record_version_with_reservation(b_id, key, ev, None)
+    }
+
+    /// Variant of `record_version` that checks capacity before mutating `versions` and
+    /// consumes an upfront `CapacityReservation` atomically inside `engine.write()`.
+    pub fn record_version_with_reservation(
+        &self,
+        b_id: u32,
+        key: &str,
+        ev: crate::versions::Event,
+        mut reservation: Option<CapacityReservation>,
+    ) -> Result<(), i32> {
+        let mut restore_multipart = None;
+        let dead = {
+            let mut engine = self.engine.write();
+            let before = engine.get_object(b_id, key.as_bytes()).ok().map(|m| null_version_of(&m));
             let mut vs = self.versions.write();
+            let needs_put_row = match ev {
+                crate::versions::Event::Put(v) => {
+                    if let Some(cur) = vs.current(b_id, key) {
+                        if cur.ts > v.ts { !cur.marker } else { !v.marker }
+                    } else {
+                        !v.marker
+                    }
+                }
+                crate::versions::Event::Remove(id) => {
+                    if let Some(list) = vs.versions(b_id, key) {
+                        list.iter().find(|x| x.id() != id).is_some_and(|next| !next.marker)
+                    } else {
+                        id != 0 && before.is_some()
+                    }
+                }
+            };
+            if needs_put_row {
+                let check = match reservation.as_ref() {
+                    Some(r) if r.is_reserved_for(b_id, key.as_bytes()) => {
+                        engine.has_room_with_reserved(b_id, key.as_bytes())
+                    }
+                    _ => engine.has_room_for(b_id, key.as_bytes()),
+                };
+                if let Err(code) = check {
+                    return Err(code);
+                }
+            }
             vs.start(b_id, key, before);
             let dead = vs.apply(b_id, key, ev);
             let current = vs.current(b_id, key);
             vs.tidy(b_id, key);
-            (dead, current)
+            drop(vs);
+            if let Some(ref mut r) = reservation {
+                r.release_in(&mut engine);
+            }
+            match current {
+                Some(v) if !v.marker => {
+                    engine.put_object_at(
+                        b_id,
+                        key.as_bytes(),
+                        v.vol_offset,
+                        v.size,
+                        v.etag_hi,
+                        v.etag_lo,
+                        v.part_count,
+                        v.flags,
+                        v.ts / 1_000_000,
+                    )?;
+                    if v.flags & AWAN_FLAG_MULTIPART != 0 {
+                        restore_multipart = Some(v.vol_offset);
+                    }
+                }
+                _ => {
+                    let _ = engine.delete_object(b_id, key.as_bytes());
+                }
+            }
+            dead
         };
+        if let Some(vol_offset) = restore_multipart {
+            if let Some(ext) = self.manifest_extents(b_id, vol_offset) {
+                self.multipart.restore_completed(b_id, key, ext);
+            }
+        }
         for v in dead {
             if v.vol_offset > 0 {
                 self.payload_cache.remove(b_id, v.vol_offset);
                 self.needle_crc_map.write().remove(&(b_id, v.vol_offset));
                 let dead_bytes = (64 + key.len() as u64 + v.size).div_ceil(4096) * 4096;
                 self.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
-            }
-        }
-        match current {
-            Some(v) if !v.marker => {
-                self.engine.write().put_object_at(b_id, key.as_bytes(), v.vol_offset, v.size, v.etag_hi, v.etag_lo, v.part_count, v.flags, v.ts / 1_000_000)?;
-                if v.flags & AWAN_FLAG_MULTIPART != 0 {
-                    if let Some(ext) = self.manifest_extents(b_id, v.vol_offset) {
-                        self.multipart.restore_completed(b_id, key, ext);
-                    }
-                }
-            }
-            _ => {
-                let _ = self.engine.write().delete_object(b_id, key.as_bytes());
             }
         }
         Ok(())

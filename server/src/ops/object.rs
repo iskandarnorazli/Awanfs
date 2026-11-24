@@ -12,7 +12,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::ffi_bridge::{
-    unpack_flags, unpack_part_count, AWAN_FLAG_ACTIVE, AWAN_FLAG_MULTIPART, AWAN_FLAG_ZERO_BYTE,
+    unpack_flags, unpack_part_count, CapacityReservation, AWAN_FLAG_ACTIVE, AWAN_FLAG_MULTIPART,
+    AWAN_FLAG_ZERO_BYTE,
 };
 use crate::iam::Iam;
 use crate::precondition::{
@@ -28,6 +29,7 @@ use crate::s3_api::{
 use crate::volume::{global_offset, VolumeError};
 use crate::xml::{copy_object_result_xml, s3_error_xml};
 
+#[allow(clippy::too_many_arguments)]
 fn finish_put(
     state: &S3ServiceState,
     b_id: u32,
@@ -41,7 +43,22 @@ fn finish_put(
     etag_hex: &str,
     created_at_ms: u64,
     checksum: Option<(crate::checksum::ChecksumAlgorithm, &str)>,
+    reservation: CapacityReservation,
 ) -> Response<ResponseBody> {
+    if let Err(code) = reservation.commit_put_at(
+        &state.engine,
+        b_id,
+        key.as_bytes(),
+        vol_offset,
+        payload_len,
+        etag_hi,
+        etag_lo,
+        0,
+        flags,
+        created_at_ms,
+    ) {
+        return engine_error_response(code, key);
+    }
     if let Some((prev_off, prev_sz)) = old_info {
         if prev_off > 0 && prev_off != vol_offset {
             state.payload_cache.remove(b_id, prev_off);
@@ -50,9 +67,6 @@ fn finish_put(
             let dead_bytes = raw_len.div_ceil(4096) as u64 * 4096;
             state.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
         }
-    }
-    if let Err(code) = state.engine.write().put_object_at(b_id, key.as_bytes(), vol_offset, payload_len, etag_hi, etag_lo, 0, flags, created_at_ms) {
-        return engine_error_response(code, key);
     }
     let mut b = Response::builder()
         .status(StatusCode::OK)
@@ -389,6 +403,7 @@ pub(crate) fn finish_version_put(
     etag_hi: u64,
     etag_lo: u64,
     part_count: u16,
+    reservation: CapacityReservation,
 ) -> Result<String, Response<ResponseBody>> {
     let v = crate::versions::Version {
         ts,
@@ -402,7 +417,7 @@ pub(crate) fn finish_version_put(
         part_count,
         flags,
     };
-    match state.record_version(b_id, key, crate::versions::Event::Put(v)) {
+    match state.record_version_with_reservation(b_id, key, crate::versions::Event::Put(v), Some(reservation)) {
         Ok(()) => Ok(v.id_string()),
         Err(code) => Err(engine_error_response(code, key)),
     }
@@ -842,9 +857,10 @@ pub async fn copy_object(
         AWAN_FLAG_ACTIVE
     };
     let _key_guard = state.lock_key(b_id, key).await;
-    if let Err(code) = state.engine.read().has_room_for(b_id, key.as_bytes()) {
-        return Ok(engine_error_response(code, key));
-    }
+    let reservation = match CapacityReservation::acquire(&state.engine, b_id, key.as_bytes()) {
+        Ok(r) => r,
+        Err(code) => return Ok(engine_error_response(code, key)),
+    };
     let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset);
     let stamp = state.version_stamp(b_id, key);
     let flags = flags | stamp.map_or(0, |s| s.0);
@@ -861,7 +877,7 @@ pub async fn copy_object(
         },
     };
     if let Some((_, ts)) = stamp {
-        let vid = match finish_version_put(&state, b_id, key, ts, flags, vol_offset, src_size, src_etag_hi, src_etag_lo, 0) {
+        let vid = match finish_version_put(&state, b_id, key, ts, flags, vol_offset, src_size, src_etag_hi, src_etag_lo, 0, reservation) {
             Ok(v) => v,
             Err(r) => return Ok(r),
         };
@@ -882,13 +898,8 @@ pub async fn copy_object(
             .body(full_body(Bytes::from(copy_object_result_xml(&etag_hex, &crate::versions::iso8601(ts)))))
             .unwrap());
     }
-    if let Some(prev_off) = old_info {
-        if prev_off > 0 && prev_off != vol_offset {
-            state.payload_cache.remove(b_id, prev_off);
-            state.needle_crc_map.write().remove(&(b_id, prev_off));
-        }
-    }
-    if let Err(code) = state.engine.write().put_object_at(
+    if let Err(code) = reservation.commit_put_at(
+        &state.engine,
         b_id,
         key.as_bytes(),
         vol_offset,
@@ -900,6 +911,12 @@ pub async fn copy_object(
         created_ns / 1_000_000,
     ) {
         return Ok(engine_error_response(code, key));
+    }
+    if let Some(prev_off) = old_info {
+        if prev_off > 0 && prev_off != vol_offset {
+            state.payload_cache.remove(b_id, prev_off);
+            state.needle_crc_map.write().remove(&(b_id, prev_off));
+        }
     }
     if let Some(e) = late {
         return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e)));
@@ -1143,9 +1160,10 @@ pub async fn put_object(
                 .body(full_body(Bytes::from(xml)))
                 .unwrap());
         }
-        if let Err(code) = state.engine.read().has_room_for(b_id, key.as_bytes()) {
-            return Ok(engine_error_response(code, key));
-        }
+        let mut reservation = match CapacityReservation::acquire(&state.engine, b_id, key.as_bytes()) {
+            Ok(r) => r,
+            Err(code) => return Ok(engine_error_response(code, key)),
+        };
         let ticket = state.streams.enter(b_id, key);
         let begin_flags = base_flags | state.version_stamp(b_id, key).map_or(0, |s| s.0);
         let mut writer = match state.begin_needle_on_active(b_id, key, &put_attrs, len, begin_flags) {
@@ -1439,7 +1457,7 @@ pub async fn put_object(
                 ))))
                 .unwrap());
         }
-        if let Err(code) = state.engine.read().has_room_for(b_id, key.as_bytes()) {
+        if let Err(code) = reservation.ensure_room(&state.engine, b_id, key.as_bytes()) {
             return Ok(engine_error_response(code, key));
         }
         let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size));
@@ -1501,7 +1519,7 @@ pub async fn put_object(
         state.hook("put_stored", key);
         let stream_cksum_ref = stream_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
         let answer = if let Some((extra, ts)) = stamp {
-            match finish_version_put(&state, b_id, key, ts, flags, vol_offset, len, etag_hi, etag_lo, 0) {
+            match finish_version_put(&state, b_id, key, ts, flags, vol_offset, len, etag_hi, etag_lo, 0, reservation) {
                 Ok(vid) => {
                     let resp_vid = (extra & crate::meta_index::FLAG_NULL_ID == 0).then_some(vid.as_str());
                     put_ok_response(&etag_hex, resp_vid, stream_cksum_ref)
@@ -1509,7 +1527,7 @@ pub async fn put_object(
                 Err(r) => r,
             }
         } else {
-            finish_put(&state, b_id, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns / 1_000_000, stream_cksum_ref)
+            finish_put(&state, b_id, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns / 1_000_000, stream_cksum_ref, reservation)
         };
         return Ok(after_late_failure(key, late, answer));
     }
@@ -1609,9 +1627,10 @@ pub async fn put_object(
             .body(full_body(Bytes::from(xml)))
             .unwrap());
     }
-    if let Err(code) = state.engine.read().has_room_for(b_id, key.as_bytes()) {
-        return Ok(engine_error_response(code, key));
-    }
+    let reservation = match CapacityReservation::acquire(&state.engine, b_id, key.as_bytes()) {
+        Ok(r) => r,
+        Err(code) => return Ok(engine_error_response(code, key)),
+    };
     let old_info = {
         let engine = state.engine.read();
         engine.get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size))
@@ -1654,7 +1673,7 @@ pub async fn put_object(
     state.hook("put_stored", key);
     let buf_cksum_ref = buf_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
     let answer = if let Some((extra, ts)) = stamp {
-        match finish_version_put(&state, b_id, key, ts, flags, vol_offset, payload_len, etag_hi, etag_lo, 0) {
+        match finish_version_put(&state, b_id, key, ts, flags, vol_offset, payload_len, etag_hi, etag_lo, 0, reservation) {
             Ok(vid) => {
                 let resp_vid = (extra & crate::meta_index::FLAG_NULL_ID == 0).then_some(vid.as_str());
                 put_ok_response(&final_etag_hex, resp_vid, buf_cksum_ref)
@@ -1662,7 +1681,7 @@ pub async fn put_object(
             Err(r) => r,
         }
     } else {
-        finish_put(&state, b_id, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns / 1_000_000, buf_cksum_ref)
+        finish_put(&state, b_id, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns / 1_000_000, buf_cksum_ref, reservation)
     };
     Ok(after_late_failure(key, late, answer))
 }

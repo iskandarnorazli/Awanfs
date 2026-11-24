@@ -27,7 +27,7 @@ AwanFS (`s3-server`) implements the subset of the **Amazon S3 REST API (`2006-03
 For `Expect: 100-continue` (`server/tests/s3_details_test.rs`), request classification, SigV4 authentication, bucket resolution, IAM authorization, key/body-limit validation (`<= 5 GiB` on object `PUT`), `If-None-Match: *` check, `Content-Length` check, `Content-MD5` base64 syntax validation, and `x-amz-checksum-*` header parsing run **before** polling the request body:
 
 1. If any header/metadata pre-check fails, the server sends the error (`403 Forbidden`, `404 NoSuchBucket`, `400 InvalidDigest`, `400 KeyTooLongError`, `400 EntityTooLarge`, `411 MissingContentLength`, `412 PreconditionFailed`) immediately without writing `HTTP/1.1 100 Continue`.
-2. Otherwise Hyper emits `HTTP/1.1 100 Continue\r\n\r\n` when body reading starts. `<= 4 MiB` bodies are admitted against the `--memory-budget` in-flight bodies half (`503 SlowDown` if exhausted); `> 4 MiB` object bodies stream directly to disk (`400`, `408`, or `500` on body failure).
+2. Otherwise Hyper emits `HTTP/1.1 100 Continue\r\n\r\n` when body reading starts. `<= 4 MiB` bodies are admitted against the `--memory-budget` in-flight bodies half (`503 SlowDown` with `Retry-After: 1` if exhausted); `> 4 MiB` object bodies stream directly to disk (`400`, `408`, or `500` on body failure).
 3. `Expect` header values other than `100-continue` (e.g. `200` or empty) are accepted without `417 ExpectationFailed`.
 
 ---
@@ -52,7 +52,7 @@ For `Expect: 100-continue` (`server/tests/s3_details_test.rs`), request classifi
 
 | HTTP Verb | Path & Query | S3 Operation | Wire Characteristics & Response Headers |
 | :--- | :--- | :--- | :--- |
-| **`PUT`** | `/{bucket}/{key}` | `PutObject` | Maximum object body `5 GiB` (`400 EntityTooLarge` if exceeded); requires `Content-Length`, `Transfer-Encoding: chunked`, or `aws-chunked` (`411 MissingContentLength` otherwise). Bodies `<= 4 MiB` are admitted against `--memory-budget` (`503 SlowDown` if exhausted); bodies `> 4 MiB` stream directly to 4096B-aligned format-3 needles in growing volumes ([`volume-format`](features.toml#L1138)), optionally compressed with `zstd` per bucket config ([`compression`](features.toml#L1037)). Verifies `Content-MD5` (`400 InvalidDigest` / `BadDigest`), `x-amz-content-sha256` (`400 XAmzContentSHA256Mismatch`), and `x-amz-checksum-*` (`CRC32`, `CRC32C`, `CRC64NVME`, `SHA1`, `SHA256`; `400 BadDigest`). Stores standard metadata headers, `x-amz-meta-*` (`<= 2048` bytes total -> `400 MetadataTooLarge`), and `x-amz-tagging`. Supports `If-None-Match: *` (`412 PreconditionFailed`). Returns `200 OK` with `ETag: "<32-hex-md5>"`, optional `x-amz-version-id`, and requested `x-amz-checksum-*`. |
+| **`PUT`** | `/{bucket}/{key}` | `PutObject` | Maximum object body `5 GiB` (`400 EntityTooLarge` if exceeded); requires `Content-Length`, `Transfer-Encoding: chunked`, or `aws-chunked` (`411 MissingContentLength` otherwise). Bodies `<= 4 MiB` are admitted against `--memory-budget` (`503 SlowDown` with `Retry-After: 1` if exhausted); bodies `> 4 MiB` stream directly to 4096B-aligned format-3 needles in growing volumes ([`volume-format`](features.toml#L1138)), optionally compressed with `zstd` per bucket config ([`compression`](features.toml#L1037)). Verifies `Content-MD5` (`400 InvalidDigest` / `BadDigest`), `x-amz-content-sha256` (`400 XAmzContentSHA256Mismatch`), and `x-amz-checksum-*` (`CRC32`, `CRC32C`, `CRC64NVME`, `SHA1`, `SHA256`; `400 BadDigest`). Stores standard metadata headers, `x-amz-meta-*` (`<= 2048` bytes total -> `400 MetadataTooLarge`), and `x-amz-tagging`. Supports `If-None-Match: *` (`412 PreconditionFailed`). Returns `200 OK` with `ETag: "<32-hex-md5>"`, optional `x-amz-version-id`, and requested `x-amz-checksum-*`. |
 | **`PUT`** | `/{bucket}/{key}` (+ `x-amz-copy-source`) | `CopyObject` | Copies source object (or specific `?versionId`) bytes into a new needle; supports `x-amz-metadata-directive` (`COPY` / `REPLACE`), `x-amz-tagging-directive` (`COPY` / `REPLACE`), and `x-amz-copy-source-if-*` preconditions (`412 PreconditionFailed`). Returns `200 OK` `<CopyObjectResult>` XML, `ETag`, and optional `x-amz-version-id` / `x-amz-copy-source-version-id`. |
 | **`GET`** | `/{bucket}/{key}` | `GetObject` | Objects `<= 4 MiB` use `PayloadCache` + `SingleFlight` (and mmap for small multipart); single objects and multipart objects `> 4 MiB` stream via positioned page-cache reads (`PreadBody`). Supports `Range: bytes=...` (`206 Partial Content`), `?partNumber=N` (`1..=10000`), `?versionId=ID`, conditional headers (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`), `x-amz-checksum-mode: ENABLED` (whole GET/HEAD only), and `response-*` query overrides. Returns `ETag`, `Content-Length`, `Content-Type`, `Last-Modified`, `Accept-Ranges: bytes`, standard/user metadata, `x-amz-tagging-count`, and optional `x-amz-version-id`. |
 | **`HEAD`** | `/{bucket}/{key}` | `HeadObject` | Shares the `get_or_head_object` metadata, version, precondition, `?partNumber`, and `Range` evaluation path (reading needle attributes if present), returning the same headers with a 0-byte body (and empty body on `304`/`400`/`404`/`412`/`416`). |
@@ -132,6 +132,20 @@ When credentials (`AWANFS_ACCESS_KEY`/`AWANFS_SECRET_KEY` or `--config`) are con
 
 ---
 
+## 6. Retries & Backoff (`503 SlowDown`)
+
+Every S3 `503 SlowDown` response (`BodyBudget` admission timeout or a full bounded index without spill) carries `Retry-After` in whole seconds (`1` today, `RETRY_AFTER_SECS` in [`server/src/memory.rs`](server/src/memory.rs)). `Retry-After` is the **minimum wait** before retrying. Clients should wait at least that many seconds and may add jittered exponential backoff. Operator probe `/_awanfs/health/ready` is not an S3 operation and returns `503` without `Retry-After`.
+
+A `503 SlowDown` means nothing was written to object storage and no upload or version state was mutated. Index capacity (`CapacityReservation`) and body admission are acquired before writing payloads, committing multipart state, or updating `VersionStore`. The following operations are safe to retry directly after `503`:
+
+- **`PutObject` (buffered and streamed) and `CopyObject`:** No needle header or index/version entry is committed on `503`.
+- **Conditional `PUT` (`If-None-Match: *` / `If-Match`):** Preconditions and stored state are untouched on `503`, so retrying preserves optimistic concurrency semantics.
+- **`DeleteObject` and `DeleteObjects`:** Deletes are idempotent and do not allocate new index rows; a `503` on `POST ?delete` body admission rejects before parsing or mutating any key.
+- **`UploadPart` and `UploadPartCopy`:** Body admission rejects before writing `.staging/` part files or recording part metadata.
+- **`CompleteMultipartUpload`:** Capacity is reserved before writing the manifest needle or consuming `uploadId`, so the upload stays open and retrying the same `CompleteMultipartUpload` succeeds once capacity or body budget clears.
+
+---
+
 ## Not yet
 
 - **Multipart conformance remainder ([`multipart`](features.toml#L536), `#111`):** Remaining `ceph/s3-tests` multipart cases (`features.toml` lists 24/30 passing in `FEATURES.md`).
@@ -143,4 +157,4 @@ When credentials (`AWANFS_ACCESS_KEY`/`AWANFS_SECRET_KEY` or `--config`) are con
 - **Bucket Policies, ACLs, Ownership Controls, Public Access Block, & Anonymous Bucket Access ([`policy`](features.toml#L327), [`acl-ownership`](features.toml#L379), [`anonymous-and-presigned`](features.toml#L631), [`anonymous-bucket-gone`](features.toml#L70), [`anonymous-cors`](features.toml#L79), `#122`):** Return `501 NotImplemented`; identity policies in `--config` ([`iam`](features.toml#L1029), `#53`) are enforced on authenticated users today.
 - **Bucket Server Access Logging (`?logging`) ([`bucket-logging`](features.toml#L88), `#153`):** Returns `501 NotImplemented` (operator access logs use `--access-log`, [`access-log`](features.toml#L1086)).
 - **Background payload scrubbing on large objects (`#155`)** and **Multi-node replication / erasure coding ([`erasure-coding`](features.toml#L1161), `#52`, `#27`)**.
-- **Out of scope (`501 NotImplemented` / unsupported):** AWS SigV2 ([`sigv2`](features.toml#L7)), Storage Classes / tiering ([`storage-classes`](features.toml#L103), `#162`), RGW-specific extensions ([`rgw-only`](features.toml#L48), `#163`), IAM/STS/SNS/Select/Control APIs (`#164`), and `Retry-After` guidance on `503 SlowDown` (`#356`).
+- **Out of scope (`501 NotImplemented` / unsupported):** AWS SigV2 ([`sigv2`](features.toml#L7)), Storage Classes / tiering ([`storage-classes`](features.toml#L103), `#162`), RGW-specific extensions ([`rgw-only`](features.toml#L48), `#163`), and IAM/STS/SNS/Select/Control APIs (`#164`).

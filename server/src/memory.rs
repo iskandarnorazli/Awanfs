@@ -23,6 +23,8 @@ pub const MIN_DEFAULT_BUDGET: u64 = 128 << 20;
 pub const MAX_DEFAULT_BUDGET: u64 = 2 << 30;
 /// Maximum spill index memory (64 MiB: its memtable and the segments' filters), carved out of the cache half.
 pub const MAX_SPILL_CACHE: u64 = 64 << 20;
+/// Whole-second minimum wait emitted in `Retry-After` on S3 `503 SlowDown` responses (#356).
+pub const RETRY_AFTER_SECS: u64 = 1;
 /// A cgroup limit at or above this means "no limit" (cgroup v1 writes i64::MAX rounded down).
 const NO_LIMIT: u64 = 1 << 60;
 

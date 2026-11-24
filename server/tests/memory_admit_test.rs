@@ -154,8 +154,20 @@ async fn server_bounds_concurrent_puts_and_returns_503_slowdown_when_exhausted()
     .await;
     assert!(resp.starts_with("HTTP/1.1 503"), "expected 503, got: {}", resp);
     assert!(resp.contains("<Code>SlowDown</Code>"), "expected SlowDown XML, got: {}", resp);
+    assert!(
+        resp.lines().any(|l| l.trim_end_matches('\r').eq_ignore_ascii_case("retry-after: 1")),
+        "expected Retry-After: 1 header, got: {}",
+        resp
+    );
+
+    // Rejected over-budget PUT must not write or index the object.
+    assert_eq!(
+        client.get(format!("{}/admit/too-much", url)).send().await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
 
     let m = scrape_metrics(&client, &url).await;
+    assert!(m.contains_key("awanfs_memory_bodies_rejected_total"));
     assert_eq!(m["awanfs_memory_bodies_rejected_total"], 1.0);
     assert_eq!(m["awanfs_memory_bodies_in_use_bytes"], (3 << 20) as f64);
 
@@ -192,6 +204,12 @@ async fn server_bounds_concurrent_puts_and_returns_503_slowdown_when_exhausted()
     assert_eq!(ok.status(), StatusCode::OK);
     let m = scrape_metrics(&client, &url).await;
     assert_eq!(m["awanfs_memory_bodies_in_use_bytes"], 0.0);
+
+    // Non-S3 readiness probe stays 503 without Retry-After when not ready.
+    state.set_not_ready(Some("draining"));
+    let ready = client.get(format!("{}/_awanfs/health/ready", url)).send().await.unwrap();
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(ready.headers().get("retry-after").is_none());
 
     handle.shutdown();
 }
@@ -258,6 +276,11 @@ async fn server_admits_upload_part_and_xml_bodies_and_releases_on_error() {
     .await;
     assert!(part_rej.starts_with("HTTP/1.1 503"), "expected 503, got: {}", part_rej);
     assert!(part_rej.contains("<Code>SlowDown</Code>"), "expected SlowDown XML, got: {}", part_rej);
+    assert!(
+        part_rej.lines().any(|l| l.trim_end_matches('\r').eq_ignore_ascii_case("retry-after: 1")),
+        "expected Retry-After: 1 header on UploadPart 503, got: {}",
+        part_rej
+    );
 
     // Drop stalled XML client and verify release.
     drop(slow_xml);
