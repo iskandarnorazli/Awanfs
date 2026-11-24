@@ -1,0 +1,10 @@
+[
+  {
+    "id": 1001,
+    "user": { "login": "iskandarnorazli" },
+    "author_association": "OWNER",
+    "created_at": "2026-11-19T04:00:00Z",
+    "html_url": "https://github.com/iskandarnorazli/Awanfs/issues/999#issuecomment-1001",
+    "body": "**Owner decision, 2026-11-19:** `test_s3::test_delta_moved` moves to #122 (ACLs / anonymous authorization)."
+  }
+]

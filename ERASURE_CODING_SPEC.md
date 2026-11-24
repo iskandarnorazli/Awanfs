@@ -1,5 +1,7 @@
 # Awan Storage Erasure Coding Specification ($8+4$ Cauchy Reed-Solomon)
 
+> **Input, not the design.** Written 2026-11-10 for awan-lang (`failover.awan` below is awan-lang code). The decisions now: large objects are erasure-coded when written, above a measured size (decision 64, [`CLUSTERING.md`](CLUSTERING.md) section 4.6), with CPU vector code first and no GPU path (decision 66). The 8+4 layout here is not decided; #27 decides it.
+
 > **Mathematical Formulation, Matrix Layouts, and SIMD Vectorized Reconstruction**
 
 ---

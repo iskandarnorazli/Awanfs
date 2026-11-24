@@ -219,6 +219,35 @@ the mapped read path (`SimFile` has no mapping, so simulated reads use positione
 path keeps its own tests). Not chosen: a whole-server simulation, and `loom` or `shuttle` for
 interleavings (owner, 2026-11-16, option B).
 
+**Decision 68 (Claude, 2026-11-19, #26 stage 5): the metadata segments are leveled.** Flushes
+write level-0 segments, which may overlap; each deeper level holds non-overlapping segments and is
+about ten times larger than the one above (LevelDB's layout). A lookup reads the level-0 segments
+and then at most one segment per level, each behind its key range and Bloom filter, so the cost
+of an absent key stays near zero as the store grows, and a prefix scan reads one cursor per
+level. Compaction streams: it reads its inputs block by block and writes segments of at most
+64 MiB as it goes, so its memory does not grow with the segments. The manifest (format 2,
+`FORMAT.md`) records each segment's level; `verification/tla/Levels.tla` checks the three rules
+(level 0 compacts whole, every overlapping segment below is taken, tombstones drop only at the
+bottom). The design replaces stage 4's `merge` of two named segments, which gave its output a
+sequence number above newer segments it had not merged, so an older row could win (nothing in
+the server used it). Not chosen: size-tiered runs (fewer rewrites, but more segments for a
+lookup to check and larger scans' merges).
+
+**Decision 69 (owner, 2026-11-20, #322): AwanFS scales across cores and disks with a
+partitioned store on today's runtime, then a data and metadata split.** P fixed partitions by
+hash(bucket, key), each with its own volume, journal, group commit, index and spill, spread over
+cores and disks; any tokio thread serves any partition (option B). Large objects then move to
+per-disk extent stores (option D). Each step is gated by a measurement: first where PUT stops
+(#262, blocked by #326, a client that is not the cap) and the index's P99 (#316), then a
+throwaway two-partition prototype, then a design issue for the owner (partition layout on disk,
+the per-partition commit path and recovery, the listing merge, memory slices, adding a partition).
+Booting from a checkpoint, one per partition, moved here from #26 (owner decision on #26,
+2026-11-20, option 3). The partition map is the one clustering uses (decision 64). Not chosen:
+finer locks on one store (option A: it keeps the single flush); shared-nothing thread-per-core
+(option C, Seastar's model) unless per-partition locks or CPU are measured as the limit after B,
+since Linux-first runtimes conflict with the both-platforms rule. The owner's agreement:
+[#322](https://github.com/iskandarnorazli/Awanfs/issues/322#issuecomment-7033753496).
+
 **Decision 66 (owner, 2026-11-17): no GPU or APU code path for now.** Erasure coding (decision
 64) is built with CPU vector instructions first and measured against the network rate. A GPU path
 on unified-memory APUs (Strix Halo, MI300A) is weighed only if CPU erasure coding cannot keep up
@@ -252,8 +281,8 @@ page cache outside `--memory-budget` (#206) and one copy-on-write write transact
 spilled key. The segments of #26 do that job:
 - sorted, immutable runs of the 64-byte rows and their keys, in separate columns per block;
 - fence keys and a bloom filter in heap, read with positioned reads (decision 58);
-- a manifest of live segments, so a restart opens a checkpoint instead of rebuilding from every
-  volume;
+- a manifest of live segments, written at every flush; booting from it instead of rebuilding
+  from every volume moved to the partitioned store (#322, [owner decision, 2026-11-20](https://github.com/iskandarnorazli/Awanfs/issues/26#issuecomment-7028770759));
 - compaction that merges runs and drops dead rows.
 They borrow awan-lang's flat-memory designs: the 64-byte row as stored, columns within a block,
 and SIMD search over keys. awan-lang's own collections (`awan-db`, `awan-cache`, the OLC B+tree
@@ -279,8 +308,14 @@ gate requires that the production segments do not lose either:
 - boot at 10M keys under 1 s;
 - a run with concurrent writers.
 
-redb stays until #26 lands. #206 still applies until then. #208 (every spilled key also held
-in heap) goes away with redb.
+#26 stage 6 (2026-11-19) switched the spill index to the segments: a memtable inside the spill
+share of `--memory-budget` (#206), flushed to leveled segments (decision 68). The server deletes
+a `metadata.db` it finds at boot and keeps redb only as the benchmark's point of comparison
+(a dev-dependency). #208 is gone with it: no set of spilled keys. The index is still cleared and
+rebuilt from the volumes at boot: 254.9 s and 1,594.8 MiB peak RSS on Linux, 3,391.8 s and 1,244.6 MiB on
+Windows, at 10M objects (`measurements/2026-11-20-boot-full-replay.md`). Booting from the manifest's
+checkpoint is not #26's: it moved to the partitioned store, a checkpoint per partition (#322,
+[owner decision, 2026-11-20](https://github.com/iskandarnorazli/Awanfs/issues/26#issuecomment-7028770759)).
 
 **Decision 58 (owner, 2026-11-16): stored data is read with positioned reads, not through
 mappings, wherever the bytes could grow without bound.** Pages read through a mapping stay
@@ -349,7 +384,10 @@ the next open trims them, so only the active volume holds up to one extension of
 **Decision 53 (2026-11-15): `--memory-budget` bounds the heap, not the mapped pages.** It covers
 the payload cache and the bytes request bodies hold. Pages of the mapped volume files are
 outside it; they are bounded by taking large reads out of the mapping (#155, step two), not by
-asking the system to drop pages. #127.
+asking the system to drop pages. #127. Step three (PR #340) does the same for multipart parts above
+4 MiB, which GET used to map: a 1 GiB multipart range GET peaked at about 1,190 MB RSS through the
+mapping and 274.5 MB with positioned reads, at the same throughput on one VM
+(`measurements/2026-11-20-multipart-read-modes.md`).
 
 **Decision 54 (2026-11-15): the `--access-log` file may drop lines, and counts them,** like the
 stderr request log (decision 41): a slow or full log disk must not stall requests. An access

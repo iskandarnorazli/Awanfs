@@ -13,7 +13,7 @@ pub async fn put_bucket_lifecycle(
     path: &str,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
-    let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, body, MAX_XML_BODY, None, state.body_idle_timeout(), path).await? {
+    let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, &state.work, body, MAX_XML_BODY, None, state.body_idle_timeout(), path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };

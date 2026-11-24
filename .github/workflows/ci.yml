@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, windows-latest ]
+        os: [ ubuntu-latest, ubuntu-24.04-arm, windows-latest ]
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -26,6 +26,8 @@ jobs:
           workspaces: server
       - name: Build and test the server
         run: cargo test --locked --no-fail-fast --manifest-path server/Cargo.toml
+      - name: Print CRC32C implementation path
+        run: cargo test --locked --manifest-path server/Cargo.toml --test streaming_digest_test test_crc32c_implementation_path -- --nocapture
       - name: Spill index at 1.2M keys, peak RSS at most 200 MB (#13, Linux)
         if: runner.os == 'Linux'
         timeout-minutes: 15
@@ -52,12 +54,22 @@ jobs:
         run: python3 -m json.tool deploy/grafana/awanfs-dashboard.json > /dev/null
       - name: No benchmark job writes over a committed measurement
         run: python3 scripts/check_workflow_outputs.py
-      - name: STATE_MACHINES.md names functions and tests that exist
-        run: python3 scripts/test_check_state_machines.py && python3 scripts/check_state_machines.py
+      - name: State machines (STATE_MACHINES.md and step results)
+        run: |
+          python3 scripts/test_check_state_machines.py && python3 scripts/check_state_machines.py &&
+          python3 scripts/test_check_fsm_driven.py && python3 scripts/check_fsm_driven.py
       - name: Conformance profile matches start_server.sh and workflow
         run: python3 scripts/test_check_profile.py && python3 scripts/check_profile.py
       - name: s3-tests ratchet log self-tests
         run: python3 scripts/test_check_ratchet_log.py
+      - name: Feature registry self-tests and check
+        run: |
+          python3 scripts/test_features.py
+          python3 tests/s3tests/test_conformance_map.py
+          S3TESTS_COMMIT=$(sed -n 's/^[[:space:]]*S3TESTS_COMMIT=\([0-9a-f]\{40\}\).*/\1/p' .github/workflows/s3-tests.yml)
+          curl -fsSL --retry 5 --retry-all-errors -o /tmp/test_s3.py "https://raw.githubusercontent.com/ceph/s3-tests/$S3TESTS_COMMIT/s3tests/functional/test_s3.py"
+          curl -fsSL --retry 5 --retry-all-errors -o /tmp/test_headers.py "https://raw.githubusercontent.com/ceph/s3-tests/$S3TESTS_COMMIT/s3tests/functional/test_headers.py"
+          python3 scripts/features.py check --ceph-suite /tmp/test_s3.py /tmp/test_headers.py
       - name: Every test removed from passing.txt has a RATCHET_LOG.md row
         if: github.event_name == 'pull_request'
         run: |
@@ -95,6 +107,48 @@ jobs:
       - run: cargo build --locked --release --manifest-path server/Cargo.toml
       - name: Journeys (scripts/verify_drive.sh)
         run: bash scripts/verify_drive.sh
+      - uses: actions/cache@v4
+        id: warp-cache
+        with:
+          path: .tmp/warp
+          key: warp-linux-v1
+      - uses: actions/setup-go@v5
+        if: steps.warp-cache.outputs.cache-hit != 'true'
+        with:
+          go-version: stable
+          cache: false
+      - name: Build MinIO warp
+        if: steps.warp-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .tmp/warp
+          git clone -q --depth 1 https://github.com/minio/warp "$RUNNER_TEMP/warp-src"
+          (cd "$RUNNER_TEMP/warp-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/warp/warp" .)
+      - name: Drive with MinIO warp (warp put)
+        run: |
+          set -euo pipefail
+          DATA=$(mktemp -d)
+          LOG="$RUNNER_TEMP/warp-server.log"
+          PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+          PID=""
+          cleanup() {
+            [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
+            [ -n "$PID" ] && wait "$PID" 2>/dev/null || true
+            rm -rf "$DATA" "$RUNNER_TEMP/warp-bench"*
+          }
+          trap cleanup EXIT
+          AWANFS_ACCESS_KEY=warpkey AWANFS_SECRET_KEY=warps3secret \
+            ./server/target/release/s3-server --port "$PORT" --data-dir "$DATA" >"$LOG" 2>&1 &
+          PID=$!
+          for _ in $(seq 1 100); do
+            if curl -s -o /dev/null "http://127.0.0.1:$PORT/"; then break; fi
+            sleep 0.1
+          done
+          curl -s -o /dev/null "http://127.0.0.1:$PORT/" || { echo "server did not start"; cat "$LOG"; exit 1; }
+          if ! .tmp/warp/warp put --host "127.0.0.1:$PORT" --access-key warpkey --secret-key warps3secret \
+            --duration 10s --no-color --benchdata "$RUNNER_TEMP/warp-bench"; then
+            tail -n 30 "$LOG" || true
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:

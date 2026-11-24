@@ -21,7 +21,7 @@ pub const BUDGET_PERCENT: u64 = 25;
 pub const MIN_DEFAULT_BUDGET: u64 = 128 << 20;
 /// The default budget never goes above this, so the default cache stays at 1 GiB.
 pub const MAX_DEFAULT_BUDGET: u64 = 2 << 30;
-/// Maximum redb spill index page cache (64 MiB), carved out of the cache half.
+/// Maximum spill index memory (64 MiB: its memtable and the segments' filters), carved out of the cache half.
 pub const MAX_SPILL_CACHE: u64 = 64 << 20;
 /// A cgroup limit at or above this means "no limit" (cgroup v1 writes i64::MAX rounded down).
 const NO_LIMIT: u64 = 1 << 60;

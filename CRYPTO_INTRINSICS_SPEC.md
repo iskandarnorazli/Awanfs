@@ -1,5 +1,7 @@
 # Awan Storage Cryptographic Intrinsics Specification
 
+> **Background from before the PoC (written 2026-11-10/11, in part for awan-lang).** Kept for its reasoning; it is not the design and does not list what AwanFS does. Where it disagrees with [`ARCHITECTURE.md`](ARCHITECTURE.md), [`FORMAT.md`](FORMAT.md) or the code, those win.
+
 > **Hardware Acceleration: Intel SHA Extensions, ARMv8 Crypto, and Castagnoli CRC32C**
 
 ---

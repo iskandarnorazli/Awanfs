@@ -29,11 +29,10 @@ from budget_rss import create_bucket  # noqa: E402
 from ratio_check import wait_port  # noqa: E402
 from run_warp_benchmark import get_free_port, run_workload_phase  # noqa: E402
 
+# Every server at its defaults (owner, 2026-11-20). The sparse and no-sync rows were measured
+# once (decision 52) and are no longer run.
 CONFIGS = [
     ("default", {}),
-    ("no sync", {"AWANFS_DURABILITY": "fast"}),
-    ("sparse volume", {"AWAN_SPARSE_VOLUME": "1"}),
-    ("sparse, no sync", {"AWAN_SPARSE_VOLUME": "1", "AWANFS_DURABILITY": "fast"}),
 ]
 
 

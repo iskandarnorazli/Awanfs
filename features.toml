@@ -1,0 +1,1642 @@
+# AwanFS feature registry (#277): every feature mapped to all tests that prove it.
+# `done` means every ceph test the feature owns is in tests/s3tests/passing.txt, or is listed under
+# [feature.waits_on] with the unfinished feature it needs; scripts/features.py check enforces it.
+# Seeded from tests/s3tests/conformance_map.py, .claude/skills/verify-awanfs/features/README.md,
+# server/tests/, and server/fuzz/. Read by scripts/features.py and tests/s3tests/conformance_map.py.
+
+[[feature]]
+id = "sigv2"
+name = "SigV2 request signing (AWS Signature Version 2)"
+status = "out-of-scope"
+issue = "out of scope"
+area = "sigv2"
+design_section = "9"
+decision = "https://github.com/iskandarnorazli/Awanfs/pull/232"
+ceph = [
+  "mark:auth_aws2",
+  "re:_aws2$",
+  "test_s3::test_cors_presigned_get_object_v2",
+  "test_s3::test_cors_presigned_get_object_tenant_v2",
+  "test_s3::test_cors_presigned_put_object_v2",
+  "test_s3::test_cors_presigned_put_object_tenant_v2",
+]
+mint = [
+  "minio-go: testComposeMultipleSources::ComposeObject(destination, sourceList)",
+  "minio-go: testComposeObjectErrorCasesWrapper::ComposeObject(destination, sourceList)",
+  "minio-go: testCopyObjectV2::CopyObject(destination, source)",
+  "minio-go: testFGetObjectContextV2::FGetObject(ctx, bucketName, objectName,fileName)",
+  "minio-go: testFPutObjectContextV2::FPutObjectContext(ctx, bucketName, objectName, fileName, opts)",
+  "minio-go: testFPutObjectV2::FPutObject(bucketName, objectName, fileName, opts)",
+  "minio-go: testFunctionalV2::MakeBucket(bucketName, location)",
+  "minio-go: testGetObjectClosedTwiceV2::MakeBucket(bucketName, region)",
+  "minio-go: testGetObjectContextV2::GetObject(ctx, bucketName, objectName)",
+  "minio-go: testGetObjectReadAtFunctionalV2::GetObject(bucketName, objectName)",
+  "minio-go: testGetObjectReadSeekFunctionalV2::GetObject(bucketName, objectName)",
+  "minio-go: testMakeBucketErrorV2::MakeBucket(bucketName, region)",
+  "minio-go: testMakeBucketRegionsV2::MakeBucket(bucketName, region)",
+  "minio-go: testPutObject0ByteV2::PutObject(bucketName, objectName, reader, size, opts)",
+  "minio-go: testPutObjectContextV2::PutObject(ctx, bucketName, objectName, reader, size, opts)",
+  "minio-go: testPutObjectMetadataNonUSASCIIV2::PutObject(bucketName, objectName, reader, size, opts)",
+  "minio-go: testPutObjectNoLengthV2::PutObject(bucketName, objectName, reader, size, opts)",
+  "minio-go: testPutObjectsUnknownV2::PutObject(bucketName, objectName, reader,size,opts)",
+  "minio-go: testUserMetadataCopyingWrapper::CopyObject(destination, source)",
+]
+
+[[feature]]
+id = "request-headers-unsendable"
+name = "Missing Content-Length header over botocore/urllib3 (unsendable by client)"
+status = "out-of-scope"
+issue = "out of scope"
+area = "request-headers-unsendable"
+design_section = "9"
+decision = "https://github.com/iskandarnorazli/Awanfs/issues/160#issuecomment-6998463532"
+ceph = ["test_headers::test_object_create_bad_contentlength_none"]
+
+[[feature]]
+id = "request-headers"
+name = "HTTP request header validation (Content-MD5, Content-Length, Content-Type, Expect)"
+status = "partial"
+issue = "#160"
+area = "request-headers"
+design_section = "3"
+operations = ["PutObject (headers)", "CreateBucket (headers)"]
+ceph = ["re:^test_headers::(?!.*_aws2$)(?!test_object_create_bad_contentlength_none$).+"]
+server_tests = ["server/tests/s3_details_test.rs", "server/tests/parser_robustness_test.rs", "server/tests/operation_table_test.rs"]
+moved = [
+  { test = "test_headers::test_object_create_bad_contentlength_none", to = "request-headers-unsendable", decision = "https://github.com/iskandarnorazli/Awanfs/issues/160#issuecomment-6998463532" },
+]
+
+[[feature]]
+id = "rgw-only"
+name = "Ceph RGW-specific extensions (usage headers, unordered listing, tenants, torrents)"
+status = "out-of-scope"
+issue = "#163"
+area = "rgw-only"
+design_section = "9"
+decision = "https://github.com/iskandarnorazli/Awanfs/issues/163#issuecomment-6871114522"
+ceph = [
+  "test_s3::test_account_usage",
+  "test_s3::test_head_bucket_usage",
+  "test_s3::test_bucket_list_unordered",
+  "test_s3::test_bucket_listv2_unordered",
+  "test_s3::test_bucket_head_extended",
+  "test_s3::test_object_raw_get_x_amz_expires_not_expired_tenant",
+  "test_s3::test_object_presigned_put_object_with_acl_tenant",
+  "test_s3::test_cors_presigned_get_object_tenant",
+  "test_s3::test_cors_presigned_put_object_tenant",
+  "test_s3::test_bucket_policy_different_tenant",
+  "test_s3::test_get_object_torrent",
+]
+
+[[feature]]
+id = "anonymous-bucket-gone"
+name = "Anonymous DELETE on non-existent bucket (authorization precedence)"
+status = "planned"
+issue = "#122"
+area = "anonymous-bucket-gone"
+design_section = "5"
+ceph = ["test_s3::test_object_delete_key_bucket_gone"]
+
+[[feature]]
+id = "anonymous-cors"
+name = "Anonymous GET CORS response on public-read buckets"
+status = "planned"
+issue = "#122"
+area = "anonymous-cors"
+design_section = "5"
+ceph = ["test_s3::test_cors_origin_response", "test_s3::test_cors_origin_wildcard"]
+
+[[feature]]
+id = "bucket-logging"
+name = "Bucket server access logging"
+status = "planned"
+issue = "#153"
+area = "bucket-logging"
+design_section = "8.4"
+operations = ["PutBucketLogging", "GetBucketLogging"]
+ceph = [
+  "mark:bucket_logging",
+  "mark:bucket_logging_cleanup",
+  "mark:fails_without_logging_rollover",
+  "re:logging",
+]
+
+[[feature]]
+id = "storage-classes"
+name = "Storage classes, lifecycle transitions, and cloud tier restore"
+status = "out-of-scope"
+issue = "#162"
+area = "storage-classes"
+design_section = "9"
+decision = "https://github.com/iskandarnorazli/Awanfs/issues/162#issuecomment-6871114176"
+ceph = [
+  "test_s3::test_lifecycle_transition_set_invalid_date",
+  "test_s3::test_lifecycle_transition",
+  "test_s3::test_lifecycle_transition_single_rule_multi_trans",
+  "test_s3::test_lifecycle_set_noncurrent_transition",
+  "test_s3::test_lifecycle_noncur_transition",
+  "test_s3::test_lifecycle_plain_null_version_current_transition",
+  "test_s3::test_lifecycle_cloud_transition",
+  "test_s3::test_lifecycle_cloud_multiple_transition",
+  "test_s3::test_lifecycle_noncur_cloud_transition",
+  "test_s3::test_lifecycle_cloud_transition_large_obj",
+  "test_s3::test_lifecycle_cloud_transition_target_by_bucket",
+  "test_s3::test_lifecycle_cloud_transition_target_by_bucket_multiple_buckets",
+  "test_s3::test_restore_object_temporary",
+  "test_s3::test_restore_object_permanent",
+  "test_s3::test_read_through",
+  "test_s3::test_restore_noncur_obj",
+  "test_s3::test_list_objects_restore_status",
+  "test_s3::test_list_object_versions_restore_status",
+  "test_s3::test_lifecycle_transition_encrypted",
+]
+mint = [
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api head-object --bucket awscli-mint-test-bucket --key datafile-1-kB-copy",
+  "mc::test_put_object_with_storage_class",
+  "mc::test_put_object_with_storage_class_error",
+  "minio-go: testStorageClassInvalidMetadataPutObject::testStorageClassInvalidMetadataPutObject()",
+  "minio-go: testStorageClassMetadataCopyObject::testStorageClassMetadataCopyObject()",
+  "minio-go: testStorageClassMetadataPutObject::testStorageClassMetadataPutObject()",
+]
+
+[[feature]]
+id = "encryption"
+name = "Server-side encryption (SSE-C, SSE-S3, SSE-KMS, bucket default encryption)"
+status = "partial"
+issue = "#121"
+area = "encryption"
+design_section = "8.2"
+operations = [
+  "PutObject (SSE)",
+  "GetObject (SSE)",
+  "CopyObject (SSE)",
+  "PutBucketEncryption",
+  "GetBucketEncryption",
+  "DeleteBucketEncryption",
+]
+ceph = ["re:^test_s3::(?!.*transition).*(sse|encrypt|kms|_enc_|_enc$|noenc)"]
+mint = [
+  "minio-go: testEncryptedSSES3ToSSES3CopyObject::CopyObject(destination, source)",
+  "minio-go: testEncryptedSSES3ToUnencryptedCopyObject::CopyObject(destination, source)",
+  "minio-go: testSSES3EncryptedGetObjectReadAtFunctional::GetObject(bucketName, objectName)",
+  "minio-go: testSSES3EncryptedGetObjectReadSeekFunctional::GetObject(bucketName, objectName)",
+  "minio-go: testSSES3EncryptedToSSES3CopyObjectPart::CopyObjectPart(destination, source)",
+  "minio-go: testSSES3EncryptedToUnencryptedCopyPart::CopyObjectPart(destination, source)",
+  "minio-go: testSSES3EncryptionFPut::FPutEncryptedObject(bucketName, objectName, filePath, contentType, sse)",
+  "minio-go: testSSES3EncryptionPutGet::PutEncryptedObject(bucketName, objectName, reader, sse)",
+  "minio-go: testUnencryptedToSSES3CopyObject::CopyObject(destination, source)",
+  "minio-go: testUnencryptedToSSES3CopyObjectPart::CopyObjectPart(destination, source)",
+  "minio-java::deleteBucketEncryption()",
+  "minio-java::getBucketEncryption()",
+  "minio-java::setBucketEncryption()",
+  "minio-js::Get encryption of a bucket:",
+  "minio-js::Get encryption on a bucket:",
+  "minio-js::Put an object to check for default encryption bucket:",
+  "minio-js::Remove encryption on a bucket:",
+  "minio-js::Set Encryption on a bucket:",
+  "minio-js::Stat of an object to check for default encryption applied on a bucket:",
+]
+
+[[feature]]
+id = "lifecycle"
+name = "Bucket lifecycle configuration and expiration sweep"
+status = "partial"
+issue = "#118"
+area = "lifecycle"
+design_section = "8.3"
+operations = ["PutBucketLifecycleConfiguration", "GetBucketLifecycleConfiguration", "DeleteBucketLifecycle"]
+ceph = ["re:^test_s3::test_lifecycle_(?!.*(transition|cloud))", "test_s3::test_lifecyclev2_expiration", "test_s3::test_delete_marker_expiration"]
+mint = [
+  "minio-java::deleteBucketLifecycle()",
+  "minio-java::getBucketLifecycle()",
+  "minio-java::setBucketLifecycle()",
+  "minio-js::Remove lifecycle config of a bucket",
+  "minio-js::Set lifecycle config of a bucket",
+  "minio-js::Set lifecycle config on a bucket:",
+]
+server_tests = ["server/tests/lifecycle_test.rs", "server/tests/scheduler_test.rs", "server/tests/clock_and_dates_test.rs"]
+fuzz = ["lifecycle_xml", "lifecycle_config_xml"]
+
+[[feature]]
+id = "object-lock"
+name = "S3 Object Lock, governance/compliance retention, and legal hold"
+status = "planned"
+issue = "#120"
+area = "object-lock"
+design_section = "8.1"
+operations = [
+  "PutObjectLockConfiguration",
+  "GetObjectLockConfiguration",
+  "PutObjectRetention",
+  "GetObjectRetention",
+  "PutObjectLegalHold",
+  "GetObjectLegalHold",
+]
+ceph = ["re:^test_s3::test_object_lock_"]
+mint = [
+  "minio-java::disableObjectLegalHold()",
+  "minio-java::enableObjectLegalHold()",
+  "minio-java::getObjectLockConfiguration()",
+  "minio-java::getObjectRetention()",
+  "minio-java::isObjectLegalHoldEnabled()",
+  "minio-java::setObjectLockConfiguration()",
+  "minio-java::setObjectRetention()",
+  "minio-js::Check if bucket with object lock can be created:",
+  "minio-js::Get and verify lock config on a bucket after reset/update:",
+  "minio-js::Get lock config on a bucket:",
+  "minio-js::Set lock config on a bucket:",
+  "minio-js::Update or replace lock config on a bucket:",
+  "minio-js::getObjectLegalHold(bucketName, objectName, setOpts={})",
+  "minio-js::putObjectRetention(bucketName, objectName, putOpts)",
+  "minio-js::setObjectLegalHold(bucketName, objectName, setOpts={})",
+  "minio-py:test_make_bucket_default_region::make_bucket(bucket_name, location, object_lock)",
+  "minio-py:test_negative_make_bucket_invalid_name::make_bucket(bucket_name, location, object_lock)",
+]
+fuzz = ["object_lock_xml"]
+
+[[feature]]
+id = "post-object"
+name = "Browser POST object form uploads (multipart/form-data)"
+status = "planned"
+issue = "#119"
+area = "post-object"
+design_section = "7.3"
+operations = ["PostObject"]
+ceph = ["re:^test_s3::test_post_object_"]
+mint = [
+  "aws-sdk-ruby::presignedPost(bucket_name,file_name,expires_in_sec,max_byte_size)",
+  "minio-go: testPresignedPostPolicy::PresignedPostPolicy(policy)",
+  "minio-go: testPresignedPostPolicyEmptyFileName::PresignedPostPolicy(policy)",
+  "minio-go: testPresignedPostPolicyWrongFile::PresignedPostPolicy(policy)",
+  "minio-java::getPresignedPostFormData()",
+  "minio-js::presignedPostPolicy(postPolicy, cb)",
+  "minio-py:test_presigned_post_policy",
+]
+fuzz = ["form_upload"]
+
+[[feature]]
+id = "cors"
+name = "Bucket CORS: configuration, preflight, response headers"
+status = "done"
+issue = "#116"
+area = "cors"
+design_section = "7.2"
+operations = [
+  "PutBucketCors",
+  "GetBucketCors",
+  "DeleteBucketCors",
+  "OPTIONS preflight",
+]
+ceph = [
+  "test_s3::test_set_cors",
+  "test_s3::test_cors_header_option",
+  "test_s3::test_cors_presigned_get_object",
+  "test_s3::test_cors_presigned_put_object",
+  "test_s3::test_cors_presigned_put_object_with_acl",
+  "test_s3::test_cors_presigned_put_object_tenant_with_acl",
+]
+mint = [
+  "minio-go: testCors::SetBucketCors(bucketName, cors)",
+  "minio-go: testCorsSetGetDelete::SetBucketCors(bucketName, cors)",
+  "minio-java::deleteBucketCors()",
+  "minio-java::getBucketCors()",
+  "minio-java::setBucketCors()",
+]
+server_tests = ["server/tests/cors_test.rs"]
+drive = ["cors"]
+fuzz = ["cors_xml"]
+moved = [
+  { test = "test_s3::test_cors_origin_response", to = "anonymous-cors", decision = "https://github.com/iskandarnorazli/Awanfs/issues/116#issuecomment-6999372853" },
+  { test = "test_s3::test_cors_origin_wildcard", to = "anonymous-cors", decision = "https://github.com/iskandarnorazli/Awanfs/issues/116#issuecomment-6999372853" },
+]
+
+[[feature]]
+id = "checksums"
+name = "Additional object and multipart checksums (CRC32, CRC32C, CRC64NVME, SHA1, SHA256)"
+status = "done"
+issue = "#117"
+area = "checksums"
+design_section = "7.1"
+operations = [
+  "PutObject (x-amz-checksum-*)",
+  "UploadPart (x-amz-checksum-*)",
+  "CompleteMultipartUpload (checksum)",
+  "GetObject (x-amz-checksum-mode)",
+  "HeadObject (x-amz-checksum-mode)",
+]
+ceph = [
+  "test_s3::test_object_checksum_sha256",
+  "test_s3::test_object_checksum_crc64nvme",
+  "test_s3::test_multipart_checksum_sha256",
+  "test_s3::test_multipart_reupload_checksum_and_etag",
+  "test_s3::test_multipart_use_cksum_helper_sha256",
+  "test_s3::test_multipart_use_cksum_helper_crc64nvme",
+  "test_s3::test_multipart_use_cksum_helper_crc32",
+  "test_s3::test_multipart_use_cksum_helper_crc32c",
+  "test_s3::test_multipart_use_cksum_helper_sha1",
+  "test_s3::test_get_multipart_checksum_object_attributes",
+  "test_s3::test_get_checksum_object_attributes",
+]
+mint = [
+  "minio-go: testPutMultipartObjectWithChecksums::PutObject(bucketName, objectName, reader,size, opts)",
+  "minio-go: testPutObjectWithAutomaticChecksums::PutObject(bucketName, objectName, reader,size, opts)",
+  "minio-go: testPutObjectWithChecksums::PutObject(bucketName, objectName, reader, size, opts)",
+  "minio-go: testTrailingChecksums::PutObject(bucketName, objectName, reader,size, opts)",
+]
+server_tests = ["server/tests/checksum_test.rs", "server/tests/streaming_digest_test.rs"]
+drive = ["checksums"]
+fuzz = ["attrs_values"]
+
+[[feature]]
+id = "object-attributes-api"
+name = "GetObjectAttributes API (ETag, Checksum, ObjectParts, StorageClass, ObjectSize)"
+status = "done"
+issue = "#117"
+area = "object-attributes-api"
+design_section = "7.1"
+operations = ["GetObjectAttributes"]
+ceph = [
+  "test_s3::test_get_multipart_object_attributes",
+  "test_s3::test_get_paginated_multipart_object_attributes",
+  "test_s3::test_get_single_multipart_object_attributes",
+  "test_s3::test_get_versioned_object_attributes",
+  "test_s3::test_get_object_attributes",
+]
+mint = [
+  "minio-go: testGetObjectAttributes::GetObjectAttributes(ctx, bucketName, objectName, opts)",
+  "minio-go: testGetObjectAttributesErrorCases::GetObjectAttributes(ctx, bucketName, objectName, opts)",
+  "minio-go: testPutObjectWithTrailingChecksums::GetObjectAttributes(...)",
+  "minio-java::getObjectAttributes()",
+]
+server_tests = ["server/tests/checksum_test.rs", "server/tests/attributes_test.rs"]
+drive = ["checksums"]
+
+[[feature]]
+id = "tagging"
+name = "Object and bucket tagging"
+status = "done"
+issue = "#115"
+area = "tagging"
+design_section = "6.2"
+operations = [
+  "PutObjectTagging",
+  "GetObjectTagging",
+  "DeleteObjectTagging",
+  "PutBucketTagging",
+  "GetBucketTagging",
+  "DeleteBucketTagging",
+]
+ceph = [
+  "test_s3::test_set_bucket_tagging",
+  "test_s3::test_set_multipart_tagging",
+  "test_s3::test_get_obj_tagging",
+  "test_s3::test_get_obj_head_tagging",
+  "test_s3::test_put_max_tags",
+  "test_s3::test_put_excess_tags",
+  "test_s3::test_put_max_kvsize_tags",
+  "test_s3::test_put_excess_key_tags",
+  "test_s3::test_put_excess_val_tags",
+  "test_s3::test_put_modify_tags",
+  "test_s3::test_put_delete_tags",
+  "test_s3::test_put_obj_with_tags",
+  "test_s3::test_get_tags_acl_public",
+  "test_s3::test_put_tags_acl_public",
+  "test_s3::test_delete_tags_obj_public",
+  "test_s3::test_bucket_policy_get_obj_existing_tag",
+  "test_s3::test_bucket_policy_get_obj_tagging_existing_tag",
+  "test_s3::test_bucket_policy_put_obj_tagging_existing_tag",
+  "test_s3::test_bucket_policy_put_obj_copy_source",
+  "test_s3::test_bucket_policy_put_obj_copy_source_meta",
+  "test_s3::test_bucket_policy_put_obj_acl",
+  "test_s3::test_bucket_policy_put_obj_request_obj_tag",
+  "test_s3::test_bucket_policy_get_obj_acl_existing_tag",
+]
+mint = [
+  "minio-go: testGetBucketTagging::GetBucketTagging(bucketName)",
+  "minio-go: testObjectTaggingWithVersioning::{Get,Set,Remove}ObjectTagging()",
+  "minio-go: testRemoveBucketTagging::RemoveBucketTagging(bucketName)",
+  "minio-go: testSetBucketTagging::SetBucketTagging(bucketName, tags)",
+  "minio-java::deleteBucketTags()",
+  "minio-java::deleteObjectTags()",
+  "minio-java::getBucketTags()",
+  "minio-java::getObjectTags()",
+  "minio-java::setBucketTags()",
+  "minio-java::setObjectTags()",
+  "minio-js::Get tags on an object",
+  "minio-js::Set tags on a bucket",
+  "minio-js::Set tags on an object",
+  "minio-js::getObjectTagging  object",
+  "minio-js::remove Tags on an object",
+  "minio-js::removeObjectTagging on an object",
+  "minio-js::setObjectTagging  object",
+  "versioning::testPutObjectWithTaggingAndMetadata",
+  "versioning::testTagging",
+]
+server_tests = ["server/tests/tagging_test.rs"]
+drive = ["tagging"]
+fuzz = ["tagging_xml"]
+
+# Its other ceph tests pass; these fail only because each each calls PutBucketPolicy first (owner, 2026-11-21).
+[feature.waits_on]
+"test_s3::test_get_tags_acl_public" = "policy"
+"test_s3::test_put_tags_acl_public" = "policy"
+"test_s3::test_delete_tags_obj_public" = "policy"
+"test_s3::test_bucket_policy_get_obj_existing_tag" = "policy"
+"test_s3::test_bucket_policy_get_obj_tagging_existing_tag" = "policy"
+"test_s3::test_bucket_policy_put_obj_tagging_existing_tag" = "policy"
+"test_s3::test_bucket_policy_put_obj_copy_source" = "policy"
+"test_s3::test_bucket_policy_put_obj_copy_source_meta" = "policy"
+"test_s3::test_bucket_policy_put_obj_acl" = "policy"
+"test_s3::test_bucket_policy_put_obj_request_obj_tag" = "policy"
+"test_s3::test_bucket_policy_get_obj_acl_existing_tag" = "policy"
+
+[[feature]]
+id = "policy"
+name = "Bucket policies, policy status, and Public Access Block"
+status = "planned"
+issue = "#122"
+area = "policy"
+design_section = "5"
+operations = [
+  "PutBucketPolicy",
+  "GetBucketPolicy",
+  "DeleteBucketPolicy",
+  "GetBucketPolicyStatus",
+  "PutPublicAccessBlock",
+  "GetPublicAccessBlock",
+  "DeletePublicAccessBlock",
+]
+ceph = [
+  "test_s3::test_bucket_policy",
+  "test_s3::test_bucketv2_policy",
+  "test_s3::test_bucket_policy_deny_self_denied_policy",
+  "test_s3::test_bucket_policy_deny_self_denied_policy_confirm_header",
+  "test_s3::test_bucket_policy_acl",
+  "test_s3::test_bucketv2_policy_acl",
+  "test_s3::test_bucket_policy_multipart",
+  "test_s3::test_bucket_policy_tenanted_bucket",
+  "test_s3::test_bucket_policy_another_bucket",
+  "test_s3::test_bucketv2_policy_another_bucket",
+  "test_s3::test_bucket_policy_set_condition_operator_end_with_IfExists",
+  "test_s3::test_set_get_del_bucket_policy",
+  "test_s3::test_bucket_policy_upload_part_copy",
+  "test_s3::test_bucket_policy_put_obj_grant",
+  "test_s3::test_get_bucket_policy_status",
+  "test_s3::test_get_public_acl_bucket_policy_status",
+  "test_s3::test_get_authpublic_acl_bucket_policy_status",
+  "test_s3::test_get_publicpolicy_acl_bucket_policy_status",
+  "test_s3::test_get_nonpublicpolicy_acl_bucket_policy_status",
+  "test_s3::test_get_nonpublicpolicy_principal_bucket_policy_status",
+  "test_s3::test_bucket_policy_allow_notprincipal",
+  "test_s3::test_get_undefined_public_block",
+  "test_s3::test_get_public_block_deny_bucket_policy",
+  "test_s3::test_put_public_block",
+  "test_s3::test_block_public_put_bucket_acls",
+  "test_s3::test_block_public_object_canned_acls",
+  "test_s3::test_block_public_policy",
+  "test_s3::test_block_public_policy_with_principal",
+  "test_s3::test_block_public_restrict_public_buckets",
+  "test_s3::test_ignore_public_acls",
+  "test_s3::test_put_get_delete_public_block",
+  "test_s3::test_multipart_upload_on_a_bucket_with_policy",
+  "test_s3::test_head_object_404_with_policy_prefix",
+]
+mint = [
+  "minio-go: testFunctional::GetBucketPolicy(ctx, bucketName)",
+  "minio-java::deleteBucketPolicy()",
+  "minio-java::getBucketPolicy()",
+  "minio-java::setBucketPolicy()",
+  "minio-js::getBucketPolicy(bucketName, cb)",
+  "minio-js::setBucketPolicy(bucketName, bucketPolicy, cb)",
+]
+
+[[feature]]
+id = "acl-ownership"
+name = "Bucket/object ACLs and Object Ownership Controls"
+status = "partial"
+issue = "#122"
+area = "acl-ownership"
+design_section = "5"
+operations = [
+  "PutBucketAcl",
+  "GetBucketAcl",
+  "PutObjectAcl",
+  "GetObjectAcl",
+  "PutBucketOwnershipControls",
+  "GetBucketOwnershipControls",
+  "DeleteBucketOwnershipControls",
+]
+ceph = [
+  "test_s3::test_bucket_listv2_fetchowner_notempty",
+  "test_s3::test_bucket_listv2_fetchowner_defaultempty",
+  "test_s3::test_bucket_listv2_fetchowner_empty",
+  "test_s3::test_bucket_concurrent_set_canned_acl",
+  "test_s3::test_expected_bucket_owner",
+  "test_s3::test_object_raw_get_bucket_acl",
+  "test_s3::test_object_raw_get_object_acl",
+  "test_s3::test_object_put_acl_mtime",
+  "test_s3::test_object_raw_authenticated_bucket_acl",
+  "test_s3::test_object_raw_authenticated_object_acl",
+  "test_s3::test_object_presigned_put_object_with_acl",
+  "test_s3::test_bucket_create_exists_nonowner",
+  "test_s3::test_bucket_recreate_overwrite_acl",
+  "test_s3::test_bucket_recreate_new_acl",
+  "test_s3::test_bucket_acl_default",
+  "test_s3::test_bucket_acl_canned_during_create",
+  "test_s3::test_bucket_acl_canned",
+  "test_s3::test_bucket_acl_canned_publicreadwrite",
+  "test_s3::test_bucket_acl_canned_authenticatedread",
+  "test_s3::test_put_bucket_acl_grant_group_read",
+  "test_s3::test_object_acl_default",
+  "test_s3::test_object_acl_canned_during_create",
+  "test_s3::test_object_acl_canned",
+  "test_s3::test_object_acl_canned_publicreadwrite",
+  "test_s3::test_object_acl_canned_authenticatedread",
+  "test_s3::test_object_acl_canned_bucketownerread",
+  "test_s3::test_object_acl_canned_bucketownerfullcontrol",
+  "test_s3::test_object_acl_full_control_verify_owner",
+  "test_s3::test_object_acl_full_control_verify_attributes",
+  "test_s3::test_bucket_acl_canned_private_to_private",
+  "test_s3::test_object_acl",
+  "test_s3::test_object_acl_write",
+  "test_s3::test_object_acl_writeacp",
+  "test_s3::test_object_acl_read",
+  "test_s3::test_object_acl_readacp",
+  "test_s3::test_bucket_acl_grant_userid_fullcontrol",
+  "test_s3::test_bucket_acl_grant_userid_read",
+  "test_s3::test_bucket_acl_grant_userid_readacp",
+  "test_s3::test_bucket_acl_grant_userid_write",
+  "test_s3::test_bucket_acl_grant_userid_writeacp",
+  "test_s3::test_bucket_acl_grant_nonexist_user",
+  "test_s3::test_object_header_acl_grants",
+  "test_s3::test_bucket_header_acl_grants",
+  "test_s3::test_bucket_acl_grant_email",
+  "test_s3::test_bucket_acl_grant_email_not_exist",
+  "test_s3::test_bucket_acl_revoke_all",
+  "test_s3::test_access_bucket_private_object_private",
+  "test_s3::test_access_bucket_private_objectv2_private",
+  "test_s3::test_access_bucket_private_object_publicread",
+  "test_s3::test_access_bucket_private_objectv2_publicread",
+  "test_s3::test_access_bucket_private_object_publicreadwrite",
+  "test_s3::test_access_bucket_private_objectv2_publicreadwrite",
+  "test_s3::test_access_bucket_publicread_object_private",
+  "test_s3::test_access_bucket_publicread_object_publicread",
+  "test_s3::test_access_bucket_publicread_object_publicreadwrite",
+  "test_s3::test_access_bucket_publicreadwrite_object_private",
+  "test_s3::test_access_bucket_publicreadwrite_object_publicread",
+  "test_s3::test_access_bucket_publicreadwrite_object_publicreadwrite",
+  "test_s3::test_object_copy_not_owned_bucket",
+  "test_s3::test_object_copy_not_owned_object_bucket",
+  "test_s3::test_object_copy_canned_acl",
+  "test_s3::test_list_multipart_upload_owner",
+  "test_s3::test_versioned_object_acl",
+  "test_s3::test_versioned_object_acl_no_version_specified",
+  "test_s3::test_create_bucket_no_ownership_controls",
+  "test_s3::test_create_bucket_bucket_owner_enforced",
+  "test_s3::test_create_bucket_bucket_owner_preferred",
+  "test_s3::test_create_bucket_object_writer",
+  "test_s3::test_put_bucket_ownership_bucket_owner_enforced",
+  "test_s3::test_put_bucket_ownership_bucket_owner_preferred",
+  "test_s3::test_put_bucket_ownership_object_writer",
+  "test_s3::test_bucket_create_delete_bucket_ownership",
+]
+mint = [
+  "minio-go: testGetObjectACLContext::GetObjectACL(ctx, bucketName, objectName)",
+  "minio-java::getObjectAcl()",
+]
+
+[[feature]]
+id = "conditional"
+name = "Conditional GET, HEAD, PUT, CopyObject, and DELETE (If-Match, If-None-Match, dates)"
+status = "partial"
+issue = "#112"
+area = "conditional"
+design_section = "6.3"
+operations = [
+  "GetObject (conditional)",
+  "HeadObject (conditional)",
+  "PutObject (conditional)",
+  "CopyObject (conditional)",
+  "DeleteObject (conditional)",
+]
+ceph = [
+  "test_s3::test_get_object_ifmatch_good",
+  "test_s3::test_get_object_ifmatch_failed",
+  "test_s3::test_get_object_ifnonematch_good",
+  "test_s3::test_get_object_ifnonematch_failed",
+  "test_s3::test_get_object_ifmodifiedsince_good",
+  "test_s3::test_get_object_ifmodifiedsince_failed",
+  "test_s3::test_get_object_ifunmodifiedsince_good",
+  "test_s3::test_get_object_ifunmodifiedsince_failed",
+  "test_s3::test_put_object_ifmatch_good",
+  "test_s3::test_put_object_ifmatch_failed",
+  "test_s3::test_put_object_ifmatch_overwrite_existed_good",
+  "test_s3::test_put_object_ifmatch_nonexisted_failed",
+  "test_s3::test_put_object_ifnonmatch_good",
+  "test_s3::test_put_object_ifnonmatch_failed",
+  "test_s3::test_put_object_ifnonmatch_nonexisted_good",
+  "test_s3::test_put_object_ifnonmatch_overwrite_existed_failed",
+  "test_s3::test_atomic_conditional_write_1mb",
+  "test_s3::test_atomic_dual_conditional_write_1mb",
+  "test_s3::test_copy_object_ifmatch_good",
+  "test_s3::test_copy_object_ifmatch_failed",
+  "test_s3::test_copy_object_ifnonematch_good",
+  "test_s3::test_copy_object_ifnonematch_failed",
+  "test_s3::test_put_object_if_match",
+  "test_s3::test_multipart_put_object_if_match",
+  "test_s3::test_put_current_object_if_none_match",
+  "test_s3::test_multipart_put_current_object_if_none_match",
+  "test_s3::test_put_current_object_if_match",
+  "test_s3::test_multipart_put_current_object_if_match",
+  "test_s3::test_put_object_current_if_match",
+  "test_s3::test_delete_object_if_match",
+  "test_s3::test_delete_object_current_if_match",
+  "test_s3::test_delete_object_version_if_match",
+  "test_s3::test_delete_object_if_match_last_modified_time",
+  "test_s3::test_delete_object_current_if_match_last_modified_time",
+  "test_s3::test_delete_object_version_if_match_last_modified_time",
+  "test_s3::test_delete_object_if_match_size",
+  "test_s3::test_delete_object_current_if_match_size",
+  "test_s3::test_delete_object_version_if_match_size",
+  "test_s3::test_delete_objects_if_match",
+  "test_s3::test_delete_objects_current_if_match",
+  "test_s3::test_delete_objects_version_if_match",
+  "test_s3::test_delete_objects_if_match_last_modified_time",
+  "test_s3::test_delete_objects_current_if_match_last_modified_time",
+  "test_s3::test_delete_objects_version_if_match_last_modified_time",
+  "test_s3::test_delete_objects_if_match_size",
+  "test_s3::test_delete_objects_current_if_match_size",
+  "test_s3::test_delete_objects_version_if_match_size",
+]
+mint = [
+  "minio-go: testGetObjectModified::GetObject(bucketName, objectName)",
+  "minio-js::copyObject(bucketName, objectName, srcObject, conditions, cb)",
+  "minio-py:test_copy_object_etag_match",
+  "minio-py:test_copy_object_modified_since",
+  "minio-py:test_copy_object_negative_etag_match",
+  "minio-py:test_copy_object_unmodified_since",
+]
+server_tests = ["server/tests/precondition_test.rs", "server/tests/edge_cases_test.rs"]
+drive = ["objects"]
+
+[[feature]]
+id = "multipart"
+name = "Multipart uploads (Create, UploadPart, Complete, Abort, ListParts, ListMultipartUploads)"
+status = "partial"
+issue = "#111"
+area = "multipart"
+design_section = "6.4"
+operations = [
+  "CreateMultipartUpload",
+  "UploadPart",
+  "UploadPartCopy",
+  "CompleteMultipartUpload",
+  "AbortMultipartUpload",
+  "ListParts",
+  "ListMultipartUploads",
+]
+ceph = [
+  "test_s3::test_object_copy_versioning_multipart_upload",
+  "test_s3::test_multipart_upload_empty",
+  "test_s3::test_multipart_upload_complete_without_create",
+  "test_s3::test_multipart_upload_small",
+  "test_s3::test_multipart_copy_small",
+  "test_s3::test_multipart_copy_invalid_range",
+  "test_s3::test_multipart_copy_improper_range",
+  "test_s3::test_multipart_copy_without_range",
+  "test_s3::test_multipart_copy_special_names",
+  "test_s3::test_multipart_upload",
+  "test_s3::test_multipart_copy_versioned",
+  "test_s3::test_multipart_upload_resend_part",
+  "test_s3::test_multipart_upload_multiple_sizes",
+  "test_s3::test_multipart_copy_multiple_sizes",
+  "test_s3::test_multipart_upload_size_too_small",
+  "test_s3::test_multipart_upload_contents",
+  "test_s3::test_multipart_upload_overwrite_existing_object",
+  "test_s3::test_abort_multipart_upload",
+  "test_s3::test_abort_multipart_upload_not_found",
+  "test_s3::test_list_multipart_upload",
+  "test_s3::test_multipart_upload_missing_part",
+  "test_s3::test_multipart_upload_incorrect_etag",
+  "test_s3::test_multipart_get_part",
+  "test_s3::test_multipart_single_get_part",
+  "test_s3::test_non_multipart_get_part",
+  "test_s3::test_atomic_multipart_upload_write",
+  "test_s3::test_multipart_resend_first_finishes_last",
+  "test_s3::test_versioning_obj_create_overwrite_multipart",
+  "test_s3::test_versioning_bucket_multipart_upload_return_version_id",
+  "test_s3::test_upload_part_copy_percent_encoded_key",
+]
+mint = [
+  "aws-sdk-php::createMultipartUpload ( array $params = [] )",
+  "aws-sdk-php::listMultipartUploads ( array $params = [] )",
+  "aws-sdk-php::uploadPart ( array $params = [] )",
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api create-multipart-upload --bucket awscli-mint-test-bucket --key awscli-mint-test-bucket-object",
+  "minio-go: testFPutObjectMultipart::FPutObject(bucketName, objectName, fileName, opts)",
+  "minio-java::composeObject()",
+  "minio-js::Clean up temp directory part files",
+  "minio-js::Create a local file of 100 MB and split",
+  "minio-js::Remove Composed target Object::",
+  "minio-js::Remove Object Parts from Bucket::",
+  "minio-js::Upload parts to Bucket",
+  "minio-js::composeObject(destObjConfig, sourceObjList, cb)::",
+  "minio-js::listIncompleteUploads(bucketName, prefix, recursive)",
+  "minio-js::removeIncompleteUploads(bucketName, prefix)",
+  "s3cmd::test_get_object_multipart",
+  "s3cmd::test_put_object_multipart",
+]
+server_tests = [
+  "server/tests/multipart_complete_test.rs",
+  "server/tests/multipart_conformance_test.rs",
+  "server/tests/multipart_sigv4_test.rs",
+  "server/tests/multipart_zero_copy_test.rs",
+  "server/tests/part_write_error_test.rs",
+  "server/tests/staged_mpu_test.rs",
+  "server/tests/streaming_part_test.rs",
+  "server/tests/upload_id_restart_test.rs",
+  "server/tests/upload_part_copy_test.rs",
+  "server/tests/test_boto3_compat.py",
+]
+drive = ["multipart"]
+fuzz = ["request_xml"]
+
+[[feature]]
+id = "object-metadata"
+name = "Object metadata, standard headers, copy directives, and response overrides"
+status = "done"
+issue = "#152"
+area = "object-metadata"
+design_section = "4"
+operations = [
+  "PutObject (metadata)",
+  "HeadObject (metadata)",
+  "GetObject (response-*)",
+  "CopyObject (x-amz-metadata-directive)",
+]
+ceph = [
+  "test_s3::test_object_write_cache_control",
+  "test_s3::test_object_write_expires",
+  "test_s3::test_object_set_get_metadata_none_to_good",
+  "test_s3::test_object_set_get_metadata_none_to_empty",
+  "test_s3::test_object_set_get_metadata_overwrite_to_empty",
+  "test_s3::test_object_set_get_unicode_metadata",
+  "test_s3::test_object_metadata_replaced_on_put",
+  "test_s3::test_object_raw_response_headers",
+  "test_s3::test_object_content_encoding_aws_chunked",
+  "test_s3::test_object_copy_verify_contenttype",
+  "test_s3::test_object_copy_to_itself_with_metadata",
+  "test_s3::test_object_copy_retaining_metadata",
+  "test_s3::test_object_copy_replacing_metadata",
+]
+mint = [
+  "aws-sdk-go-v2::testObjectMetadata",
+  "minio-go: testPutObjectWithContentLanguage::PutObject(bucketName, objectName, reader, size, opts)",
+  "minio-go: testPutObjectWithMetadata::PutObject(bucketName, objectName, reader,size, opts)",
+  "minio-go: testUserMetadataCopyingWrapper::ComposeObject(destination, sources)",
+  "minio-js::fPutObject(bucketName, objectName, filePath, metaData)",
+  "minio-js::fPutObject(bucketName, objectName, filePath, metaData, callback)",
+  "minio-js::initiateNewMultipartUpload(bucketName, objectName, metaData, cb)",
+  "minio-js::putObject(bucketName, objectName, stream, metaData)",
+  "minio-js::putObject(bucketName, objectName, stream, metaData, cb)",
+  "minio-js::putObject(bucketName, objectName, stream, metadata, cb)",
+  "minio-js::putObject(bucketName, objectName, stream, size, metaData, callback)",
+  "minio-py:test_copy_object_with_metadata",
+  "minio-py:test_fput_object_with_content_type",
+]
+server_tests = ["server/tests/metadata_test.rs", "server/tests/attributes_test.rs"]
+drive = ["metadata"]
+fuzz = ["attrs_block", "attrs_values", "iso8601"]
+
+[[feature]]
+id = "anonymous-and-presigned"
+name = "Anonymous access and presigned URLs (X-Amz-Expires)"
+status = "partial"
+issue = "#122"
+area = "anonymous-and-presigned"
+design_section = "5"
+operations = ["GetObject (presigned)", "PutObject (presigned)", "Anonymous requests"]
+ceph = [
+  "test_s3::test_bucket_list_objects_anonymous",
+  "test_s3::test_bucket_listv2_objects_anonymous",
+  "test_s3::test_bucket_list_objects_anonymous_fail",
+  "test_s3::test_bucket_listv2_objects_anonymous_fail",
+  "test_s3::test_object_raw_get",
+  "test_s3::test_object_raw_get_bucket_gone",
+  "test_s3::test_object_raw_get_object_gone",
+  "test_s3::test_object_raw_authenticated",
+  "test_s3::test_object_raw_authenticated_bucket_gone",
+  "test_s3::test_object_raw_authenticated_object_gone",
+  "test_s3::test_object_raw_get_x_amz_expires_not_expired",
+  "test_s3::test_object_raw_get_x_amz_expires_out_range_zero",
+  "test_s3::test_object_raw_get_x_amz_expires_out_max_range",
+  "test_s3::test_object_raw_get_x_amz_expires_out_positive_range",
+  "test_s3::test_object_anon_put",
+  "test_s3::test_object_anon_put_write_access",
+  "test_s3::test_object_put_authenticated",
+  "test_s3::test_object_raw_put_authenticated_expired",
+  "test_s3::test_list_buckets_anonymous",
+]
+mint = [
+  "aws-sdk-go-v2::PresignedPut",
+  "aws-sdk-ruby::presignedGet(bucket_name,file_name)",
+  "aws-sdk-ruby::presignedPut(bucket_name,file_name)",
+  "minio-java::getPresignedObjectUrl()",
+  "minio-js::presignedGetObject(bucketName, objectName, 1000, respHeaders, requestDate, cb)",
+  "minio-js::presignedGetObject(bucketName, objectName, cb)",
+  "minio-js::presignedGetObject(bucketName, objectName, expires)",
+  "minio-js::presignedGetObject(bucketName, objectName, expires, cb)",
+  "minio-js::presignedGetObject(bucketName, objectName, expires, respHeaders, cb)",
+  "minio-js::presignedGetObject(bucketName, objectName, respHeaders, cb)",
+  "minio-js::presignedPutObject(bucketName, objectName)",
+  "minio-js::presignedPutObject(bucketName, objectName, expires)",
+  "minio-js::presignedPutObject(bucketName, objectName, expires, cb)",
+  "minio-js::presignedPutObject(bucketName, objectName, expires=1000, cb)",
+  "minio-js::presignedUrl(httpMethod, bucketName, objectName, expires, cb)",
+  "minio-py:test_presigned_get_object_default_expiry",
+  "minio-py:test_presigned_get_object_expiry",
+  "minio-py:test_presigned_get_object_response_headers",
+  "minio-py:test_presigned_get_object_version",
+  "minio-py:test_presigned_put_object_default_expiry",
+  "minio-py:test_presigned_put_object_expiry",
+]
+server_tests = ["server/tests/multipart_sigv4_test.rs"]
+fuzz = ["sigv4"]
+
+[[feature]]
+id = "copy"
+name = "CopyObject (same-bucket, cross-bucket, and versioned copy)"
+status = "done"
+issue = "#152"
+area = "copy"
+design_section = "4"
+operations = ["CopyObject"]
+ceph = [
+  "test_s3::test_object_copy_zero_size",
+  "test_s3::test_object_copy_16m",
+  "test_s3::test_object_copy_same_bucket",
+  "test_s3::test_object_copy_to_itself",
+  "test_s3::test_object_copy_diff_bucket",
+  "test_s3::test_object_copy_bucket_not_found",
+  "test_s3::test_object_copy_key_not_found",
+  "test_s3::test_object_copy_versioned_bucket",
+  "test_s3::test_object_copy_versioned_url_encoding",
+  "test_s3::test_versioning_obj_suspended_copy",
+  "test_s3::test_versioning_copy_obj_version",
+]
+mint = [
+  "aws-sdk-php::copyObject ( array $params = [] )",
+  "aws-sdk-ruby::copyObject(source_bucket_name,target_bucket_name,source_file_name,target_file_name)",
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api copy-object --bucket awscli-mint-test-bucket --key datafile-1-kB-copy --copy-source awscli-mint-test-bucket/datafile-1-kB",
+  "minio-go: testCopyObject::CopyObject(dst, src)",
+  "minio-java::copyObject()",
+  "minio-js::copyObject(bucketName, objectName, srcObject)",
+  "minio-js::copyObject(bucketName, objectName, srcObject, cb)",
+  "minio-py:test_copy_object_no_copy_condition",
+]
+server_tests = [
+  "server/tests/copy_version_test.rs",
+  "server/tests/metadata_test.rs",
+  "server/tests/key_encoding_test.rs",
+  "server/tests/test_boto3_compat.py",
+]
+drive = ["copy"]
+
+[[feature]]
+id = "versioning"
+name = "Bucket versioning, versioned GET/DELETE, delete markers, and ListObjectVersions"
+status = "done"
+issue = "#113"
+area = "versioning"
+design_section = "6.5"
+operations = [
+  "PutBucketVersioning",
+  "GetBucketVersioning",
+  "ListObjectVersions",
+  "GetObject (versionId)",
+  "DeleteObject (versionId)",
+]
+ceph = [
+  "test_s3::test_bucket_list_return_data_versioning",
+  "test_s3::test_versioning_concurrent_multi_object_delete",
+  "test_s3::test_versioning_bucket_create_suspend",
+  "test_s3::test_versioning_obj_create_read_remove",
+  "test_s3::test_versioning_obj_create_read_remove_head",
+  "test_s3::test_versioning_stack_delete_merkers",
+  "test_s3::test_versioning_obj_plain_null_version_removal",
+  "test_s3::test_versioning_obj_plain_null_version_overwrite",
+  "test_s3::test_versioning_obj_plain_null_version_overwrite_suspended",
+  "test_s3::test_versioning_obj_suspend_versions",
+  "test_s3::test_versioning_obj_create_versions_remove_all",
+  "test_s3::test_versioning_obj_create_versions_remove_special_names",
+  "test_s3::test_versioning_obj_list_marker",
+  "test_s3::test_versioning_multi_object_delete",
+  "test_s3::test_versioning_multi_object_delete_with_marker",
+  "test_s3::test_versioning_multi_object_delete_with_marker_create",
+  "test_s3::test_versioned_concurrent_object_create_concurrent_remove",
+  "test_s3::test_versioned_concurrent_object_create_and_remove",
+  "test_s3::test_versioning_bucket_atomic_upload_return_version_id",
+  "test_s3::test_delete_marker_nonversioned",
+  "test_s3::test_delete_marker_versioned",
+  "test_s3::test_delete_marker_suspended",
+]
+mint = [
+  "minio-go: testComposeObjectWithVersioning::ComposeObject()",
+  "minio-go: testConcurrentCopyObjectWithVersioning::CopyObject()",
+  "minio-go: testCopyObjectWithVersioning::CopyObject()",
+  "minio-go: testGetObjectWithVersioning::GetObject()",
+  "minio-go: testListObjectVersions::ListObjectVersions(bucketName, prefix, recursive)",
+  "minio-go: testPutObjectWithVersioning::GetObject()",
+  "minio-go: testRemoveObjectWithVersioning::DeleteObject()",
+  "minio-go: testRemoveObjectsWithVersioning::DeleteObjects()",
+  "minio-go: testStatObjectWithVersioning::StatObject",
+  "minio-java::getBucketVersioning()",
+  "minio-java::setBucketVersioning()",
+  'minio-js::"after all" hook in "Force Deletion of objects with versions"',
+  'minio-js::"after all" hook in "Force Deletion of prefix with versions"',
+  "minio-js::Check if versioning is Suspended on a bucket",
+  "minio-js::Check if versioning is enabled on a bucket",
+  "minio-js::Enable Versioning on Bucket: setBucketVersioning(bucketName,versioningConfig)",
+  "minio-js::Enable versioning  on a bucket",
+  "minio-js::Suspend versioning  on a bucket",
+  "minio-js::listObjects(bucketName, '', true, {IncludeVersion: true}, cb)",
+  "minio-js::setBucketVersioning(bucketName, versionConfig):",
+  "minio-py:test_fget_object_version",
+  "minio-py:test_get_object_version",
+  "minio-py:test_list_object_v1_versions",
+  "minio-py:test_list_object_versions",
+  "minio-py:test_stat_object_version",
+  "versioning::testCreateVersioningBucket",
+  "versioning::testDeleteObject",
+  "versioning::testDeleteObjects",
+  "versioning::testGetObject",
+  "versioning::testListObjectKeysContinuation",
+  "versioning::testListObjectVersionIDContinuation",
+  "versioning::testListObjectVersionsSimple",
+  "versioning::testListObjectVersionsWithPrefixAndDelimiter",
+  "versioning::testListObjectsVersionsWithEmptyDirObject",
+  "versioning::testPutObject",
+  "versioning::testStatObject",
+]
+server_tests = [
+  "server/tests/versioning_test.rs",
+  "server/tests/versioning_edge_test.rs",
+  "server/tests/versioning_stream_race_test.rs",
+  "server/tests/list_versions_test.rs",
+]
+drive = ["versioning"]
+fuzz = ["version_id", "request_xml"]
+
+# Its other ceph tests pass; these fail only because each calls GetObjectAcl (owner, 2026-11-21).
+[feature.waits_on]
+"test_s3::test_bucket_list_return_data_versioning" = "acl-ownership"
+
+[[feature]]
+id = "listing"
+name = "Bucket listing (ListObjects, ListObjectsV2, paginated ListBuckets)"
+status = "done"
+issue = "#114"
+area = "listing"
+design_section = "6.6"
+operations = ["ListObjects", "ListObjectsV2", "ListBuckets (paginated)"]
+ceph = [
+  "test_s3::test_bucket_list_empty",
+  "test_s3::test_bucket_list_distinct",
+  "test_s3::test_bucket_list_many",
+  "test_s3::test_bucket_listv2_many",
+  "test_s3::test_basic_key_count",
+  "test_s3::test_bucket_list_delimiter_basic",
+  "test_s3::test_bucket_listv2_delimiter_basic",
+  "test_s3::test_bucket_listv2_encoding_basic",
+  "test_s3::test_bucket_list_encoding_basic",
+  "test_s3::test_bucket_list_delimiter_prefix",
+  "test_s3::test_bucket_listv2_delimiter_prefix",
+  "test_s3::test_bucket_listv2_delimiter_prefix_ends_with_delimiter",
+  "test_s3::test_bucket_list_delimiter_prefix_ends_with_delimiter",
+  "test_s3::test_bucket_list_delimiter_alt",
+  "test_s3::test_bucket_listv2_delimiter_alt",
+  "test_s3::test_bucket_list_delimiter_prefix_underscore",
+  "test_s3::test_bucket_listv2_delimiter_prefix_underscore",
+  "test_s3::test_bucket_list_delimiter_percentage",
+  "test_s3::test_bucket_listv2_delimiter_percentage",
+  "test_s3::test_bucket_list_delimiter_whitespace",
+  "test_s3::test_bucket_listv2_delimiter_whitespace",
+  "test_s3::test_bucket_list_delimiter_dot",
+  "test_s3::test_bucket_listv2_delimiter_dot",
+  "test_s3::test_bucket_list_delimiter_unreadable",
+  "test_s3::test_bucket_listv2_delimiter_unreadable",
+  "test_s3::test_bucket_list_delimiter_empty",
+  "test_s3::test_bucket_listv2_delimiter_empty",
+  "test_s3::test_bucket_list_delimiter_none",
+  "test_s3::test_bucket_listv2_delimiter_none",
+  "test_s3::test_bucket_list_delimiter_not_exist",
+  "test_s3::test_bucket_listv2_delimiter_not_exist",
+  "test_s3::test_bucket_list_delimiter_not_skip_special",
+  "test_s3::test_bucket_list_prefix_basic",
+  "test_s3::test_bucket_listv2_prefix_basic",
+  "test_s3::test_bucket_list_prefix_alt",
+  "test_s3::test_bucket_listv2_prefix_alt",
+  "test_s3::test_bucket_list_prefix_empty",
+  "test_s3::test_bucket_listv2_prefix_empty",
+  "test_s3::test_bucket_list_prefix_none",
+  "test_s3::test_bucket_listv2_prefix_none",
+  "test_s3::test_bucket_list_prefix_not_exist",
+  "test_s3::test_bucket_listv2_prefix_not_exist",
+  "test_s3::test_bucket_list_prefix_unreadable",
+  "test_s3::test_bucket_listv2_prefix_unreadable",
+  "test_s3::test_bucket_list_prefix_delimiter_basic",
+  "test_s3::test_bucket_listv2_prefix_delimiter_basic",
+  "test_s3::test_bucket_list_prefix_delimiter_alt",
+  "test_s3::test_bucket_listv2_prefix_delimiter_alt",
+  "test_s3::test_bucket_list_prefix_delimiter_prefix_not_exist",
+  "test_s3::test_bucket_listv2_prefix_delimiter_prefix_not_exist",
+  "test_s3::test_bucket_list_prefix_delimiter_delimiter_not_exist",
+  "test_s3::test_bucket_listv2_prefix_delimiter_delimiter_not_exist",
+  "test_s3::test_bucket_list_prefix_delimiter_prefix_delimiter_not_exist",
+  "test_s3::test_bucket_listv2_prefix_delimiter_prefix_delimiter_not_exist",
+  "test_s3::test_bucket_list_maxkeys_one",
+  "test_s3::test_bucket_listv2_maxkeys_one",
+  "test_s3::test_bucket_list_maxkeys_zero",
+  "test_s3::test_bucket_listv2_maxkeys_zero",
+  "test_s3::test_bucket_list_maxkeys_none",
+  "test_s3::test_bucket_listv2_maxkeys_none",
+  "test_s3::test_bucket_list_maxkeys_invalid",
+  "test_s3::test_bucket_list_marker_none",
+  "test_s3::test_bucket_list_marker_empty",
+  "test_s3::test_bucket_listv2_continuationtoken_empty",
+  "test_s3::test_bucket_listv2_continuationtoken",
+  "test_s3::test_bucket_listv2_both_continuationtoken_startafter",
+  "test_s3::test_bucket_list_marker_unreadable",
+  "test_s3::test_bucket_listv2_startafter_unreadable",
+  "test_s3::test_bucket_list_marker_not_in_list",
+  "test_s3::test_bucket_listv2_startafter_not_in_list",
+  "test_s3::test_bucket_list_marker_after_list",
+  "test_s3::test_bucket_listv2_startafter_after_list",
+  "test_s3::test_bucket_list_return_data",
+  "test_s3::test_bucketv2_notexist",
+  "test_s3::test_multi_objectv2_delete",
+  "test_s3::test_bucket_list_long_name",
+  "test_s3::test_buckets_create_then_list",
+  "test_s3::test_buckets_list_ctime",
+  "test_s3::test_list_buckets_invalid_auth",
+  "test_s3::test_list_buckets_bad_auth",
+  "test_s3::test_list_buckets_paginated",
+  "test_s3::test_bucket_list_special_prefix",
+]
+mint = [
+  "aws-sdk-php::listBuckets ( array $params = [] )",
+  "aws-sdk-php::listObjects ( array $params = [] )",
+  "aws-sdk-ruby::listBuckets()",
+  "aws-sdk-ruby::listObjects(bucket_name)",
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api list-objects --bucket awscli-mint-test-bucket --prefix datafile-1-kB",
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api list-objects-v2 --bucket awscli-mint-test-bucket --max-keys 1",
+  "mc::test_list_dir",
+  "minio-go: testListObjects::ListObjects(bucketName, objectPrefix, recursive, doneCh)",
+  "minio-java::listBuckets()",
+  "minio-java::listObjects()",
+  "minio-js::listBuckets()",
+  "minio-js::listBuckets(cb)",
+  "minio-js::listObjects(bucketName, prefix, recursive)",
+  "minio-js::listObjectsV2(bucketName, prefix, recursive)",
+  "minio-py:test_list_buckets::remove_bucket(bucket_name)",
+  "minio-py:test_list_objects",
+  "minio-py:test_list_objects_v1",
+  "minio-py:test_list_objects_with_1001_files",
+  "minio-py:test_list_objects_with_prefix",
+  "s3cmd::test_sync_list_objects",
+]
+server_tests = [
+  "server/tests/list_objects_test.rs",
+  "server/tests/listing_test.rs",
+  "server/tests/clock_and_dates_test.rs",
+  "server/tests/test_boto3_compat.py",
+]
+drive = ["listing"]
+
+# Its other ceph tests pass; these fail only because each calls GetObjectAcl (owner, 2026-11-21).
+[feature.waits_on]
+"test_s3::test_bucket_list_return_data" = "acl-ownership"
+
+[[feature]]
+id = "buckets"
+name = "Bucket operations (CreateBucket, ListBuckets, HeadBucket, DeleteBucket, GetBucketLocation)"
+status = "done"
+issue = "#140"
+area = "bucket-basics"
+design_section = "6.7"
+operations = [
+  "CreateBucket",
+  "ListBuckets",
+  "HeadBucket",
+  "DeleteBucket",
+  "GetBucketLocation",
+]
+ceph = [
+  "test_s3::test_bucket_notexist",
+  "test_s3::test_bucket_delete_notexist",
+  "test_s3::test_bucket_delete_nonempty",
+  "test_s3::test_bucket_create_delete",
+  "test_s3::test_bucket_head",
+  "test_s3::test_bucket_head_notexist",
+  "test_s3::test_bucket_create_naming_bad_starts_nonalpha",
+  "test_s3::test_bucket_create_naming_bad_short_one",
+  "test_s3::test_bucket_create_naming_bad_short_two",
+  "test_s3::test_bucket_create_naming_good_long_60",
+  "test_s3::test_bucket_create_naming_good_long_61",
+  "test_s3::test_bucket_create_naming_good_long_62",
+  "test_s3::test_bucket_create_naming_good_long_63",
+  "test_s3::test_bucket_create_naming_bad_ip",
+  "test_s3::test_bucket_create_naming_dns_underscore",
+  "test_s3::test_bucket_create_naming_dns_long",
+  "test_s3::test_bucket_create_naming_dns_dash_at_end",
+  "test_s3::test_bucket_create_naming_dns_dot_dot",
+  "test_s3::test_bucket_create_naming_dns_dot_dash",
+  "test_s3::test_bucket_create_naming_dns_dash_dot",
+  "test_s3::test_bucket_create_exists",
+  "test_s3::test_bucket_get_location",
+  "test_s3::test_bucket_create_naming_good_starts_alpha",
+  "test_s3::test_bucket_create_naming_good_starts_digit",
+  "test_s3::test_bucket_create_naming_good_contains_period",
+  "test_s3::test_bucket_create_naming_good_contains_hyphen",
+  "test_s3::test_bucket_recreate_not_overriding",
+  "test_s3::test_bucket_create_special_key_names",
+  "test_s3::test_atomic_write_bucket_gone",
+]
+mint = [
+  "aws-sdk-php::getBucketLocation ( array $params = [] )",
+  "aws-sdk-php::headBucket ( array $params = [] )",
+  "aws-sdk-ruby::bucketExists?(bucket_name)",
+  "aws-sdk-ruby::makeBucket(bucket_name)",
+  "aws-sdk-ruby::removeBucket(bucket_name)",
+  "awscli::make_bucket",
+  "mc::test_make_bucket",
+  "mc::test_make_bucket_error",
+  "mc::test_rb",
+  "minio-go: testMakeBucketError::MakeBucket(bucketName, region)",
+  "minio-go: testMakeBucketRegions::MakeBucket(bucketName, region)",
+  "minio-java::bucketExists()",
+  "minio-java::makeBucket()",
+  "minio-java::removeBucket()",
+  'minio-js::"after all" hook in "functional tests"',
+  "minio-js::Check if bucket can be deleted:",
+  "minio-js::bucketExists(bucketName)",
+  "minio-js::bucketExists(bucketName, cb)",
+  "minio-js::makeBucket(bucketName, region)",
+  "minio-js::makeBucket(bucketName, region, cb)",
+  "minio-js::removeBucket(bucketName)",
+  "minio-js::removeBucket(bucketName, )",
+  "minio-js::removeBucket(bucketName, cb)",
+  "minio-py:test_make_bucket_with_region",
+  "s3cmd::test_make_bucket",
+  "s3cmd::test_make_bucket_error",
+]
+server_tests = [
+  "server/tests/s3_details_test.rs",
+  "server/tests/bucket_config_test.rs",
+  "server/tests/wire_test.rs",
+  "server/tests/test_aws_cli.py",
+  "server/tests/test_boto3_compat.py",
+]
+drive = ["buckets"]
+fuzz = ["s3_target"]
+moved = [
+  { test = "test_s3::test_object_delete_key_bucket_gone", to = "anonymous-bucket-gone", decision = "https://github.com/iskandarnorazli/Awanfs/issues/140#issuecomment-6998945944" },
+]
+
+# Its other ceph tests pass; these fail only because each calls PutObjectAcl (owner, 2026-11-21).
+[feature.waits_on]
+"test_s3::test_bucket_create_special_key_names" = "acl-ownership"
+
+[[feature]]
+id = "ranges"
+name = "Range GET requests (bytes=a-b, bytes=a-, bytes=-n, 416 InvalidRange)"
+status = "done"
+issue = "#140"
+area = "object-basics"
+design_section = "6.7"
+operations = ["GetObject (Range)"]
+ceph = ["re:^test_s3::test_ranged_"]
+mint = [
+  "aws-sdk-go-v2::testGetObjectRange",
+  "minio-go: testGetObjectRanges::GetObject(ctx, bucketName, objectName, fileName)",
+  "minio-go: testGetObjectReadAtFunctional::GetObject(bucketName, objectName)",
+  "minio-go: testGetObjectReadAtWhenEOFWasReached::GetObject(bucketName, objectName)",
+  "minio-go: testGetObjectReadSeekFunctional::GetObject(bucketName, objectName)",
+  "minio-go: testGetObjectSeekEnd::GetObject(bucketName, objectName)",
+  "minio-go: testPutObjectReadAt::PutObject(bucketName, objectName, reader, opts)",
+  "minio-js::getPartialObject(bucketName, objectName, offset, length, cb)",
+  "minio-js::getPartialObject(bucketName, objectName, offset, length, getOpts)",
+  "minio-py:test_get_partial_object",
+]
+server_tests = [
+  "server/tests/mmap_slice_test.rs",
+  "server/tests/large_get_test.rs",
+  "server/tests/stream_read_test.rs",
+  "server/tests/stream_read_disconnect_test.rs",
+  "server/tests/wire_test.rs",
+  "server/tests/property_tests.rs",
+  "server/tests/test_boto3_compat.py",
+]
+drive = ["ranges"]
+fuzz = ["range"]
+
+[[feature]]
+id = "objects"
+name = "Single-object CRUD and multi-object DeleteObjects"
+status = "done"
+issue = "#140"
+area = "object-basics"
+design_section = "6.7"
+operations = [
+  "PutObject",
+  "GetObject",
+  "HeadObject",
+  "DeleteObject",
+  "DeleteObjects",
+]
+ceph = [
+  "test_s3::test_object_write_to_nonexist_bucket",
+  "test_s3::test_object_write_with_chunked_transfer_encoding",
+  "test_s3::test_object_read_not_exist",
+  "test_s3::test_object_requestid_matches_header_on_error",
+  "test_s3::test_multi_object_delete",
+  "test_s3::test_multi_object_delete_key_limit",
+  "test_s3::test_multi_objectv2_delete_key_limit",
+  "test_s3::test_object_head_zero_bytes",
+  "test_s3::test_object_write_check_etag",
+  "test_s3::test_object_write_read_update_read_delete",
+  "test_s3::test_object_write_file",
+  "test_s3::test_100_continue",
+  "test_s3::test_100_continue_error_retry",
+  "test_s3::test_atomic_read_1mb",
+  "test_s3::test_atomic_read_4mb",
+  "test_s3::test_atomic_read_8mb",
+  "test_s3::test_atomic_write_1mb",
+  "test_s3::test_atomic_write_4mb",
+  "test_s3::test_atomic_write_8mb",
+  "test_s3::test_atomic_dual_write_1mb",
+  "test_s3::test_atomic_dual_write_4mb",
+  "test_s3::test_atomic_dual_write_8mb",
+  "test_s3::test_object_read_unreadable",
+]
+mint = [
+  "aws-sdk-go-v2::testBasicObjectOperations",
+  "aws-sdk-php::deleteObjects (array $params = [] )",
+  "aws-sdk-php::getObject ( array $params = [] )",
+  "aws-sdk-php::headObject ( array $params = [] )",
+  "aws-sdk-ruby::getObject(bucket_name,file,destination)",
+  "aws-sdk-ruby::putObject(bucket_name,file)",
+  "aws-sdk-ruby::removeObject(bucket_name,file)",
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api get-object --bucket awscli-mint-test-bucket --key awscli-mint-test-bucket-object /tmp/datafile-0-b",
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api get-object --bucket awscli-mint-test-bucket --key datafile-1-kB /tmp/datafile-1-kB",
+  "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api head-object --bucket awscli-mint-test-bucket --key prefix/directory/datafile-1-kB",
+  "mc::test_put_object",
+  "mc::test_put_object_0byte",
+  "mc::test_put_object_error",
+  "minio-go: testFGetObjectContext::FGetObject(ctx, bucketName, objectName, fileName)",
+  "minio-go: testFPutObject::StatObject(bucketName, objectName, opts)",
+  "minio-go: testFPutObjectContext::FPutObject(bucketName, objectName, fileName, opts)",
+  "minio-go: testGetObjectClosedTwice::GetObject(bucketName, objectName)",
+  "minio-go: testGetObjectContext::GetObject(ctx, bucketName, objectName)",
+  "minio-go: testPutObjectContext::PutObject(ctx, bucketName, objectName, fileName, opts)",
+  "minio-go: testPutObjectStreaming::PutObject(bucketName, objectName, reader,size,opts)",
+  "minio-go: testPutObjectUploadSeekedObject::PutObject(bucketName, objectName, fileToUpload, contentType)",
+  "minio-go: testRemoveMultipleObjects::RemoveObjects(bucketName, objectsCh)",
+  "minio-go: testRemoveMultipleObjectsIter::RemoveObjects(bucketName, objectsCh)",
+  "minio-go: testRemoveMultipleObjectsWithResult::RemoveObjects(bucketName, objectsCh)",
+  "minio-go: testRemoveObjects::RemoveObjects(bucketName, objectsCh, opts)",
+  "minio-go: testRemoveObjectsIter::RemoveObjects(bucketName, objectsCh, opts)",
+  "minio-java::downloadObject()",
+  "minio-java::getObject()",
+  "minio-java::putObject()",
+  "minio-java::removeObject()",
+  "minio-java::removeObjects()",
+  "minio-java::statObject()",
+  "minio-java::uploadObject()",
+  'minio-js::"after all" hook in "Force Deletion of prefix"',
+  "minio-js::Remove object on a bucket:",
+  "minio-js::fGetObject(bucketName, objectName, filePath)",
+  "minio-js::fGetObject(bucketName, objectName, filePath, callback)",
+  "minio-js::fGetObject(bucketName, objectName, filePath, getOpts={})",
+  "minio-js::fPutObject(bucketName, objectName, filePath, callback)",
+  "minio-js::getObject(bucketName, objectName)",
+  "minio-js::getObject(bucketName, objectName, callback)",
+  "minio-js::getObject(bucketName, objectName, cb)",
+  "minio-js::getObject(bucketName, objectName, getOpts)",
+  "minio-js::putObject(bucketName, objectName, 0byte)",
+  "minio-js::putObject(bucketName, objectName, stream)",
+  "minio-js::putObject(bucketName, objectName, stream, callback)",
+  "minio-js::putObject(bucketName, objectName, stream, size, contentType, callback)",
+  "minio-js::removeObject object",
+  "minio-js::removeObject(0byte, objectName)",
+  "minio-js::removeObject(bucketName, objectList, removeOpts)",
+  "minio-js::removeObject(bucketName, objectName)",
+  "minio-js::removeObject(bucketName, objectName, callback)",
+  "minio-js::removeObject(bucketName, objectName, cb)",
+  "minio-js::removeObject(bucketName, objectName, filePath, callback)",
+  "minio-js::removeObject(bucketName, objectName, removeOpts)",
+  "minio-js::removeObject(bucketName, objectName, stream)",
+  "minio-js::removeObjects with non latin characters",
+  "minio-js::removeObjects(bucketName, objectList, removeOpts)",
+  "minio-js::removeObjects(bucketName, objectsList)",
+  "minio-js::statObject(bucketName, objectName)",
+  "minio-js::statObject(bucketName, objectName, cb)",
+  "minio-js::statObject(bucketName, objectName, cb)::",
+  "minio-js::statObject(bucketName, objectName, statOpts)",
+  "minio-py:test_fget_object",
+  "minio-py:test_fput_object_large_file",
+  "minio-py:test_fput_object_small_file",
+  "minio-py:test_get_object",
+  "minio-py:test_get_object_with_default_length",
+  "minio-py:test_negative_put_object_with_path_segment",
+  "minio-py:test_put_object",
+  "minio-py:test_stat_object",
+  "minio-py:test_thread_safe",
+  "s3cmd::test_get_object",
+  "s3cmd::test_put_object",
+  "s3cmd::test_put_object_error",
+]
+server_tests = [
+  "server/tests/delete_objects_test.rs",
+  "server/tests/edge_cases_test.rs",
+  "server/tests/key_encoding_test.rs",
+  "server/tests/large_get_test.rs",
+  "server/tests/s3_details_test.rs",
+  "server/tests/wire_test.rs",
+  "server/tests/property_tests.rs",
+  "server/tests/streaming_put_test.rs",
+  "server/tests/test_aws_cli.py",
+  "server/tests/test_boto3_compat.py",
+]
+drive = ["objects"]
+fuzz = ["request_xml", "s3_target"]
+
+# Its other ceph tests pass; these fail only because each calls PutBucketAcl (owner, 2026-11-21).
+[feature.waits_on]
+"test_s3::test_100_continue" = "acl-ownership"
+
+[[feature]]
+id = "restart"
+name = "Crash durability, restart recovery, and volume persistence"
+status = "done"
+issue = "#29"
+operations = ["Server restart recovery", "Durability modes (group, strict, fast)"]
+server_tests = [
+  "server/tests/durability_test.rs",
+  "server/tests/process_restart_test.rs",
+  "server/tests/restart_durability_test.rs",
+  "server/tests/graceful_shutdown_test.rs",
+  "server/tests/key_order_test.rs",
+  "server/tests/delete_objects_test.rs",
+  "server/tests/integrity_test.rs",
+  "server/tests/late_failure_test.rs",
+  "server/tests/journal_retry_test.rs",
+  "server/tests/relocation_test.rs",
+  "server/tests/volume_gap_test.rs",
+  "server/tests/volume_packing_test.rs",
+  "server/tests/volume_rollover_test.rs",
+  "server/tests/sparse_mmap_test.rs",
+  "server/tests/stepped_growth_test.rs",
+  "server/tests/concurrent_io_test.rs",
+]
+drive = ["restart"]
+
+[[feature]]
+id = "sigv4-auth"
+name = "SigV4 header and aws-chunked payload authentication"
+status = "done"
+issue = "#35"
+operations = ["SigV4 authorization", "aws-chunked signature verification"]
+server_tests = [
+  "server/tests/auth_test.rs",
+  "server/tests/chunk_signature_test.rs",
+  "server/tests/multipart_sigv4_test.rs",
+  "server/tests/parser_robustness_test.rs",
+]
+drive = ["doctor"]
+fuzz = ["sigv4", "aws_chunked", "iso8601"]
+
+[[feature]]
+id = "iam"
+name = "IAM users and identity policies via --config"
+status = "partial"
+issue = "#53"
+operations = ["User authentication (--config)", "Identity policy authorization"]
+server_tests = ["server/tests/iam_test.rs", "server/tests/anonymous_with_config_test.rs"]
+
+[[feature]]
+id = "compression"
+name = "Opt-in per-bucket zstd compression in 64 KiB blocks"
+status = "partial"
+issue = "#51"
+operations = ["PutObject (zstd)", "GetObject (zstd range decode)"]
+server_tests = ["server/tests/compression_test.rs"]
+
+[[feature]]
+id = "compaction"
+name = "Volume compaction, auto-compaction, and I/O throttling"
+status = "done"
+issue = "#14"
+user_visible = false
+server_tests = [
+  "server/tests/compactor_test.rs",
+  "server/tests/compaction_safety_test.rs",
+  "server/tests/compaction_inflight_test.rs",
+  "server/tests/auto_compaction_test.rs",
+  "server/tests/throttle_test.rs",
+  "server/tests/volume_packing_test.rs",
+]
+
+[[feature]]
+id = "health"
+name = "Operator health endpoints (/_awanfs/health/live, /_awanfs/health/ready)"
+status = "done"
+issue = "#44"
+user_visible = false
+operations = ["GET /_awanfs/health/live", "GET /_awanfs/health/ready"]
+server_tests = ["server/tests/health_test.rs"]
+
+[[feature]]
+id = "metrics"
+name = "Prometheus metrics (/_awanfs/metrics) and dashboard alerts"
+status = "done"
+issue = "#42"
+user_visible = false
+operations = ["GET /_awanfs/metrics"]
+server_tests = ["server/tests/metrics_test.rs", "server/tests/deploy_metrics_test.rs"]
+
+[[feature]]
+id = "tls"
+name = "HTTPS TLS termination with rustls (--cert, --key, --http-port)"
+status = "done"
+issue = "#30"
+user_visible = false
+server_tests = ["server/tests/tls_test.rs"]
+
+[[feature]]
+id = "access-log"
+name = "S3 access log file (--access-log)"
+status = "done"
+issue = "#46"
+user_visible = false
+server_tests = ["server/tests/access_log_test.rs"]
+
+[[feature]]
+id = "request-log"
+name = "Structured JSON request log and request IDs (x-amz-request-id)"
+status = "done"
+issue = "#41"
+user_visible = false
+server_tests = ["server/tests/request_id_test.rs", "server/tests/stalled_log_test.rs"]
+
+[[feature]]
+id = "otlp-tracing"
+name = "OpenTelemetry OTLP trace export and W3C traceparent propagation"
+status = "done"
+issue = "#43"
+user_visible = false
+server_tests = ["server/tests/otlp_test.rs"]
+fuzz = ["traceparent"]
+
+[[feature]]
+id = "memory-budget"
+name = "Memory budget, body admission control, timeouts, and payload cache"
+status = "done"
+issue = "#127"
+user_visible = false
+server_tests = [
+  "server/tests/memory_budget_test.rs",
+  "server/tests/memory_admit_test.rs",
+  "server/tests/memory_cache_test.rs",
+  "server/tests/payload_cache_test.rs",
+  "server/tests/lru_cache_test.rs",
+  "server/tests/spill_budget_test.rs",
+  "server/tests/body_limit_test.rs",
+  "server/tests/body_timeout_test.rs",
+  "server/tests/stalled_put_test.rs",
+]
+fuzz = ["parse_size"]
+
+[[feature]]
+id = "metadata-index"
+name = "In-memory columnar metadata index and spill index"
+status = "done"
+issue = "#13"
+user_visible = false
+server_tests = ["server/tests/meta_index_test.rs", "server/tests/metadata_spill_test.rs", "server/tests/index_full_test.rs"]
+
+[[feature]]
+id = "volume-format"
+name = "On-disk volume format v3, needle attributes block, and work counts"
+status = "done"
+issue = "#50"
+user_visible = false
+server_tests = [
+  "server/tests/format_version_test.rs",
+  "server/tests/attributes_test.rs",
+  "server/tests/needle_writer_state_test.rs",
+  "server/tests/work_count_test.rs",
+  "server/tests/commit_cost_probe.rs",
+]
+fuzz = ["attrs_block", "attrs_values"]
+
+[[feature]]
+id = "operation-table"
+name = "Central S3 operation table, 501 handling, and bucket config manifest"
+status = "done"
+issue = "#148"
+user_visible = false
+server_tests = ["server/tests/operation_table_test.rs", "server/tests/bucket_config_test.rs"]
+
+[[feature]]
+id = "erasure-coding"
+name = "Erasure coding and cluster gossip heartbeat scaffold"
+status = "planned"
+issue = "#52"
+user_visible = false
+server_tests = ["server/tests/erasure_coding_test.rs"]
+
+[[feature]]
+id = "mint-vs-aws"
+name = "Mint tests whose assertions disagree with AWS S3 docs and ceph s3-tests"
+status = "out-of-scope"
+issue = "out of scope"
+area = "mint-vs-aws"
+design_section = "9"
+decision = "https://github.com/iskandarnorazli/Awanfs/issues/278#issuecomment-7073548866"
+mint = [
+  "aws-sdk-php::abortMultipartupload ( array $params = [] )",
+  "minio-go: testListMultipartUpload::GetObject()",
+]
+
+[[feature]]
+id = "minio-only"
+name = "MinIO-specific health, admin, and S3 extension APIs"
+status = "out-of-scope"
+issue = "out of scope"
+area = "minio-only"
+design_section = "9"
+decision = "https://github.com/iskandarnorazli/Awanfs/issues/278#issuecomment-7073548866"
+mint = [
+  "healthcheck::testLivenessEndpoint",
+  "minio-go: testBucketVersioningExcludedPrefixes::GetBucketVersioning/SetBucketVersioning",
+  "minio-go: testGetObjectS3Zip::GetObject(bucketName, objectName)",
+  "minio-java::addCannedPolicy()",
+  "minio-java::addUser()",
+  "minio-java::deleteUser()",
+  "minio-java::getUserInfo()",
+  "minio-java::listCannedPolicies()",
+  "minio-java::listUsers()",
+  "minio-java::putObjectFanOut()",
+  "minio-java::removeCannedPolicy()",
+  "minio-java::setPolicy()",
+  "minio-java::uploadSnowballObjects()",
+  "minio-js::extensions.listObjectsV2WithMetadata(bucketName, prefix, recursive)",
+  "minio-py:test_set_get_bucket_versioning",
+]
+
+# Decision 47 on #164: https://github.com/iskandarnorazli/Awanfs/issues/164#issuecomment-6871114933
+[[feature]]
+id = "s3-select"
+name = "S3 Select SQL object content queries (SelectObjectContent)"
+status = "out-of-scope"
+issue = "#164"
+area = "s3-select"
+design_section = "9"
+decision = "https://github.com/iskandarnorazli/Awanfs/issues/278#issuecomment-7073548866"
+mint = [
+  "minio-java::selectObjectContent()",
+  'minio-js::"after all" hook for "Remove Object post select of content:',
+  "minio-js::selectObjectContent(bucketName, objectName, selectOpts)",
+  "s3select:test_csv_input_quote_char::select_object_content(bucket_name, object_name, request)",
+]
+
+[[feature]]
+id = "bucket-notifications"
+name = "Bucket event notifications (Put/Get/Delete/ListenBucketNotification)"
+status = "out-of-scope"
+issue = "out of scope"
+area = "bucket-notifications"
+design_section = "9"
+decision = "https://github.com/iskandarnorazli/Awanfs/issues/278#issuecomment-7073548866"
+mint = [
+  "minio-go: testBucketNotification::SetBucketNotification(bucketName)",
+  "minio-java::deleteBucketNotification()",
+  "minio-java::getBucketNotification()",
+  "minio-java::listenBucketNotification()",
+  "minio-java::setBucketNotification()",
+  "minio-js::listenBucketNotification(bucketName, prefix, suffix, events)",
+]
+
+[[feature]]
+id = "bucket-replication"
+name = "Bucket replication configuration (Put/Get/DeleteBucketReplication)"
+status = "out-of-scope"
+issue = "out of scope"
+area = "bucket-replication"
+design_section = "9"
+decision = "https://github.com/iskandarnorazli/Awanfs/issues/278#issuecomment-7073548866"
+mint = [
+  "minio-java::deleteBucketReplication()",
+  "minio-java::getBucketReplication()",
+  "minio-java::setBucketReplication()",
+]

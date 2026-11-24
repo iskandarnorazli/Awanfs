@@ -5,11 +5,11 @@
         --junit /tmp/s3tests-results.xml [--junit /tmp/s3tests-headers-results.xml] \
         --report CONFORMANCE_MAP.md
 
-Every test function in the pinned suite is assigned to exactly one area by the first rule
-that matches its pytest markers or its name (AREAS, in order). An area names the issue that
-owns it and the section of CONFORMANCE_DESIGN.md that says how it is built. A test no rule
-matches is "unassigned", and the script exits 1: a new upstream test has to be given an owner
-before the map is trusted again.
+Every test function in the pinned suite is assigned to an area read from `features.toml`
+at the repository root (single source of truth). Each feature with `ceph` rules names its
+area, owner issue (or "out of scope") and the section of CONFORMANCE_DESIGN.md that says how
+it is built. A test no rule matches is "unassigned", and the script exits 1: a new upstream
+test has to be given an owner in `features.toml` before the map is trusted again.
 
 Status per test: "pass" when it is in passing.txt; otherwise what the junit file says
 ("fail", "skip"), or "unknown" without one. The junit file also gives each failure's first
@@ -20,47 +20,32 @@ import ast
 import os
 import re
 import sys
+import tomllib
 import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# (area, issue, design section, name regex or None, markers). First match wins, so the order
-# is part of the map: narrow areas come before the broad ones that would also match.
-AREAS: List[Tuple[str, str, str, Optional[str], frozenset]] = [
-    # SigV2 request signing: out of scope (owner, 2026-11-17; CONFORMANCE_DESIGN.md section 9).
-    ("sigv2", "out of scope", "9", r"_aws2$|^test_cors_presigned_(get|put)_object(_tenant)?_v2$", frozenset({"auth_aws2"})),
-    # Botocore and urllib3 put Content-Length back, so no client can send this request; upstream
-    # marks it fails_on_rgw (owner, 2026-11-18; #160).
-    ("request-headers-unsendable", "out of scope", "9", r"^test_headers::test_object_create_bad_contentlength_none$", frozenset()),
-    ("request-headers", "#160", "3", r"^test_headers::", frozenset()),
-    ("rgw-only", "out of scope", "9", r"^test_(head_bucket_usage|account_usage|bucket_head_extended|get_object_torrent)$|_unordered$|_tenant$", frozenset()),
-    # An anonymous DELETE is refused before the bucket is looked up: authorization, #122 (owner, 2026-11-18; #140).
-    ("anonymous-bucket-gone", "#122", "5", r"^test_object_delete_key_bucket_gone$", frozenset()),
-    # Unsigned GETs on a public-read bucket: the 403 is authorization, #122; CORS's matching is
-    # covered by server/tests/cors_test.rs (owner, 2026-11-19; #116).
-    ("anonymous-cors", "#122", "5", r"^test_cors_origin_(response|wildcard)$", frozenset()),
-    ("bucket-logging", "#153", "8.4", r"logging", frozenset({"bucket_logging", "bucket_logging_cleanup", "fails_without_logging_rollover"})),
-    ("storage-classes", "out of scope", "9", r"transition|cloud|restore|storage_class", frozenset({"lifecycle_transition", "cloud_transition", "cloud_restore"})),
-    ("encryption", "#121", "8.2", r"sse|encrypt|kms", frozenset({"encryption", "sse_s3", "bucket_encryption"})),
-    ("lifecycle", "#118", "8.3", r"lifecycle", frozenset({"lifecycle", "lifecycle_expiration"})),
-    ("object-lock", "#120", "8.1", r"object_lock|legal_hold|retention", frozenset()),
-    ("post-object", "#119", "7.3", r"^test_post_object|presigned_post", frozenset()),
-    ("cors", "#116", "7.2", r"cors", frozenset()),
-    ("checksums", "#117", "7.1", r"checksum", frozenset({"checksum"})),
-    ("object-attributes-api", "#117", "7.1", r"object_attributes", frozenset()),
-    ("tagging", "#115", "6.2", r"tagging|_tags?_|_tags$", frozenset({"tagging"})),
-    ("policy", "#122", "5", r"policy|public_block|block_public|ignore_public", frozenset({"bucket_policy"})),
-    ("acl-ownership", "#122", "5", r"acl|grant|ownership|owner|access_bucket|_not_owned", frozenset({"object_ownership"})),
-    ("conditional", "#112", "6.3", r"if_?match|if_?none_?match|ifnonmatch|if_?modified|if_?unmodified|conditional", frozenset({"conditional_write"})),
-    ("multipart", "#111", "6.4", r"multipart|upload_part|get_part", frozenset()),
-    ("object-metadata", "#152", "4", r"metadata|content_?type|cache_control|expires$|content_encoding|response_headers|copy_verify", frozenset()),
-    ("anonymous-and-presigned", "#122", "5", r"anon|raw_get|raw_put|x_amz_expires|presign|authenticated|_public", frozenset()),
-    ("copy", "#152", "4", r"copy", frozenset({"copy"})),
-    ("versioning", "#113", "6.5", r"version|delete_marker", frozenset({"delete_marker"})),
-    ("listing", "#114", "6.6", r"list", frozenset({"list_objects_v2"})),
-    ("bucket-basics", "#140", "6.7", r"^test_bucket_|bucket_create|naming|buckets_|bucket_gone", frozenset()),
-    ("object-basics", "#140", "6.7", r"^test_object|^test_get_obj|^test_put_obj|^test_delete|^test_multi_object|^test_ranged|^test_atomic|range|^test_head|100_continue|^test_abort|^test_set_|^test_upload_", frozenset()),
-]
+REGISTRY_PATH = Path(__file__).resolve().parent.parent.parent / "features.toml"
+
+
+def load_areas(registry_path: Path = REGISTRY_PATH) -> List[Tuple[str, str, str, Tuple[str, ...]]]:
+    """Load `(area, owner, design_section, ceph_patterns)` rules from `features.toml`."""
+    with open(registry_path, "rb") as fh:
+        data = tomllib.load(fh)
+    rules: List[Tuple[str, str, str, Tuple[str, ...]]] = []
+    for feat in data.get("feature", []):
+        pats = feat.get("ceph", [])
+        if not pats:
+            continue
+        area = feat.get("area") or feat["id"]
+        owner = "out of scope" if feat.get("status") == "out-of-scope" else feat.get("issue", "")
+        section = feat.get("design_section", "")
+        rules.append((area, owner, section, tuple(pats)))
+    return rules
+
+
+AREAS = load_areas()
 
 
 def suite_tests(path: str, prefix: str = "") -> "OrderedDict[str, List[str]]":
@@ -79,10 +64,24 @@ def suite_tests(path: str, prefix: str = "") -> "OrderedDict[str, List[str]]":
     return out
 
 
+def _matches(patterns: Tuple[str, ...], qname: str, markers: set) -> bool:
+    for pat in patterns:
+        if pat.startswith("re:"):
+            if re.search(pat[3:], qname):
+                return True
+        elif pat.startswith("mark:"):
+            if pat[5:] in markers:
+                return True
+        elif qname == pat:
+            return True
+    return False
+
+
 def area_of(name: str, markers) -> Optional[Tuple[str, str, str]]:
     ms = set(markers)
-    for area, issue, section, rx, marks in AREAS:
-        if ms & marks or (rx and re.search(rx, name)):
+    qname = name if "::" in name else f"test_s3::{name}"
+    for area, issue, section, patterns in AREAS:
+        if _matches(patterns, qname, ms):
             return area, issue, section
     return None
 
@@ -149,7 +148,7 @@ def build(tests, passing: set, junit: Optional[Dict[str, Tuple[str, str]]]):
 
 
 def render(rows, unassigned, suite_ref: str) -> str:
-    order = [a[0] for a in AREAS] + ["unassigned"]
+    order = list(OrderedDict.fromkeys(a[0] for a in AREAS)) + ["unassigned"]
     info = {a[0]: (a[1], a[2]) for a in AREAS}
     counts = {a: Counter() for a in order}
     for _, area, _, _, status, _ in rows:

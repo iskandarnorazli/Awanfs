@@ -177,6 +177,8 @@ test_s3::test_encrypted_transfer_13b
 test_s3::test_encrypted_transfer_1MB
 test_s3::test_encrypted_transfer_1b
 test_s3::test_encrypted_transfer_1kb
+test_s3::test_encryption_sse_c_multipart_upload
+test_s3::test_encryption_sse_c_unaligned_multipart_upload
 test_s3::test_get_checksum_object_attributes
 test_s3::test_get_multipart_checksum_object_attributes
 test_s3::test_get_multipart_object_attributes
@@ -222,9 +224,11 @@ test_s3::test_multipart_copy_special_names
 test_s3::test_multipart_copy_versioned
 test_s3::test_multipart_copy_without_range
 test_s3::test_multipart_get_part
+test_s3::test_multipart_resend_first_finishes_last
 test_s3::test_multipart_reupload_checksum_and_etag
 test_s3::test_multipart_single_get_part
 test_s3::test_multipart_sse_c_get_part
+test_s3::test_multipart_upload
 test_s3::test_multipart_upload_complete_without_create
 test_s3::test_multipart_upload_contents
 test_s3::test_multipart_upload_empty
@@ -232,6 +236,8 @@ test_s3::test_multipart_upload_incorrect_etag
 test_s3::test_multipart_upload_missing_part
 test_s3::test_multipart_upload_multiple_sizes
 test_s3::test_multipart_upload_overwrite_existing_object
+test_s3::test_multipart_upload_resend_part
+test_s3::test_multipart_upload_size_too_small
 test_s3::test_multipart_upload_small
 test_s3::test_multipart_use_cksum_helper_crc32
 test_s3::test_multipart_use_cksum_helper_crc32c
@@ -257,6 +263,7 @@ test_s3::test_object_copy_to_itself_with_metadata
 test_s3::test_object_copy_verify_contenttype
 test_s3::test_object_copy_versioned_bucket
 test_s3::test_object_copy_versioned_url_encoding
+test_s3::test_object_copy_versioning_multipart_upload
 test_s3::test_object_copy_zero_size
 test_s3::test_object_head_zero_bytes
 test_s3::test_object_metadata_replaced_on_put
@@ -278,6 +285,7 @@ test_s3::test_object_requestid_matches_header_on_error
 test_s3::test_object_set_get_metadata_none_to_empty
 test_s3::test_object_set_get_metadata_none_to_good
 test_s3::test_object_set_get_metadata_overwrite_to_empty
+test_s3::test_object_set_get_unicode_metadata
 test_s3::test_object_write_cache_control
 test_s3::test_object_write_check_etag
 test_s3::test_object_write_expires
@@ -309,6 +317,7 @@ test_s3::test_set_cors
 test_s3::test_set_multipart_tagging
 test_s3::test_sse_kms_multipart_invalid_chunks_1
 test_s3::test_sse_kms_multipart_invalid_chunks_2
+test_s3::test_sse_kms_multipart_upload
 test_s3::test_sse_kms_present
 test_s3::test_sse_kms_transfer_13b
 test_s3::test_sse_kms_transfer_1MB
@@ -319,6 +328,7 @@ test_s3::test_versioned_concurrent_object_create_and_remove
 test_s3::test_versioned_concurrent_object_create_concurrent_remove
 test_s3::test_versioning_bucket_atomic_upload_return_version_id
 test_s3::test_versioning_bucket_create_suspend
+test_s3::test_versioning_bucket_multipart_upload_return_version_id
 test_s3::test_versioning_concurrent_multi_object_delete
 test_s3::test_versioning_copy_obj_version
 test_s3::test_versioning_multi_object_delete

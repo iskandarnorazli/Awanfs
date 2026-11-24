@@ -492,3 +492,37 @@ async fn prop_no_crlf_injection_and_exact_roundtrip_plus_aws_chunked_literal_enc
 
     handle.shutdown();
 }
+
+/// ceph's `test_object_set_get_unicode_metadata`: a metadata value is read as UTF-8 when its
+/// bytes are UTF-8, else as ISO-8859-1, and GET and HEAD write it as ISO-8859-1 when every
+/// character fits, else as UTF-8. botocore sends `\xe9` as UTF-8 (0xC3 0xA9) and reads response
+/// headers as ISO-8859-1, so it must get 0xE9 back (run 44790246516 showed `Hello WorldÃ©` when
+/// the bytes were echoed). Values used to be refused with 400 ("must be valid UTF-8") or,
+/// signed, with AuthorizationHeaderMalformed.
+#[tokio::test]
+async fn non_ascii_user_metadata_bytes_come_back_as_they_were_sent() {
+    let dir = temp_dir("unicode");
+    let (_s, url, _h) = start(&dir).await;
+    let c = reqwest::Client::new();
+    assert_eq!(c.put(format!("{}/meta-bucket", url)).send().await.unwrap().status(), StatusCode::OK);
+    // (key, bytes sent, bytes GET and HEAD must answer)
+    let cases: [(&str, &[u8], &[u8]); 4] = [
+        ("botocore", "Hello World\u{e9}".as_bytes(), b"Hello World\xe9"),
+        ("latin1", b"Hello World\xe9", b"Hello World\xe9"),
+        ("beyond-latin1", "Hello \u{e9} \u{4e16}\u{754c}".as_bytes(), "Hello \u{e9} \u{4e16}\u{754c}".as_bytes()),
+        ("not-utf8", b"\xa0\xff\x80 mixed", b"\xa0\xff\x80 mixed"),
+    ];
+    for (key, value, want) in cases {
+        let v = reqwest::header::HeaderValue::from_bytes(value).unwrap();
+        let res = c.put(format!("{}/meta-bucket/{}", url, key)).header("x-amz-meta-meta1", v).body("bar").send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "PUT {}", key);
+        for head in [false, true] {
+            let req = if head { c.head(format!("{}/meta-bucket/{}", url, key)) } else { c.get(format!("{}/meta-bucket/{}", url, key)) };
+            let res = req.send().await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{} {}", if head { "HEAD" } else { "GET" }, key);
+            let got = res.headers().get("x-amz-meta-meta1").map(|v| v.as_bytes().to_vec());
+            assert_eq!(got.as_deref(), Some(want), "{} {}", if head { "HEAD" } else { "GET" }, key);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

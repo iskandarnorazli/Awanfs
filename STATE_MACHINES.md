@@ -30,9 +30,11 @@ or a test that is not in the file.
 | Lifecycle of an object under a rule | live, expired, removed | implicit | `server/src/lifecycle.rs` | lifecycle tests | none | #118 |
 | Encrypted multipart upload | key and nonce state per part | not built | | | | #121 |
 | A scheduled background task | idle, running, stopping, stopped | wired | `server/src/fsm.rs::task_step`, called by `Scheduler` in `server/src/scheduler.rs` | `task_every_pair_is_decided`, server/tests/scheduler_test.rs | none | #158 |
-| A streamed response | opening, streaming, done, aborted (read error, checksum mismatch, client gone) | wired | `server/src/fsm.rs::stream_step`, called by the reader in `server/src/stream_read.rs` | `stream_every_pair_is_decided`, `server/tests/stream_read_test.rs`, `server/tests/stream_read_disconnect_test.rs` | none: one reader per response | #155 step two |
+| A streamed response | opening, streaming, done, aborted (read error, checksum mismatch, client gone) | wired | `server/src/fsm.rs::stream_step`, called by the reader in `server/src/stream_read.rs`, which sends one segment (a large object) or one per part (a multipart object above 4 MiB, `multipart_body`) | `stream_every_pair_is_decided`, `server/tests/stream_read_test.rs`, `server/tests/stream_read_disconnect_test.rs`, `server/tests/multipart_get_reads_test.rs`, `server/tests/multipart_get_disconnect_test.rs` | none: one reader per response | #155 steps two and three |
 | Scrub of a needle | unchecked, good, bad | not built | | | none | #155 |
 | POST object form parser | preamble, part headers, part body, epilogue | not built | | | none | #119 |
+| Streamed PUT pipeline | filling, draining, failed, done | wired | `server/src/fsm.rs::pipeline_step`, called by `put_object` in `server/src/ops/object.rs` | `pipeline_every_pair_is_decided`, `server/tests/streaming_put_test.rs` | none: one pipeline per streamed PUT | #170 |
+| Streamed UploadPart pipeline | filling, draining, failed, done | wired | `server/src/fsm.rs::part_pipeline_step`, called by `upload_part` in `server/src/ops/multipart.rs` | `part_pipeline_every_pair_is_decided`, `server/tests/streaming_part_test.rs` | none: one pipeline per streamed UploadPart | #57 |
 
 Not state machines, and tested as tables instead: request classification (#148) and the
 authorization decision (#151).

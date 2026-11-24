@@ -1,0 +1,109 @@
+name: MinIO Mint
+
+# Second S3 conformance suite (#278): MinIO Mint runs real clients/SDKs against a fresh AwanFS.
+# Fails only when a test in tests/mint/passing.txt stops passing; the report lists new passes to add.
+
+on:
+  schedule:
+    - cron: "17 21 * * *"
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  mint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Does this change need the suite?
+        id: changes
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # A pull request is checked out as its merge commit: HEAD^1 is the base.
+          files=$(git diff --name-only HEAD^1 HEAD)
+          printf '%s\n' "$files"
+          if printf '%s\n' "$files" | grep -q -E '^(server/src/|server/Cargo\.(toml|lock)$|tests/mint/|\.github/workflows/mint\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "mint skipped: this pull request changes no server code, tests/mint file, or this workflow." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.changes.outputs.run == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.changes.outputs.run == 'true'
+        with:
+          workspaces: server
+      - name: Build
+        if: steps.changes.outputs.run == 'true'
+        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Start AwanFS
+        if: steps.changes.outputs.run == 'true'
+        run: bash tests/mint/start_server.sh
+      - name: Run Mint
+        id: run
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          # Pinned minio/mint:edge (2026-01-08, commit 12559d50)
+          MINT_IMAGE="minio/mint@sha256:08a05e68893c68be2a83b6f79556853ed6aa3c6c9e64c823a00853e4e55d2200"
+          echo "Mint image: $MINT_IMAGE" | tee -a "$GITHUB_STEP_SUMMARY"
+          docker rm -f mint-run >/dev/null 2>&1 || true
+          rm -rf /tmp/mint-log
+          docker run \
+            --name mint-run \
+            --network host \
+            -e SERVER_ENDPOINT=127.0.0.1:9000 \
+            -e ACCESS_KEY=AWANFSMAINKEY0000000 \
+            -e SECRET_KEY=awanfs-main-secret-for-mint-tests-0000000 \
+            -e ENABLE_HTTPS=0 \
+            -e SERVER_REGION=us-east-1 \
+            -e MINT_MODE=full \
+            -e RUN_ON_FAIL=1 \
+            "$MINT_IMAGE" || true
+          docker cp mint-run:/mint/log /tmp/mint-log
+          docker rm -f mint-run >/dev/null 2>&1 || true
+          chmod -R a+rX /tmp/mint-log
+          test -s /tmp/mint-log/log.json
+      - name: Stop AwanFS
+        if: always() && steps.changes.outputs.run == 'true'
+        run: |
+          if [ -f /tmp/awanfs-mint.pid ]; then
+            kill "$(cat /tmp/awanfs-mint.pid)" 2>/dev/null || true
+          fi
+      - name: Ratchet
+        id: ratchet
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          python3 tests/mint/test_ratchet.py
+          python3 tests/mint/ratchet.py /tmp/mint-log/log.json tests/mint/passing.txt --report /tmp/mint-report.md
+      - name: Every test removed from passing.txt has a RATCHET_LOG.md row
+        if: always() && github.event_name == 'pull_request' && steps.changes.outputs.run == 'true'
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+          python3 tests/mint/ratchet.py --check-removals "origin/${{ github.base_ref }}"
+      - name: Feature registry check
+        if: always() && steps.changes.outputs.run == 'true'
+        run: |
+          python3 scripts/test_features.py
+          python3 scripts/features.py check --mint-log /tmp/mint-log/log.json
+      - name: Summary
+        if: always() && steps.changes.outputs.run == 'true'
+        run: |
+          [ -f /tmp/mint-report.md ] && cat /tmp/mint-report.md >> "$GITHUB_STEP_SUMMARY"
+          tail -20 /tmp/awanfs-mint.log || true
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.changes.outputs.run == 'true'
+        with:
+          name: mint-results
+          path: |
+            /tmp/mint-log/
+            /tmp/mint-report.md
+            /tmp/awanfs-mint.log

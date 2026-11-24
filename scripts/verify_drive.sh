@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Drives a fresh s3-server the way a user does (aws CLI) and keeps the evidence.
-#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata restart (default: all)
+#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart (default: all)
 # Needs: a built server (cargo build --release --manifest-path server/Cargo.toml), the aws CLI, curl.
 # Evidence: verification/evidence/<UTC timestamp>/ (kept after cleanup). Exit 0 only if every journey passed.
 set -uo pipefail
@@ -152,6 +152,96 @@ j_metadata() { echo "meta-data" >"$EVID/md.bin" &&
   S3 head-object --bucket verify-bkt --key md --query CacheControl --output text | grep -qx max-age=60 &&
   S3 copy-object --bucket verify-bkt --key md --copy-source verify-bkt/md --metadata-directive REPLACE --metadata owner=bob >/dev/null &&
   S3 head-object --bucket verify-bkt --key md --query 'Metadata.owner' --output text | grep -qx bob; }
+j_bucket_tagging() { local id e1; S3 create-bucket --bucket verify-btag &&
+  ! S3 get-bucket-tagging --bucket verify-btag 2>"$EVID/bt0.err" && grep -q NoSuchTagSet "$EVID/bt0.err" &&
+  S3 put-bucket-tagging --bucket verify-btag --tagging 'TagSet=[{Key=z,Value=2},{Key=a,Value=1}]' &&
+  S3 get-bucket-tagging --bucket verify-btag --query 'TagSet[].Key' --output text | grep -qxE 'a[[:space:]]+z' &&
+  S3 get-bucket-tagging --bucket verify-btag --query 'TagSet[0].Value' --output text | grep -qx 1 &&
+  S3 get-bucket-tagging --bucket verify-btag --query 'TagSet[1].Value' --output text | grep -qx 2 &&
+  S3 delete-bucket-tagging --bucket verify-btag &&
+  ! S3 get-bucket-tagging --bucket verify-btag 2>"$EVID/bt1.err" && grep -q NoSuchTagSet "$EVID/bt1.err" &&
+  echo "mp-tag" >"$EVID/btmp.bin" &&
+  id=$(S3 create-multipart-upload --bucket verify-btag --key mp-tagged --tagging "mk1=mv1&mk2=mv2" --query UploadId --output text) &&
+  e1=$(S3 upload-part --bucket verify-btag --key mp-tagged --part-number 1 --upload-id "$id" --body "$EVID/btmp.bin" --query ETag --output text) &&
+  S3 complete-multipart-upload --bucket verify-btag --key mp-tagged --upload-id "$id" --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$e1}]}" >/dev/null &&
+  S3 head-object --bucket verify-btag --key mp-tagged --query TagCount --output text | grep -qx 2 &&
+  S3 get-object-tagging --bucket verify-btag --key mp-tagged --query 'TagSet[].Key' --output text | grep -qxE 'mk1[[:space:]]+mk2' &&
+  S3 copy-object --bucket verify-btag --key cp-keep --copy-source verify-btag/mp-tagged >/dev/null &&
+  S3 head-object --bucket verify-btag --key cp-keep --query TagCount --output text | grep -qx 2 &&
+  S3 copy-object --bucket verify-btag --key cp-rep --copy-source verify-btag/mp-tagged --tagging-directive REPLACE --tagging "cpk=cpv" >/dev/null &&
+  S3 get-object-tagging --bucket verify-btag --key cp-rep --query 'TagSet[].Key' --output text | grep -qx cpk &&
+  S3 copy-object --bucket verify-btag --key cp-clr --copy-source verify-btag/mp-tagged --tagging-directive REPLACE >/dev/null &&
+  S3 get-object-tagging --bucket verify-btag --key cp-clr --query 'length(TagSet)' --output text | grep -qx 0; }
+j_list_buckets() { local tok1 tok2;
+  S3 create-bucket --bucket verify-lb-a && S3 create-bucket --bucket verify-lb-b && S3 create-bucket --bucket verify-lb-c &&
+  tok1=$(S3 list-buckets --prefix verify-lb- --max-buckets 1 --no-paginate --query ContinuationToken --output text) &&
+  [ -n "$tok1" ] && [ "$tok1" != None ] &&
+  S3 list-buckets --prefix verify-lb- --max-buckets 1 --no-paginate --query '[Prefix, Buckets[0].Name]' --output text | grep -qxE 'verify-lb-[[:space:]]+verify-lb-a' &&
+  tok2=$(S3 list-buckets --prefix verify-lb- --max-buckets 1 --continuation-token "$tok1" --no-paginate --query ContinuationToken --output text) &&
+  [ -n "$tok2" ] && [ "$tok2" != None ] &&
+  S3 list-buckets --prefix verify-lb- --max-buckets 1 --continuation-token "$tok1" --no-paginate --query 'Buckets[0].Name' --output text | grep -qx verify-lb-b &&
+  S3 list-buckets --prefix verify-lb- --max-buckets 1 --continuation-token "$tok2" --no-paginate --query '[Buckets[0].Name, ContinuationToken]' --output text | grep -qxE 'verify-lb-c[[:space:]]+None' &&
+  [ "$(S3 list-buckets --prefix verify-lb- --page-size 1 --query 'Buckets[].Name' --output text | words)" = "verify-lb-a verify-lb-b verify-lb-c " ] &&
+  ! S3 list-buckets --continuation-token zzz --no-paginate 2>"$EVID/lb-bad.err" && grep -q InvalidArgument "$EVID/lb-bad.err"; }
+j_v1_prefix() { local p1 p2; S3 create-bucket --bucket verify-v1p && echo "v1" >"$EVID/v1p.bin" &&
+  S3 put-object --bucket verify-v1p --key "sp dir/item 1" --body "$EVID/v1p.bin" >/dev/null &&
+  p1=$(S3 list-objects --bucket verify-v1p --prefix "sp " --query '[Prefix, Contents[0].Key]' --output text) &&
+  [ "$p1" = $'sp \tsp dir/item 1' ] &&
+  p2=$(S3 list-objects --bucket verify-v1p --prefix "sp " --encoding-type url --query '[Prefix, Contents[0].Key]' --output text) &&
+  [ "$p2" = $'sp \tsp%20dir/item%201' ] &&
+  S3 list-objects-v2 --bucket verify-v1p --prefix "sp " --encoding-type url --query '[Prefix, Contents[0].Key]' --output text | grep -qxE 'sp%20[[:space:]]+sp%20dir/item%201'; }
+j_checksums_extra() { local c64 cs256 id64 out e64_1 k64_1 e64_2 k64_2 full64 p64 ids es_1 ks_1 es_2 ks_2 comps ps;
+  echo "checksum-extra-data" >"$EVID/cke.bin" &&
+  c64=$(S3 put-object --bucket verify-bkt --key ck64 --body "$EVID/cke.bin" --checksum-algorithm CRC64NVME --query ChecksumCRC64NVME --output text) &&
+  [ -n "$c64" ] && [ "$c64" != None ] &&
+  S3 head-object --bucket verify-bkt --key ck64 --checksum-mode ENABLED --query ChecksumCRC64NVME --output text | grep -qxF "$c64" &&
+  S3 get-object --bucket verify-bkt --key ck64 --checksum-mode ENABLED "$EVID/ck64.out" --query ChecksumCRC64NVME --output text | grep -qxF "$c64" &&
+  same "$EVID/cke.bin" "$EVID/ck64.out" &&
+  S3 get-object-attributes --bucket verify-bkt --key ck64 --object-attributes Checksum ObjectSize --query Checksum.ChecksumCRC64NVME --output text | grep -qxF "$c64" &&
+  cs256=$(S3 put-object --bucket verify-bkt --key ck256 --body "$EVID/cke.bin" --checksum-algorithm SHA256 --query ChecksumSHA256 --output text) &&
+  [ -n "$cs256" ] && [ "$cs256" != None ] &&
+  S3 get-object --bucket verify-bkt --key ck256 --checksum-mode ENABLED "$EVID/ck256.out" --query ChecksumSHA256 --output text | grep -qxF "$cs256" &&
+  same "$EVID/cke.bin" "$EVID/ck256.out" &&
+  head -c 5300000 /dev/urandom >"$EVID/ckp1.bin" && head -c 1000 /dev/urandom >"$EVID/ckp2.bin" &&
+  id64=$(S3 create-multipart-upload --bucket verify-bkt --key mp-ck64 --checksum-algorithm CRC64NVME --checksum-type FULL_OBJECT --query UploadId --output text) &&
+  out=$(S3 upload-part --bucket verify-bkt --key mp-ck64 --part-number 1 --upload-id "$id64" --body "$EVID/ckp1.bin" --checksum-algorithm CRC64NVME --query '[ETag, ChecksumCRC64NVME]' --output text) &&
+  e64_1=${out%%$'\t'*} && k64_1=${out#*$'\t'} && [ -n "$k64_1" ] && [ "$k64_1" != None ] &&
+  out=$(S3 upload-part --bucket verify-bkt --key mp-ck64 --part-number 2 --upload-id "$id64" --body "$EVID/ckp2.bin" --checksum-algorithm CRC64NVME --query '[ETag, ChecksumCRC64NVME]' --output text) &&
+  e64_2=${out%%$'\t'*} && k64_2=${out#*$'\t'} && [ -n "$k64_2" ] && [ "$k64_2" != None ] &&
+  full64=$(S3 complete-multipart-upload --bucket verify-bkt --key mp-ck64 --upload-id "$id64" --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$e64_1,\"ChecksumCRC64NVME\":\"$k64_1\"},{\"PartNumber\":2,\"ETag\":$e64_2,\"ChecksumCRC64NVME\":\"$k64_2\"}]}" --query ChecksumCRC64NVME --output text) &&
+  [ -n "$full64" ] && [ "$full64" != None ] &&
+  p64=$(S3 get-object --bucket verify-bkt --key mp-ck64 --part-number 1 "$EVID/mpck64-p1.out" --query '[ChecksumType, ChecksumCRC64NVME]' --output text) &&
+  [ "$p64" = $'FULL_OBJECT\t'"$k64_1" ] && same "$EVID/ckp1.bin" "$EVID/mpck64-p1.out" &&
+  ids=$(S3 create-multipart-upload --bucket verify-bkt --key mp-ck256 --checksum-algorithm SHA256 --checksum-type COMPOSITE --query UploadId --output text) &&
+  out=$(S3 upload-part --bucket verify-bkt --key mp-ck256 --part-number 1 --upload-id "$ids" --body "$EVID/ckp1.bin" --checksum-algorithm SHA256 --query '[ETag, ChecksumSHA256]' --output text) &&
+  es_1=${out%%$'\t'*} && ks_1=${out#*$'\t'} && [ -n "$ks_1" ] && [ "$ks_1" != None ] &&
+  out=$(S3 upload-part --bucket verify-bkt --key mp-ck256 --part-number 2 --upload-id "$ids" --body "$EVID/ckp2.bin" --checksum-algorithm SHA256 --query '[ETag, ChecksumSHA256]' --output text) &&
+  es_2=${out%%$'\t'*} && ks_2=${out#*$'\t'} && [ -n "$ks_2" ] && [ "$ks_2" != None ] &&
+  comps=$(S3 complete-multipart-upload --bucket verify-bkt --key mp-ck256 --upload-id "$ids" --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$es_1,\"ChecksumSHA256\":\"$ks_1\"},{\"PartNumber\":2,\"ETag\":$es_2,\"ChecksumSHA256\":\"$ks_2\"}]}" --query ChecksumSHA256 --output text) &&
+  [[ "$comps" == *-2 ]] &&
+  ps=$(S3 get-object --bucket verify-bkt --key mp-ck256 --part-number 1 "$EVID/mpck256-p1.out" --query '[ChecksumType, ChecksumSHA256]' --output text) &&
+  [ "$ps" = $'COMPOSITE\t'"$ks_1" ] && same "$EVID/ckp1.bin" "$EVID/mpck256-p1.out" &&
+  ! S3 put-object --bucket verify-bkt --key ck-bad64 --body "$EVID/cke.bin" --checksum-crc64-nvme AAAA 2>"$EVID/ckbad1.err" && grep -q BadDigest "$EVID/ckbad1.err" &&
+  ! S3 put-object --bucket verify-bkt --key ck-bad256 --body "$EVID/cke.bin" --checksum-sha256 bad! 2>"$EVID/ckbad2.err" && grep -q BadDigest "$EVID/ckbad2.err"; }
+j_suspended() { local v1 vid_buf vid_strm; S3 create-bucket --bucket verify-susp &&
+  S3 put-bucket-versioning --bucket verify-susp --versioning-configuration Status=Enabled &&
+  echo "v1-data" >"$EVID/susp-v1.bin" && echo "v2-data" >"$EVID/susp-v2.bin" &&
+  head -c 4300000 /dev/urandom >"$EVID/susp-big.bin" &&
+  v1=$(S3 put-object --bucket verify-susp --key k --body "$EVID/susp-v1.bin" --query VersionId --output text) &&
+  [ -n "$v1" ] && [ "$v1" != None ] && [ "$v1" != null ] &&
+  S3 put-bucket-versioning --bucket verify-susp --versioning-configuration Status=Suspended &&
+  S3 get-bucket-versioning --bucket verify-susp --query Status --output text | grep -qx Suspended &&
+  vid_buf=$(S3 put-object --bucket verify-susp --key k --body "$EVID/susp-v2.bin" --query VersionId --output text) &&
+  [ "$vid_buf" = None ] &&
+  vid_strm=$(S3 put-object --bucket verify-susp --key k-big --body "$EVID/susp-big.bin" --query VersionId --output text) &&
+  [ "$vid_strm" = None ] &&
+  S3 head-object --bucket verify-susp --key k --query VersionId --output text | grep -qx null &&
+  S3 get-object --bucket verify-susp --key k "$EVID/susp-k.out" --query VersionId --output text | grep -qx null &&
+  same "$EVID/susp-v2.bin" "$EVID/susp-k.out" &&
+  S3 get-object --bucket verify-susp --key k --version-id "$v1" "$EVID/susp-v1.out" --query VersionId --output text | grep -qxF "$v1" &&
+  same "$EVID/susp-v1.bin" "$EVID/susp-v1.out" &&
+  S3 list-object-versions --bucket verify-susp --query 'length(Versions)' --output text | grep -qx 3 &&
+  S3 list-object-versions --bucket verify-susp --query 'Versions[].VersionId' --output text | tr '\t' '\n' | grep -cx null | grep -qx 2; }
 j_restart() { local id e1 e2 a; echo "survives" >"$EVID/s.bin" && S3 put-object --bucket verify-bkt --key s --body "$EVID/s.bin" >/dev/null &&
   S3 put-object --bucket verify-bkt --key s-gone --body "$EVID/s.bin" >/dev/null && S3 delete-object --bucket verify-bkt --key s-gone &&
   head -c 5300000 /dev/urandom >"$EVID/sp1" && head -c 700 /dev/urandom >"$EVID/sp2" &&
@@ -169,6 +259,28 @@ j_restart() { local id e1 e2 a; echo "survives" >"$EVID/s.bin" && S3 put-object 
   S3 get-bucket-versioning --bucket verify-rv --query Status --output text | grep -qx Enabled &&
   S3 get-object --bucket verify-rv --key k --version-id "$a" "$EVID/srv.out" >/dev/null && same "$EVID/s.bin" "$EVID/srv.out" &&
   S3 head-bucket --bucket verify-bkt; }
+j_quickstart() { local qd qpid; qd="$EVID/qs" && mkdir -p "$qd/server/target/release" && ln -sfn "$BIN" "$qd/server/target/release/s3-server" && (
+  cd "$qd" || exit 1
+  qpid=""
+  cleanup_qs() { [ -n "${qpid:-}" ] && kill "$qpid" 2>/dev/null || true; [ -n "${qpid:-}" ] && wait "$qpid" 2>/dev/null || true; }
+  trap cleanup_qs EXIT
+  AWANFS_ACCESS_KEY=s3admin AWANFS_SECRET_KEY=s3secret \
+    ./server/target/release/s3-server --port 9000 --data-dir ./s3-data >"$EVID/quickstart-server.log" 2>&1 &
+  qpid=$!
+  for _ in $(seq 1 100); do curl -sf http://127.0.0.1:9000/_awanfs/health/ready >/dev/null && break; sleep 0.1; done
+  curl -sf http://127.0.0.1:9000/_awanfs/health/ready >/dev/null || exit 1
+  export AWS_ACCESS_KEY_ID=s3admin
+  export AWS_SECRET_ACCESS_KEY=s3secret
+  export AWS_DEFAULT_REGION=us-east-1
+  echo "hello awanfs" > hello.txt &&
+    aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://quickstart-bkt &&
+    aws --endpoint-url http://127.0.0.1:9000 s3 cp hello.txt s3://quickstart-bkt/hello.txt &&
+    aws --endpoint-url http://127.0.0.1:9000 s3 ls s3://quickstart-bkt/ | grep -q "hello.txt" &&
+    aws --endpoint-url http://127.0.0.1:9000 s3 cp s3://quickstart-bkt/hello.txt hello.out &&
+    cmp -s hello.txt hello.out &&
+    aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://quickstart-bkt/hello.txt &&
+    aws --endpoint-url http://127.0.0.1:9000 s3 rb s3://quickstart-bkt
+); }
 
 # Refuse to run a journey whose && chain is split by a `local x;` (see the note above md5q).
 masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:]]+local [^;]*;|&& *local ' || true)
@@ -176,7 +288,7 @@ masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:
 
 start || exit 1
 check doctor doctor
-features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata restart)
+features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart)
 [[ " ${features[*]} " == *" buckets "* ]] || check buckets j_buckets
 for f in "${features[@]}"; do check "$f" "j_$f"; done
 ls -la "$DATA" >"$EVID/data-dir.txt" 2>&1

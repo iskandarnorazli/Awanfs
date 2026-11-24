@@ -1,8 +1,8 @@
-"""Report for #207: redb against the segment prototype, from meta_index_bench's JSON lines.
+"""Report for #207 and #26: redb against the segment stores, from meta_index_bench's JSON lines.
 
     python benchmarks/meta_index_report.py results.jsonl --report meta_index.md
 
-Exit 0 when both stores answered every query the same and without a wrong answer, 1 when they
+Exit 0 when every store answered every query the same and without a wrong answer, 1 when they
 did not (the comparison means nothing then), 2 when a phase is missing.
 """
 
@@ -27,16 +27,25 @@ ROWS = [
 ]
 
 
+WRITER_ROWS = [
+    ("puts_per_s", "inserts per second, {n} writers at once"),
+    ("put_p50_us", "put P50 with {n} writers, us"),
+    ("put_p99_us", "put P99 with {n} writers, us"),
+    ("put_p999_us", "put P99.9 with {n} writers, us"),
+    ("flushes", "flushes with {n} writers"),
+]
+
+
 def load(lines):
-    """{(store, phase): record}; a later line for the same pair wins (a warm run after a cold one
-    is given a different phase name by the workflow)."""
+    """{(store, phase): record} or {(store, 'writers', count): record}; a later line wins."""
     out = {}
     for line in lines:
         line = line.strip()
         if not line.startswith("{"):
             continue
         r = json.loads(line)
-        out[(r["store"], r["phase"])] = r
+        key = (r["store"], "writers", r.get("writers")) if r["phase"] == "writers" else (r["store"], r["phase"])
+        out[key] = r
     return out
 
 
@@ -48,24 +57,44 @@ def fmt(v):
     return f"{v:,}"
 
 
+NAMES = {"redb": "redb (the spill index before #26 stage 6)", "seg": "segments (#207 prototype)", "prod": "segments (production, #26)"}
+
+
 def report(recs, title):
-    missing = [(s, p) for s in ("redb", "seg") for p in ("build", "query") if (s, p) not in recs]
+    """redb and at least one segment store must have both phases; every store present must give
+    the same answers hash and no wrong answer."""
+    stores = [s for s in ("redb", "seg", "prod") if (s, "build") in recs or (s, "query") in recs]
+    missing = [(s, p) for s in stores for p in ("build", "query") if (s, p) not in recs]
+    if "redb" not in stores:
+        missing.append(("redb", "build"))
+    if len(stores) < 2:
+        missing.append(("seg or prod", "build"))
     if missing:
         return 2, f"missing phases: {missing}\n"
-    q = {s: recs[(s, "query")] for s in ("redb", "seg")}
-    lines = [f"## {title}", "", "| | redb (AwanFS's spill index) | segments (prototype) |", "|---|---|---|"]
+    q = {s: recs[(s, "query")] for s in stores}
+    lines = [f"## {title}", "", "| | " + " | ".join(NAMES[s] for s in stores) + " |", "|---|" + "---|" * len(stores)]
     for phase, field, label in ROWS:
-        lines.append(f"| {label} | {fmt(recs[('redb', phase)].get(field))} | {fmt(recs[('seg', phase)].get(field))} |")
-    for phase in ("query_cold",):
-        if ("redb", phase) in recs and ("seg", phase) in recs:
-            lines.append(f"| open time after dropping the page cache, s | {fmt(recs[('redb', phase)].get('open_secs'))} | {fmt(recs[('seg', phase)].get('open_secs'))} |")
-            lines.append(f"| get P50 after dropping the page cache, us | {fmt(recs[('redb', phase)].get('get_p50_us'))} | {fmt(recs[('seg', phase)].get('get_p50_us'))} |")
-    same = q["redb"]["answers"] == q["seg"]["answers"]
-    wrong = q["redb"]["wrong"] + q["seg"]["wrong"]
-    lines += ["", "redb as AwanFS uses it today is cleared at every boot and rebuilt from the volumes, so its"
+        lines.append(f"| {label} | " + " | ".join(fmt(recs[(s, phase)].get(field)) for s in stores) + " |")
+    if all((s, "query_cold") in recs for s in stores):
+        for field, label in (("open_secs", "open time after dropping the page cache, s"), ("get_p50_us", "get P50 after dropping the page cache, us")):
+            lines.append(f"| {label} | " + " | ".join(fmt(recs[(s, "query_cold")].get(field)) for s in stores) + " |")
+    writer_counts = sorted(
+        {k[2] for k in recs if len(k) == 3 and k[1] == "writers" and k[0] in stores},
+        key=lambda n: (n is None, n),
+    )
+    for n in writer_counts:
+        for field, label in WRITER_ROWS:
+            lines.append(
+                f"| {label.format(n=n)} | "
+                + " | ".join(fmt(recs[(s, "writers", n)].get(field)) if (s, "writers", n) in recs else "not measured" for s in stores)
+                + " |"
+            )
+    same = len({q[s]["answers"] for s in stores}) == 1
+    wrong = sum(q[s]["wrong"] for s in stores)
+    lines += ["", "redb as AwanFS used it is cleared at every boot and rebuilt from the volumes, so its"
               " boot cost is its build time, not its open time; the segments' open time is a boot from the"
-              " checkpoint #26 would keep.", "", f"Keys: {q['seg']['keys']:,}. Answers hash: redb {q['redb']['answers']}, segments {q['seg']['answers']}: "
-              + ("the same." if same else "DIFFERENT."), f"Wrong answers: {wrong}."]
+              " checkpoint #26 keeps.", "", f"Keys: {q[stores[0]]['keys']:,}. Answers hash: "
+              + ", ".join(f"{s} {q[s]['answers']}" for s in stores) + ": " + ("the same." if same else "DIFFERENT."), f"Wrong answers: {wrong}."]
     return (0 if same and wrong == 0 else 1), "\n".join(lines) + "\n"
 
 

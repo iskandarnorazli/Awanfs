@@ -22,7 +22,13 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from run_warp_benchmark import get_free_port, get_process_peak_rss_mb, run_workload_phase  # noqa: E402
+from run_warp_benchmark import (  # noqa: E402
+    PeakRssSampler,
+    get_free_port,
+    get_process_peak_rss_mb,
+    parse_proc_status,
+    run_workload_phase,
+)
 
 from ratio_check import wait_port  # noqa: E402
 
@@ -51,59 +57,46 @@ def start_server(server_bin: str, budget: str, data_dir: str, env_extra=None) ->
 
 def parse_status(text: str) -> dict:
     """RssAnon, RssFile and RssShmem in MiB from the text of /proc/<pid>/status (Linux)."""
-    out = {}
-    for line in text.splitlines():
-        name, _, rest = line.partition(":")
-        if name in ("RssAnon", "RssFile", "RssShmem"):
-            fields = rest.split()
-            if len(fields) == 2 and fields[1] == "kB" and fields[0].isdigit():
-                out[name] = int(fields[0]) / 1024.0
-    return out
+    return {k: v for k, v in parse_proc_status(text).items() if k in ("RssAnon", "RssFile", "RssShmem")}
 
 
-class RssSplit:
-    """The highest RssAnon (heap) and RssFile (pages of mapped files, here the volume mapping)
-    seen while a phase runs. Peak RSS (VmHWM) has no per-kind peak, so this samples. On a
-    platform without /proc both stay None and the report says "not measured" (#127: the owner
-    asked for this split before deciding what the budget covers)."""
+class RssSplit(PeakRssSampler):
+    """The highest split memory seen while a phase runs:
+    - Linux: RssAnon (heap) and RssFile (pages of mapped files) from /proc/<pid>/status.
+    - Windows: private and wset from psutil memory_full_info() (or Win32 PROCESS_MEMORY_COUNTERS_EX).
+    Fields stay None when unavailable and the report says "not measured"."""
 
-    def __init__(self, pid: int, every: float = 0.05):
-        self.path = f"/proc/{pid}/status"
-        self.every = every
-        self.anon = None
-        self.file = None
-        self._stop = None
-        self._thread = None
+    @property
+    def anon(self):
+        return self.rss_anon_mb
 
-    def sample(self) -> None:
-        try:
-            with open(self.path, encoding="ascii") as fh:
-                got = parse_status(fh.read())
-        except OSError:
-            return
-        if "RssAnon" in got:
-            self.anon = max(self.anon or 0.0, got["RssAnon"])
-        if "RssFile" in got:
-            self.file = max(self.file or 0.0, got["RssFile"])
+    @anon.setter
+    def anon(self, val):
+        self.rss_anon_mb = val
 
-    def __enter__(self):
-        import threading
-        self.sample()
-        self._stop = threading.Event()
+    @property
+    def file(self):
+        return self.rss_file_mb
 
-        def loop():
-            while not self._stop.wait(self.every):
-                self.sample()
+    @file.setter
+    def file(self, val):
+        self.rss_file_mb = val
 
-        self._thread = threading.Thread(target=loop, daemon=True)
-        self._thread.start()
-        return self
+    @property
+    def private(self):
+        return self.win_private_mb
 
-    def __exit__(self, *exc):
-        self._stop.set()
-        self._thread.join(timeout=5)
-        self.sample()
-        return False
+    @private.setter
+    def private(self, val):
+        self.win_private_mb = val
+
+    @property
+    def wset(self):
+        return self.win_wset_mb
+
+    @wset.setter
+    def wset(self, val):
+        self.win_wset_mb = val
 
 
 def server_env(pairs) -> dict:
@@ -219,6 +212,81 @@ def create_bucket(port: int, bucket: str) -> None:
         sys.exit(f"could not create bucket {bucket}: HTTP {resp.status}")
 
 
+def _detect_split_kind(rows) -> str:
+    for row in rows:
+        anon, filep = row[5], row[6]
+        if anon is not None or filep is not None:
+            return "linux"
+        if len(row) >= 10 and (row[8] is not None or row[9] is not None):
+            return "windows"
+    return "windows" if sys.platform == "win32" else "linux"
+
+
+def format_report(
+    cmd: str,
+    budget: str,
+    budget_mib: float,
+    overhead: float,
+    rows: list,
+    peak: float,
+    seen_env: dict,
+    size_bytes: int,
+    split_kind: "str | None" = None,
+    now=None,
+    env_extra: "dict | None" = None,
+) -> str:
+    ceiling = ceiling_mib(budget_mib, overhead)
+    result, reasons = verdict(rows, peak, budget_mib, overhead, size_bytes)
+    kind = split_kind or _detect_split_kind(rows)
+    if kind == "windows":
+        header = ("| phase | MiB/s | ops/s | P99 ms | peak RSS MiB | "
+                  "peak private bytes (private) MiB | peak working set (wset) MiB | "
+                  "payload cache MiB | private less cache MiB |")
+    else:
+        header = ("| phase | MiB/s | ops/s | P99 ms | peak RSS MiB | "
+                  "peak heap (RssAnon) MiB | peak file pages (RssFile) MiB | "
+                  "payload cache MiB | heap less cache MiB |")
+    asked = env_extra if env_extra is not None else seen_env
+    lines = [
+        f"Command: `{cmd}`",
+        "",
+        f"# Does --memory-budget {budget} hold? ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(now))})",
+        "",
+        f"Machine: {platform.node()} ({platform.platform()}, {os.cpu_count()} CPUs).",
+        "",
+        "Server environment: " + ("; ".join(
+            f"{k}={v} asked, the server's own environment has "
+            f"{'not measured' if seen_env.get(k) is None else seen_env[k]}"
+            for k, v in asked.items()) or "nothing extra") + ".",
+        "",
+        header,
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        mode, mib, ops, p99, rss, anon, filep, cache = row[:8]
+        private = row[8] if len(row) > 8 else None
+        wset = row[9] if len(row) > 9 else None
+        if kind == "windows":
+            c1, c2 = private, wset
+        else:
+            c1, c2 = anon, filep
+        rest = None if c1 is None or cache is None else c1 - cache
+        lines.append(f"| {mode} | {mib:.2f} | {ops:.1f} | {p99:.2f} | {mib_or_nm(rss)} | {mib_or_nm(c1)} | {mib_or_nm(c2)} "
+                     f"| {mib_or_nm(cache)} | {mib_or_nm(rest)} |")
+    lines += [
+        "",
+        f"Peak RSS {peak:.1f} MiB against a ceiling of {ceiling:.1f} MiB "
+        f"(budget {budget_mib:.0f} + overhead {overhead:.0f}): **{result}**."
+        + ("".join(f"\n- {r}" for r in reasons)),
+        "",
+        "The budget bounds the payload cache and the bytes in-flight request bodies hold. The "
+        "overhead above it is the binary, the runtime, the resident pages of the volume mapping "
+        "and the index.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     a = build_parser().parse_args(argv)
 
@@ -234,47 +302,18 @@ def main(argv=None) -> int:
                 m = run_workload_phase("127.0.0.1", port, "budget", SIZES[a.size], a.concurrency,
                                        a.duration, mode, server_pid=proc.pid,
                                        unique_keys=(a.unique_keys and mode == "put"))
-            peak = max(peak, get_process_peak_rss_mb(proc.pid))
-            rows.append((mode, m.mib_per_sec, m.ops_per_sec, m.p99_ms, peak, split.anon, split.file, cache_mib(port)))
+            peak = max(peak, get_process_peak_rss_mb(proc.pid), split.peak_rss_mb or 0.0)
+            rows.append((mode, m.mib_per_sec, m.ops_per_sec, m.p99_ms, peak,
+                         split.anon, split.file, cache_mib(port), split.private, split.wset))
     finally:
         proc.kill()
         proc.wait()
 
-    ceiling = ceiling_mib(a.budget_mib, a.overhead)
     result, reasons = verdict(rows, peak, a.budget_mib, a.overhead, SIZES[a.size])
     cmd = (f"python benchmarks/budget_rss.py --budget {a.budget} --concurrency {a.concurrency} "
            f"--size {a.size} --duration {a.duration} --overhead {a.overhead}"
            + (" --unique-keys" if a.unique_keys else ""))
-    lines = [
-        f"Command: `{cmd}`",
-        "",
-        f"# Does --memory-budget {a.budget} hold? ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
-        "",
-        f"Machine: {platform.node()} ({platform.platform()}, {os.cpu_count()} CPUs).",
-        "",
-        "Server environment: " + ("; ".join(
-            f"{k}={v} asked, the server's own environment has {'not measured' if seen_env[k] is None else seen_env[k]}"
-            for k, v in env_extra.items()) or "nothing extra") + ".",
-        "",
-        "| phase | MiB/s | ops/s | P99 ms | peak RSS MiB | peak heap (RssAnon) MiB | peak file pages (RssFile) MiB | payload cache MiB | heap less cache MiB |",
-        "|---|---|---|---|---|---|---|---|---|",
-    ]
-    for mode, mib, ops, p99, rss, anon, filep, cache in rows:
-        rest = None if anon is None or cache is None else anon - cache
-        lines.append(f"| {mode} | {mib:.2f} | {ops:.1f} | {p99:.2f} | {rss:.1f} | {mib_or_nm(anon)} | {mib_or_nm(filep)} "
-                     f"| {mib_or_nm(cache)} | {mib_or_nm(rest)} |")
-    lines += [
-        "",
-        f"Peak RSS {peak:.1f} MiB against a ceiling of {ceiling:.1f} MiB "
-        f"(budget {a.budget_mib:.0f} + overhead {a.overhead:.0f}): **{result}**."
-        + ("".join(f"\n- {r}" for r in reasons)),
-        "",
-        "The budget bounds the payload cache and the bytes in-flight request bodies hold. The "
-        "overhead above it is the binary, the runtime, the resident pages of the volume mapping "
-        "and the index.",
-        "",
-    ]
-    report = "\n".join(lines)
+    report = format_report(cmd, a.budget, a.budget_mib, a.overhead, rows, peak, seen_env, SIZES[a.size], env_extra=env_extra)
     print(report)
     if a.report:
         with open(a.report, "w", encoding="utf-8") as fh:
