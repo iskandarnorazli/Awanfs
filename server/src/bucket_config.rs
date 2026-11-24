@@ -987,47 +987,8 @@ pub fn base64_encode(input: &[u8]) -> String {
 }
 
 pub fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
-    let bytes = input.as_bytes();
-    if bytes.len() % 4 != 0 {
-        return Err(());
-    }
-    if bytes.is_empty() {
+    if input.is_empty() {
         return Ok(Vec::new());
     }
-    let val = |c: u8| -> Result<u8, ()> {
-        match c {
-            b'A'..=b'Z' => Ok(c - b'A'),
-            b'a'..=b'z' => Ok(c - b'a' + 26),
-            b'0'..=b'9' => Ok(c - b'0' + 52),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            _ => Err(()),
-        }
-    };
-    let mut out = Vec::with_capacity((bytes.len() / 4) * 3);
-    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
-        let is_last = (i + 1) * 4 == bytes.len();
-        let a = val(chunk[0])?;
-        let b = val(chunk[1])?;
-        if chunk[2] == b'=' {
-            if !is_last || chunk[3] != b'=' {
-                return Err(());
-            }
-            out.push((a << 2) | (b >> 4));
-        } else if chunk[3] == b'=' {
-            if !is_last {
-                return Err(());
-            }
-            let c = val(chunk[2])?;
-            out.push((a << 2) | (b >> 4));
-            out.push((b << 4) | (c >> 2));
-        } else {
-            let c = val(chunk[2])?;
-            let d = val(chunk[3])?;
-            out.push((a << 2) | (b >> 4));
-            out.push((b << 4) | (c >> 2));
-            out.push((c << 6) | d);
-        }
-    }
-    Ok(out)
+    crate::checksum::base64_decode(input).ok_or(())
 }

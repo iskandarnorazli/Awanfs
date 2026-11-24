@@ -9,6 +9,8 @@ on:
   pull_request:
     paths:
       - "server/src/auth.rs"
+      - "server/src/bucket_config.rs"
+      - "server/src/checksum.rs"
       - "server/src/sigv4.rs"
       - "server/src/aws_chunked.rs"
       - "server/src/lifecycle.rs"

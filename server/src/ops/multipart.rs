@@ -265,7 +265,7 @@ pub async fn upload_part(
                 .unwrap());
         }
         enum PartMsg {
-            Data(Vec<u8>),
+            Data(crate::work::InflightBuf),
             Finish,
         }
         enum PipelineFailure {
@@ -278,8 +278,9 @@ pub async fn upload_part(
         const PART_COALESCE: usize = crate::multipart::PART_CHUNK;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<PartMsg>(2);
         let mut tx = Some(tx);
-        let (recycle_tx, mut recycle_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
-        let _ = recycle_tx.try_send(Vec::with_capacity(PART_COALESCE));
+        let (recycle_tx, recycle_rx) = tokio::sync::mpsc::channel::<crate::work::InflightBuf>(2);
+        let mut recycle_rx = Some(recycle_rx);
+        let _ = recycle_tx.try_send(crate::work::InflightBuf::with_capacity(&state.work, PART_COALESCE));
         let mp_for_task = Arc::clone(&state.multipart);
         let uid_for_task = upload_id.to_string();
         let mut writer_task = Some(tokio::task::spawn_blocking(
@@ -327,7 +328,7 @@ pub async fn upload_part(
             })
         });
         let idle_timeout = state.body_idle_timeout();
-        let mut cur_buf = Vec::with_capacity(PART_COALESCE);
+        let mut cur_buf = crate::work::InflightBuf::with_capacity(&state.work, PART_COALESCE);
         let mut total_fed: u64 = 0;
         let mut pipe_state = crate::fsm::PartPipelineState::Filling;
         let mut failure: Option<PipelineFailure> = None;
@@ -342,7 +343,7 @@ pub async fn upload_part(
                                 if let Some(h) = sha.as_mut() {
                                     h.update(&data);
                                 }
-                                let mut ready: Vec<Vec<u8>> = Vec::new();
+                                let mut ready: Vec<crate::work::InflightBuf> = Vec::new();
                                 let fed = {
                                     let mut sink = |d: &[u8]| -> Result<(), String> {
                                         if total_fed + d.len() as u64 > len {
@@ -362,8 +363,11 @@ pub async fn upload_part(
                                             rem = &rem[take..];
                                             if cur_buf.len() == PART_COALESCE {
                                                 let next_buf = recycle_rx
-                                                    .try_recv()
-                                                    .unwrap_or_else(|_| Vec::with_capacity(PART_COALESCE));
+                                                    .as_mut()
+                                                    .and_then(|rx| rx.try_recv().ok())
+                                                    .unwrap_or_else(|| {
+                                                        crate::work::InflightBuf::with_capacity(&state.work, PART_COALESCE)
+                                                    });
                                                 ready.push(std::mem::replace(&mut cur_buf, next_buf));
                                             }
                                         }
@@ -485,12 +489,14 @@ pub async fn upload_part(
                             let sent_tail = if !cur_buf.is_empty() {
                                 sender.send(PartMsg::Data(std::mem::take(&mut cur_buf))).await.is_ok()
                             } else {
+                                drop(std::mem::take(&mut cur_buf));
                                 true
                             };
                             if sent_tail {
                                 let _ = sender.send(PartMsg::Finish).await;
                             }
                         }
+                        drop(recycle_rx.take());
                         match writer_task.take().expect("part writer task present").await {
                             Ok(Ok(Some(p))) => {
                                 staged_path = Some(p);
@@ -524,6 +530,8 @@ pub async fn upload_part(
                 }
                 crate::fsm::PartPipelineState::Failed => {
                     drop(tx.take());
+                    drop(recycle_rx.take());
+                    drop(std::mem::take(&mut cur_buf));
                     if let Some(t) = writer_task.take() {
                         let _ = t.await;
                     }

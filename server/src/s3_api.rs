@@ -4,7 +4,7 @@
 
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
-use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HOST, LAST_MODIFIED};
+use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST};
 use hyper::{Method, Request, Response, StatusCode};
 use md5::{Digest, Md5};
 use parking_lot::RwLock;
@@ -1508,7 +1508,7 @@ impl S3ServiceState {
         drop(old);
         report.volume_removed = std::fs::remove_file(dir.join(format!("volume_{:04}.dat", old_id))).is_ok();
         let _ = std::fs::remove_file(dir.join(format!("volume_{:04}.idx", old_id)));
-        let _ = self.total_volume_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| Some(t.saturating_sub(reclaimed)));
+        let _ = self.total_volume_bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |t| Some(t.saturating_sub(reclaimed)));
         self.tombstone_bytes.store(0, Ordering::Relaxed);
         Ok(report)
     }

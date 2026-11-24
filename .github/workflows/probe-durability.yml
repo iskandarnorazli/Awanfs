@@ -1,0 +1,140 @@
+name: Durability probe
+
+# benchmarks/durability_probe.py: counts each default server's sync calls and O_DSYNC/O_SYNC
+# opens per 64 KiB PUT under strace on Linux, plus an un-straced 64 KiB PUT throughput pass (#334).
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "benchmarks/durability_probe.py"
+      - "benchmarks/test_durability_probe.py"
+      - ".github/workflows/probe-durability.yml"
+
+permissions:
+  contents: read
+
+env:
+  MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+  RUSTFS_TAG: 1.0.5
+
+jobs:
+  probe:
+    name: Durability probe (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Build s3-server (--release)
+        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+
+      - uses: actions/cache@v4
+        id: tools
+        with:
+          path: |
+            .tmp/minio
+            .tmp/rustfs
+          key: bench-tools-${{ runner.os }}-${{ env.MINIO_RELEASE }}-rustfs-${{ env.RUSTFS_TAG }}-v1
+      - name: Fetch pinned MinIO and mc binaries if missing
+        id: fetch-minio
+        run: |
+          if [ ! -x .tmp/minio/minio ] || [ ! -x .tmp/minio/mc ]; then
+            python3 -c "import sys; sys.path.insert(0, 'benchmarks'); import core_scaling as cs; cs.ensure_minio_binaries(None, None, auto_fetch=True)" || true
+          fi
+          if [ -x .tmp/minio/minio ] && [ -x .tmp/minio/mc ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-go@v5
+        if: steps.fetch-minio.outputs.ready != 'true'
+        with:
+          go-version: stable
+          cache: false
+      - name: Build MinIO and mc from source if still missing
+        if: steps.fetch-minio.outputs.ready != 'true'
+        run: |
+          if [ -x .tmp/minio/minio ] && [ -x .tmp/minio/mc ]; then
+            exit 0
+          fi
+          mkdir -p .tmp/minio
+          if [ ! -x .tmp/minio/minio ]; then
+            git clone -q --depth 1 --branch "$MINIO_RELEASE" https://github.com/minio/minio "$RUNNER_TEMP/minio-src"
+            (cd "$RUNNER_TEMP/minio-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/minio" .)
+          fi
+          if [ ! -x .tmp/minio/mc ]; then
+            git clone -q --depth 1 https://github.com/minio/mc "$RUNNER_TEMP/mc-src"
+            (cd "$RUNNER_TEMP/mc-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/mc" .)
+          fi
+      - name: Download RustFS release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -x .tmp/rustfs/rustfs ]; then
+            exit 0
+          fi
+          mkdir -p .tmp/rustfs "$RUNNER_TEMP/rustfs-dl"
+          tag=""
+          for t in "$RUSTFS_TAG" "v$RUSTFS_TAG"; do
+            if gh release view "$t" -R rustfs/rustfs >/dev/null 2>&1; then tag="$t"; break; fi
+          done
+          if [ -z "$tag" ]; then echo "::error::RustFS release $RUSTFS_TAG not found"; exit 1; fi
+          asset=$(gh release view "$tag" -R rustfs/rustfs --json assets --jq '.assets[].name' | grep -Ei 'linux.*(x86_64|amd64).*\.zip$' | grep -vi musl | head -1)
+          [ -z "$asset" ] && asset=$(gh release view "$tag" -R rustfs/rustfs --json assets --jq '.assets[].name' | grep -Ei 'linux.*(x86_64|amd64).*\.zip$' | head -1)
+          if [ -z "$asset" ]; then echo "::error::no Linux x86_64 RustFS asset in $tag"; exit 1; fi
+          gh release download "$tag" -R rustfs/rustfs -p "$asset" -D "$RUNNER_TEMP/rustfs-dl"
+          (cd "$RUNNER_TEMP/rustfs-dl" && unzip -q -o "$asset")
+          found=$(find "$RUNNER_TEMP/rustfs-dl" -type f -name "rustfs" | head -1)
+          if [ -z "$found" ]; then echo "::error::rustfs not found in $asset"; exit 1; fi
+          cp "$found" ".tmp/rustfs/rustfs"
+          chmod +x ".tmp/rustfs/rustfs"
+
+      - name: Install strace and check tool versions
+        run: |
+          command -v strace >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y strace)
+          strace -V | head -1
+          ./server/target/release/s3-server --version || true
+          .tmp/minio/minio --version | head -1
+          .tmp/minio/mc --version | head -1
+          .tmp/rustfs/rustfs --version | head -1
+
+      - name: Durability probe self-tests
+        run: python3 benchmarks/test_durability_probe.py
+
+      - name: Run durability probe (strace + 64-worker PUT throughput)
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          rm -f "$RUNNER_TEMP/durability_probe.md"
+          sudo -E env "PATH=$PATH" python3 -u benchmarks/durability_probe.py \
+            --server-bin server/target/release/s3-server \
+            --minio-bin .tmp/minio/minio \
+            --mc-bin .tmp/minio/mc \
+            --rustfs-bin .tmp/rustfs/rustfs \
+            --data-dir "$RUNNER_TEMP" \
+            --run-id "${{ github.run_id }}" \
+            --output $RUNNER_TEMP/durability_probe.md
+
+      - name: Write job summary
+        if: always()
+        run: |
+          if [ -s "$RUNNER_TEMP/durability_probe.md" ]; then
+            cat "$RUNNER_TEMP/durability_probe.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Durability probe produced no report." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: durability-probe
+          path: ${{ runner.temp }}/durability_probe.md
+          if-no-files-found: warn

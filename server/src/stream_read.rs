@@ -274,19 +274,22 @@ fn read_into(job: Job, tx: tokio::sync::mpsc::Sender<std::io::Result<Bytes>>) {
         }
         let checksum_ok = seg.verify.is_none_or(|want| want == crc);
         if !checksum_ok {
+            state = step(state, StreamEvent::End { checksum_ok });
+            debug_assert_eq!(state, StreamState::Aborted(StreamAbort::ChecksumMismatch));
             job.failures.fetch_add(1, Ordering::SeqCst);
             tracing::error!(object = %job.what, expected = seg.verify.unwrap_or(0), actual = crc, "payload checksum mismatch while sending; the transfer is cut");
-            let _ = stream_step(state, StreamEvent::End { checksum_ok });
             let _ = tx.blocking_send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "the object's bytes failed their checksum")));
             return;
         }
     }
     if let Some(last) = held {
         if tx.blocking_send(Ok(last)).is_err() {
-            let _ = stream_step(state, StreamEvent::ClientGone);
+            state = step(state, StreamEvent::ClientGone);
+            debug_assert_eq!(state, StreamState::Aborted(StreamAbort::ClientGone));
             return;
         }
         state = step(state, StreamEvent::Chunk);
     }
-    let _ = stream_step(state, StreamEvent::End { checksum_ok: true });
+    state = step(state, StreamEvent::End { checksum_ok: true });
+    debug_assert_eq!(state, StreamState::Done);
 }

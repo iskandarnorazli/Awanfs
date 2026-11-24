@@ -16,6 +16,7 @@ on:
       - "benchmarks/put_path_probe.py"
       - "benchmarks/large_volume_probe.py"
       - "benchmarks/test_large_volume_probe.py"
+      - "server/examples/bare_listeners.rs"
       - "server/tests/commit_cost_probe.rs"
       - ".github/workflows/probe-sync.yml"
 
@@ -62,6 +63,10 @@ jobs:
           workspaces: server
       - name: Build s3-server
         run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Build bare listeners example
+        run: cargo build --locked --release --example bare_listeners --manifest-path server/Cargo.toml
+      - name: Test bare listeners example
+        run: cargo test --locked --manifest-path server/Cargo.toml --example bare_listeners
 
       - uses: actions/cache@v4
         id: minio-cache
@@ -121,8 +126,8 @@ jobs:
           grep -E '^(Data under|\|)' commit_cost.txt >> "$GITHUB_STEP_SUMMARY"
       - name: Probe self-tests
         run: python benchmarks/test_large_volume_probe.py
-      # #248: loopback connect cost on AwanFS vs MinIO on the same runner.
-      - name: Loopback connect cost, AwanFS against MinIO
+      # #248, #320: loopback connect cost across bare std, bare tokio, s3-server, and MinIO.
+      - name: Loopback connect cost, bare std and tokio against s3-server and MinIO
         shell: bash
         env:
           TMP: ${{ runner.temp }}
@@ -130,11 +135,13 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: |
           bin=server/target/release/s3-server
+          bare=server/target/release/examples/bare_listeners
           exe=""
-          if [ -f "$bin.exe" ]; then bin="$bin.exe"; exe=".exe"; fi
+          if [ -f "$bin.exe" ]; then bin="$bin.exe"; bare="$bare.exe"; exe=".exe"; fi
           python -u benchmarks/large_volume_probe.py --server-bin "$bin" \
+            --bare-bin "$bare" \
             --minio-bin ".tmp/minio/minio$exe" --mc-bin ".tmp/minio/mc$exe" \
-            --connect-only --report connect_probe.md
+            --connect-only --connect-rounds 3 --report connect_probe.md
           cat connect_probe.md >> "$GITHUB_STEP_SUMMARY"
       # Decision 52: new volumes grow. Does that cost anything once the volume is large?
       - name: A large volume, growing against sparse

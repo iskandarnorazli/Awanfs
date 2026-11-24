@@ -11,7 +11,7 @@
 ```mermaid
 flowchart TD
     subgraph UseCases["Target Workloads"]
-        UC1["1. Agent Sandboxes (BoxCompute / KotakSakti)"]
+        UC1["1. Agent Sandboxes"]
         UC2["2. PyTorch Large Model Checkpoints (AI/HPC)"]
         UC3["3. Distributed Mutex & Workspace Locking"]
         UC4["4. Game Asset & Video Stream Ingestion"]
@@ -34,7 +34,7 @@ flowchart TD
 
 ## 2. Industrial Use Cases & Operational Contracts
 
-### Use Case 1: AI Agent Sandbox RootFS & MicroVM Snapshotting (BoxCompute / KotakSakti)
+### Use Case 1: AI Agent Sandbox RootFS & MicroVM Snapshotting
 
 #### The Problem:
 - Agent sandbox platforms spin up thousands of ephemeral Firecracker microVMs or container sandboxes per hour.

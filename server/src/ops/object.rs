@@ -99,6 +99,32 @@ fn valid_header_str<'a>(val: &'a hyper::header::HeaderValue, key: &str) -> Resul
         .map_err(|_| bad_request("InvalidArgument", "Metadata header value must be valid UTF-8.", key))
 }
 
+/// A user metadata value as text: its bytes as UTF-8 when they are UTF-8, else one character
+/// per byte (ISO-8859-1). ASCII is unchanged. CR and LF stay refused. botocore sends `\xe9` as
+/// UTF-8 (0xC3 0xA9) and reads response headers as ISO-8859-1, so ceph's
+/// `test_object_set_get_unicode_metadata` needs `header_bytes` to answer 0xE9.
+fn meta_value_text(val: &hyper::header::HeaderValue, key: &str) -> Result<String, Response<ResponseBody>> {
+    let bytes = val.as_bytes();
+    if bytes.iter().any(|&b| b == b'\r' || b == b'\n') {
+        return Err(bad_request("InvalidArgument", "Metadata header value must not contain CR or LF.", key));
+    }
+    Ok(match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => bytes.iter().map(|&b| b as char).collect(),
+    })
+}
+
+/// A metadata value's bytes on the wire: ISO-8859-1 when every character fits (one byte each,
+/// how HTTP clients read header bytes), else UTF-8.
+fn header_bytes(text: &str) -> hyper::header::HeaderValue {
+    let bytes: Vec<u8> = if text.chars().all(|c| (c as u32) <= 0xFF) {
+        text.chars().map(|c| c as u32 as u8).collect()
+    } else {
+        text.as_bytes().to_vec()
+    };
+    hyper::header::HeaderValue::from_bytes(&bytes).unwrap_or_else(|_| hyper::header::HeaderValue::from_static(""))
+}
+
 fn strip_aws_chunked(raw: &str) -> String {
     raw.split(',')
         .map(str::trim)
@@ -147,15 +173,15 @@ pub(crate) fn request_attrs_map(
             if suffix.is_empty() {
                 continue;
             }
-            let val = valid_header_str(value, key)?;
+            let val = meta_value_text(value, key)?;
             let lower = suffix.to_ascii_lowercase();
             user_meta
                 .entry(lower)
                 .and_modify(|existing| {
                     existing.push_str(", ");
-                    existing.push_str(val);
+                    existing.push_str(&val);
                 })
-                .or_insert_with(|| val.to_string());
+                .or_insert(val);
         }
     }
     let total_user_meta: usize = user_meta.iter().map(|(k, v)| k.len() + v.len()).sum();
@@ -307,7 +333,7 @@ impl MetadataHeadersExt for hyper::http::response::Builder {
             self = self.header("x-amz-website-redirect-location", v);
         }
         for (k, v) in view.attrs.user_meta() {
-            self = self.header(format!("x-amz-meta-{}", k), v);
+            self = self.header(format!("x-amz-meta-{}", k), header_bytes(v));
         }
         self
     }
@@ -702,7 +728,7 @@ pub async fn copy_object(
         (src_b_id, src_meta)
     };
 
-    let mut src_view: Result<crate::attrs::Attrs, VolumeError> = Ok(crate::attrs::Attrs::new());
+    let src_view: Result<crate::attrs::Attrs, VolumeError>;
     let read = match (&src_vid, &src_meta) {
         (Some(vid), _) => {
             let Some(id) = crate::versions::parse_id(vid) else {
@@ -896,25 +922,38 @@ pub async fn copy_object(
 /// `crate::fsm::pipeline_step`.
 struct StreamPipeline {
     state: crate::fsm::PipelineState,
-    tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    tx: Option<tokio::sync::mpsc::Sender<crate::work::InflightBuf>>,
+    recycle_rx: Option<tokio::sync::mpsc::Receiver<crate::work::InflightBuf>>,
     writer_task: Option<tokio::task::JoinHandle<Result<crate::volume::NeedleWriter, (&'static str, String)>>>,
-    cur_buf: Vec<u8>,
+    cur_buf: crate::work::InflightBuf,
+    work: Arc<crate::work::WorkCounters>,
     failure: Option<Result<Response<ResponseBody>, hyper::Error>>,
 }
 
 impl StreamPipeline {
     fn new(
-        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        tx: tokio::sync::mpsc::Sender<crate::work::InflightBuf>,
+        recycle_rx: tokio::sync::mpsc::Receiver<crate::work::InflightBuf>,
         writer_task: tokio::task::JoinHandle<Result<crate::volume::NeedleWriter, (&'static str, String)>>,
+        work: Arc<crate::work::WorkCounters>,
         cap: usize,
     ) -> Self {
+        let cur_buf = crate::work::InflightBuf::with_capacity(&work, cap);
         Self {
             state: crate::fsm::PipelineState::Filling,
             tx: Some(tx),
+            recycle_rx: Some(recycle_rx),
             writer_task: Some(writer_task),
-            cur_buf: Vec::with_capacity(cap),
+            cur_buf,
+            work,
             failure: None,
         }
+    }
+
+    fn release_buffers(&mut self) {
+        drop(self.tx.take());
+        drop(self.recycle_rx.take());
+        self.cur_buf = crate::work::InflightBuf::default();
     }
 
     fn step(&mut self, event: crate::fsm::PipelineEvent) -> Result<crate::fsm::PipelineState, crate::fsm::Refusal> {
@@ -922,15 +961,13 @@ impl StreamPipeline {
             Ok(next) => {
                 self.state = next;
                 if next == crate::fsm::PipelineState::Failed {
-                    drop(self.tx.take());
-                    self.cur_buf = Vec::new();
+                    self.release_buffers();
                 }
                 Ok(next)
             }
             Err(r) => {
                 self.state = crate::fsm::PipelineState::Failed;
-                drop(self.tx.take());
-                self.cur_buf = Vec::new();
+                self.release_buffers();
                 Err(r)
             }
         }
@@ -950,7 +987,7 @@ impl StreamPipeline {
     }
 
     async fn join_writer(&mut self, key: &str) -> Option<crate::volume::NeedleWriter> {
-        drop(self.tx.take());
+        self.release_buffers();
         let res = match self.writer_task.take() {
             Some(t) => t.await,
             None => {
@@ -1050,17 +1087,27 @@ pub async fn put_object(
             .body(full_body(Bytes::from(xml)))
             .unwrap());
     }
-    let content_md5_hdr = headers.get("content-md5").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
-    if let Some(ref content_md5) = content_md5_hdr {
-        if !crate::bucket_config::base64_decode(content_md5).is_ok_and(|b| b.len() == 16) {
-            let xml = s3_error_xml("InvalidDigest", "The Content-MD5 you specified was invalid.", key, "req-bad-digest");
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header(CONTENT_TYPE, "application/xml")
-                .body(full_body(Bytes::from(xml)))
-                .unwrap());
+    let mut md5_values = headers.get_all("content-md5").iter();
+    let content_md5_hdr = match md5_values.next() {
+        Some(v) => {
+            let valid = md5_values
+                .next()
+                .is_none()
+                .then(|| v.to_str().ok().map(str::trim))
+                .flatten()
+                .filter(|s| crate::bucket_config::base64_decode(s).is_ok_and(|b| b.len() == 16));
+            let Some(valid_md5) = valid else {
+                let xml = s3_error_xml("InvalidDigest", "The Content-MD5 you specified was invalid.", key, "req-bad-digest");
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(full_body(Bytes::from(xml)))
+                    .unwrap());
+            };
+            Some(valid_md5.to_string())
         }
-    }
+        None => None,
+    };
     let signed_headers = headers.clone();
     let req_checksum = match crate::checksum::requested_checksum(&signed_headers) {
         Ok(c) => c,
@@ -1123,9 +1170,9 @@ pub async fn put_object(
         });
         let idle_timeout = state.body_idle_timeout();
         const COALESCE_CAP: usize = 1024 * 1024;
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
-        let (recycle_tx, mut recycle_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
-        drop(recycle_tx.try_send(Vec::with_capacity(COALESCE_CAP)));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::work::InflightBuf>(2);
+        let (recycle_tx, recycle_rx) = tokio::sync::mpsc::channel::<crate::work::InflightBuf>(2);
+        drop(recycle_tx.try_send(crate::work::InflightBuf::with_capacity(&state.work, COALESCE_CAP)));
         let writer_task = tokio::task::spawn_blocking(
             move || -> Result<crate::volume::NeedleWriter, (&'static str, String)> {
                 while let Some(mut buf) = rx.blocking_recv() {
@@ -1144,7 +1191,7 @@ pub async fn put_object(
                 Ok(writer)
             },
         );
-        let mut pipe = StreamPipeline::new(tx, writer_task, COALESCE_CAP);
+        let mut pipe = StreamPipeline::new(tx, recycle_rx, writer_task, Arc::clone(&state.work), COALESCE_CAP);
         let mut total_fed: u64 = 0;
         let mut outcome: Option<(
             crate::volume::NeedleWriter,
@@ -1192,8 +1239,10 @@ pub async fn put_object(
                         if let Some(h) = sha.as_mut() {
                             h.update(&data);
                         }
-                        let mut ready_bufs: Vec<Vec<u8>> = Vec::new();
+                        let mut ready_bufs: Vec<crate::work::InflightBuf> = Vec::new();
                         let cur_buf = &mut pipe.cur_buf;
+                        let recycle_rx = &mut pipe.recycle_rx;
+                        let work = &pipe.work;
                         let digest_ref = digest.as_mut().expect("digest present while filling");
                         let mut append_decoded = |mut d: &[u8]| -> Result<(), String> {
                             if total_fed + d.len() as u64 > len {
@@ -1210,7 +1259,10 @@ pub async fn put_object(
                                 cur_buf.extend_from_slice(&d[..n]);
                                 d = &d[n..];
                                 if cur_buf.len() == COALESCE_CAP {
-                                    let next = recycle_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(COALESCE_CAP));
+                                    let next = recycle_rx
+                                        .as_mut()
+                                        .and_then(|rx| rx.try_recv().ok())
+                                        .unwrap_or_else(|| crate::work::InflightBuf::with_capacity(work, COALESCE_CAP));
                                     ready_bufs.push(std::mem::replace(cur_buf, next));
                                 }
                             }
@@ -1359,8 +1411,7 @@ pub async fn put_object(
                     }
                 }
                 crate::fsm::PipelineState::Failed => {
-                    drop(pipe.tx.take());
-                    pipe.cur_buf = Vec::new();
+                    pipe.release_buffers();
                     if let Some(t) = pipe.writer_task.take() {
                         if let Ok(Ok(w)) = t.await {
                             drop(w);
@@ -1700,7 +1751,6 @@ pub async fn get_or_head_object(
 
     let etag_val = format_object_etag(meta.etag_hi, meta.etag_lo, is_multipart, unpack_part_count(meta.bucket_flags));
     let lm_secs = last_modified_secs_from_ms(meta.created_at);
-    let lm_str = format_http_date(lm_secs);
     let facts = ObjectFacts {
         etag: etag_val.clone(),
         last_modified_secs: lm_secs,
