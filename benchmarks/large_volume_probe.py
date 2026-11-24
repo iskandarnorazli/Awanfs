@@ -13,6 +13,7 @@ import argparse
 import http.client
 import os
 import platform
+import re
 import shutil
 import statistics
 import subprocess
@@ -31,6 +32,9 @@ FILL_OBJECT = 4 * MIB
 SMALL = 64 * 1024
 # Every server at its defaults (owner, 2026-11-20); the sparse row was measured once (decision 52).
 CONFIGS = [("growing (default)", {})]
+TWO_LISTENERS = ("AwanFS", "MinIO")
+FOUR_LISTENERS = ("bare std", "bare tokio", "s3-server", "MinIO")
+FOUR_ONLY_LISTENERS = ("bare std", "bare tokio", "s3-server")
 
 
 def volume_bytes(data_dir: str) -> int:
@@ -179,6 +183,27 @@ def start_minio(minio_bin: str, mc_bin: str):
     return proc, port, data
 
 
+def start_bare_listener(bare_bin: str, mode: str):
+    """Start the bare std or tokio TCP listener example on 127.0.0.1 with output logged to a file."""
+    if mode not in ("std", "tokio"):
+        raise ValueError(f"bare listener mode must be 'std' or 'tokio', got {mode!r}")
+    data = tempfile.mkdtemp(prefix=f"bare_{mode}_probe_")
+    port = get_free_port()
+    log_path = os.path.join(data, "server.log")
+    with open(log_path, "ab") as log:
+        proc = subprocess.Popen(
+            [bare_bin, "--mode", mode, "--port", str(port)],
+            stdout=log, stderr=subprocess.STDOUT,
+        )
+    if not wait_port(port, timeout=40.0):
+        proc.kill()
+        proc.wait()
+        tail = _read_log_tail(log_path)
+        shutil.rmtree(data, ignore_errors=True)
+        raise SystemExit(f"bare listener ({mode}) did not answer on port {port}\n{tail}")
+    return proc, port, data
+
+
 def measure_connect(port: int, rounds: int, bucket: str = "probe") -> dict:
     """Measure fresh loopback connection setup (`c.connect()`) followed by a 64 KiB GET."""
     small = os.urandom(SMALL)
@@ -211,14 +236,41 @@ def resolve_mc_bin(minio_bin: str, mc_bin: str) -> str:
     return sibling if os.path.isfile(sibling) else ""
 
 
-def run_connect_comparison(server_bin: str, minio_bin: str, mc_bin: str, rounds: int) -> list:
-    starters = [("AwanFS", lambda: start_awanfs(server_bin))]
+def _round_order(starters: list, round_no: int) -> list:
+    if not starters:
+        return []
+    shift = ((round_no - 1) // 2) % len(starters)
+    rotated = starters[shift:] + starters[:shift]
+    return list(reversed(rotated)) if round_no % 2 == 0 else rotated
+
+
+def run_connect_comparison(
+    server_bin: str,
+    minio_bin: str,
+    mc_bin: str,
+    rounds: int,
+    bare_bin: str = "",
+    connect_rounds: int = None,
+) -> list:
+    """Measure connect + 64 KiB GET latency across servers in alternating rounds."""
+    if bare_bin:
+        starters = [
+            ("bare std", lambda: start_bare_listener(bare_bin, "std")),
+            ("bare tokio", lambda: start_bare_listener(bare_bin, "tokio")),
+            ("s3-server", lambda: start_awanfs(server_bin)),
+        ]
+        n_rounds = 3 if connect_rounds is None else connect_rounds
+    else:
+        starters = [("AwanFS", lambda: start_awanfs(server_bin))]
+        n_rounds = 2 if connect_rounds is None else connect_rounds
     if minio_bin:
         mc = resolve_mc_bin(minio_bin, mc_bin)
         starters.append(("MinIO", lambda m=mc: start_minio(minio_bin, m)))
+    if n_rounds < 1:
+        raise ValueError(f"connect_rounds must be >= 1, got {n_rounds}")
     results = []
-    for round_no, order in enumerate((starters, list(reversed(starters))), 1):
-        for name, start in order:
+    for round_no in range(1, n_rounds + 1):
+        for name, start in _round_order(starters, round_no):
             print(f"connect round {round_no}: {name} ...", flush=True)
             proc, port, data = start()
             try:
@@ -228,29 +280,126 @@ def run_connect_comparison(server_bin: str, minio_bin: str, mc_bin: str, rounds:
     return results
 
 
+def _is_four_listener_results(results) -> bool:
+    return any(srv in FOUR_ONLY_LISTENERS for srv, _, _ in results)
+
+
+def _metric_stats(values) -> tuple:
+    vals = list(values)
+    return statistics.median(vals), min(vals), max(vals)
+
+
+def _ratio_or_none(num_entry, den_entry) -> float:
+    if not num_entry or not den_entry or den_entry["connect_p50_ms"] <= 0:
+        return None
+    return num_entry["connect_p50_ms"] / den_entry["connect_p50_ms"]
+
+
 def summarize_connect(results) -> dict:
     by_server = {}
     for server, _round_no, m in results:
         by_server.setdefault(server, []).append(m)
+    four_mode = _is_four_listener_results(results)
+    listeners = FOUR_LISTENERS if four_mode else TWO_LISTENERS
     summary = {}
-    for server in ("AwanFS", "MinIO"):
+    for server in listeners:
         entries = by_server.get(server)
         if not entries:
             summary[server] = None
             continue
+        c50, c50_lo, c50_hi = _metric_stats(e["connect"][0] for e in entries)
+        c99, c99_lo, c99_hi = _metric_stats(e["connect"][1] for e in entries)
+        g50, g50_lo, g50_hi = _metric_stats(e["open_conn"][0] for e in entries)
+        g99, g99_lo, g99_hi = _metric_stats(e["open_conn"][1] for e in entries)
         summary[server] = {
-            "connect_p50_ms": statistics.median(e["connect"][0] for e in entries),
-            "connect_p99_ms": statistics.median(e["connect"][1] for e in entries),
-            "open_conn_p50_ms": statistics.median(e["open_conn"][0] for e in entries),
-            "open_conn_p99_ms": statistics.median(e["open_conn"][1] for e in entries),
+            "connect_p50_ms": c50,
+            "connect_p50_min_ms": c50_lo,
+            "connect_p50_max_ms": c50_hi,
+            "connect_p99_ms": c99,
+            "connect_p99_min_ms": c99_lo,
+            "connect_p99_max_ms": c99_hi,
+            "open_conn_p50_ms": g50,
+            "open_conn_p50_min_ms": g50_lo,
+            "open_conn_p50_max_ms": g50_hi,
+            "open_conn_p99_ms": g99,
+            "open_conn_p99_min_ms": g99_lo,
+            "open_conn_p99_max_ms": g99_hi,
+            "rounds": len(entries),
         }
-    a = summary.get("AwanFS")
-    b = summary.get("MinIO")
-    summary["ratio"] = (a["connect_p50_ms"] / b["connect_p50_ms"]) if (a and b and b["connect_p50_ms"] > 0) else None
+    if four_mode:
+        summary["ratios"] = {
+            "bare_tokio_vs_bare_std": _ratio_or_none(summary.get("bare tokio"), summary.get("bare std")),
+            "s3_server_vs_bare_tokio": _ratio_or_none(summary.get("s3-server"), summary.get("bare tokio")),
+            "s3_server_vs_minio": _ratio_or_none(summary.get("s3-server"), summary.get("MinIO")),
+        }
+    else:
+        summary["ratio"] = _ratio_or_none(summary.get("AwanFS"), summary.get("MinIO"))
     return summary
 
 
+def _fmt_spread(med: float, lo: float, hi: float) -> str:
+    return f"{med:.2f} ({lo:.2f}..{hi:.2f})"
+
+
+def _render_four_listener_connect(results, rounds: int, cmd: str, summary: dict) -> str:
+    round_nums = sorted({rnd for _, rnd, _ in results})
+    by_srv_round = {(srv, rnd): m for srv, rnd, m in results}
+    order_desc = "; ".join(
+        f"round {rnd}: " + " -> ".join(srv for srv, r, _ in results if r == rnd)
+        for rnd in round_nums
+    )
+    lines = [
+        f"Command: `{cmd}`",
+        "",
+        f"# Loopback connect cost: bare std, bare tokio, s3-server, and MinIO ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
+        "",
+        f"Machine: {platform.node()} ({platform.platform()}, {os.cpu_count()} CPUs). Data under {tempfile.gettempdir()}. "
+        f"{rounds} fresh connections per round, {len(round_nums)} rounds in alternating order ({order_desc}).",
+        "",
+        "| listener | " + " | ".join(f"round {rnd} (connect P50, P99; GET P50 ms)" for rnd in round_nums) + " |",
+        "|---|" + "---|" * len(round_nums),
+    ]
+    for srv in FOUR_LISTENERS:
+        cells = []
+        for rnd in round_nums:
+            m = by_srv_round.get((srv, rnd))
+            if m is None:
+                cells.append("not measured")
+            else:
+                cells.append(f"{m['connect'][0]:.2f}, {m['connect'][1]:.2f}; {m['open_conn'][0]:.2f}")
+        lines.append(f"| {srv} | " + " | ".join(cells) + " |")
+    lines += [
+        "",
+        "| listener | connect P50 ms, median (min..max) | connect P99 ms, median (min..max) | open-conn GET P50 ms, median (min..max) |",
+        "|---|---|---|---|",
+    ]
+    for srv in FOUR_LISTENERS:
+        s = summary.get(srv)
+        if s is None:
+            lines.append(f"| {srv} | not measured | not measured | not measured |")
+        else:
+            lines.append(
+                f"| {srv} | {_fmt_spread(s['connect_p50_ms'], s['connect_p50_min_ms'], s['connect_p50_max_ms'])} "
+                f"| {_fmt_spread(s['connect_p99_ms'], s['connect_p99_min_ms'], s['connect_p99_max_ms'])} "
+                f"| {_fmt_spread(s['open_conn_p50_ms'], s['open_conn_p50_min_ms'], s['open_conn_p50_max_ms'])} |"
+            )
+    ratios = summary["ratios"]
+    lines.append("")
+    for key, label in (
+        ("bare_tokio_vs_bare_std", "bare tokio / bare std connect P50 ratio"),
+        ("s3_server_vs_bare_tokio", "s3-server / bare tokio connect P50 ratio"),
+        ("s3_server_vs_minio", "s3-server / MinIO connect P50 ratio"),
+    ):
+        val = ratios.get(key)
+        lines.append(f"{label}: {val:.2f}x" if val is not None else f"{label}: not measured")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def render_connect(results, rounds: int, cmd: str) -> str:
+    summary = summarize_connect(results)
+    if _is_four_listener_results(results):
+        return _render_four_listener_connect(results, rounds, cmd, summary)
     lines = [
         f"Command: `{cmd}`",
         "",
@@ -269,8 +418,7 @@ def render_connect(results, rounds: int, cmd: str) -> str:
         "| server | connect P50 ms (median) | connect P99 ms (median) | open-conn GET P50 ms (median) |",
         "|---|---|---|---|",
     ]
-    summary = summarize_connect(results)
-    for server in ("AwanFS", "MinIO"):
+    for server in TWO_LISTENERS:
         s = summary.get(server)
         if s is None:
             lines.append(f"| {server} | not measured | not measured | not measured |")
@@ -288,23 +436,73 @@ def render_connect(results, rounds: int, cmd: str) -> str:
     return "\n".join(lines)
 
 
+_SPREAD_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*\(([0-9]+(?:\.[0-9]+)?)\.\.([0-9]+(?:\.[0-9]+)?)\)$")
+
+
+def _parse_metric_cell(cell: str) -> tuple:
+    m = _SPREAD_RE.match(cell.strip())
+    if m:
+        return float(m.group(1)), float(m.group(2)), float(m.group(3))
+    val = float(cell.strip())
+    return val, val, val
+
+
+def _parse_ratio_val(text: str):
+    val = text.split(":", 1)[1].strip()
+    if val != "not measured" and val.endswith("x"):
+        return float(val[:-1])
+    return None
+
+
 def parse_connect_summary(text: str) -> dict:
-    """Parse the summary table and ratio line from render_connect output."""
-    out = {"AwanFS": None, "MinIO": None, "ratio": None}
+    """Parse the summary table and ratio lines from render_connect output."""
+    out = {
+        "AwanFS": None,
+        "MinIO": None,
+        "ratio": None,
+        "bare std": None,
+        "bare tokio": None,
+        "s3-server": None,
+        "ratios": {
+            "bare_tokio_vs_bare_std": None,
+            "s3_server_vs_bare_tokio": None,
+            "s3_server_vs_minio": None,
+        },
+    }
+    known = set(TWO_LISTENERS) | set(FOUR_LISTENERS)
+    ratio_prefixes = {
+        "bare tokio / bare std connect P50 ratio:": "bare_tokio_vs_bare_std",
+        "s3-server / bare tokio connect P50 ratio:": "s3_server_vs_bare_tokio",
+        "s3-server / MinIO connect P50 ratio:": "s3_server_vs_minio",
+    }
     for line in text.splitlines():
         s = line.strip()
-        if s.startswith("| AwanFS |") or s.startswith("| MinIO |"):
+        if s.startswith("| "):
             parts = [p.strip() for p in s.strip("|").split("|")]
-            if len(parts) >= 4 and parts[1] != "not measured":
-                out[parts[0]] = {
-                    "connect_p50_ms": float(parts[1]),
-                    "connect_p99_ms": float(parts[2]),
-                    "open_conn_p50_ms": float(parts[3]),
-                }
+            if len(parts) == 4 and parts[0] in known and parts[1] != "not measured":
+                # Only match the 4-column summary table, skipping any multi-column per-round table.
+                if "(" in parts[1] or re.match(r"^[0-9]+(?:\.[0-9]+)?$", parts[1]):
+                    c50, c50_lo, c50_hi = _parse_metric_cell(parts[1])
+                    c99, c99_lo, c99_hi = _parse_metric_cell(parts[2])
+                    g50, g50_lo, g50_hi = _parse_metric_cell(parts[3])
+                    out[parts[0]] = {
+                        "connect_p50_ms": c50,
+                        "connect_p50_min_ms": c50_lo,
+                        "connect_p50_max_ms": c50_hi,
+                        "connect_p99_ms": c99,
+                        "connect_p99_min_ms": c99_lo,
+                        "connect_p99_max_ms": c99_hi,
+                        "open_conn_p50_ms": g50,
+                        "open_conn_p50_min_ms": g50_lo,
+                        "open_conn_p50_max_ms": g50_hi,
+                    }
         elif s.startswith("AwanFS / MinIO connect P50 ratio:"):
-            val = s.split(":", 1)[1].strip()
-            if val != "not measured" and val.endswith("x"):
-                out["ratio"] = float(val[:-1])
+            out["ratio"] = _parse_ratio_val(s)
+        else:
+            for prefix, key in ratio_prefixes.items():
+                if s.startswith(prefix):
+                    out["ratios"][key] = _parse_ratio_val(s)
+                    break
     return out
 
 
@@ -381,9 +579,11 @@ def render(results, fill_gib, cmd):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--server-bin", required=True)
+    ap.add_argument("--bare-bin", default="")
     ap.add_argument("--minio-bin", default="")
     ap.add_argument("--mc-bin", default="")
     ap.add_argument("--connect-only", action="store_true")
+    ap.add_argument("--connect-rounds", type=int, default=None)
     ap.add_argument("--fill-gib", type=float, default=10.0)
     ap.add_argument("--seconds", type=float, default=5.0)
     ap.add_argument("--rounds", type=int, default=300)
@@ -391,7 +591,14 @@ def main(argv=None):
     a = ap.parse_args(argv)
     cmd = "python benchmarks/large_volume_probe.py " + " ".join(argv if argv is not None else sys.argv[1:])
     if a.connect_only:
-        connect_results = run_connect_comparison(a.server_bin, a.minio_bin, a.mc_bin, a.rounds)
+        connect_results = run_connect_comparison(
+            a.server_bin,
+            a.minio_bin,
+            a.mc_bin,
+            a.rounds,
+            bare_bin=a.bare_bin,
+            connect_rounds=a.connect_rounds,
+        )
         text = render_connect(connect_results, a.rounds, cmd)
         print(text)
         if a.report:
@@ -403,8 +610,15 @@ def main(argv=None):
     if fill < a.fill_gib:
         print(f"{free_gib:.1f} GiB free under {tempfile.gettempdir()}: filling {fill:.1f} GiB, not {a.fill_gib:g}", flush=True)
     sections = []
-    if a.minio_bin:
-        connect_results = run_connect_comparison(a.server_bin, a.minio_bin, a.mc_bin, a.rounds)
+    if a.minio_bin or a.bare_bin:
+        connect_results = run_connect_comparison(
+            a.server_bin,
+            a.minio_bin,
+            a.mc_bin,
+            a.rounds,
+            bare_bin=a.bare_bin,
+            connect_rounds=a.connect_rounds,
+        )
         sections.append(render_connect(connect_results, a.rounds, cmd))
     results = []
     # Twice, in opposite orders: one pass cannot tell a difference from the runner's drift.

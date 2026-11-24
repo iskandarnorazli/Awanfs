@@ -125,3 +125,46 @@ async fn test_negative_control_content_md5_tamper_detected() {
 
     handle.shutdown();
 }
+
+#[test]
+fn test_crc32c_implementation_path() {
+    let digest = StreamingDigest::new();
+    let expected_hw = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            is_x86_feature_detected!("sse4.2") || is_x86_feature_detected!("avx2")
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            std::arch::is_aarch64_feature_detected!("crc")
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            false
+        }
+    };
+    let path = if digest.is_software_fallback() {
+        "software"
+    } else {
+        "hardware"
+    };
+    println!(
+        "CRC32C implementation on {}: {} (hardware_detected={})",
+        std::env::consts::ARCH,
+        path,
+        expected_hw
+    );
+    assert_eq!(
+        digest.is_software_fallback(),
+        !expected_hw,
+        "StreamingDigest path ({}) must match CPU feature detection ({})",
+        path,
+        expected_hw
+    );
+
+    let mut check = StreamingDigest::new();
+    check.update(b"Hello world!");
+    let (_, _, _, _, crc) = check.finalize();
+    assert_eq!(crc, 0x7B_98_E7_51);
+    assert_eq!(crc, crc32c::crc32c(b"Hello world!"));
+}

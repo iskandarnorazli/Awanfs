@@ -13,17 +13,13 @@ decisions are numbered in [`ARCHITECTURE.md`](ARCHITECTURE.md); stored bytes are
 
 ## Which issues
 
-- Work only on issues labelled `ready:antigravity` with no `wip:` label. An empty queue means stop and say so.
+- Work on any unblocked issue labelled `ready:antigravity` or `ready:claude` with no `wip:` label (owner, 2026-11-24). An empty queue means stop and say so.
 - An issue blocked by another (GitHub's "blocked by" link, or a first line "Blocked by #N") waits until #N is closed.
 - Never start an issue labelled `outline` or `needs-decision`.
 - **An owner decision is a comment the owner wrote on the issue** (owner, 2026-11-19). Cite it by its link. A decision given anywhere else (a chat, a task file) is not one until the owner posts it there: stop with `needs-decision` and the options instead. On 2026-11-18 three evidence comments cited an "owner decision" that was on no issue, and two of them set aside a failing gate test.
 - **A gate line is checked on the PR** (owner, 2026-11-17). Whoever writes an issue writes each gate line as something the PR's checks or a command run on its branch can show, before merge: never "the nightly run shows". A conformance gate names its tests (must pass, and owned elsewhere with the owning issue), as `CONFORMANCE_DESIGN.md` 6.1 says. A gate line the builder cannot check on the PR is a reason to stop and ask, not to skip it.
-- These need Claude or the owner, even when an issue seems to ask for them. Stop with `needs-decision` and say which:
+- These need the owner's decision before changing, even when an issue seems to ask for them. Stop with `needs-decision` and say which (owner, 2026-11-24):
   - stored bytes in volumes: the needle header, the journal, the volume format (`FORMAT.md`). A bucket manifest record is allowed when the issue gives its exact text and its gate has restart and replay tests;
-  - recovery and replay, the key lock, the commit path, group commit, compaction;
-  - authentication, authorization, SigV4, IAM, encryption;
-  - the meaning of a TLA+ model in `verification/tla` (adding the configuration an issue names is fine);
-  - the rules of an existing machine in `server/src/fsm.rs` (wiring a handler to it is fine);
   - any decision in `ARCHITECTURE.md`. A test never reverses one.
 
   Moving code is not changing it: a refactor may move such code when the issue says so, if what it decides and stores is unchanged and the existing tests pass untouched.
@@ -33,9 +29,9 @@ decisions are numbered in [`ARCHITECTURE.md`](ARCHITECTURE.md); stored bytes are
 1. Add `wip:antigravity` (or `wip:claude`). Branch from `main`: `issue/<n>-<slug>`. **One issue, one branch, one PR**, even when several issues are worked in parallel (owner, 2026-11-17). Never combine issues into a batch PR: in #216 ten issues in one PR hid a regression, skipped each issue's checks and could not be reverted one at a time.
 2. Read the Goal, the Gate and the Stop list. Write the tests first and show them failing.
 3. Commit as `Iskandar Norazli <111472977+iskandarnorazli@users.noreply.github.com>`, with no AI or Co-Authored-By lines. The message states the tests added, the commands run with their results, and the negative control: the fix turned off, the new test failing.
-4. Push the branch and open a **draft** PR. Never push `main`, never force-push, never merge.
+4. Push the branch and open a **draft** PR. Never push `main` directly and never force-push.
 5. **Wait for the PR's checks and read them:** `gh pr checks <pr>`. Every check passes, including `s3tests`; it runs the ceph suite when the PR changes server code and passes in seconds otherwise. A failing or pending check means the work is not done: fix it, or stop and say why. `main` requires these checks, so a red PR cannot merge. Check the evidence comment with `python3 scripts/check_gate_comment.py <issue>` so every gate line is answered.
-6. Comment on the issue: each gate line, its command and its result, and the `gh pr checks <pr>` output pasted as it printed. A suite-wide line ("cargo test passed") does not answer a line that names something else (a journey, a test list, a run id). Remove `wip:`, add `needs-review`. Never close an issue; the owner or a reviewer who did not build it does.
+6. Comment on the issue: each gate line, its command and its result, and the `gh pr checks <pr>` output pasted as it printed. A suite-wide line ("cargo test passed") does not answer a line that names something else (a journey, a test list, a run id). Remove `wip:`. Once every required check in `gh pr checks <pr>` is green and `python3 scripts/check_gate_comment.py <issue>` exits `0`, mark the PR ready and merge it with `gh pr ready <pr> && gh pr merge <pr> --squash --delete-branch`, then close the linked issue (owner, 2026-11-24). If any check fails or a stop condition triggers, leave the PR as draft, add `needs-review` or `needs-decision`, and stop.
 7. Stop and leave a comment when the work needs a file the issue does not list, a design decision, or a change to an existing test's expectation. Removing a test from `tests/s3tests/passing.txt` is a change to a test's expectation.
 
 ## Gate commands

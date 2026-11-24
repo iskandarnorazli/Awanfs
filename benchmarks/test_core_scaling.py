@@ -974,10 +974,7 @@ class GarageAndSeaweedfsTests(unittest.TestCase):
         self.assertEqual(set(posix_rows.keys()), set(cs.SERVERS))
         self.assertEqual(posix_rows["AwanFS"][1], "Yes")
         self.assertEqual(posix_rows["MinIO"][1], "Yes")
-        # RustFS runs at its release defaults; `_start_rustfs` never set the strict mode the
-        # row used to claim, so its sync is not measured until #334.
-        self.assertEqual(posix_rows["RustFS"][1], "Not measured")
-        self.assertEqual(posix_rows["RustFS"][0], "release defaults")
+        self.assertEqual(posix_rows["RustFS"][1], "Yes")
         self.assertEqual(posix_rows["Garage"][1], "No")
         self.assertEqual(posix_rows["SeaweedFS"][1], "No")
         self.assertIn("metadata_fsync = false", posix_rows["Garage"][0])
@@ -1302,6 +1299,79 @@ class DurabilityAndAutoProfileTests(unittest.TestCase):
         a.compare_fast = True
         self.assertTrue(cs._resolve_profile_config(a, [1, 2, 4, 8], 16)[2])
 
+    def test_start_rustfs_env_matches_durability_labels(self):
+        spawned_envs = []
+
+        class FakeProc:
+            pid = 4343
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_rustfs = os.path.join(tmpdir, "rustfs")
+            fake_mc = os.path.join(tmpdir, "mc")
+            for p in (fake_rustfs, fake_mc):
+                with open(p, "wb") as fh:
+                    fh.write(b"bin")
+            with mock.patch.dict(os.environ, {"RUSTFS_DURABILITY_MODE": "strict"}, clear=False), \
+                 mock.patch.object(cs, "_spawn_pinned", side_effect=lambda argv, n, lp, env=None: spawned_envs.append(dict(env or {})) or FakeProc()), \
+                 mock.patch.object(cs, "_wait_port", return_value=None), \
+                 mock.patch.object(cs, "_setup_mc_bucket"), \
+                 mock.patch.object(cs.rwb, "anonymous_put_ok", return_value=True):
+                _proc, _port, data_dir, _log = cs._start_rustfs(fake_rustfs, fake_mc, 1, tmpdir)
+                cs.shutil.rmtree(data_dir, ignore_errors=True)
+
+        self.assertEqual(len(spawned_envs), 1)
+        env = spawned_envs[0]
+        posix_rows = {srv: (cfg, waits, note) for srv, cfg, waits, note in cs.server_durability_rows("posix")}
+        rustfs_cfg, rustfs_waits, rustfs_note = posix_rows["RustFS"]
+
+        cores, results = _sample_results()
+        core_md = cs.render_report(
+            cmd="python benchmarks/core_scaling.py",
+            cores=cores,
+            results=results,
+            total_cores=4,
+            runs=2,
+            duration_sec=2.0,
+        )
+        patterns, sizes, m_cores, concs, m_results = _sample_matrix_results()
+        matrix_md = cs.render_matrix_report(
+            cmd="python benchmarks/core_scaling.py --matrix",
+            patterns=patterns,
+            sizes=sizes,
+            cores=m_cores,
+            concurrencies=concs,
+            results=m_results,
+            total_cores=4,
+            runs=2,
+            duration_sec=2.0,
+            seed=42,
+            memory_budget="32MiB",
+            prefill_bytes=48 * cs.MIB,
+        )
+        core_dur = next(ln for ln in core_md.splitlines() if ln.startswith("- **Durability:**"))
+        matrix_dur = next(ln for ln in matrix_md.splitlines() if ln.startswith("- **Durability:**"))
+
+        self.assertIsNone(env.get("RUSTFS_DURABILITY_MODE"))
+        self.assertEqual(rustfs_waits, "Yes")
+        self.assertIn("release defaults", rustfs_cfg)
+        self.assertIn("durable", rustfs_cfg)
+        self.assertIn("2026-11-21-durability-probe.md", rustfs_note)
+        for text in (rustfs_cfg, core_dur, matrix_dur):
+            self.assertNotIn("RUSTFS_DURABILITY_MODE=strict", text)
+            self.assertIn("release defaults", text)
+            self.assertIn("durable", text)
+            if text is not rustfs_cfg:
+                self.assertIn("2026-11-21-durability-probe.md", text)
+
     def test_should_auto_profile_put_requires_16_plus_split_client_cores(self):
         self.assertTrue(cs.should_auto_profile_put(16, [1, 2, 4, 8]))
         self.assertFalse(cs.should_auto_profile_put(4, [1, 2, 4]))
@@ -1467,6 +1537,423 @@ class FastAndThreadReportTests(unittest.TestCase):
             finally:
                 httpd.shutdown()
                 httpd.server_close()
+
+
+class ClientProcSplitAndPinningTests(unittest.TestCase):
+    def test_split_concurrency_distributes_across_active_procs(self):
+        self.assertEqual(cs.split_concurrency(16, 4), [4, 4, 4, 4])
+        self.assertEqual(cs.split_concurrency(10, 4), [3, 3, 2, 2])
+        self.assertEqual(cs.split_concurrency(2, 4), [1, 1])
+        self.assertEqual(cs.split_concurrency(1, 4), [1])
+        self.assertEqual(cs.split_concurrency(64, 1), [64])
+        for conc in (1, 2, 5, 10, 16, 64):
+            for procs in (1, 3, 4, 8):
+                shares = cs.split_concurrency(conc, procs)
+                self.assertEqual(sum(shares), conc)
+                self.assertEqual(len(shares), min(conc, procs))
+                self.assertTrue(all(s >= 1 for s in shares))
+        with self.assertRaises(ValueError):
+            cs.split_concurrency(0, 4)
+        with self.assertRaises(ValueError):
+            cs.split_concurrency(4, 0)
+
+    def test_client_proc_cores_spreads_across_mask_without_leaving_mask(self):
+        disjoint = [cs.client_proc_cores(i, 4, [4, 5, 6, 7]) for i in range(4)]
+        self.assertEqual(disjoint, [[4], [5], [6], [7]])
+
+        wide = [cs.client_proc_cores(i, 4, [8, 9, 10, 11, 12, 13, 14, 15]) for i in range(4)]
+        self.assertEqual(wide, [[8, 9], [10, 11], [12, 13], [14, 15]])
+
+        narrow = [cs.client_proc_cores(i, 4, [1, 2, 3]) for i in range(4)]
+        self.assertEqual(set().union(*narrow), {1, 2, 3})
+        self.assertTrue(all(set(c).issubset({1, 2, 3}) and len(c) > 0 for c in narrow))
+
+    def test_pinning_command_cores_uses_taskset_on_linux_only(self):
+        self.assertEqual(
+            cs.pinning_command_cores(["python", "w.py"], [2, 3], "linux"),
+            ["taskset", "-c", "2,3", "python", "w.py"],
+        )
+        self.assertEqual(
+            cs.pinning_command_cores(["python", "w.py"], [2, 3], "win32"),
+            ["python", "w.py"],
+        )
+
+    def test_sum_processes_cpu_times_aggregates_all_pids(self):
+        def fake_cpu(pid):
+            return {101: (1.2, 0.3), 102: (0.8, 0.2), 103: (2.0, 0.5)}.get(pid, (0.0, 0.0))
+
+        with mock.patch.object(cs, "process_cpu_times_total", side_effect=fake_cpu):
+            u, s = cs.sum_processes_cpu_times([101, 102, 103, 101])
+        self.assertAlmostEqual(u, 4.0)
+        self.assertAlmostEqual(s, 1.0)
+
+
+class MultiProcWorkerAggregationTests(unittest.TestCase):
+    def test_aggregate_worker_results_sums_throughput_pools_latencies_and_client_cpu(self):
+        workers = [
+            cs.WorkerResult(
+                worker_index=0,
+                concurrency=4,
+                ops=100,
+                total_bytes=100 * 4096,
+                latencies_ms=tuple([1.0] * 100),
+                client_user_s=0.4,
+                client_sys_s=0.1,
+                wall_sec=2.0,
+            ),
+            cs.WorkerResult(
+                worker_index=1,
+                concurrency=4,
+                ops=300,
+                total_bytes=300 * 4096,
+                latencies_ms=tuple([3.0] * 290 + [10.0] * 10),
+                client_user_s=0.8,
+                client_sys_s=0.2,
+                wall_sec=2.0,
+            ),
+        ]
+        pt = cs.aggregate_worker_results(
+            workers,
+            wall_sec=2.0,
+            server_cpu_before=(1.0, 0.5),
+            server_cpu_after=(2.0, 1.0),
+            client_cores_given=3,
+            client_procs=2,
+            concurrency=8,
+            shares_cores=False,
+        )
+        self.assertTrue(pt.measured)
+        self.assertAlmostEqual(pt.ops_per_sec, 200.0)
+        self.assertAlmostEqual(pt.mib_per_sec, (400 * 4096 / float(cs.MIB)) / 2.0)
+        self.assertAlmostEqual(pt.p50_ms, 3.0)
+        self.assertAlmostEqual(pt.p99_ms, 10.0)
+        self.assertAlmostEqual(pt.cpu_pct, 75.0)
+        self.assertAlmostEqual(pt.client_cpu_pct, 75.0)
+        self.assertEqual(pt.client_cores_given, 3)
+        self.assertEqual(pt.client_procs, 2)
+
+        bad_workers = [
+            workers[0],
+            cs.WorkerResult(
+                worker_index=1,
+                concurrency=4,
+                ops=5,
+                total_bytes=20480,
+                latencies_ms=(1.0,) * 5,
+                errors=3,
+                error_notes=(("HTTP 500", 3),),
+            ),
+        ]
+        bad = cs.aggregate_worker_results(bad_workers, wall_sec=2.0, client_cores_given=3, client_procs=2, concurrency=8)
+        self.assertFalse(bad.measured)
+        self.assertIn("3 failed", bad.reason)
+        self.assertIn("HTTP 500 x3", bad.reason)
+
+    def test_pattern_request_source_stride_prevents_key_collisions(self):
+        s0 = cs.PatternRequestSource("seq-write", 4096, seed=42, prefill_count=100, large_obj_size=16 * cs.MIB, step_offset=0, step_stride=4)
+        s1 = cs.PatternRequestSource("seq-write", 4096, seed=42, prefill_count=100, large_obj_size=16 * cs.MIB, step_offset=1, step_stride=4)
+        self.assertEqual([s0.next_request().key for _ in range(3)], ["seq/000000", "seq/000004", "seq/000008"])
+        self.assertEqual([s1.next_request().key for _ in range(3)], ["seq/000001", "seq/000005", "seq/000009"])
+
+    def test_live_multiprocess_client_runs_four_procs_against_stub_http_server(self):
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cs.rwb.BaselineFileS3Handler.storage_root = tmpdir
+            port = cs.rwb.get_free_port()
+            httpd = cs.rwb.ThreadedHTTPServer(("127.0.0.1", port), cs.rwb.BaselineFileS3Handler)
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            os.makedirs(os.path.join(tmpdir, cs.BUCKET), exist_ok=True)
+            try:
+                cli_cores = list(range(max(1, os.cpu_count() or 1)))
+                pt_write = cs._run_pattern_phase_with_cpu(
+                    "127.0.0.1",
+                    port,
+                    cs.BUCKET,
+                    "seq-write",
+                    4 * cs.KIB,
+                    concurrency=8,
+                    duration_sec=0.25,
+                    seed=42,
+                    prefill_bytes=64 * cs.KIB,
+                    server_pid=os.getpid(),
+                    shares_cores=True,
+                    client_procs=4,
+                    cli_cores=cli_cores,
+                )
+                self.assertTrue(pt_write.measured, pt_write.reason)
+                self.assertGreater(pt_write.ops_per_sec, 0.0)
+                self.assertGreater(pt_write.mib_per_sec, 0.0)
+                self.assertIsNotNone(pt_write.client_cpu_pct)
+                self.assertEqual(pt_write.client_cores_given, len(cli_cores))
+                self.assertEqual(pt_write.client_procs, 4)
+
+                seq_dir = os.path.join(tmpdir, cs.BUCKET, "seq")
+                written_keys = [f for f in os.listdir(seq_dir) if not f.endswith(".meta")]
+                self.assertGreaterEqual(len(written_keys), 8)
+                expected_ops = round(pt_write.ops_per_sec * pt_write.wall_sec)
+                self.assertEqual(len(written_keys), expected_ops)
+
+                pt_get = cs._run_phase_with_cpu(
+                    "127.0.0.1",
+                    port,
+                    cs.BUCKET,
+                    4 * cs.KIB,
+                    concurrency=8,
+                    duration_sec=0.2,
+                    mode="get",
+                    server_pid=os.getpid(),
+                    shares_cores=True,
+                    client_procs=4,
+                    cli_cores=cli_cores,
+                )
+                self.assertTrue(pt_get.measured, pt_get.reason)
+                self.assertGreater(pt_get.ops_per_sec, 0.0)
+                self.assertIsNotNone(pt_get.client_cpu_pct)
+                self.assertEqual(pt_get.client_cores_given, len(cli_cores))
+                self.assertEqual(pt_get.client_procs, 4)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+    def test_multiprocess_phase_returns_error_point_on_worker_done_timeout(self):
+        import socket
+        import time
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(8)
+        port = sock.getsockname()[1]
+        try:
+            t0 = time.perf_counter()
+            pt = cs._run_multiprocess_phase(
+                shares=[1, 1],
+                cli_cores=list(range(max(1, os.cpu_count() or 1))),
+                worker_spec_builder=lambda i, _c, _off: {
+                    "kind": "fixed",
+                    "mode": "get",
+                    "host": "127.0.0.1",
+                    "port": port,
+                    "bucket": cs.BUCKET,
+                    "size": 4 * cs.KIB,
+                    "duration_sec": 3.0,
+                    "validate_get_size": False,
+                    "label": f"timeout_test_{i}",
+                },
+                duration_sec=3.0,
+                server_pid=None,
+                shares_cores=False,
+                done_timeout_sec=0.3,
+            )
+            elapsed = time.perf_counter() - t0
+            self.assertFalse(pt.measured)
+            self.assertIn("timed out", (pt.reason or "").lower())
+            self.assertLess(elapsed, 15.0)
+        finally:
+            sock.close()
+
+    def test_http_threads_start_gate_limits_thread_spawn_skew(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proc, port, _backend = cs.start_trivial_http_server(data_root=tmpdir, get_size=4 * cs.KIB)
+            try:
+                res = cs._run_http_threads(
+                    host="127.0.0.1",
+                    port=port,
+                    concurrency=256,
+                    duration_sec=0.3,
+                    size=4 * cs.KIB,
+                    request_fn=lambda _wid, _rc: cs.RequestSpec("GET", "/obj"),
+                    bucket=None,
+                    validate_get_size=False,
+                    label="gate_skew",
+                )
+                self.assertEqual(res.errors, 0, res.error_notes)
+                self.assertEqual(res.stuck, 0)
+                self.assertGreater(res.ops, 0)
+                self.assertLess(res.wall_sec, 1.5)
+            finally:
+                cs._stop_proc(proc)
+
+
+class ClientCpuReportAndCapTests(unittest.TestCase):
+    def test_client_cap_info_flags_proc_cap_and_core_cap(self):
+        proc_capped = cs.PointResult(
+            ops_per_sec=4800.0,
+            p50_ms=3.0,
+            p99_ms=12.0,
+            cpu_pct=85.0,
+            client_cpu_pct=94.0,
+            client_cores_given=12,
+            client_procs=1,
+            concurrency=64,
+            shares_cores=False,
+        )
+        cores_g, util_g, cap_g = cs.client_cap_info(proc_capped, n_cores=4, total_cores=16, default_client_procs=1)
+        self.assertEqual(cores_g, 12)
+        self.assertAlmostEqual(util_g, (94.0 / 1200.0) * 100.0, places=2)
+        self.assertTrue(cap_g.startswith("yes"), cap_g)
+
+        core_capped = cs.PointResult(
+            ops_per_sec=14000.0,
+            p50_ms=2.0,
+            p99_ms=6.0,
+            cpu_pct=90.0,
+            client_cpu_pct=185.0,
+            client_cores_given=2,
+            client_procs=4,
+            concurrency=32,
+            shares_cores=False,
+        )
+        cores_c, util_c, cap_c = cs.client_cap_info(core_capped, n_cores=2, total_cores=4, default_client_procs=4)
+        self.assertEqual(cores_c, 2)
+        self.assertAlmostEqual(util_c, 92.5)
+        self.assertTrue(cap_c.startswith("yes"), cap_c)
+
+        uncapped = cs.PointResult(
+            ops_per_sec=35000.0,
+            p50_ms=1.5,
+            p99_ms=4.0,
+            cpu_pct=370.0,
+            client_cpu_pct=140.0,
+            client_cores_given=12,
+            client_procs=4,
+            concurrency=64,
+            shares_cores=False,
+        )
+        cores_u, util_u, cap_u = cs.client_cap_info(uncapped, n_cores=4, total_cores=16, default_client_procs=4)
+        self.assertEqual(cores_u, 12)
+        self.assertAlmostEqual(util_u, (140.0 / 1200.0) * 100.0, places=2)
+        self.assertEqual(cap_u, "no")
+
+    def test_reports_show_client_cpu_against_cores_without_changing_existing_columns(self):
+        cores, results = _sample_results()
+        results["put_4k"]["AwanFS"][1] = cs.PointResult(
+            ops_per_sec=4800.0,
+            p50_ms=3.0,
+            p99_ms=10.0,
+            cpu_pct=65.0,
+            ops_per_busy_core=7384.6,
+            client_cpu_pct=95.0,
+            client_cores_given=3,
+            client_procs=1,
+            concurrency=16,
+            shares_cores=False,
+        )
+        results["put_4k"]["AwanFS"][2] = cs.PointResult(
+            ops_per_sec=19000.0,
+            p50_ms=1.6,
+            p99_ms=4.2,
+            cpu_pct=180.0,
+            ops_per_busy_core=10555.6,
+            client_cpu_pct=80.0,
+            client_cores_given=2,
+            client_procs=4,
+            concurrency=32,
+            shares_cores=False,
+        )
+        md = cs.render_report(
+            cmd="python benchmarks/core_scaling.py --cores 1,2,4 --client-procs 4",
+            cores=cores,
+            results=results,
+            total_cores=4,
+            runs=2,
+            duration_sec=2.0,
+            client_procs=4,
+        )
+        self.assertIn("| Workload | Size | Server | 1 core | 2 cores | 4 cores | Scaling (4/1) |", md)
+        self.assertIn("| Workload | Size | Server | 1 core | 2 cores | 4 cores |", md)
+        self.assertIn("## Client CPU Usage", md)
+        self.assertIn("95.0% / 3 cores", md)
+        self.assertIn("80.0% / 2 cores", md)
+        self.assertIn("yes", md.lower())
+
+        patterns, sizes, m_cores, concs, m_results = _sample_matrix_results()
+        m_results["seq-write"][4096]["AwanFS"][1][16] = cs.PointResult(
+            ops_per_sec=12000.0,
+            mib_per_sec=46.88,
+            p50_ms=1.2,
+            p99_ms=3.5,
+            cpu_pct=88.0,
+            client_cpu_pct=250.0,
+            client_cores_given=3,
+            client_procs=4,
+            concurrency=16,
+            shares_cores=False,
+        )
+        m_md = cs.render_matrix_report(
+            cmd="python benchmarks/core_scaling.py --matrix --client-procs 4",
+            patterns=patterns,
+            sizes=sizes,
+            cores=m_cores,
+            concurrencies=concs,
+            results=m_results,
+            total_cores=4,
+            runs=2,
+            duration_sec=2.0,
+            seed=42,
+            memory_budget="32MiB",
+            prefill_bytes=48 * cs.MIB,
+            client_procs=4,
+        )
+        self.assertIn("| Server | Pattern | Size | Cores | Concurrency | ops/s | MiB/s | P50 (ms) | P99 (ms) | CPU % |", m_md)
+        self.assertIn("## Client CPU Usage", m_md)
+        self.assertIn("250.0%", m_md)
+        self.assertIn("Client Cores", m_md)
+
+
+class TrivialHttpAndCeilingProbeTests(unittest.TestCase):
+    def test_trivial_http_server_handles_put_and_get_and_ceiling_probe_runs(self):
+        import http.client
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proc, port, backend = cs.start_trivial_http_server(data_root=tmpdir, get_size=4 * cs.KIB)
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5.0)
+                conn.request("PUT", "/obj", body=b"a" * 4096, headers={"Content-Length": "4096", "Connection": "keep-alive"})
+                r1 = conn.getresponse()
+                r1.read()
+                self.assertEqual(r1.status, 200)
+
+                conn.request("GET", "/obj", headers={"Connection": "keep-alive"})
+                r2 = conn.getresponse()
+                body = r2.read()
+                self.assertEqual(r2.status, 200)
+                self.assertEqual(len(body), 4 * cs.KIB)
+                conn.close()
+            finally:
+                cs._stop_proc(proc)
+                if backend:
+                    pass
+
+            rows = cs.run_ceiling_probe(
+                data_root=tmpdir,
+                procs_list=(1, 2),
+                concurrency=4,
+                duration_sec=0.1,
+                runs=1,
+                size=4 * cs.KIB,
+            )
+            self.assertEqual(len(rows), 4)
+            for row in rows:
+                self.assertTrue(row.result.measured, row.result.reason)
+                self.assertGreater(row.result.ops_per_sec, 0.0)
+                self.assertIsNotNone(row.result.client_cpu_pct)
+
+            md = cs.render_ceiling_report(
+                cmd="python benchmarks/core_scaling.py --ceiling-probe --runs 1 --duration 0.1",
+                rows=rows,
+                procs_list=(1, 2),
+                concurrency=4,
+                duration_sec=0.1,
+                runs=1,
+                total_cores=4,
+                size=4 * cs.KIB,
+            )
+            self.assertTrue(md.startswith("Command: `python benchmarks/core_scaling.py --ceiling-probe"))
+            self.assertIn("PUT 4 KiB", md)
+            self.assertIn("GET 4 KiB", md)
+            self.assertIn("Client CPU", md)
 
 
 if __name__ == "__main__":

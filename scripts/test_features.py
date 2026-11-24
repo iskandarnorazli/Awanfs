@@ -78,6 +78,14 @@ server_tests = ["server/tests/health_test.rs"]
 """
 
 
+def cors_waits_on(other):
+    """VALID_TOML with cors's failing test listed as waiting on `other`."""
+    return VALID_TOML.replace(
+        'fuzz = ["cors_xml"]\n',
+        'fuzz = ["cors_xml"]\n\n[feature.waits_on]\n"test_s3::test_cors_header_option" = "%s"\n' % other,
+    )
+
+
 class FeaturesTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -93,7 +101,7 @@ class FeaturesTest(unittest.TestCase):
         (self.root / "server" / "fuzz" / "Cargo.toml").write_text(MINIMAL_FUZZ_CARGO, encoding="utf-8")
         (self.root / "server" / "fuzz" / "fuzz_targets" / "cors_xml.rs").write_text("", encoding="utf-8")
         (self.root / "tests" / "s3tests" / "passing.txt").write_text(
-            "test_s3::test_set_cors\n", encoding="utf-8"
+            "test_s3::test_set_cors\ntest_s3::test_cors_header_option\n", encoding="utf-8"
         )
 
         self.suite = self.root / "test_s3.py"
@@ -115,6 +123,47 @@ class FeaturesTest(unittest.TestCase):
 
     def test_valid_registry_passes(self):
         self.assertEqual(self._run_check(), 0)
+
+    # A feature is done only when its ceph tests pass, or each one that does not names the
+    # unfinished feature it waits on (owner, 2026-11-21).
+    def _passing(self, *names):
+        (self.root / "tests" / "s3tests" / "passing.txt").write_text("".join(n + "\n" for n in names), encoding="utf-8")
+
+    def _probs(self):
+        return features.check_registry(root=self.root, registry_path=self.registry, ceph_suites=[self.suite])
+
+    def test_a_done_feature_with_a_failing_ceph_test_fails(self):
+        self._passing("test_s3::test_set_cors")
+        probs = self._probs()
+        self.assertTrue(any("cors" in p and "test_s3::test_cors_header_option" in p and "done" in p for p in probs), probs)
+        self.assertEqual(self._run_check(), 1)
+
+    def test_a_failing_test_listed_under_waits_on_an_unfinished_feature_passes(self):
+        self._passing("test_s3::test_set_cors")
+        self.registry.write_text(cors_waits_on("sigv2"), encoding="utf-8")
+        self.assertEqual(self._probs(), [])
+
+    def test_waits_on_an_unknown_or_done_feature_fails(self):
+        self._passing("test_s3::test_set_cors")
+        for other, word in (("nosuch", "unknown"), ("health", "done")):
+            self.registry.write_text(cors_waits_on(other), encoding="utf-8")
+            probs = self._probs()
+            self.assertTrue(any("waits_on" in p and other in p and word in p for p in probs), (other, probs))
+
+    def test_a_waits_on_entry_for_a_passing_test_is_stale_and_fails(self):
+        self.registry.write_text(cors_waits_on("sigv2"), encoding="utf-8")
+        probs = self._probs()
+        self.assertTrue(any("waits_on" in p and "test_cors_header_option" in p and "passes" in p for p in probs), probs)
+
+    def test_a_waits_on_entry_for_another_features_test_fails(self):
+        self._passing("test_s3::test_set_cors")
+        self.registry.write_text(
+            VALID_TOML.replace('server_tests = ["server/tests/health_test.rs"]',
+                               'server_tests = ["server/tests/health_test.rs"]\n\n[feature.waits_on]\n"test_s3::test_cors_header_option" = "sigv2"'),
+            encoding="utf-8",
+        )
+        probs = self._probs()
+        self.assertTrue(any("health" in p and "waits_on" in p and "not one of its tests" in p for p in probs), probs)
 
     def test_test_in_no_feature_fails(self):
         self.suite.write_text(
@@ -274,6 +323,96 @@ class FeaturesTest(unittest.TestCase):
             mint_logs=[mint_log],
         )
         self.assertTrue(any("aws-sdk-go::MissingTest" in p for p in probs), probs)
+
+    def test_mint_log_skips_banner_lines_and_fails_on_malformed_or_empty(self):
+        good = self.root / "mint_banner.json"
+        good.write_text(
+            '{"name": "mc", "function": "test_make_bucket", "status": "PASS"}\n'
+            'Dependency validation complete\n'
+            '{"name": "mc", "function": "test_rb", "status": "PASS"}\n',
+            encoding="utf-8",
+        )
+        parsed = features.parse_mint_log([good])
+        self.assertEqual(
+            parsed,
+            {"mc::test_make_bucket": ("pass", ""), "mc::test_rb": ("pass", "")},
+        )
+
+        malformed = self.root / "mint_bad.json"
+        malformed.write_text('{"name": "mc", "function": "test_rb"\n', encoding="utf-8")
+        with self.assertRaises(ValueError):
+            features.parse_mint_log([malformed])
+        probs = features.check_registry(
+            root=self.root, registry_path=self.registry, ceph_suites=[self.suite], mint_logs=[malformed]
+        )
+        self.assertTrue(probs)
+
+        for name, text in (("mint_empty.json", "\n"), ("mint_only_banner.json", "Dependency validation complete\n")):
+            empty = self.root / name
+            empty.write_text(text, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                features.parse_mint_log([empty])
+            probs = features.check_registry(
+                root=self.root, registry_path=self.registry, ceph_suites=[self.suite], mint_logs=[empty]
+            )
+            self.assertTrue(probs, name)
+
+    def test_mint_log_normalizes_awscli_and_strips_newlines(self):
+        mint_log = self.root / "mint_awscli.json"
+        mint_log.write_text(
+            '{"name": "awscli", "function": "make_bucket\\n", "status": "PASS"}\n'
+            '{"name": "awscli", "function": "aws --endpoint-url http://127.0.0.1:9000 s3api create-multipart-upload --bucket awscli-mint-test-bucket-2170 --key awscli-mint-test-bucket-2170-object\\r\\n", "status": "PASS"}\n',
+            encoding="utf-8",
+        )
+        parsed = features.parse_mint_log([mint_log])
+        self.assertEqual(
+            sorted(parsed),
+            [
+                "awscli::aws --endpoint-url http://127.0.0.1:9000 s3api create-multipart-upload --bucket awscli-mint-test-bucket --key awscli-mint-test-bucket-object",
+                "awscli::make_bucket",
+            ],
+        )
+
+    def test_parse_passing_file_preserves_brackets_in_mint_keys(self):
+        ceph_p = self.root / "ceph_passing.txt"
+        ceph_p.write_text(
+            "test_copy_enc[sse-c]\n"
+            "test_s3::test_other[1]\n"
+            "test_headers::test_bad_header[x]\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            features.parse_passing_file(ceph_p, default_prefix="test_s3::"),
+            {"test_s3::test_copy_enc", "test_s3::test_other", "test_headers::test_bad_header"},
+        )
+
+        mint_p = self.root / "mint_passing.txt"
+        mint_p.write_text(
+            "aws-sdk-php::getBucketLocation ( array $params = [] )\n"
+            "minio-js::setObjectLegalHold(bucketName, objectName, setOpts={})\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            features.parse_passing_file(mint_p),
+            {
+                "aws-sdk-php::getBucketLocation ( array $params = [] )",
+                "minio-js::setObjectLegalHold(bucketName, objectName, setOpts={})",
+            },
+        )
+
+    def test_mint_log_empty_function_and_repeated_fail_wins(self):
+        mint_log = self.root / "mint_rep.json"
+        mint_log.write_text(
+            '{"name": "minio-py:test_put_object", "function": "", "status": "PASS"}\n'
+            '{"name": "minio-java", "function": "putObject()", "status": "PASS"}\n'
+            '{"name": "minio-java", "function": "putObject()", "status": "FAIL", "error": "AuthorizationHeaderMalformed"}\n'
+            '{"name": "minio-java", "function": "putObject()", "status": "NA"}\n'
+            '{"name": "minio-java", "function": "putObject()", "status": "PASS"}\n',
+            encoding="utf-8",
+        )
+        parsed = features.parse_mint_log([mint_log])
+        self.assertEqual(parsed["minio-py:test_put_object"], ("pass", ""))
+        self.assertEqual(parsed["minio-java::putObject()"], ("fail", "AuthorizationHeaderMalformed"))
 
     def test_report_writes_features_md_with_status_counts_and_gaps(self):
         mint_log = self.root / "mint.json"

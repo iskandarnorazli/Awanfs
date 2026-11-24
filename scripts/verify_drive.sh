@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Drives a fresh s3-server the way a user does (aws CLI) and keeps the evidence.
-#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart (default: all)
+#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart (default: all)
 # Needs: a built server (cargo build --release --manifest-path server/Cargo.toml), the aws CLI, curl.
 # Evidence: verification/evidence/<UTC timestamp>/ (kept after cleanup). Exit 0 only if every journey passed.
 set -uo pipefail
@@ -259,6 +259,28 @@ j_restart() { local id e1 e2 a; echo "survives" >"$EVID/s.bin" && S3 put-object 
   S3 get-bucket-versioning --bucket verify-rv --query Status --output text | grep -qx Enabled &&
   S3 get-object --bucket verify-rv --key k --version-id "$a" "$EVID/srv.out" >/dev/null && same "$EVID/s.bin" "$EVID/srv.out" &&
   S3 head-bucket --bucket verify-bkt; }
+j_quickstart() { local qd qpid; qd="$EVID/qs" && mkdir -p "$qd/server/target/release" && ln -sfn "$BIN" "$qd/server/target/release/s3-server" && (
+  cd "$qd" || exit 1
+  qpid=""
+  cleanup_qs() { [ -n "${qpid:-}" ] && kill "$qpid" 2>/dev/null || true; [ -n "${qpid:-}" ] && wait "$qpid" 2>/dev/null || true; }
+  trap cleanup_qs EXIT
+  AWANFS_ACCESS_KEY=s3admin AWANFS_SECRET_KEY=s3secret \
+    ./server/target/release/s3-server --port 9000 --data-dir ./s3-data >"$EVID/quickstart-server.log" 2>&1 &
+  qpid=$!
+  for _ in $(seq 1 100); do curl -sf http://127.0.0.1:9000/_awanfs/health/ready >/dev/null && break; sleep 0.1; done
+  curl -sf http://127.0.0.1:9000/_awanfs/health/ready >/dev/null || exit 1
+  export AWS_ACCESS_KEY_ID=s3admin
+  export AWS_SECRET_ACCESS_KEY=s3secret
+  export AWS_DEFAULT_REGION=us-east-1
+  echo "hello awanfs" > hello.txt &&
+    aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://quickstart-bkt &&
+    aws --endpoint-url http://127.0.0.1:9000 s3 cp hello.txt s3://quickstart-bkt/hello.txt &&
+    aws --endpoint-url http://127.0.0.1:9000 s3 ls s3://quickstart-bkt/ | grep -q "hello.txt" &&
+    aws --endpoint-url http://127.0.0.1:9000 s3 cp s3://quickstart-bkt/hello.txt hello.out &&
+    cmp -s hello.txt hello.out &&
+    aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://quickstart-bkt/hello.txt &&
+    aws --endpoint-url http://127.0.0.1:9000 s3 rb s3://quickstart-bkt
+); }
 
 # Refuse to run a journey whose && chain is split by a `local x;` (see the note above md5q).
 masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:]]+local [^;]*;|&& *local ' || true)
@@ -266,7 +288,7 @@ masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:
 
 start || exit 1
 check doctor doctor
-features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart)
+features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart)
 [[ " ${features[*]} " == *" buckets "* ]] || check buckets j_buckets
 for f in "${features[@]}"; do check "$f" "j_$f"; done
 ls -la "$DATA" >"$EVID/data-dir.txt" 2>&1

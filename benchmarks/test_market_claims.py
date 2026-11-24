@@ -4,6 +4,7 @@
 import http.server
 import json
 import os
+import re
 import socketserver
 import sys
 import tempfile
@@ -369,6 +370,161 @@ class TestReportFormatting(unittest.TestCase):
             src = fh.read()
         self.assertNotIn("stdout=subprocess.PIPE", src)
         self.assertNotIn("stderr=subprocess.PIPE", src)
+
+    def test_cold_get_labels_mark_warm_page_cache_unless_dataset_exceeds_ram(self):
+        # Default args on default_workloads() must label warm page cache + 32 MiB dataset.
+        default_labels = dict(mc.default_workloads("full"))
+        for cold_key in ("get_64k_cold", "get_1m_cold"):
+            self.assertIn("32 MiB dataset", default_labels[cold_key])
+            self.assertIn("warm page cache", default_labels[cold_key])
+
+        cmd = "python benchmarks/market_claims.py --runs 3 --duration 30"
+        m = mc.RunMeasurement(BenchmarkMetrics(4718.6, 294.9, 12.72, 20.0, 32.85, 40.0, 60.1), disk_mib=68.3, cache_hits=1, cache_misses=136767)
+        results = {"AwanFS (--durability=group, default)": {"get_64k_cold": [m], "get_1m_cold": [m]}}
+
+        # 32 MiB on 31.4 GB RAM -> warm page cache
+        hw_31g = {
+            "cpu": "Test CPU",
+            "cores": "16",
+            "ram_gb": "31.4",
+            "ram_bytes": str(int(31.4 * 1024 ** 3)),
+            "os": "Windows 11",
+        }
+        report_warm = mc.format_market_claims_report(
+            cmd=cmd,
+            hw_info=hw_31g,
+            results=results,
+            workloads=mc.default_workloads("full", cold_set_mib=32, ram_bytes=int(31.4 * 1024 ** 3)),
+            durabilities=["group"],
+            runs=3,
+            duration_sec=30.0,
+            profile="full",
+            minio_drives=4,
+            cold_set_mib=32,
+        )
+        self.assertIn("32 MiB dataset", report_warm)
+        self.assertIn("warm page cache", report_warm)
+        self.assertNotIn("Dataset exceeds host RAM", report_warm)
+        for row_prefix in ("| **64 KiB Cold GET", "| **1 MiB Cold GET", "| 64 KiB Cold GET", "| 1 MiB Cold GET"):
+            matching = [ln for ln in report_warm.splitlines() if ln.startswith(row_prefix)]
+            self.assertTrue(matching, f"missing row starting with {row_prefix!r}")
+            for ln in matching:
+                self.assertIn("32 MiB dataset", ln)
+                self.assertIn("warm page cache", ln)
+
+        # Boundary: cold_set_mib * 1024**2 == ram_bytes still does not exceed host RAM.
+        hw_32g = {"cpu": "Test CPU", "cores": "16", "ram_gb": "32.0", "ram_bytes": str(32 * 1024 ** 3), "os": "Linux"}
+        report_eq = mc.format_market_claims_report(
+            cmd=cmd,
+            hw_info=hw_32g,
+            results=results,
+            workloads=mc.default_workloads("full"),
+            durabilities=["group"],
+            runs=3,
+            duration_sec=30.0,
+            profile="full",
+            minio_drives=4,
+            cold_set_mib=32768,
+        )
+        self.assertIn("32768 MiB dataset", report_eq)
+        self.assertIn("warm page cache", report_eq)
+        self.assertNotIn("Dataset exceeds host RAM", report_eq)
+
+        # Strictly larger than host RAM -> Dataset exceeds host RAM (not warm page cache).
+        report_cold = mc.format_market_claims_report(
+            cmd=cmd,
+            hw_info=hw_32g,
+            results=results,
+            workloads=mc.default_workloads("full", cold_set_mib=40960, ram_bytes=32 * 1024 ** 3),
+            durabilities=["group"],
+            runs=3,
+            duration_sec=30.0,
+            profile="full",
+            minio_drives=4,
+            cold_set_mib=40960,
+        )
+        self.assertIn("40960 MiB dataset", report_cold)
+        self.assertIn("Dataset exceeds host RAM", report_cold)
+        self.assertNotIn("warm page cache", report_cold)
+
+        # Fallback when hw_info provides only ram_gb (no ram_bytes), as existing callers do.
+        hw_gb_only = {"cpu": "Test CPU", "cores": "16", "ram_gb": "31.4", "os": "Windows 11"}
+        report_gb_warm = mc.format_market_claims_report(
+            cmd=cmd,
+            hw_info=hw_gb_only,
+            results=results,
+            workloads=mc.default_workloads("full"),
+            durabilities=["group"],
+            runs=3,
+            duration_sec=30.0,
+            profile="full",
+            minio_drives=4,
+            cold_set_mib=32,
+        )
+        self.assertIn("32 MiB dataset", report_gb_warm)
+        self.assertIn("warm page cache", report_gb_warm)
+        self.assertNotIn("Dataset exceeds host RAM", report_gb_warm)
+
+        # Unknown host RAM must never claim Dataset exceeds host RAM.
+        hw_unknown = {"cpu": "Test CPU", "cores": "16", "ram_gb": "unknown", "os": "Linux"}
+        report_unknown = mc.format_market_claims_report(
+            cmd=cmd,
+            hw_info=hw_unknown,
+            results=results,
+            workloads=mc.default_workloads("full"),
+            durabilities=["group"],
+            runs=3,
+            duration_sec=30.0,
+            profile="full",
+            minio_drives=4,
+            cold_set_mib=32,
+        )
+        self.assertIn("warm page cache", report_unknown)
+        self.assertNotIn("Dataset exceeds host RAM", report_unknown)
+
+        ram_b = mc.host_ram_bytes()
+        if ram_b is not None:
+            self.assertGreater(ram_b, 0)
+
+    def test_readme_cold_get_claims_match_report_and_label_warm_page_cache(self):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(repo_root, "README.md"), encoding="utf-8") as fh:
+            readme = fh.read()
+        with open(os.path.join(repo_root, "measurements", "2026-11-18-market-claims.md"), encoding="utf-8") as fh:
+            report = fh.read()
+
+        def extract_report_spreads(prefix):
+            rows = [ln for ln in report.splitlines() if ln.startswith(prefix)]
+            self.assertEqual(len(rows), 5, f"expected 5 server rows for {prefix!r}")
+            spreads = []
+            for row in rows:
+                cols = [c.strip() for c in row.strip("|").split("|")]
+                # cols: Workload, Server, Client, Throughput, Ops/sec, ...
+                spreads.append((cols[3], cols[4]))
+            return spreads
+
+        cold_64k_line = next((ln for ln in readme.splitlines() if ln.startswith("| **64 KiB Cold GET")), None)
+        cold_1m_line = next((ln for ln in readme.splitlines() if ln.startswith("| **1 MiB Cold GET")), None)
+        self.assertIsNotNone(cold_64k_line, "README missing 64 KiB Cold GET row")
+        self.assertIsNotNone(cold_1m_line, "README missing 1 MiB Cold GET row")
+
+        for row_line in (cold_64k_line, cold_1m_line):
+            self.assertIn("warm page cache", row_line)
+            self.assertIn("32 MiB", row_line)
+            self.assertIn("16MiB", row_line)
+
+        for tp, ops in extract_report_spreads("| **64 KiB Cold GET"):
+            self.assertIn(tp, cold_64k_line)
+            self.assertIn(ops, cold_64k_line)
+
+        for tp, ops in extract_report_spreads("| **1 MiB Cold GET"):
+            self.assertIn(tp, cold_1m_line)
+            self.assertIn(ops, cold_1m_line)
+
+        self.assertIn("--cold-set-mib 32", readme)
+        self.assertIn("--memory-budget 16MiB", readme)
+        self.assertIn("31.4 GB", readme)
+        self.assertRegex(readme, r"warp.*AwanFS.*not measured|AwanFS.*not measured.*warp")
 
 
 if __name__ == "__main__":
