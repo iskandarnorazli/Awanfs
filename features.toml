@@ -1411,6 +1411,8 @@ server_tests = [
   "server/tests/chunk_signature_test.rs",
   "server/tests/multipart_sigv4_test.rs",
   "server/tests/parser_robustness_test.rs",
+  "server/tests/sigv4_vectors_test.rs",
+  "server/tests/sigv4_differential_test.rs",
 ]
 drive = ["doctor"]
 fuzz = ["sigv4", "aws_chunked", "iso8601"]

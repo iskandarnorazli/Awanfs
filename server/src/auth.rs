@@ -125,6 +125,25 @@ fn header_readings(headers: &HeaderMap, signed: &[&str]) -> Vec<HeaderText> {
     out
 }
 
+/// Trims leading/trailing ASCII space (`0x20`) and collapses consecutive `' '` runs into one
+/// `' '`, preserving HTAB (`\t`) and non-`0x20` bytes to match AWS SigV4 `trim_all`.
+fn trim_ascii_spaces(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut prev_space = true;
+    for ch in v.trim_matches(' ').chars() {
+        if ch == ' ' {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out
+}
+
 fn canonical_headers(headers: &HeaderMap, signed: &[&str], how: HeaderText) -> Result<String, &'static str> {
     let mut out = String::new();
     for name in signed {
@@ -132,7 +151,7 @@ fn canonical_headers(headers: &HeaderMap, signed: &[&str], how: HeaderText) -> R
             .get_all(*name)
             .iter()
             .filter_map(|v| header_text(v.as_bytes(), how))
-            .map(|v| v.split_whitespace().collect::<Vec<_>>().join(" "))
+            .map(|v| trim_ascii_spaces(&v))
             .collect();
         if values.is_empty() {
             return Err("AuthorizationHeaderMalformed");
@@ -246,7 +265,7 @@ pub fn authenticate_with(
         let payload_hash = headers
             .get("x-amz-content-sha256")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("UNSIGNED-PAYLOAD")
+            .unwrap_or(EMPTY_SHA256)
             .to_string();
         let parsed = Parsed {
             access_key,
