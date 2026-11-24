@@ -22,6 +22,17 @@ use std::sync::Arc;
 
 pub type SpillError = SegmentError;
 
+/// Timing and flush/compaction counts from one [`SpillIndex::put_measured`] call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PutSample {
+    pub lock_wait_ns: u64,
+    pub lock_hold_ns: u64,
+    pub flush_ns: u64,
+    pub compact_ns: u64,
+    pub flushes: usize,
+    pub compactions: usize,
+}
+
 /// The spill index's share of the memory budget's cache half when no budget is set (#13).
 pub const SPILL_CACHE_BYTES: usize = 64 << 20;
 
@@ -113,23 +124,31 @@ impl SpillIndex {
         Ok(())
     }
 
-    fn insert(&self, st: &mut State, key: Vec<u8>, e: Entry) -> Result<(), SpillError> {
+    fn insert_counted(&self, st: &mut State, key: Vec<u8>, e: Entry, flush_ns: &mut u64, compact_ns: &mut u64) -> Result<(usize, usize), SpillError> {
         let add = key.len() + ENTRY_OVERHEAD;
         if st.mem.insert(key, e).is_none() {
             st.mem_bytes += add;
         }
         if st.mem_bytes >= self.mem_limit {
-            self.flush_locked(st)?;
+            self.flush_locked_timed(st, flush_ns, compact_ns)
+        } else {
+            Ok((0, 0))
         }
-        Ok(())
+    }
+
+    fn insert(&self, st: &mut State, key: Vec<u8>, e: Entry) -> Result<(), SpillError> {
+        let mut flush_ns = 0;
+        let mut compact_ns = 0;
+        self.insert_counted(st, key, e, &mut flush_ns, &mut compact_ns).map(|_| ())
     }
 
     /// Writes the memtable to a segment, then compacts until no level is over its limit. The
     /// memtable is emptied only once its segment is named by a durable manifest.
-    fn flush_locked(&self, st: &mut State) -> Result<(), SpillError> {
+    fn flush_locked_timed(&self, st: &mut State, flush_ns: &mut u64, compact_ns: &mut u64) -> Result<(usize, usize), SpillError> {
         if st.mem.is_empty() {
-            return Ok(());
+            return Ok((0, 0));
         }
+        let t_flush = std::time::Instant::now();
         let now = now_ns();
         let State { mem, mem_bytes, store } = st;
         let store = store.as_mut().expect("open");
@@ -137,8 +156,17 @@ impl SpillIndex {
         store.flush_from(mem.iter().map(|(k, e)| SegEntry { key: k.clone(), entry: *e }), ReplayFrom::default(), now)?;
         mem.clear();
         *mem_bytes = 0;
-        store.compact_all(&self.policy, now)?;
-        Ok(())
+        *flush_ns = t_flush.elapsed().as_nanos() as u64;
+        let t_compact = std::time::Instant::now();
+        let compactions = store.compact_all(&self.policy, now)?;
+        *compact_ns = t_compact.elapsed().as_nanos() as u64;
+        Ok((1, compactions))
+    }
+
+    fn flush_locked(&self, st: &mut State) -> Result<(), SpillError> {
+        let mut flush_ns = 0;
+        let mut compact_ns = 0;
+        self.flush_locked_timed(st, &mut flush_ns, &mut compact_ns).map(|_| ())
     }
 
     /// Flushes the memtable now (a benchmark's build, before it reopens the index).
@@ -150,6 +178,26 @@ impl SpillIndex {
     pub fn put(&self, bucket_id: u32, key: &[u8], meta: &ObjectMeta) -> Result<(), SpillError> {
         let mut st = self.state.write();
         self.insert(&mut st, sort_key(bucket_id, key), Entry::Row(*meta))
+    }
+
+    /// Inserts like [`SpillIndex::put`] and returns the lock wait/hold breakdown and flush/compaction counts.
+    pub fn put_measured(&self, bucket_id: u32, key: &[u8], meta: &ObjectMeta) -> Result<PutSample, SpillError> {
+        let t0 = std::time::Instant::now();
+        let mut st = self.state.write();
+        let t1 = std::time::Instant::now();
+        let mut flush_ns = 0;
+        let mut compact_ns = 0;
+        let (flushes, compactions) = self.insert_counted(&mut st, sort_key(bucket_id, key), Entry::Row(*meta), &mut flush_ns, &mut compact_ns)?;
+        let lock_hold_ns = t1.elapsed().as_nanos() as u64;
+        drop(st);
+        Ok(PutSample {
+            lock_wait_ns: t1.duration_since(t0).as_nanos() as u64,
+            lock_hold_ns,
+            flush_ns,
+            compact_ns,
+            flushes,
+            compactions,
+        })
     }
 
     fn get_locked(st: &State, k: &[u8]) -> Result<Option<ObjectMeta>, SpillError> {
@@ -357,6 +405,37 @@ mod tests {
         s.clear().unwrap();
         assert!(model.keys().all(|(b, k)| s.get(*b, k).unwrap().is_none()));
         assert_eq!(DiskFs.list(&d.join("meta")).unwrap(), Vec::<PathBuf>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn put_measured_reports_lock_times_flushes_and_compactions() {
+        let d = dir("measured");
+        let policy = Policy { l0_trigger: 2, level1_bytes: 8 * 4096, ratio: 3, segment_bytes: 8 * 4096, max_level: 4 };
+        let s = SpillIndex::open_with(&d, 256 << 10, policy).unwrap();
+        let mut flush_puts = 0usize;
+        let mut total_flushes = 0usize;
+        let mut total_compactions = 0usize;
+        for i in 0..2_000u64 {
+            let k = format!("obj/{:06}", i).into_bytes();
+            let sample = s.put_measured(1, &k, &row(i)).unwrap();
+            assert!(sample.lock_hold_ns >= sample.flush_ns + sample.compact_ns);
+            if sample.flushes > 0 {
+                flush_puts += 1;
+                assert!(sample.flush_ns > 0);
+            } else {
+                assert_eq!(sample.flush_ns, 0);
+                assert_eq!(sample.compact_ns, 0);
+            }
+            total_flushes += sample.flushes;
+            total_compactions += sample.compactions;
+        }
+        assert!(flush_puts >= 2, "expected at least 2 flushes, got {}", flush_puts);
+        assert_eq!(flush_puts, total_flushes);
+        assert!(total_compactions >= 1, "expected at least 1 compaction, got {}", total_compactions);
+        for i in (0..2_000u64).step_by(97) {
+            assert_eq!(s.get(1, format!("obj/{:06}", i).as_bytes()).unwrap(), Some(row(i)));
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 }
