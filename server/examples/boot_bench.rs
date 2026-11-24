@@ -245,11 +245,13 @@ fn scan(dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
     if ids.is_empty() {
         return Err(format!("no volume_*.dat files in {}", dir.display()).into());
     }
-    // Open every volume before timing; VolumeManager::open runs an initial recovery scan.
+    // Open every volume before timing `scan_needles`; time `open` separately so `boot` splits cleanly.
+    let t_open = Instant::now();
     let mut volumes = Vec::with_capacity(ids.len());
     for id in ids {
         volumes.push(VolumeManager::open(dir, id).map_err(|e| format!("volume {}: {}", id, e))?);
     }
+    let open_secs = t_open.elapsed().as_secs_f64();
     let before_reads: Vec<u64> = volumes
         .iter()
         .map(|vm| vm.work_counters().snapshot().disk_reads)
@@ -271,8 +273,9 @@ fn scan(dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
         .sum();
     let needles_per_s = needles as f64 / secs.max(1e-9);
     Ok(format!(
-        "{{\"phase\":\"scan\",\"volumes\":{},\"secs\":{:.3},\"needles\":{},\"needles_per_s\":{:.0},\"read_calls\":{}}}",
+        "{{\"phase\":\"scan\",\"volumes\":{},\"open_secs\":{:.3},\"secs\":{:.3},\"needles\":{},\"needles_per_s\":{:.0},\"read_calls\":{}}}",
         volumes.len(),
+        open_secs,
         secs,
         needles,
         needles_per_s,
@@ -323,11 +326,15 @@ mod tests {
 
         let v: serde_json::Value = serde_json::from_str(&line).expect("scan output is valid JSON");
         assert_eq!(v["phase"], "scan");
+        assert!(v["open_secs"].as_f64().is_some(), "missing open_secs in {line}");
         assert!(v["secs"].as_f64().is_some(), "missing secs in {line}");
         assert_eq!(v["needles"].as_u64(), Some(objects));
         assert!(v["needles_per_s"].as_f64().is_some(), "missing needles_per_s in {line}");
         let read_calls = v["read_calls"].as_u64().expect("missing read_calls");
-        assert!(read_calls >= objects, "read_calls {read_calls} < needles {objects}");
+        assert!(
+            read_calls >= 1 && read_calls < objects,
+            "expected batched read_calls in 1..{objects}, got {read_calls}"
+        );
     }
 
     struct TempDir(PathBuf);

@@ -101,6 +101,80 @@ pub struct NeedleLocation {
 /// Size of the pieces a streamed needle is written in.
 pub const STREAM_CHUNK: usize = 1 << 20;
 
+/// Sequential aligned read batch size for `VolumeManager::scan_needles` and `open_with` (#324, Decision 7A).
+const SCAN_BATCH_BYTES: usize = 1 << 20;
+
+/// Reusable 1 MiB sector-aligned read window for sequential volume scans.
+struct AlignedScanWindow<'a, F: VolFile> {
+    file: &'a F,
+    file_len: u64,
+    work: Option<&'a WorkCounters>,
+    buf: AlignedBuffer,
+    buf_start: u64,
+    buf_len: usize,
+}
+
+impl<'a, F: VolFile> AlignedScanWindow<'a, F> {
+    fn new(file: &'a F, file_len: u64, work: Option<&'a WorkCounters>) -> Self {
+        Self {
+            file,
+            file_len,
+            work,
+            buf: AlignedBuffer::new(SCAN_BATCH_BYTES),
+            buf_start: 0,
+            buf_len: 0,
+        }
+    }
+
+    fn count_read(&self) {
+        if let Some(work) = self.work {
+            work.disk_read();
+        }
+    }
+
+    /// Returns at least `need_bytes` sector-aligned bytes starting at `offset`, refilling up to
+    /// `SCAN_BATCH_BYTES` clamped to whole sectors inside `file_len`.
+    fn read_at(&mut self, offset: u64, need_bytes: usize) -> Option<&[u8]> {
+        debug_assert_eq!(offset % SECTOR_SIZE as u64, 0);
+        debug_assert!(need_bytes > 0 && need_bytes % SECTOR_SIZE == 0);
+        if need_bytes > self.buf.len() {
+            self.buf = AlignedBuffer::new(need_bytes);
+            self.buf_len = 0;
+        }
+        let end = offset.checked_add(need_bytes as u64)?;
+        if end > self.file_len {
+            return None;
+        }
+        if offset >= self.buf_start && end <= self.buf_start + self.buf_len as u64 {
+            let start = (offset - self.buf_start) as usize;
+            return Some(&self.buf[start..start + need_bytes]);
+        }
+
+        let avail_bytes = ((self.file_len - offset) / SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
+        if avail_bytes < need_bytes as u64 {
+            return None;
+        }
+        let to_read = (self.buf.len() as u64).min(avail_bytes) as usize;
+        self.buf_len = 0;
+        self.count_read();
+        if self.file.read_aligned_at(offset, &mut self.buf[..to_read]).is_err() {
+            if to_read > need_bytes {
+                self.count_read();
+                if self.file.read_aligned_at(offset, &mut self.buf[..need_bytes]).is_err() {
+                    return None;
+                }
+                self.buf_start = offset;
+                self.buf_len = need_bytes;
+                return Some(&self.buf[..need_bytes]);
+            }
+            return None;
+        }
+        self.buf_start = offset;
+        self.buf_len = to_read;
+        Some(&self.buf[..need_bytes])
+    }
+}
+
 /// How far a growing volume's file is extended at a time (#178): `AWAN_VOLUME_GROWTH_STEP` in
 /// bytes, for measurements, or 256 MiB.
 pub const DEFAULT_GROWTH_STEP: u64 = 256 * 1024 * 1024;
@@ -640,14 +714,10 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             format = found;
 
             // Scan valid needles
-            let mut read_buf = AlignedBuffer::new(SECTOR_SIZE);
-            while scan_offset + (SECTOR_SIZE as u64) <= file_len {
-                if aligned_file.read_aligned_at(scan_offset, &mut read_buf).is_err() {
-                    break;
-                }
-
+            let mut window = AlignedScanWindow::new(&*aligned_file, file_len, None);
+            while let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE) {
                 let mut header_bytes = [0u8; 64];
-                header_bytes.copy_from_slice(&read_buf[0..64]);
+                header_bytes.copy_from_slice(&sector[0..64]);
 
                 let magic = u32::from_le_bytes(header_bytes[0..4].try_into().unwrap());
                 if magic != NEEDLE_MAGIC {
@@ -664,7 +734,7 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 match NeedleHeader::decode(&header_bytes) {
                     Ok(hdr) => {
                         let total_len = hdr.total_len();
-                        if scan_offset + total_len > file_len {
+                        if scan_offset.checked_add(total_len).is_none_or(|end| end > file_len) {
                             // Incomplete needle written during crash
                             match next_indexed(&indexed, scan_offset) {
                                 Some(next) => {
@@ -1425,16 +1495,11 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         // step of zeros past it (#178).
         let file_len = self.file.len()?.min(self.current_offset.load(Ordering::SeqCst));
         let mut scan_offset = SECTOR_SIZE as u64;
-        let mut read_buf = AlignedBuffer::new(SECTOR_SIZE);
+        let mut window = AlignedScanWindow::new(&*self.file, file_len, Some(&self.work));
 
-        while scan_offset + (SECTOR_SIZE as u64) <= file_len {
-            self.work.disk_read();
-            if self.file.read_aligned_at(scan_offset, &mut read_buf).is_err() {
-                break;
-            }
-
+        while let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE) {
             let mut header_bytes = [0u8; 64];
-            header_bytes.copy_from_slice(&read_buf[0..64]);
+            header_bytes.copy_from_slice(&sector[0..64]);
 
             let hdr = match NeedleHeader::decode(&header_bytes) {
                 Ok(h) => h,
@@ -1455,7 +1520,7 @@ impl<Fs: VolFs> VolumeManager<Fs> {
 
             let total_len = hdr.total_len();
 
-            if scan_offset + total_len > file_len {
+            if scan_offset.checked_add(total_len).is_none_or(|end| end > file_len) {
                 match next_indexed(&self.indexed, scan_offset) {
                     Some(next) => {
                         scan_offset = next;
@@ -1465,17 +1530,16 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 }
             }
 
-            let key_str = if (64 + hdr.key_len as usize) <= SECTOR_SIZE {
-                let k_bytes = &read_buf[64..64 + hdr.key_len as usize];
-                String::from_utf8_lossy(k_bytes).to_string()
+            let key_end = 64 + hdr.key_len as usize;
+            let key_str = if key_end <= SECTOR_SIZE {
+                String::from_utf8_lossy(&sector[64..key_end]).to_string()
             } else {
-                let mut full_buf = AlignedBuffer::new(total_len as usize);
-                self.work.disk_read();
-                if self.file.read_aligned_at(scan_offset, &mut full_buf).is_err() {
-                    break;
-                }
-                let k_bytes = &full_buf[64..64 + hdr.key_len as usize];
-                String::from_utf8_lossy(k_bytes).to_string()
+                let need_bytes = key_end.div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
+                let slice = match window.read_at(scan_offset, need_bytes) {
+                    Some(s) => s,
+                    None => break,
+                };
+                String::from_utf8_lossy(&slice[64..key_end]).to_string()
             };
 
             visitor(ScannedNeedle {
