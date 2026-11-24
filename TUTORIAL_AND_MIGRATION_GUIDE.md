@@ -1,79 +1,114 @@
-# S3 Storage Server (`s3-server`): Drop-In S3 Replacement Tutorial & Migration Guide
+# S3 Storage Server (`s3-server`): Tutorial & Migration Guide
 
-> **Written before the PoC (2026-11-10/11) and not yet checked against the code (#280).** Where it disagrees with [`ARCHITECTURE.md`](ARCHITECTURE.md), [`FORMAT.md`](FORMAT.md) or the code, those win.
+`s3-server` is a standalone, single-node S3-compatible object storage daemon in Rust ([`server/src/main.rs`](server/src/main.rs)). It stores payloads in 4096-byte sector-aligned format-3 WORM needle volumes (growing on write up to `32 GiB`, rolled over automatically), indexes hot rows in a 64-byte columnar `ObjectMeta` table with leveled [`SpillIndex`](server/src/spill.rs) disk segments (`meta/`), and stages multipart upload parts in `.staging/` files.
 
-`s3-server` is a high-performance, zero-GC, wire-compatible Amazon S3 object storage daemon implemented 100% in pure Rust. It is built on a 64-byte columnar Struct-of-Arrays (`ObjectMeta`) in-memory metadata index, 32 GiB sparse virtual volume pre-allocation, and 4096-byte sector-aligned WORM Needle volume slabs (`O_DIRECT` / `FILE_FLAG_NO_BUFFERING`).
-
-Because `s3-server` speaks the standard AWS S3 REST XML protocol (RFC 9110 byte ranges, Multipart Uploads, AWS Signature Version 4 `AWS4-HMAC-SHA256`, `aws-chunked` streaming, conditional `If-Match` / `If-None-Match: *` mutex headers, single and batch deletions, and lifecycle expiration rules), **you do not need to rewrite your application logic, adapt schemas, or install a proprietary SDK**. Any S3 client library or CLI tool can switch to `s3-server` by changing **one configuration line**: `endpoint_url`.
+You can switch supported S3 tools (`aws` CLI, `boto3`, and S3 clients speaking the implemented subset in [`API_SPECIFICATION.md`](API_SPECIFICATION.md)) by pointing `endpoint_url` at `http://127.0.0.1:9000` (path-style by default) and supplying matching SigV4 credentials. Features outside that subset return `501 NotImplemented` or are tracked in [Not yet](#not-yet) and [`features.toml`](features.toml).
 
 ---
 
 ## Table of Contents
 
-1. [Quickstart: Starting `s3-server` in 30 Seconds](#1-quickstart-starting-s3-server-in-30-seconds)
-2. [How to Replace MinIO / AWS S3 in Your Code (By Language)](#2-how-to-replace-minio--aws-s3-in-your-code-by-language)
-   - [Python (`boto3`, `s3fs`, Polars, DuckDB, PyTorch Checkpoints)](#21-python-boto3-s3fs-polars-duckdb-pytorch)
-   - [JavaScript / TypeScript / Node.js / Bun (`@aws-sdk/client-s3`)](#22-javascript--typescript--nodejs--bun)
-   - [Go (`aws-sdk-go-v2` & `minio-go`)](#23-go-aws-sdk-go-v2--minio-go)
-   - [Rust (`aws-sdk-s3` & Apache Arrow `object_store`)](#24-rust-aws-sdk-s3--apache-arrow-object_store)
-3. [CLI Tools (`aws s3`, `rclone`, `s5cmd`)](#3-cli-tools-aws-s3-rclone-s5cmd)
-4. [Replacing MinIO in Docker Compose & Production (`systemd`)](#4-replacing-minio-in-docker-compose--production-systemd)
-5. [Zero-Downtime Migration from MinIO / Ceph / AWS S3](#5-zero-downtime-migration-from-minio--ceph--aws-s3)
-   - [Wire Parity & Metadata Compatibility (No Converter Needed)](#51-wire-parity--metadata-compatibility-no-converter-needed)
-   - [S3 Update & Delete Semantics (Overwrites & Batch Deletes)](#52-s3-update--delete-semantics-overwrites--batch-deletes)
-   - [Hardware Capability & Non-AVX Software Fallback](#53-hardware-capability--non-avx-software-fallback)
-   - [Zero-Downtime Live Migration Workflow with `rclone`](#54-zero-downtime-live-migration-workflow-with-rclone)
-6. [Supported S3 Operations & Advanced Features](#6-supported-s3-operations--advanced-features)
-7. [Architecture Deep Dive: Columnar SoA Index & Sparse WORM Needle Storage](#7-architecture-deep-dive-columnar-soa-index--sparse-worm-needle-storage)
-   - [7.1 64-Byte Packed `ObjectMeta` Struct-of-Arrays (SoA)](#71-64-byte-packed-objectmeta-struct-of-arrays-soa)
-   - [7.2 32 GiB Sparse Virtual Volume Pre-Allocation (`FSCTL_SET_SPARSE`)](#72-32-gib-sparse-virtual-volume-pre-allocation-fsctl_set_sparse)
-   - [7.3 Staged Parallel Part Files for Multipart Uploads](#73-staged-parallel-part-files-for-multipart-uploads)
-   - [7.4 Streaming Hardware-Accelerated MD5 & CRC32C Dual Checksum](#74-streaming-hardware-accelerated-md5--crc32c-dual-checksum)
-   - [7.5 Zero-Copy Direct Extent Slicing for Range GETs](#75-zero-copy-direct-extent-slicing-for-range-gets)
-   - [7.6 Concurrency Control: Single-Flight, Auto-Scaling Slab Cache & MVCC](#76-concurrency-control-single-flight-auto-scaling-slab-cache--mvcc)
-8. [Build from Source, Multi-OS Matrix & Production Verification (58 Tests)](#8-build-from-source-multi-os-matrix--production-verification-58-tests)
+1. [Quickstart: Starting `s3-server` & Verifying with AWS CLI](#1-quickstart-starting-s3-server--verifying-with-aws-cli)
+   - [CLI Flags & Environment Variables](#cli-flags--environment-variables)
+2. [Using S3 SDKs (`boto3`, JS v3, Go v2, Rust)](#2-using-s3-sdks-boto3-js-v3-go-v2-rust)
+3. [CLI Tools (`aws s3`, `s5cmd`, `rclone`)](#3-cli-tools-aws-s3-s5cmd-rclone)
+4. [Docker Compose & Production (`systemd`)](#4-docker-compose--production-systemd)
+5. [Migrating from MinIO / Ceph / AWS S3](#5-migrating-from-minio--ceph--aws-s3)
+6. [Supported Operations Summary](#6-supported-operations-summary)
+7. [Architecture Summary (`ObjectMeta`, Volumes, Staged Multipart, Memory Budget)](#7-architecture-summary-objectmeta-volumes-staged-multipart-memory-budget)
+8. [Building from Source, Test Suite & Benchmark Tooling](#8-building-from-source-test-suite--benchmark-tooling)
+9. [Not yet](#not-yet)
 
 ---
 
-## 1. Quickstart: Starting `s3-server` in 30 Seconds
+## 1. Quickstart: Starting `s3-server` & Verifying with AWS CLI
 
-### Option A: Run the Prebuilt Release Binary
+Build the release binary from the repository root:
+
 ```bash
-# Windows (PowerShell)
-.\awan-storage\dist\s3-server-x86_64-windows.exe --port 9000 --data-dir C:\s3-data
-
-# Linux (x86_64 / ARM64)
-./awan-storage/dist/s3-server-x86_64-linux-gnu --port 9000 --data-dir /var/lib/s3-data
+cargo build --locked --release --manifest-path server/Cargo.toml
 ```
 
-### Option B: Build from Source (`--release`)
+(Prebuilt archives for Windows `x86_64`, Linux `x86_64` glibc/musl, and macOS `aarch64` are built by [`.github/workflows/release.yml`](.github/workflows/release.yml) on releases/dispatch; the `dist/` directory in git tracks only `dist/SHA256SUMS.txt` unless [`scripts/build_release_matrix.py`](scripts/build_release_matrix.py) is run locally on Windows.)
+
+Start `s3-server` with static root keys (`AWANFS_ACCESS_KEY` and `AWANFS_SECRET_KEY`). Running `s3-server` without credentials, `--config`, or `--allow-anonymous` exits with status code `2` ([`sigv4-auth`](features.toml#L1014), [`server/tests/auth_test.rs`](server/tests/auth_test.rs)):
+
 ```bash
-cd awan-storage/server
-cargo build --release
-./target/release/s3-server --port 9000 --data-dir ./s3-data
+AWANFS_ACCESS_KEY=s3admin AWANFS_SECRET_KEY=s3secret \
+  ./server/target/release/s3-server --port 9000 --data-dir ./s3-data
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:AWANFS_ACCESS_KEY="s3admin"; $env:AWANFS_SECRET_KEY="s3secret"
+.\server\target\release\s3-server.exe --port 9000 --data-dir .\s3-data
+```
+
+In a second terminal, check [`health`](features.toml#L1060) readiness and run end-to-end [`buckets`](features.toml#L847) and [`objects`](features.toml#L930) operations with `aws` (verified continuously by `j_quickstart` in [`scripts/verify_drive.sh`](scripts/verify_drive.sh)):
+
+```bash
+curl -sf http://127.0.0.1:9000/_awanfs/health/ready
+export AWS_ACCESS_KEY_ID=s3admin
+export AWS_SECRET_ACCESS_KEY=s3secret
+export AWS_DEFAULT_REGION=us-east-1
+
+echo "hello awanfs" > hello.txt
+aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://quickstart-bkt
+aws --endpoint-url http://127.0.0.1:9000 s3 cp hello.txt s3://quickstart-bkt/hello.txt
+aws --endpoint-url http://127.0.0.1:9000 s3 ls s3://quickstart-bkt/
+aws --endpoint-url http://127.0.0.1:9000 s3 cp s3://quickstart-bkt/hello.txt hello.out
+cmp -s hello.txt hello.out
+aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://quickstart-bkt/hello.txt
+aws --endpoint-url http://127.0.0.1:9000 s3 rb s3://quickstart-bkt
 ```
 
 ### CLI Flags & Environment Variables
 
+All CLI options accepted by `s3-server` are defined in [`server/src/main.rs`](server/src/main.rs):
+
 | Flag | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--port <u16>`, `-p` | `S3_PORT` | `9000` | TCP port for the HTTP/1.1 S3 wire reactor (`0.0.0.0:<port>`). |
-| `--data-dir <path>`, `-d` | `S3_DATA_DIR` | System temp dir | Directory where 32 GiB sparse `volume_0001.dat` and `volume_0001.idx` WORM Needle slabs are persisted. |
+| `-p, --port <PORT>` | `S3_PORT` / `AWAN_S3_PORT` | `9000` | Listen port for S3 HTTP/HTTPS traffic. |
+| `--listen <ADDR>` | `AWANFS_LISTEN` | `127.0.0.1` | Bind IP address (loopback by default per `ARCHITECTURE.md` Decision 2). |
+| `-d, --data-dir <DIR>` | `S3_DATA_DIR` / `AWAN_S3_DATA_DIR` | `<temp_dir>/s3_vol_<pid>_<id>` (`S3ServiceState::new()`) | Volume/manifest/segment directory (growing format-3 `volume_NNNN.dat` + `.idx`, `buckets.manifest`, `meta/`, `.staging/`). |
+| `--durability <MODE>` | `AWANFS_DURABILITY` | `group` | Sync durability mode: `group` (default shared sync before 200), `fast` (~1s background flush), or `strict` (per-write sync) ([`restart`](features.toml#L988)). |
+| `--cert <PATH>` | `AWANFS_TLS_CERT` | *(none)* | TLS certificate PEM path (must be paired with `--key`; disables plain HTTP unless `--http-port` is set) ([`tls`](features.toml#L1078)). |
+| `--key <PATH>` | `AWANFS_TLS_KEY` | *(none)* | TLS private key PEM path (reloaded every 60s when files change and on `SIGHUP`). |
+| `--http-port <PORT>` | *(none)* | *(none)* | Optional plain HTTP listener port when TLS (`--cert`/`--key`) is active. |
+| `--compaction-rate <MB/S>` | `AWANFS_COMPACTION_RATE_MB` | `50` | Max background compaction copy throughput in MB/s (`0` = unlimited) ([`compaction`](features.toml#L1045)). |
+| `--auto-compaction <on\|off>` | `AWANFS_AUTO_COMPACTION` | `on` | Background compaction pass (every `600s` on oldest volume with `>= 20%` dead space and `>= 1 GiB` for a lone volume). |
+| `--otlp-endpoint <URL>` | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(none)* | OpenTelemetry OTLP/HTTP trace export URL (`traceparent` header propagation) ([`otlp-tracing`](features.toml#L1102)). |
+| `--access-log <PATH\|->` | `AWANFS_ACCESS_LOG` | *(off)* | Write S3 access log lines to a file or `-` for stdout (bounded 4,096-line queue; may drop under saturation) ([`access-log`](features.toml#L1086)). |
+| `--config <PATH>` | `AWANFS_CONFIG` | *(none)* | TOML config for IAM users/policies ([`iam`](features.toml#L1029)) and per-bucket `zstd` compression (`[[buckets]]`) ([`compression`](features.toml#L1037)). |
+| `--memory-budget <SIZE>` | `AWANFS_MEMORY_BUDGET` | `25%` of RAM/cgroup (`128 MiB..2 GiB`; `2 GiB` fallback) | Total heap cap split evenly between cache (`PayloadCache` + `<= 64 MiB` spill cache) and in-flight bodies ([`memory-budget`](features.toml#L1111)). |
+| `--body-idle-timeout <DUR>` | *(none)* | `20s` | Idle deadline between consecutive request body frames (accepts `s`, `ms`, or seconds). Returns `408 RequestTimeout`. |
+| `--region <NAME>` | `AWANFS_REGION` | `us-east-1` | Server region checked by `CreateBucket` `<LocationConstraint>` and returned by `?location`. |
+| `--allow-anonymous` | `AWANFS_ALLOW_ANONYMOUS=1` | `false` | Permit unsigned requests. Refused with exit code `2` if `--config` defines any IAM users. |
+| `--allow-small-parts` | *(none)* | `false` | Allow non-final multipart parts `< 5 MiB` (benchmark/test option). |
+| `--lifecycle-day-seconds <N>` | *(none)* | `86400` | Seconds per day for internal timing/multipart expiry (test-use only; prints a warning if not `86400`). |
+| `-h, --help` | *(none)* | — | Print CLI help and exit `0`. |
+
+Additional environment variables read by the server:
+- **Credentials:** `AWANFS_ACCESS_KEY` and `AWANFS_SECRET_KEY` (root SigV4 credential pair).
+- **Request log:** `AWANFS_LOG=off` disables the per-request JSON line written asynchronously to stderr ([`request-log`](features.toml#L1094)).
+- **Volume/I/O tuning:** `AWAN_SPARSE_VOLUME=1` (opt into legacy 32 GiB sparse volume files instead of growing volumes), `AWAN_VOLUME_GROWTH_STEP` (default `256 MiB`), `AWAN_READ_CHUNK` (default `1 MiB`), `AWAN_READ_AHEAD` (1..8, default `1`), `AWAN_DIRECT_READ_MIN` (off by default), `AWAN_DIRECT_IO=1`, and `MALLOC_MMAP_THRESHOLD_` (on Linux glibc, server pins `M_MMAP_THRESHOLD` to `128 KiB` unless overridden).
+
+*(Note: `--sizes`, `--concurrent`, and `--duration` are arguments to [`benchmarks/run_warp_benchmark.py`](benchmarks/run_warp_benchmark.py), not `s3-server`.)*
 
 ---
 
-## 2. How to Replace MinIO / AWS S3 in Your Code (By Language)
+## 2. Using S3 SDKs (`boto3`, JS v3, Go v2, Rust)
 
-To migrate any existing S3 or MinIO codebase, keep all your `put_object`, `get_object`, `delete_object`, `upload_file`, or multipart code identical and point the client's **endpoint** to `http://127.0.0.1:9000` (or your server's hostname).
+Start `s3-server` with matching credentials (`AWANFS_ACCESS_KEY=s3admin AWANFS_SECRET_KEY=s3secret`) before running any of the examples below. Note: among client SDKs, **`boto3`** (via [`server/tests/test_boto3_compat.py`](server/tests/test_boto3_compat.py) and `ceph/s3-tests`), **`aws` CLI**, **`reqwest`**, and **`warp put`** are continuously tested in CI; examples for JS/Go/Rust/Polars/DuckDB are standard S3 path-style configurations not run in CI.
 
-### 2.1 Python (`boto3`, `s3fs`, Polars, DuckDB, PyTorch)
+### 2.1 Python (`boto3`, `s3fs`, Polars, DuckDB)
 
-#### Standard `boto3` Client (Full CRUD: Put, Get, Overwrite, Delete)
+#### Standard `boto3` Client (Tested in CI)
 ```python
 import boto3
 from botocore.config import Config
 
-# Drop-in replacement: only `endpoint_url` changes from AWS S3 or MinIO
 s3 = boto3.client(
     "s3",
     endpoint_url="http://127.0.0.1:9000",
@@ -83,36 +118,20 @@ s3 = boto3.client(
     config=Config(s3={"addressing_style": "path"}, signature_version="s3v4"),
 )
 
-# 1. Create a bucket
 s3.create_bucket(Bucket="ai-checkpoints")
-
-# 2. Upload an object (Standard PUT or automatic Multipart for large files)
 s3.put_object(Bucket="ai-checkpoints", Key="models/resnet50.pt", Body=b"...model weights v1...")
-
-# 3. Update an object (Overwrites are atomic MVCC snapshot commits in s3-server)
 s3.put_object(Bucket="ai-checkpoints", Key="models/resnet50.pt", Body=b"...model weights v2...")
 
-# 4. Byte-Range Partial Read (RFC 9110 — zero-copy mmap slice read)
 resp = s3.get_object(Bucket="ai-checkpoints", Key="models/resnet50.pt", Range="bytes=0-1023")
 header_chunk = resp["Body"].read()
 
-# 5. Delete an object
 s3.delete_object(Bucket="ai-checkpoints", Key="models/resnet50.pt")
-
-# 6. Batch Delete multiple objects in a single HTTP request (up to 1,000 keys)
 s3.delete_objects(
     Bucket="ai-checkpoints",
-    Delete={
-        "Objects": [
-            {"Key": "models/checkpoint_01.pt"},
-            {"Key": "models/checkpoint_02.pt"},
-        ],
-        "Quiet": False,
-    },
+    Delete={"Objects": [{"Key": "k1"}, {"Key": "k2"}], "Quiet": False},
 )
 
-# 7. Distributed Atomic Lock using S3 Conditional Put (`IfNoneMatch="*"`)
-# Succeeds with 200 OK if lock does not exist; raises 412 PreconditionFailed if held by another worker
+# Distributed atomic lock using If-None-Match: *
 s3.put_object(
     Bucket="ai-checkpoints",
     Key="locks/training-job-42.lock",
@@ -121,7 +140,7 @@ s3.put_object(
 )
 ```
 
-#### Polars & Pandas (`s3fs` / `fsspec`)
+#### Polars & DuckDB (Standard S3 Path-Style Configuration; Not Run in CI)
 ```python
 import polars as pl
 
@@ -132,12 +151,9 @@ storage_options = {
     "aws_region": "us-east-1",
     "aws_allow_http": "true",
 }
-
-# Polars pushes predicate & byte-range reads directly to s3-server's RFC 9110 Range engine
 df = pl.read_parquet("s3://ai-checkpoints/datasets/events.parquet", storage_options=storage_options)
 ```
 
-#### DuckDB Direct S3 Querying
 ```sql
 INSTALL httpfs;
 LOAD httpfs;
@@ -148,24 +164,12 @@ SET s3_url_style='path';
 SET s3_access_key_id='s3admin';
 SET s3_secret_access_key='s3secret';
 
-SELECT count(*), avg(latency_ms)
-FROM read_parquet('s3://ai-checkpoints/datasets/*.parquet');
+SELECT count(*) FROM read_parquet('s3://ai-checkpoints/datasets/*.parquet');
 ```
 
----
-
-## 2.2 JavaScript / TypeScript / Node.js / Bun
-
-#### AWS SDK for JavaScript v3 (`@aws-sdk/client-s3`)
+### 2.2 JavaScript / TypeScript (`@aws-sdk/client-s3`; Not Run in CI)
 ```typescript
-import {
-  S3Client,
-  CreateBucketCommand,
-  PutObjectCommand,
-  GetObjectCommand,
-  DeleteObjectCommand,
-  DeleteObjectsCommand,
-} from "@aws-sdk/client-s3";
+import { S3Client, CreateBucketCommand, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 
 const s3 = new S3Client({
   endpoint: "http://127.0.0.1:9000",
@@ -174,224 +178,136 @@ const s3 = new S3Client({
     accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? "s3admin",
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? "s3secret",
   },
-  forcePathStyle: true, // Required for IP / localhost endpoints
+  forcePathStyle: true,
 });
 
-// Create Bucket
 await s3.send(new CreateBucketCommand({ Bucket: "app-assets" }));
-
-// Put Object
-await s3.send(new PutObjectCommand({
-  Bucket: "app-assets",
-  Key: "logo.png",
-  Body: Buffer.from("...image bytes..."),
-}));
-
-// Range GET (Zero-Copy)
-const getResp = await s3.send(new GetObjectCommand({
-  Bucket: "app-assets",
-  Key: "logo.png",
-  Range: "bytes=0-511",
-}));
-
-// Delete Object
-await s3.send(new DeleteObjectCommand({
-  Bucket: "app-assets",
-  Key: "logo.png",
-}));
+await s3.send(new PutObjectCommand({ Bucket: "app-assets", Key: "logo.png", Body: Buffer.from("...") }));
+const getResp = await s3.send(new GetObjectCommand({ Bucket: "app-assets", Key: "logo.png", Range: "bytes=0-511" }));
+await s3.send(new DeleteObjectCommand({ Bucket: "app-assets", Key: "logo.png" }));
 ```
 
----
-
-## 2.3 Go (`aws-sdk-go-v2` & `minio-go`)
-
+### 2.3 Go (`aws-sdk-go-v2`; Not Run in CI)
 ```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"strings"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
+cfg, _ := config.LoadDefaultConfig(context.TODO(),
+	config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("s3admin", "s3secret", "")),
+	config.WithRegion("us-east-1"),
 )
-
-func main() {
-	cfg, _ := config.LoadDefaultConfig(context.TODO(),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("s3admin", "s3secret", "")),
-		config.WithRegion("us-east-1"),
-	)
-
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String("http://127.0.0.1:9000")
-		o.UsePathStyle = true
-	})
-
-	// Put Object
-	_, err := client.PutObject(context.TODO(), &s3.PutObjectInput{
-		Bucket: aws.String("data"),
-		Key:    aws.String("log.txt"),
-		Body:   strings.NewReader("hello world"),
-	})
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println("Uploaded log.txt successfully")
-}
+client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+	o.BaseEndpoint = aws.String("http://127.0.0.1:9000")
+	o.UsePathStyle = true
+})
+_, _ = client.CreateBucket(context.TODO(), &s3.CreateBucketInput{Bucket: aws.String("data")})
+_, err := client.PutObject(context.TODO(), &s3.PutObjectInput{
+	Bucket: aws.String("data"),
+	Key:    aws.String("log.txt"),
+	Body:   strings.NewReader("hello world"),
+})
 ```
 
----
-
-## 2.4 Rust (`aws-sdk-s3` & Apache Arrow `object_store`)
-
+### 2.4 Rust (`aws-sdk-s3`; Not Run in CI)
 ```rust
-use aws_sdk_s3::config::{Builder, Credentials, Region};
-use aws_sdk_s3::Client;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = Builder::new()
-        .endpoint_url("http://127.0.0.1:9000")
-        .region(Region::new("us-east-1"))
-        .credentials_provider(Credentials::new("s3admin", "s3secret", None, None, "static"))
-        .force_path_style(true)
-        .build();
-
-    let client = Client::from_conf(config);
-
-    client.put_object()
-        .bucket("rust-bucket")
-        .key("records.json")
-        .body(r#"{"status": "ok"}"#.as_bytes().to_vec().into())
-        .send()
-        .await?;
-
-    Ok(())
-}
+let config = Builder::new()
+    .endpoint_url("http://127.0.0.1:9000")
+    .region(Region::new("us-east-1"))
+    .credentials_provider(Credentials::new("s3admin", "s3secret", None, None, "static"))
+    .force_path_style(true)
+    .build();
+let client = Client::from_conf(config);
+client.create_bucket().bucket("rust-bucket").send().await?;
+client.put_object().bucket("rust-bucket").key("records.json").body(b"{}".to_vec().into()).send().await?;
 ```
 
 ---
 
-## 3. CLI Tools (`aws s3`, `rclone`, `s5cmd`)
+## 3. CLI Tools (`aws s3`, `s5cmd`, `rclone`)
 
-### AWS CLI (`aws s3` / `aws s3api`)
+### AWS CLI (`aws s3` / `aws s3api`, Tested in CI)
 ```bash
-# Set alias or pass --endpoint-url
-alias s3c="aws --endpoint-url http://127.0.0.1:9000 s3"
+export AWS_ACCESS_KEY_ID=s3admin
+export AWS_SECRET_ACCESS_KEY=s3secret
+export AWS_DEFAULT_REGION=us-east-1
 
-s3c mb s3://my-bucket
-s3c cp ./dataset.tar.gz s3://my-bucket/
-s3c ls s3://my-bucket/
-s3c rm s3://my-bucket/dataset.tar.gz
+aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://my-bucket
+aws --endpoint-url http://127.0.0.1:9000 s3 cp ./dataset.tar.gz s3://my-bucket/
+aws --endpoint-url http://127.0.0.1:9000 s3 ls s3://my-bucket/
+aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://my-bucket/dataset.tar.gz
 ```
 
-### High-Speed Parallel CLI (`s5cmd`)
+### `s5cmd` (Standard S3 Endpoint Override; Not Run in CI)
 ```bash
-export S3_ENDPOINT_URL="http://127.0.0.1:9000"
 export AWS_ACCESS_KEY_ID="s3admin"
 export AWS_SECRET_ACCESS_KEY="s3secret"
 
-s5cmd --endpoint-url http://127.0.0.1:9000 sync ./local-folder/ s3://my-bucket/
+s5cmd --endpoint-url http://127.0.0.1:9000 cp ./local-folder/ s3://my-bucket/
 ```
 
 ---
 
-## 4. Replacing MinIO in Docker Compose & Production (`systemd`)
+## 4. Docker Compose & Production (`systemd`)
 
-### Docker Compose Drop-in Replacement (`docker-compose.yml`)
+### Docker / Docker Compose (Matches [`Dockerfile`](Dockerfile) & [`.github/workflows/docker.yml`](.github/workflows/docker.yml))
+
+`Dockerfile` compiles `s3-server`, sets `ENV AWANFS_LISTEN=0.0.0.0`, and invokes `ENTRYPOINT ["/usr/local/bin/s3-server", "--port", "9000", "--data-dir", "/data"]`:
+
 ```yaml
-version: "3.8"
-
 services:
-  # Replace 'image: minio/minio' with 's3-server'
   s3-server:
-    image: ghcr.io/iskandarnorazli/s3-server:latest
-    container_name: s3-storage
+    build: .
+    container_name: awanfs
     ports:
       - "9000:9000"
     environment:
-      - S3_PORT=9000
-      - S3_DATA_DIR=/data
+      - AWANFS_ACCESS_KEY=s3admin
+      - AWANFS_SECRET_KEY=s3secret
     volumes:
-      - s3_volume_data:/data
+      - awanfs_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9000/_awanfs/health/ready || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     restart: unless-stopped
 
 volumes:
-  s3_volume_data:
+  awanfs_data:
 ```
 
-### Linux Production `systemd` Service (`/etc/systemd/system/s3-server.service`)
+(Pass `--build` on first run or pull a tagged image if published by `.github/workflows/docker.yml`. Note: `Dockerfile` hardcodes `--port 9000 --data-dir /data` via `ENTRYPOINT`, so `S3_PORT` / `S3_DATA_DIR` are overridden unless `--entrypoint` is replaced.)
+
+### Linux Production `systemd` Service ([`deploy/systemd/awanfs.service`](deploy/systemd/awanfs.service))
+
+Install `s3-server` to `/usr/local/bin/s3-server`, copy [`deploy/systemd/awanfs.service`](deploy/systemd/awanfs.service) to `/etc/systemd/system/awanfs.service`, and create `/etc/awanfs/awanfs.env` (`chmod 0600`) with:
+
 ```ini
-[Unit]
-Description=S3 Storage High-Performance Server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=s3server
-Group=s3server
-ExecStart=/usr/local/bin/s3-server --port 9000 --data-dir /var/lib/s3-storage
-Restart=on-failure
-RestartSec=2s
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
+AWANFS_ACCESS_KEY=s3admin
+AWANFS_SECRET_KEY=s3secret
+# AWANFS_LISTEN=0.0.0.0
+# AWANFS_DURABILITY=group
 ```
+
+[`deploy/systemd/awanfs.service`](deploy/systemd/awanfs.service) runs with `DynamicUser=yes`, `StateDirectory=awanfs`, `ExecStart=/usr/local/bin/s3-server --port 9000 --data-dir /var/lib/awanfs`, `TimeoutStopSec=45`, and `LimitNOFILE=65536`.
 
 ---
 
-## 5. Zero-Downtime Migration from MinIO / Ceph / AWS S3
+## 5. Migrating from MinIO / Ceph / AWS S3
 
-### 5.1 Wire Parity & Metadata Compatibility (No Converter Needed)
+### 5.1 Wire Compatibility & Converter-Free Migration
+- AwanFS's columnar `ObjectMeta` index, `meta/` segments, and format-3 WORM needle volumes are internal storage formats; data enters and leaves over HTTP/HTTPS S3 XML/REST.
+- Unimplemented S3 sub-resources (such as `?policy`, `?acl`, `?encryption`, `?object-lock`, `?logging`) return `501 NotImplemented` (`ARCHITECTURE.md` Decision 61), and error responses follow `<Code><Message><Resource><RequestId>` (`server/src/xml.rs:48-65`).
 
-A common concern when adopting high-performance storage is: **"Will our existing datasets require a complex migration or schema transformation because `s3-server` uses a columnar Struct-of-Arrays metadata index and WORM needles instead of MinIO's `xl.meta` files?"**
+### 5.2 Updates, Deletes & Auto-Compaction
+1. **Overwrites (`PutObject`):** Appends a fresh needle to the active volume under a striped key lock (acquired only at commit for `> 4 MiB` streamed PUTs) and swaps the index row atomically.
+2. **Single-Object Deletes (`DeleteObject`):** Appends a tombstone needle (or delete marker when versioned) and updates the index (`204 No Content`, idempotent if missing when unversioned).
+3. **Multi-Object Batch Deletes (`DeleteObjects`):** `POST /{bucket}?delete` deletes `1..=1000` keys per `<Delete>` XML request and returns `<DeleteResult>` XML (`Content-MD5` is not checked on `DeleteObjects`).
+4. **Background Compaction:** Runs every `600s` (unless `--auto-compaction off`) when dead space in the oldest volume is `>= 20%` (and a lone active volume is `>= 1 GiB`), rate-limited to `50 MB/s` default (`--compaction-rate`).
 
-The answer is **no metadata converter is ever needed**:
-- `s3-server`'s columnar `ObjectMeta` table and WORM volume files are **internal physical representations**.
-- Over the network, `s3-server` implements 100% standard AWS S3 REST XML semantics: wire ETags, headers, dates, XML error formats, and bucket structures match Amazon S3 and MinIO bit-for-bit.
-- Any tool capable of speaking S3 (`rclone`, `aws s3 sync`, `s5cmd`, Spark S3A, PyTorch) reads from your old storage and writes directly into `s3-server`. The internal columnar index and 4096B sector alignment are generated dynamically on-the-fly during ingestion.
+### 5.3 Hardware Checksums & Software Fallback
+- `StreamingDigest` ([`server/src/digest.rs`](server/src/digest.rs)) uses `is_x86_feature_detected!("sse4.2") || is_x86_feature_detected!("avx2")` or `aarch64` CRC detection with a bit-identical pure-Rust software fallback (`StreamingDigest::new_software_fallback()`, 256-entry `0x82F63B78` CRC32C table), verified across 9 buffer sizes in [`server/tests/streaming_digest_test.rs`](server/tests/streaming_digest_test.rs).
 
-### 5.2 S3 Update & Delete Semantics (Overwrites & Batch Deletes)
-
-Standard S3 does not define an explicit `UPDATE` HTTP method; object updates are performed via overwrite `PutObject` requests:
-1. **Atomic Overwrites (Updates):**
-   - When a client sends `PUT /{bucket}/{key}` for an existing key, `s3-server` writes the new needle sequentially to the active volume slab and calculates the new ETag.
-   - It then performs an atomic CAS version update in the `@flat ObjectMeta` index.
-   - In-flight readers reading the previous version continue streaming safely without torn reads via MVCC epoch isolation. Once readers finish, the old extent is marked for compaction.
-2. **Single Object Deletes (`DeleteObject`):**
-   - `DELETE /{bucket}/{key}` validates bucket existence and atomically marks the object's `bucket_flags` with `FLAG_TOMBSTONE` (`0x0002`).
-   - The key is immediately removed from `ListObjectsV2` results and returns `404 NoSuchKey` to subsequent `GET` requests in sub-microseconds.
-3. **Multi-Object Batch Deletes (`DeleteObjects`):**
-   - `POST /{bucket}?delete` accepts standard XML containing up to 1,000 keys.
-   - `s3-server` parses the XML, marks all matching keys with `FLAG_TOMBSTONE`, and returns the `<DeleteResult>` XML payload with individual `<Deleted>` or `<Error>` statuses.
-   - Tombstoned volume extents are reclaimed in the background when dead space exceeds 30%.
-
-### 5.3 Hardware Capability & Non-AVX Software Fallback
-
-Another common concern in cloud and virtualized environments is CPU compatibility: **"What happens if our servers or VMs do not support AVX2 or SSE4.2 instructions?"**
-
-`s3-server` features an automated runtime detection and fallback architecture:
-- **Runtime CPU Detection:** At initialization, `StreamingDigest` evaluates CPU capabilities (`is_x86_feature_detected!("sse4.2")`, AVX2, ARMv8 CRC).
-- **SIMD Fast-Path:** When SSE4.2 is present, hardware CRC32C and vector instructions compute digests in registers at wire rate.
-- **Bit-Identical Software Fallback:** If SSE4.2 or AVX2 instructions are missing (e.g. on older x86_64 machines, non-AVX cloud hypervisors, or standard ARM emulators), the engine automatically dispatches to `StreamingDigest::fallback()`.
-- The software fallback uses a 256-entry precomputed Castagnoli polynomial table (`0x82F63B78`) and RFC 4648 base64 encoding. It produces **100% bit-for-bit identical MD5 ETags and CRC32C checksums** as the hardware SIMD path, guaranteeing compatibility across any infrastructure.
-
-### 5.4 Zero-Downtime Live Migration Workflow with `rclone`
-
-1. **Configure `rclone.conf` with both your legacy S3/MinIO server and `s3-server`:**
+### 5.4 Live Migration Example with `rclone` (Not Run in CI)
+1. Configure `rclone.conf` (using server credentials matching `AWANFS_ACCESS_KEY`/`AWANFS_SECRET_KEY`):
    ```ini
-   [legacy-minio]
-   type = s3
-   provider = Minio
-   access_key_id = minioadmin
-   secret_access_key = minioadmin
-   endpoint = http://10.0.0.10:9000
-
    [new-s3-server]
    type = s3
    provider = Other
@@ -400,123 +316,85 @@ Another common concern in cloud and virtualized environments is CPU compatibilit
    endpoint = http://127.0.0.1:9000
    force_path_style = true
    ```
-
-2. **Run initial background bulk sync (while your app continues running):**
+2. Run bulk transfer and final delta sync:
    ```bash
    rclone sync legacy-minio:my-production-bucket new-s3-server:my-production-bucket --transfers 32 --checkers 64 -P
-   ```
-
-3. **Cut over application `S3_ENDPOINT_URL` to `s3-server` and run a final delta sync:**
-   ```bash
    rclone sync legacy-minio:my-production-bucket new-s3-server:my-production-bucket --checksum
    ```
 
 ---
 
-## 6. Supported S3 Operations & Advanced Features
+## 6. Supported Operations Summary
 
-| Category | S3 REST Operations | Architectural Acceleration in `s3-server` |
-| :--- | :--- | :--- |
-| **Bucket Operations** | `CreateBucket` (`PUT /{bucket}`), `DeleteBucket` (`DELETE /{bucket}`), `HeadBucket`, `ListBuckets` (`GET /`), `GetBucketLocation` (`?location`) | Instant $O(1)$ bucket ID resolution up to 65,536 buckets. |
-| **Object CRUD** | `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`, `CopyObject` (`x-amz-copy-source`), `DeleteObjects` (`POST /?delete` batch up to 1,000 keys) | 64B `ObjectMeta` SoA index + 32 GiB sparse WORM Needle slabs with Castagnoli CRC32C verification. `CopyObject` uses zero-copy `FLAG_SHARED_REF` extent cloning. |
-| **Listing & Prefix Scan** | `ListObjectsV2` (`GET /{bucket}?list-type=2&prefix=...&start-after=...&max-keys=...`) | Contiguous key arena scan (1,000,000 objects scanned in **1.0 ms**). |
-| **RFC 9110 Byte Ranges** | `Range: bytes=start-end`, `bytes=start-`, `bytes=-suffix` (`206 Partial Content`, `416 Range Not Satisfiable`) | Clamped zero-copy slice extraction via `Bytes::from_owner(MmapOwner(mmap)).slice(...)`; zero heap allocation. |
-| **Multipart Uploads** | `CreateMultipartUpload` (`?uploads`), `UploadPart` (`?partNumber=N&uploadId=ID`), `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListParts`, `ListMultipartUploads` | Independent parallel staged part files (`.staging/`), composite MD5 ETag (`"<md5>-<parts>"`), `EntityTooSmall` & `InvalidPartOrder` validation. |
-| **Concurrency & Locks** | `If-None-Match: *` (atomic distributed mutex creation), `If-Match: "<etag>"`, Single-Flight hot-key coalescing, MVCC snapshot reads | Prevents thundering-herd I/O amplification when 1,000+ workers read the same model checkpoint simultaneously; concurrent `GET`s never observe half-written `PUT`s. |
-| **Auth & Framing** | AWS Signature V4 (`AWS4-HMAC-SHA256` Header & Pre-Signed URLs), `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (`aws-chunked`) | Thread-local `SigV4KeyCache` caches the 4-step HMAC-SHA256 signing key derivation (`kDate -> kRegion -> kService -> kSigning`). |
-| **Lifecycle Management** | `PutBucketLifecycleConfiguration` (`PUT /?lifecycle`), `GetBucketLifecycleConfiguration`, `DeleteBucketLifecycleConfiguration` | Prefix-scoped object expiration and stale multipart upload abort sweeps. |
-
----
-
-## 7. Architecture Deep Dive: Columnar SoA Index & Sparse WORM Needle Storage
-
-`s3-server` achieves its extreme throughput by doing away with per-object filesystem inodes (`ext4` / `NTFS` metadata churn) and replacing them with an in-memory columnar metadata index, 32 GiB sparse virtual volumes, and memory-mapped extent slicing.
-
-### 7.1 64-Byte Packed `ObjectMeta` Struct-of-Arrays (SoA)
-Instead of allocating a heap node or JSON structure per object, every object is represented by exactly 64 bytes laid out in cache-line-aligned parallel columns:
-
-```rust
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct ObjectMeta {
-    pub key_hash: u64,      // 64-bit keyed XXH3 hash of (bucket_id, key)
-    pub bucket_flags: u64,  // [63:32] bucket_id | [31:16] part_count | [15:0] flags
-    pub vol_offset: u64,    // [63:48] volume_id | [47:0] 4096B-aligned volume offset
-    pub size: u64,          // Decoded payload byte length
-    pub etag_hi: u64,       // Upper 64 bits of 128-bit MD5 digest
-    pub etag_lo: u64,       // Lower 64 bits of 128-bit MD5 digest
-    pub created_at: u64,    // Unix timestamp (ms)
-    pub key_slice: u64,     // [63:16] Key String Arena offset | [15:0] key_len
-}
-```
-
-- **Zero Allocations on Lookup**: Resolving a key takes a single `xxh3` hash lookup into open-addressing slot arrays, checking only the `key_hash` and `bucket_flags` columns.
-- **Arena-Backed Keys**: Key strings are appended sequentially into a single contiguous `Vec<u8>` Key Arena, eliminating thousands of individual string allocations.
-- **Memory Density**: 1,000,000 objects require only ~40 MB of RAM.
-
-### 7.2 32 GiB Sparse Virtual Volume Pre-Allocation (`FSCTL_SET_SPARSE`)
-- Rather than resizing volume files on every write or allocating large physical disk space upfront, `s3-server` creates volume files as 32 GiB sparse virtual files (`FSCTL_SET_SPARSE` on Windows, `fallocate` sparse holes on Linux).
-- The entire 32 GiB address space is mapped once into memory at startup via `memmap2::Mmap` (`VolumeManager::open_sparse`).
-- This completely eliminates runtime `Mmap::map` remap stalls and lock contention while reading and writing concurrently.
-
-### 7.3 Staged Parallel Part Files for Multipart Uploads
-- During high-concurrency multipart uploads, multiple client workers upload parts simultaneously.
-- To eliminate Windows kernel `FO_SYNCHRONOUS_IO` lock contention on a single shared file handle, parts are written to independent files under `.staging/<upload-id>/part_<num>.dat`.
-- On `CompleteMultipartUpload`, parts are appended to the sparse volume in order and published atomically to the index.
-
-### 7.4 Streaming Hardware-Accelerated MD5 & CRC32C Dual Checksum
-- `StreamingDigest` dual-hashes TCP chunks in real time as they arrive over the wire.
-- Concurrently updates MD5 (for the S3 `ETag` and `Content-MD5` header verification) and Castagnoli CRC32C (for the 4096B needle header).
-- Automatically utilizes hardware SSE4.2 and AVX2 instructions with a pure software table fallback on non-AVX systems.
-
-### 7.5 Zero-Copy Direct Extent Slicing for Range GETs
-- Range GET requests (`Range: bytes=start-end`) leverage zero-copy extent slicing directly from memory-mapped volume files and staged parts.
-- Using `Bytes::from_owner(MmapOwner(mmap)).slice(start..end)`, payload bytes stream directly into Hyper network buffers without intermediate heap copies or disk read syscalls.
-
-### 7.6 Concurrency Control: Single-Flight, Auto-Scaling Slab Cache & MVCC
-- **Single-Flight Coalescing**: When 100 concurrent requests request the same cold key, exactly one disk read is issued; all 99 other requests wait on a broadcast barrier and receive the identical buffer without redundant I/O.
-- **Auto-Scaling LRU Slab Cache**: Hot objects are cached in a bounded 16 MiB slab cache (`SlabCache`) to provide microsecond response times without growing server resident memory.
-- **MVCC Read Isolation**: Readers pin active version snapshots; in-flight readers continue streaming undisturbed even when concurrent writers commit newer versions of the same key.
+| Feature ([`features.toml`](features.toml)) | Implemented Surface Today |
+| :--- | :--- |
+| [`buckets`](features.toml#L847) | `CreateBucket`, `DeleteBucket`, `HeadBucket`, `ListBuckets` (`prefix`, `max-buckets`, `continuation-token`), `GetBucketLocation`. |
+| [`objects`](features.toml#L930), [`object-metadata`](features.toml#L599) | `PutObject` (`<= 5 GiB`, streaming `> 4 MiB`), `GetObject`, `HeadObject`, `DeleteObject`, `DeleteObjects` (`1..=1000` keys), `x-amz-meta-*` (`<= 2048 B`), standard HTTP metadata, `response-*` query overrides. |
+| [`copy`](features.toml#L663) | `CopyObject` (`x-amz-copy-source`, `?versionId`, `COPY`/`REPLACE` metadata & tags directives, `x-amz-copy-source-if-*`; copies payload into a new needle). |
+| [`listing`](features.toml#L743) | `ListObjectsV2` (`?list-type=2`), `ListObjects` (V1), `prefix`, `delimiter`, `max-keys`, `start-after`, `marker`, `continuation-token`, `encoding-type=url`, `fetch-owner`. |
+| [`ranges`](features.toml#L909) | Single-span `Range: bytes=start-end`, `bytes=start-`, `bytes=-suffix` (`206` clamped / `416 InvalidRange`). `<= 4 MiB` objects/parts may use cache/mmap; `> 4 MiB` objects & multipart objects stream via `PreadBody`. |
+| [`multipart`](features.toml#L536) | `CreateMultipartUpload`, `UploadPart`, `UploadPartCopy`, `CompleteMultipartUpload` (`--allow-small-parts` optional), `AbortMultipartUpload`, `ListParts`, `ListMultipartUploads`, `GET`/`HEAD ?partNumber=N`. |
+| [`conditional`](features.toml#L470) | `If-None-Match: *` on `PutObject`; full RFC 7232 preconditions on `GetObject`, `HeadObject`, `CopyObject`, `UploadPartCopy` (`PUT If-Match` / `DELETE` conditionals `#112`). |
+| [`versioning`](features.toml#L692) | `PutBucketVersioning`, `GetBucketVersioning`, `ListObjectVersions`, `?versionId` on `Get`/`Head`/`Delete`/`Copy`/`Tagging`/`Attributes`, null versions for suspended buckets. |
+| [`tagging`](features.toml#L269) | Bucket & object `Put/Get/Delete*Tagging`, `PutObject`/`CreateMultipartUpload` `x-amz-tagging`, `x-amz-tagging-count`. |
+| [`cors`](features.toml#L191) | `Put/Get/DeleteBucketCors`, `OPTIONS` preflight, actual CORS response headers. |
+| [`checksums`](features.toml#L220), [`object-attributes-api`](features.toml#L251) | `CRC32`, `CRC32C`, `CRC64NVME`, `SHA1`, `SHA256` on PUT/Multipart, `x-amz-checksum-mode: ENABLED`, `GetObjectAttributes` (`?attributes`). |
+| [`sigv4-auth`](features.toml#L1014), [`anonymous-and-presigned`](features.toml#L631), [`iam`](features.toml#L1029) | `AWS4-HMAC-SHA256` header & presigned query URLs, `aws-chunked` chunk signature verification, `--allow-anonymous`, TOML `--config` IAM users & identity policies (`SigV4KeyCache` shared `RwLock<HashMap>`). |
+| [`compression`](features.toml#L1037), [`compaction`](features.toml#L1045), [`restart`](features.toml#L988), [`memory-budget`](features.toml#L1111) | Per-bucket `zstd` level 1 in 64 KiB blocks, `group`/`fast`/`strict` durability, automatic 32 GiB rollover, `>= 20%` dead-space auto-compaction, `--memory-budget` cache/body enforcement (`503 SlowDown`). |
+| [`health`](features.toml#L1060), [`metrics`](features.toml#L1069), [`tls`](features.toml#L1078), [`request-log`](features.toml#L1094), [`access-log`](features.toml#L1086), [`otlp-tracing`](features.toml#L1102) | `/_awanfs/health/live`, `/_awanfs/health/ready`, `/_awanfs/metrics`, `--cert`/`--key`/`--http-port`, stderr JSON request log, `--access-log`, `--otlp-endpoint`. |
 
 ---
 
-## 8. Build from Source, Multi-OS Matrix & Production Verification (58 Tests)
+## 7. Architecture Summary (`ObjectMeta`, Volumes, Staged Multipart, Memory Budget)
 
-### 8.1 Standalone Distribution Binaries (`awan-storage/dist/`)
+- **Metadata index ([`metadata-index`](features.toml#L1130)):** [`ObjectMeta`](server/src/meta_index.rs#L15-L26) is `64` bytes per in-memory row (`key_hash`, `bucket_flags`, `vol_offset`, `size`, `etag_hi`, `etag_lo`, `created_at`, `key_slice`), backed by an append-only `key_arena`, `HashMap<(u32, u64), Vec<usize>>` collision chains, per-bucket `BTreeMap` key index, and leveled [`SpillIndex`](server/src/spill.rs) segments under `meta/` for keys past the in-memory limit (plus key/index structures in heap).
+- **Growing volumes ([`volume-format`](features.toml#L1138)):** Format-3 needle files (`volume_NNNN.dat` + `.idx`) grow as written up to `32 GiB` (`AWAN_SPARSE_VOLUME=1` opts into 32 GiB sparse pre-allocation). On restart, the store replays `buckets.manifest` and scans `volume_*.dat` sequentially, truncating torn tails back to a 4096-byte boundary.
+- **Staged multipart ([`multipart`](features.toml#L536)):** `UploadPart` writes `.staging/upload-<hex>/part_NNNNN.dat` files; `CompleteMultipartUpload` keeps part payloads in `.staging/` and records an `AWNMPU1` manifest needle in the active volume.
+- **Read paths & memory budget ([`memory-budget`](features.toml#L1111)):** `PayloadCache` and `SingleFlight` serve buffered reads `<= 4 MiB`, bounded by `--memory-budget` (`total/2` for cache minus `min(cache/4, 64 MiB)` spill cache; `2 GiB` fallback when RAM/cgroup detection is unavailable). Single objects and multipart objects `> 4 MiB` stream via positioned page-cache reads (`PreadBody`).
 
-The `dist/` directory provides a verified release build and SHA-256 integrity manifest:
-- `s3-server-x86_64-windows.exe` (Windows x86_64 Release Binary)
-- `SHA256SUMS.txt` (Cryptographic verification checksums)
+---
 
-To rebuild the release binary and run the multi-target cross-compilation matrix locally:
+## 8. Building from Source, Test Suite & Benchmark Tooling
+
+### 8.1 Multi-OS Release Builds
+- CI release workflow ([`.github/workflows/release.yml`](.github/workflows/release.yml)) builds binaries for `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, and `aarch64-apple-darwin`.
+- On Windows, run [`scripts/build_release_matrix.py`](scripts/build_release_matrix.py) to compile `dist/s3-server-x86_64-windows.exe` + `dist/SHA256SUMS.txt` and `cargo check` the three Linux targets:
+  ```bash
+  python scripts/build_release_matrix.py
+  ```
+
+### 8.2 Running the Test & Verification Suites
+Run all Rust unit and integration tests (98 test files across `server/tests/`):
+
 ```bash
-python awan-storage/scripts/build_release_matrix.py
+cargo test --locked --no-fail-fast --manifest-path server/Cargo.toml
 ```
-This builds `--release` on Windows and verifies compilation across:
-1. `x86_64-unknown-linux-gnu` (Linux glibc)
-2. `x86_64-unknown-linux-musl` (Linux musl static)
-3. `aarch64-unknown-linux-gnu` (Linux ARM64 / AWS Graviton)
 
-### 8.2 Running the Pure Rust Test Suite (58 Tests)
-```bash
-cd awan-storage/server
-cargo test
-```
-The test suite spans 58 comprehensive integration and unit tests across:
-- **`sparse_mmap_test.rs`**: 32-worker concurrency verification with zero `Mmap::map` remap allocations, crash recovery scan, and trailing garbage negative control.
-- **`staged_mpu_test.rs`**: 16 parallel workers uploading parts concurrently to independent staged files with bit-identical GET assembly and abort cleanup.
-- **`streaming_digest_test.rs`**: Bit-identical dual-hasher verification across 9 buffer sizes comparing hardware SIMD against software table fallback, streaming PUT digest, and `Content-MD5` tamper negative control.
-- **`multipart_zero_copy_test.rs`**: Single-extent and multi-part boundary straddling zero-copy mmap slice reads and 416 out-of-bounds range negative control.
-- **`edge_cases_test.rs`**: Path traversal defenses (`../../etc/passwd`), 0-byte objects, single-flight coalescing, and conditional `If-None-Match: *` atomic mutex locks.
-- **`meta_index_test.rs`**: 1,000,000 object ingestion and scan benchmark, C-ABI FFI panic safety, and bucket lifecycle.
-- **`lifecycle_test.rs`**: Prefix-scoped lifecycle expiration rules and stale multipart upload abort sweeps.
-- **`multipart_sigv4_test.rs`**: AWS chunked streaming decoder, SigV4 HMAC-SHA256 signing, and composite multipart ETags.
-- **`property_tests.rs`**: Generative property-based testing (500 cases) validating RFC 9110 range slice arithmetic and stateful BTreeMap equivalence.
-- **`volume_packing_test.rs`**: 4096B sector alignment, Castagnoli CRC32C silent bitrot detection, and crash recovery.
-- **`wire_test.rs`**: Virtual-Host vs Path-Style routing and HTTP range clamping.
+Representative suites in [`server/tests/`](server/tests/):
+- [`sparse_mmap_test.rs`](server/tests/sparse_mmap_test.rs): 32 concurrent workers on legacy sparse mode (`AWAN_SPARSE_VOLUME=1` opt-in), boundary recovery, and trailing garbage detection.
+- [`staged_mpu_test.rs`](server/tests/staged_mpu_test.rs) & [`multipart_conformance_test.rs`](server/tests/multipart_conformance_test.rs): 16 parallel part upload workers, abort cleanup, XML/ETag/`--allow-small-parts` validation.
+- [`streaming_digest_test.rs`](server/tests/streaming_digest_test.rs): SIMD vs `StreamingDigest::new_software_fallback()` across 9 buffer sizes, streaming PUT digest, and `BadDigest` tamper check.
+- [`multipart_zero_copy_test.rs`](server/tests/multipart_zero_copy_test.rs) & [`multipart_get_reads_test.rs`](server/tests/multipart_get_reads_test.rs): single/multi-part ranges (`<= 4 MiB` and `> 4 MiB` positioned reads).
+- [`edge_cases_test.rs`](server/tests/edge_cases_test.rs), [`body_timeout_test.rs`](server/tests/body_timeout_test.rs), & [`memory_admit_test.rs`](server/tests/memory_admit_test.rs): path traversal, 0-byte objects, `SingleFlight`, `If-None-Match: *` contention, `408 RequestTimeout`, and `503 SlowDown`.
+- [`meta_index_test.rs`](server/tests/meta_index_test.rs) & [`tiered_meta_test.rs`](server/tests/tiered_meta_test.rs): `ObjectMeta` layout, collision check, prefix scan, C-ABI FFI, `1,000,000`-object benchmark test, and leveled segment recovery.
+- [`lifecycle_test.rs`](server/tests/lifecycle_test.rs): XML roundtrip + direct `run_lifecycle_sweep` unit tests (`#118` covers wiring periodic persisted sweeps).
+- [`multipart_sigv4_test.rs`](server/tests/multipart_sigv4_test.rs), [`auth_test.rs`](server/tests/auth_test.rs), & [`chunk_signature_test.rs`](server/tests/chunk_signature_test.rs): SigV4, presigned URLs, skew checks, and `aws-chunked` verification.
+- [`property_tests.rs`](server/tests/property_tests.rs) & [`volume_packing_test.rs`](server/tests/volume_packing_test.rs) & [`wire_test.rs`](server/tests/wire_test.rs): 500-case proptests, 4096B needle alignment/recovery, virtual-host vs path routing, and range clamping.
+- End-to-end AWS CLI drive script: `bash scripts/verify_drive.sh`.
 
-### 8.3 Running the Live Warp Benchmark Suite
+### 8.3 Running the Benchmark Harness
+[`benchmarks/run_warp_benchmark.py`](benchmarks/run_warp_benchmark.py) drives `AwanFS`, MinIO, and RustFS comparisons (`--sizes`, `--concurrent`, `--duration`, `--runs`, `--rss-ceiling-mib`, `--output` are flags of that benchmark script, not `s3-server`):
+
 ```bash
-python benchmarks/s3_warp/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB,10GiB --concurrent 64 --duration 2 --output docs/measurements/s3_warp_minio_vs_awan.md
+python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB,10GiB --concurrent 64 --duration 3s --output measurements/s3_warp_minio_vs_awan.md
 ```
-Outputs live throughput, operations per second, P50/P90/P99/P99.9 latencies, and kernel peak working set RSS against live MinIO and RustFS instances.
+
+---
+
+## 9. Not yet
+
+- **Multipart edge cases ([`multipart`](features.toml#L536), `#111`):** Remaining `ceph/s3-tests` multipart conformance checks.
+- **Conditional `PUT If-Match` / `DELETE` ([`conditional`](features.toml#L470), `#112`):** Full preconditions beyond `PutObject` `If-None-Match: *` and `GET`/`HEAD`/`Copy`.
+- **Automated lifecycle expiration & persistence ([`lifecycle`](features.toml#L150), `#118`):** Currently lifecycle rules live in memory and `run_lifecycle_sweep` is not registered on the background `Scheduler`.
+- **POST Object ([`post-object`](features.toml#L180), `#119`)**, **Object Lock ([`object-lock`](features.toml#L162), `#120`)**, **Server-Side Encryption ([`encryption`](features.toml#L133), `#121`)**, **Bucket Policies / ACLs / Public Access Block ([`policy`](features.toml#L327), [`acl-ownership`](features.toml#L379), `#122`)**, **Bucket Logging ([`bucket-logging`](features.toml#L88), `#153`)**.
+- **Large-object background scrub (`#155`)**, **Checkpoint boot recovery (`#322`)**, **`503 SlowDown` `Retry-After` guidance (`#356`)**, and **Multi-node replication / erasure coding ([`erasure-coding`](features.toml#L1161), `#52`, `#27`)**.

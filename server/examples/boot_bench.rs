@@ -1,5 +1,5 @@
 //! #26 (owner decision 2026-11-20, option 3): how long a server takes to boot from a full
-//! replay of its volumes, and its peak RSS while it does, with N objects.
+//! replay of its volumes, and its peak heap and RSS while it does, with N objects.
 //!
 //!   cargo run --release --example boot_bench -- fill --dir <DIR> --objects 10000000
 //!   cargo run --release --example boot_bench -- scan --dir <DIR>
@@ -8,16 +8,73 @@
 //! `fill` writes N small objects through `S3ServiceState::store_object` with `--durability
 //! fast` (setup only: no sync per object), then syncs every volume. `scan` opens each volume
 //! in `DIR` and times `VolumeManager::scan_needles` alone, reporting needles per second and
-//! `disk_reads`. `boot` runs in a fresh process, so its peak RSS is the boot's own: it opens
-//! the directory with `S3ServiceState::try_with_data_dir` (the server's boot: bucket manifest,
-//! every volume replayed, the hot table and the spill index rebuilt) and checks a sample of
-//! objects. Each phase prints one JSON line.
+//! `read_calls`. `boot` runs in a fresh process, so its peak RSS and peak heap are the boot's
+//! own: it opens the directory with `S3ServiceState::try_with_data_dir` (the server's boot:
+//! bucket manifest, then every volume replayed, the hot table and the spill index rebuilt) and
+//! checks a sample of objects. Each phase prints one JSON line.
 
 use bytes::Bytes;
 use s3_server::{compute_md5, Durability, S3ServiceState, VolumeManager, AWAN_FLAG_ACTIVE};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Counts the heap this process holds, so a boot can tell heap from the rest of its RSS.
+struct Counting;
+
+static HEAP_LIVE: AtomicUsize = AtomicUsize::new(0);
+static HEAP_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+fn heap_grew(by: usize) {
+    let now = HEAP_LIVE.fetch_add(by, Ordering::Relaxed) + by;
+    HEAP_PEAK.fetch_max(now, Ordering::Relaxed);
+}
+
+fn reset_heap_peak() {
+    HEAP_PEAK.store(HEAP_LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+// SAFETY: every call goes to the system allocator unchanged; this only counts bytes.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc(layout);
+        if !p.is_null() {
+            heap_grew(layout.size());
+        }
+        p
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc_zeroed(layout);
+        if !p.is_null() {
+            heap_grew(layout.size());
+        }
+        p
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout);
+        HEAP_LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = System.realloc(ptr, layout, new_size);
+        if !p.is_null() {
+            if new_size >= layout.size() {
+                heap_grew(new_size - layout.size());
+            } else {
+                HEAP_LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+            }
+        }
+        p
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+fn mib(bytes: usize) -> f64 {
+    bytes as f64 / 1048576.0
+}
 
 const BUCKET: &str = "boot-bench";
 
@@ -126,10 +183,13 @@ async fn fill(dir: &std::path::Path, objects: u64, size: usize) -> Result<(), Bo
     Ok(())
 }
 
-fn boot(dir: &std::path::Path, objects: u64, size: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn boot_with(dir: &std::path::Path, objects: u64, size: usize, out: &mut dyn std::io::Write) -> Result<(), Box<dyn std::error::Error>> {
+    reset_heap_peak();
     let t = Instant::now();
     let state = S3ServiceState::try_with_data_dir(dir)?;
     let secs = t.elapsed().as_secs_f64();
+    let peak_heap = HEAP_PEAK.load(Ordering::Relaxed);
+    let heap_after = HEAP_LIVE.load(Ordering::Relaxed);
     let rss = peak_rss_mib();
     // A sample of objects answers as written: the boot rebuilt what it should.
     let engine = state.engine.read();
@@ -146,19 +206,26 @@ fn boot(dir: &std::path::Path, objects: u64, size: usize) -> Result<(), Box<dyn 
         checked += 1;
         i += step;
     }
-    println!(
-        "{{\"phase\":\"boot\",\"objects\":{},\"secs\":{:.3},\"objects_per_s\":{:.0},\"peak_rss_mib\":{},\"checked\":{},\"wrong\":{}}}",
+    writeln!(
+        out,
+        "{{\"phase\":\"boot\",\"objects\":{},\"secs\":{:.3},\"objects_per_s\":{:.0},\"peak_rss_mib\":{},\"peak_heap_mib\":{:.3},\"heap_after_mib\":{:.3},\"checked\":{},\"wrong\":{}}}",
         objects,
         secs,
         objects as f64 / secs,
         json_num(rss),
+        mib(peak_heap),
+        mib(heap_after),
         checked,
         wrong
-    );
+    )?;
     if wrong > 0 {
         return Err(format!("{} of {} sampled objects answered wrong after boot", wrong, checked).into());
     }
     Ok(())
+}
+
+fn boot(dir: &std::path::Path, objects: u64, size: usize) -> Result<(), Box<dyn std::error::Error>> {
+    boot_with(dir, objects, size, &mut std::io::stdout().lock())
 }
 
 fn volume_ids(dir: &std::path::Path) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
@@ -234,6 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[tokio::test]
     async fn scan_reports_needles_and_read_calls() {
@@ -260,5 +328,62 @@ mod tests {
         assert!(v["needles_per_s"].as_f64().is_some(), "missing needles_per_s in {line}");
         let read_calls = v["read_calls"].as_u64().expect("missing read_calls");
         assert!(read_calls >= objects, "read_calls {read_calls} < needles {objects}");
+    }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("awanfs_boot_bench_{}_{}_{}", name, std::process::id(), n));
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn boot_reports_peak_and_retained_heap() {
+        let dir = TempDir::new("heap");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(fill(&dir.0, 16, 64)).unwrap();
+        drop(rt);
+
+        let mut out = Vec::new();
+        boot_with(&dir.0, 16, 64, &mut out).unwrap();
+        let line = String::from_utf8(out).unwrap();
+        let json: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+
+        assert_eq!(json["phase"], "boot");
+        assert_eq!(json["objects"], 16);
+        assert_eq!(json["wrong"], 0);
+        let peak = json["peak_heap_mib"].as_f64().expect("boot JSON line missing numeric peak_heap_mib");
+        let after = json["heap_after_mib"].as_f64().expect("boot JSON line missing numeric heap_after_mib");
+        assert!(peak > 0.0, "expected peak_heap_mib > 0.0, got {}", peak);
+        assert!(after >= 0.0, "expected heap_after_mib >= 0.0, got {}", after);
+        assert!(peak >= after, "expected peak_heap_mib ({}) >= heap_after_mib ({})", peak, after);
+
+        // An earlier temporary allocation must not inflate a later boot's peak_heap_mib.
+        let spike_mib = (peak.ceil() as usize) + 32;
+        let spike = std::hint::black_box(vec![0u8; spike_mib << 20]);
+        drop(spike);
+
+        let mut out2 = Vec::new();
+        boot_with(&dir.0, 16, 64, &mut out2).unwrap();
+        let json2: serde_json::Value = serde_json::from_str(String::from_utf8(out2).unwrap().trim()).unwrap();
+        let peak2 = json2["peak_heap_mib"].as_f64().unwrap();
+        assert!(
+            peak2 < peak + 16.0,
+            "expected reset_heap_peak to drop prior spike ({} MiB); peak1={}, peak2={}",
+            spike_mib,
+            peak,
+            peak2
+        );
     }
 }

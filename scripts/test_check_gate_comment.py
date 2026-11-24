@@ -116,6 +116,81 @@ class CheckGateCommentTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
+    def test_133_gate_extracts_all_5_lines_and_matches_evidence(self):
+        body_path = os.path.join(FIXTURES_DIR, "issue_133_body.md")
+        comment_path = os.path.join(FIXTURES_DIR, "issue_133_comment.md")
+        with open(body_path, encoding="utf-8") as fh:
+            body_133 = fh.read()
+        lines = c.extract_gate_lines(body_133)
+        self.assertEqual(len(lines), 5, lines)
+        self.assertIn("gh pr checks <pr>", lines[0])
+        self.assertIn("peak RSS per workload", lines[1])
+        self.assertIn("measurements/<date>-large-object-rss.md", lines[2])
+        self.assertIn("self-hosted report fails", lines[3])
+        self.assertIn("bench-ratio.yml", lines[4])
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = c.main(["--body-file", body_path, "--comment-file", comment_path, "133"])
+        out = buf.getvalue()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.count("| yes |"), 5, out)
+
+    def test_code_blocks_paragraphs_and_sub_bullets_in_gate(self):
+        body = (
+            "## Problem\n"
+            "```markdown\n"
+            "## Gate\n"
+            "- fake gate before real gate\n"
+            "```\n\n"
+            "## Gate\n"
+            "- First top-level check with details:\n"
+            "  - indented sub-bullet one\n"
+            "\t- tab-indented sub-bullet two\n\n"
+            "Paragraph between bullets.\n\n"
+            "```bash\n"
+            "# bash comment must not end gate section\n"
+            "- not a gate line\n"
+            "```\n\n"
+            "~~~~\n"
+            "## tilde heading inside fence\n"
+            "* also not a gate line\n"
+            "~~~~\n\n"
+            "````markdown\n"
+            "```\n"
+            "### nested fence heading\n"
+            "```\n"
+            "````\n\n"
+            "* Second top-level check.\n"
+            " - Third top-level check.\n"
+            "\n## Files\n"
+            "- `scripts/check_gate_comment.py`\n"
+        )
+        lines = c.extract_gate_lines(body)
+        self.assertEqual(
+            lines,
+            [
+                "First top-level check with details:",
+                "Second top-level check.",
+                "Third top-level check.",
+            ],
+        )
+
+    def test_gate_heading_with_no_bullets_exits_2_with_message(self):
+        comment = "### Gate\n- `cargo test`: OK\n"
+        bodies = [
+            "## Gate\n",
+            "## Gate\n\n## Files\n- `a.py`\n",
+            "## Gate\nJust prose between headings.\n\n## Files\n- `a.py`\n",
+            "## Gate\n```sh\n- bullet inside code block\n```\n",
+            "## Gate\n<details><summary>Must pass</summary>\n\n- `test_s3::test_a`\n</details>\n",
+            "## Done when\n  - indented bullet only\n",
+        ]
+        for body in bodies:
+            rc, out = self._run_main(body, comment)
+            self.assertEqual(rc, 2, f"Expected exit 2 for {body!r}, got {rc}: {out}")
+            self.assertTrue(out.strip(), f"Expected non-empty message for {body!r}")
+
     def _run_must_pass(self, body, passing, log, comments=None, issue=None):
         with tempfile.TemporaryDirectory() as tmp:
             body_path = os.path.join(tmp, "body.md")
@@ -379,6 +454,66 @@ class CheckGateCommentTest(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("test_object_delete_key_bucket_gone", out)
         self.assertIn("assert 403 == 404", out)
+
+    def test_fetch_evidence_comment_prefers_gate_evidence_over_later_review(self):
+        with open(os.path.join(FIXTURES_DIR, "issue_133_body.md"), encoding="utf-8") as fh:
+            body_133 = fh.read()
+        with open(os.path.join(FIXTURES_DIR, "issue_133_comment.md"), encoding="utf-8") as fh:
+            evidence_133 = fh.read()
+        review_comment = (
+            "## Reviewed and merged (Claude, audit 2026-11-20)\n\n"
+            "- **Gate:** all 5 lines verified.\n"
+            "Quoted heading on non-first line:\n"
+            "## Gate evidence should not match when not on line 1\n"
+        )
+        comments = [
+            {"body": "Early note mentioning Gate"},
+            {"body": evidence_133},
+            {"body": review_comment},
+        ]
+        with mock.patch.object(c, "fetch_issue_comments", return_value=comments):
+            selected = c.fetch_evidence_comment("133")
+        self.assertEqual(selected, evidence_133)
+
+        def fake_gh_api(endpoint, allow_escape=False):
+            if endpoint == "repos/{owner}/{repo}/issues/133":
+                return json.dumps({"body": body_133})
+            if endpoint == "repos/{owner}/{repo}/issues/133/comments":
+                return json.dumps(comments)
+            raise AssertionError(f"Unexpected endpoint: {endpoint}")
+
+        buf = io.StringIO()
+        with mock.patch.object(c, "_gh_api", side_effect=fake_gh_api):
+            with mock.patch.object(c, "_gh_api_paginated", side_effect=lambda ep: json.loads(fake_gh_api(ep))):
+                with redirect_stdout(buf):
+                    rc = c.main(["133"])
+        out = buf.getvalue()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.count("| yes |"), 5, out)
+
+        earlier = "## Gate evidence for #266 (PR #285)\n- old"
+        latest = "## Gate Evidence (PR #286)\n- latest"
+        with mock.patch.object(
+            c,
+            "fetch_issue_comments",
+            return_value=[{"body": earlier}, {"body": latest}, {"body": review_comment}],
+        ):
+            self.assertEqual(c.fetch_evidence_comment("266"), latest)
+
+    def test_fetch_evidence_comment_falls_back_to_latest_gate_comment(self):
+        first = "### Gate verification\n- first attempt\n"
+        second = "Gate:\n- `pytest`: passed\n"
+        no_gate = "Unrelated follow-up note without the keyword.\n"
+        comments = [
+            {"body": first},
+            {"body": second},
+            {"body": no_gate},
+        ]
+        with mock.patch.object(c, "fetch_issue_comments", return_value=comments):
+            self.assertEqual(c.fetch_evidence_comment("187"), second)
+
+        with mock.patch.object(c, "fetch_issue_comments", return_value=[{"body": no_gate}]):
+            self.assertEqual(c.fetch_evidence_comment("187"), "")
 
 
 if __name__ == "__main__":

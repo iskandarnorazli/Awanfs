@@ -24,10 +24,12 @@ MinIO and RustFS on 8+ core NVMe hardware:
 """
 
 import argparse
+import ctypes
 import http.client
 import json
 import os
 import platform
+import re
 import shutil
 import statistics
 import subprocess
@@ -1297,7 +1299,92 @@ def run_warp_workload(
                 pass
 
 
-def default_workloads(profile: str) -> List[Tuple[str, str]]:
+_COLD_PAREN_SUFFIX_RE = re.compile(
+    r",\s*\d+\s+MiB\s+dataset,\s*(?:warm page cache|Dataset exceeds host RAM)\)$"
+)
+_COLD_STANDALONE_TAG_RE = re.compile(
+    r"\s*\(\d+\s+MiB\s+dataset,\s*(?:warm page cache|Dataset exceeds host RAM)\)$"
+)
+
+
+def host_ram_bytes() -> Optional[int]:
+    """Physical host RAM in bytes, or None when unavailable."""
+    try:
+        if sys.platform == "win32":
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            st = MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return int(st.ullTotalPhys)
+        elif hasattr(os, "sysconf") and "SC_PHYS_PAGES" in os.sysconf_names:
+            return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+    except Exception:
+        pass
+    return None
+
+
+def parse_ram_bytes(hw_info: Dict[str, str]) -> Optional[int]:
+    """Resolves host RAM in bytes from `hw_info` (`ram_bytes` or `ram_gb`)."""
+    raw_bytes = hw_info.get("ram_bytes")
+    if raw_bytes is not None:
+        try:
+            val = int(raw_bytes)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+    raw_gb = hw_info.get("ram_gb")
+    if raw_gb is not None:
+        try:
+            gb = float(raw_gb)
+            if gb > 0:
+                return int(gb * (1024 ** 3))
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def cold_dataset_exceeds_ram(cold_set_mib: int, ram_bytes: Optional[int]) -> bool:
+    """True only when `cold_set_mib * 1024**2` strictly exceeds known host RAM."""
+    if ram_bytes is None or ram_bytes <= 0:
+        return False
+    return int(cold_set_mib) * MIB > ram_bytes
+
+
+def cold_cache_status_label(cold_set_mib: int, ram_bytes: Optional[int]) -> str:
+    """Returns `{cold_set_mib} MiB dataset` paired with page-cache vs RAM status."""
+    if cold_dataset_exceeds_ram(cold_set_mib, ram_bytes):
+        return f"{cold_set_mib} MiB dataset, Dataset exceeds host RAM"
+    return f"{cold_set_mib} MiB dataset, warm page cache"
+
+
+def format_cold_workload_label(label: str, cold_set_mib: int, ram_bytes: Optional[int]) -> str:
+    """Attaches dataset size and OS page-cache status to a Cold GET workload label."""
+    base = _COLD_PAREN_SUFFIX_RE.sub(")", label)
+    base = _COLD_STANDALONE_TAG_RE.sub("", base).strip()
+    tag = cold_cache_status_label(cold_set_mib, ram_bytes)
+    if base.endswith(")"):
+        return f"{base[:-1]}, {tag})"
+    return f"{base} ({tag})"
+
+
+def default_workloads(
+    profile: str,
+    cold_set_mib: int = 32,
+    ram_bytes: Optional[int] = None,
+) -> List[Tuple[str, str]]:
     if profile == "community":
         return [
             ("seq_put_800k", "Sequential Write 800 KiB compressible (c=1)"),
@@ -1312,12 +1399,12 @@ def default_workloads(profile: str) -> List[Tuple[str, str]]:
     return [
         ("put_64k", "64 KiB PUT (c=C)"),
         ("get_64k_default", "64 KiB GET (default cache)"),
-        ("get_64k_cold", "64 KiB Cold GET (--cache-bytes 0 / >cache set)"),
+        ("get_64k_cold", format_cold_workload_label("64 KiB Cold GET (--cache-bytes 0 / >cache set)", cold_set_mib, ram_bytes)),
         ("mixed_64k", "64 KiB Mixed 80/20"),
         ("range_get_4k", "64 KiB Range GET (4 KiB)"),
         ("put_1m", "1 MiB PUT"),
         ("get_1m_default", "1 MiB GET (default cache)"),
-        ("get_1m_cold", "1 MiB Cold GET (--cache-bytes 0 / >cache set)"),
+        ("get_1m_cold", format_cold_workload_label("1 MiB Cold GET (--cache-bytes 0 / >cache set)", cold_set_mib, ram_bytes)),
         ("list_1000", "LIST 1,000 keys (ListObjectsV2)"),
         ("head_64k", "HEAD 64 KiB object"),
         ("delete_64k", "DELETE 64 KiB object"),
@@ -1370,8 +1457,26 @@ def format_market_claims_report(
     minio_drives: int,
     warp_results: Optional[Dict[str, Dict[str, List[BenchmarkMetrics]]]] = None,
     compression_ratio: Optional[float] = None,
+    cold_set_mib: int = 32,
 ) -> str:
     """Renders the Markdown report starting with `Command: `...`` on line 1."""
+    ram_bytes = parse_ram_bytes(hw_info)
+    ram_gb_label = hw_info.get("ram_gb", "unknown")
+    if cold_dataset_exceeds_ram(cold_set_mib, ram_bytes):
+        cold_setup_line = (
+            f"- **Cold-Read Setup (`--cache-bytes 0`):** `s3-server` exposes `--memory-budget` "
+            f"(minimum `16MiB`, yielding a 6 MiB payload cache) rather than `--cache-bytes 0`; "
+            f"cold-read phases start AwanFS with `--memory-budget 16MiB` and sweep a `{cold_set_mib} MiB dataset` "
+            f"against {ram_gb_label} GB host RAM (`Dataset exceeds host RAM`)."
+        )
+    else:
+        cold_setup_line = (
+            f"- **Cold-Read Setup (`--cache-bytes 0`):** `s3-server` exposes `--memory-budget` "
+            f"(minimum `16MiB`, yielding a 6 MiB payload cache) rather than `--cache-bytes 0`; "
+            f"cold-read phases start AwanFS with `--memory-budget 16MiB` and sweep a `{cold_set_mib} MiB dataset` "
+            f"on {ram_gb_label} GB host RAM (`warm page cache`: working set fits in OS page cache)."
+        )
+
     lines = [
         f"Command: `{cmd}`",
         "",
@@ -1381,7 +1486,7 @@ def format_market_claims_report(
         f"- **Profile:** `{profile}`",
         f"- **CPU Model:** {hw_info.get('cpu', 'unknown')}",
         f"- **Logical Cores:** {hw_info.get('cores', 'unknown')}",
-        f"- **Host RAM:** {hw_info.get('ram_gb', 'unknown')} GB",
+        f"- **Host RAM:** {ram_gb_label} GB",
         f"- **Operating System:** {hw_info.get('os', platform.platform())}",
         f"- **Server Affinity Pin:** {hw_info.get('affinity_server', 'not recorded')}",
         f"- **Client Affinity Pin:** {hw_info.get('affinity_client', 'not recorded')}",
@@ -1389,7 +1494,7 @@ def format_market_claims_report(
         f"- **MinIO Setup:** {minio_drives}-directory erasure set (`{hw_info.get('minio_status', 'not measured')}`)",
         f"- **RustFS Setup:** `{hw_info.get('rustfs_status', 'not measured')}`",
         f"- **MinIO `warp` Client:** {hw_info.get('warp_status', 'not measured')}",
-        "- **Cold-Read Setup (`--cache-bytes 0`):** `s3-server` exposes `--memory-budget` (minimum `16MiB`, yielding a 6 MiB payload cache) rather than `--cache-bytes 0`; cold-read phases start AwanFS with `--memory-budget 16MiB` and sweep a unique-key working set larger than the cache.",
+        cold_setup_line,
     ]
     if compression_ratio is not None:
         lines.append(f"- **Community Document Payload:** {COMMUNITY_DOC_BYTES // KIB} KiB structured log/JSON (`zlib` compression ratio {compression_ratio:.2f}x)")
@@ -1411,7 +1516,12 @@ def format_market_claims_report(
     ])
 
     cold_verification_rows: List[str] = []
-    for key, label in workloads:
+    for key, raw_label in workloads:
+        label = (
+            format_cold_workload_label(raw_label, cold_set_mib, ram_bytes)
+            if key.endswith("_cold")
+            else raw_label
+        )
         for server_label, by_wl in results.items():
             runs_list = by_wl.get(key, [])
             if not runs_list:
@@ -1674,6 +1784,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for wl, items in w_res.items():
                 all_warp[label].setdefault(wl, []).extend(items)
 
+    ram_bytes = host_ram_bytes()
     pin_srv, pin_cli = affinity_labels()
     hw_info = {
         "cpu": cpu_model(),
@@ -1686,12 +1797,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "rustfs_status": rustfs_status,
         "warp_status": f"Measured ({binary_version(warp_bin)})" if warp_bin else "not measured (warp binary not installed)",
     }
+    if ram_bytes is not None:
+        hw_info["ram_bytes"] = str(ram_bytes)
     comp_ratio = payload_compression_ratio(make_compressible_payload(COMMUNITY_DOC_BYTES, 1)) if a.profile == "community" else None
     report = format_market_claims_report(
         cmd=cmd,
         hw_info=hw_info,
         results=all_results,
-        workloads=default_workloads(a.profile),
+        workloads=default_workloads(a.profile, cold_set_mib=a.cold_set_mib, ram_bytes=ram_bytes),
         durabilities=durabilities,
         runs=a.runs,
         duration_sec=duration_sec,
@@ -1699,6 +1812,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         minio_drives=a.minio_drives,
         warp_results=all_warp if warp_bin else None,
         compression_ratio=comp_ratio,
+        cold_set_mib=a.cold_set_mib,
     )
     out_dir = os.path.dirname(os.path.abspath(a.output))
     if out_dir:

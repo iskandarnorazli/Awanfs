@@ -25,10 +25,14 @@ Skipped tests in `tests/s3tests/CONFORMANCE_MAP.md` are skipped by `pytest` beca
 
 | Skip reason | Area | What would un-skip it |
 |---|---|---|
-| ceph client extension (`bucket_logging`, `fails_without_logging_rollover`, `bucket_logging_cleanup`) | `bucket-logging` (#153) | Installing ceph's custom botocore service model extension and implementing RGW logging journal/rollover endpoints |
+| `ceph extension to bucket logging not supported at client` | `bucket-logging` (#153) | Installing ceph's custom botocore service model extension and implementing RGW logging journal and rollover endpoints |
 | `kms_keyid` | `encryption` (#121) | Setting `kms_keyid` in `s3tests.conf` and passing a key file via `--sse-master-key-file` |
-| storage classes (`lifecycle_transition`, `cloud_transition`, `cloud_restore`, `[s3 cloud]`) | `storage-classes` (out of scope, #162) | Configuring multiple storage classes and an `[s3 cloud]` tiering target in `s3tests.conf` |
-| `deny_self_denied_policy` | `policy` (#122) | Upstream conditional skip in `s3-tests` for self-denied bucket policy tests |
+| `[s3 cloud] section missing cloud_storage_class` | `storage-classes` (out of scope, #162) | Configuring `[s3 cloud]` with `cloud_storage_class` in `tests/s3tests/s3tests.conf` |
+| `no cloud_storage_class configured` | `storage-classes` (out of scope, #162) | Configuring `cloud_storage_class` in `tests/s3tests/s3tests.conf` |
+| `requires 2 or more storage classes` | `storage-classes` (out of scope, #162) | Configuring at least two storage classes in `tests/s3tests/s3tests.conf` |
+| `requires 3 or more storage classes` | `storage-classes` (out of scope, #162) | Configuring at least three storage classes in `tests/s3tests/s3tests.conf` |
+| `got empty parameter set for (source_mode_key, source_storage_class, dest_storage_class)` | `storage-classes` (out of scope, #162) | Configuring at least two storage classes so pytest generates parameters for `test_lifecycle_transition_encrypted` |
+| `[iam root] user does not belong to an account` | `policy` (#122) | Configuring an account-scoped `[iam root]` user for `test_bucket_policy_deny_self_denied_policy` and `test_bucket_policy_deny_self_denied_policy_confirm_header` |
 
 ## Planned settings
 
