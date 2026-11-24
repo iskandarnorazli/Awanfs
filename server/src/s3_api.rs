@@ -736,6 +736,12 @@ impl Default for OpenLimits {
     }
 }
 
+#[derive(Debug)]
+pub enum DeleteError {
+    PreconditionFailed(Option<crate::precondition::ObjectFacts>),
+    Internal(String),
+}
+
 impl S3ServiceState {
     pub fn new() -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -1133,7 +1139,79 @@ impl S3ServiceState {
     /// Deletes a key: removes it, or in a versioned bucket writes a delete marker, whose
     /// version id it returns (#31).
     pub async fn delete_key(&self, b_id: u32, key: &str) -> Result<Option<String>, String> {
+        let conds = crate::precondition::DeleteConditions::default();
+        self.delete_key_conditional(b_id, key, &conds)
+            .await
+            .map_err(|e| match e {
+                DeleteError::PreconditionFailed(_) => "PreconditionFailed".to_string(),
+                DeleteError::Internal(s) => s,
+            })
+    }
+
+    pub async fn delete_key_conditional(
+        &self,
+        b_id: u32,
+        key: &str,
+        conds: &crate::precondition::DeleteConditions,
+    ) -> Result<Option<String>, DeleteError> {
         let _key_guard = self.lock_key(b_id, key).await;
+        if !conds.is_empty() {
+            let (target, facts_opt) = {
+                let vs = self.versions.read();
+                if vs.has(b_id, key) {
+                    match vs.current(b_id, key) {
+                        None => (crate::precondition::DeleteTarget::Absent, None),
+                        Some(v) if v.marker => (
+                            crate::precondition::DeleteTarget::DeleteMarker {
+                                last_modified_secs: crate::ops::object::last_modified_secs_from_ns(v.modified),
+                            },
+                            None,
+                        ),
+                        Some(v) => {
+                            let etag = crate::ops::object::version_etag(&v);
+                            let lm = crate::ops::object::last_modified_secs_from_ns(v.modified);
+                            (
+                                crate::precondition::DeleteTarget::Object {
+                                    etag: etag.clone(),
+                                    last_modified_secs: lm,
+                                    size: v.size,
+                                },
+                                Some(crate::precondition::ObjectFacts { etag, last_modified_secs: lm }),
+                            )
+                        }
+                    }
+                } else {
+                    drop(vs);
+                    match self.engine.read().get_object(b_id, key.as_bytes()) {
+                        Ok(m) => {
+                            let flags = unpack_flags(m.bucket_flags);
+                            let is_mp = flags & AWAN_FLAG_MULTIPART != 0;
+                            let etag = crate::ops::object::format_object_etag(
+                                m.etag_hi,
+                                m.etag_lo,
+                                is_mp,
+                                unpack_part_count(m.bucket_flags),
+                            );
+                            let lm = crate::ops::object::last_modified_secs_from_ms(m.created_at);
+                            (
+                                crate::precondition::DeleteTarget::Object {
+                                    etag: etag.clone(),
+                                    last_modified_secs: lm,
+                                    size: m.size,
+                                },
+                                Some(crate::precondition::ObjectFacts { etag, last_modified_secs: lm }),
+                            )
+                        }
+                        Err(_) => (crate::precondition::DeleteTarget::Absent, None),
+                    }
+                }
+            };
+            if crate::precondition::delete_precondition(conds, &target)
+                == crate::precondition::PreconditionOutcome::PreconditionFailed
+            {
+                return Err(DeleteError::PreconditionFailed(facts_opt));
+            }
+        }
         self.hook("delete_start", key);
         if let Some((extra, ts)) = self.version_stamp(b_id, key) {
             let flags = AWAN_FLAG_TOMBSTONE | extra;
@@ -1151,14 +1229,14 @@ impl S3ServiceState {
                     self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                     (loc, global_offset(loc.volume_id, loc.offset), Some(format!("could not record the delete: {}", cause)))
                 }
-                Err(e) => return Err(format!("could not record the delete: {:?}", e)),
+                Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
             };
             self.needle_crc_map.write().insert((b_id, g), loc.payload_crc32c);
             self.mvcc.tombstone(b_id, key);
             let v = crate::versions::Version { ts, modified: ts, null: flags & crate::meta_index::FLAG_NULL_ID != 0, marker: true, vol_offset: g, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags };
-            self.record_version(b_id, key, crate::versions::Event::Put(v)).map_err(|c| format!("index error {} for the delete marker", c))?;
+            self.record_version(b_id, key, crate::versions::Event::Put(v)).map_err(|c| DeleteError::Internal(format!("index error {} for the delete marker", c)))?;
             if let Some(e) = late {
-                return Err(e);
+                return Err(DeleteError::Internal(e));
             }
             return Ok(Some(v.id_string()));
         }
@@ -1177,7 +1255,7 @@ impl S3ServiceState {
                 self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                 Some(format!("could not record the delete: {}", cause))
             }
-            Err(e) => return Err(format!("could not record the delete: {:?}", e)),
+            Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
         };
         self.mvcc.tombstone(b_id, key);
         let old_info = {
@@ -1196,7 +1274,7 @@ impl S3ServiceState {
             }
         }
         match late {
-            Some(e) => Err(e),
+            Some(e) => Err(DeleteError::Internal(e)),
             None => Ok(None),
         }
     }
@@ -1204,31 +1282,76 @@ impl S3ServiceState {
     /// `DELETE ?versionId=`: removes one version for good (#31). Returns it, or `None` when the
     /// key has no such version.
     pub async fn delete_version(&self, b_id: u32, key: &str, id: u64) -> Result<Option<crate::versions::Version>, String> {
+        let conds = crate::precondition::DeleteConditions::default();
+        self.delete_version_conditional(b_id, key, id, &conds)
+            .await
+            .map_err(|e| match e {
+                DeleteError::PreconditionFailed(_) => "PreconditionFailed".to_string(),
+                DeleteError::Internal(s) => s,
+            })
+    }
+
+    pub async fn delete_version_conditional(
+        &self,
+        b_id: u32,
+        key: &str,
+        id: u64,
+        conds: &crate::precondition::DeleteConditions,
+    ) -> Result<Option<crate::versions::Version>, DeleteError> {
         let _key_guard = self.lock_key(b_id, key).await;
         let before = self.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| null_version_of(&m));
-        let (target, uncovers_object) = {
-            let mut vs = self.versions.write();
+        let (target, uncovers_object, needs_start) = {
+            let vs = self.versions.read();
             if !vs.has(b_id, key) {
                 // The object of a key with no history is its null version.
                 if id != 0 || before.is_none() {
                     return Ok(None);
                 }
-                vs.start(b_id, key, before);
+                (before, false, true)
+            } else {
+                let target = vs.find(b_id, key, id);
+                let uncovers = vs
+                    .versions(b_id, key)
+                    .and_then(|l| l.iter().find(|x| x.id() != id))
+                    .is_some_and(|next| !next.marker);
+                (target, uncovers, false)
             }
-            let target = vs.find(b_id, key, id);
-            let uncovers = vs
-                .versions(b_id, key)
-                .and_then(|l| l.iter().find(|x| x.id() != id))
-                .is_some_and(|next| !next.marker);
-            (target, uncovers)
         };
         let Some(target) = target else {
-            self.versions.write().tidy(b_id, key);
             return Ok(None);
         };
+        if !conds.is_empty() {
+            let (del_target, facts_opt) = if target.marker {
+                (
+                    crate::precondition::DeleteTarget::DeleteMarker {
+                        last_modified_secs: crate::ops::object::last_modified_secs_from_ns(target.modified),
+                    },
+                    None,
+                )
+            } else {
+                let etag = crate::ops::object::version_etag(&target);
+                let lm = crate::ops::object::last_modified_secs_from_ns(target.modified);
+                (
+                    crate::precondition::DeleteTarget::Object {
+                        etag: etag.clone(),
+                        last_modified_secs: lm,
+                        size: target.size,
+                    },
+                    Some(crate::precondition::ObjectFacts { etag, last_modified_secs: lm }),
+                )
+            };
+            if crate::precondition::delete_precondition(conds, &del_target)
+                == crate::precondition::PreconditionOutcome::PreconditionFailed
+            {
+                return Err(DeleteError::PreconditionFailed(facts_opt));
+            }
+        }
+        if needs_start {
+            self.versions.write().start(b_id, key, before);
+        }
         if uncovers_object {
             if let Err(code) = self.engine.read().has_room_for(b_id, key.as_bytes()) {
-                return Err(format!("index error {} before deleting a version", code));
+                return Err(DeleteError::Internal(format!("index error {} before deleting a version", code)));
             }
         }
         let flags = AWAN_FLAG_TOMBSTONE | crate::meta_index::FLAG_VERSION_DELETE;
@@ -1245,11 +1368,11 @@ impl S3ServiceState {
                 self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                 Some(format!("could not record the delete: {}", cause))
             }
-            Err(e) => return Err(format!("could not record the delete: {:?}", e)),
+            Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
         };
-        self.record_version(b_id, key, crate::versions::Event::Remove(id)).map_err(|c| format!("index error {} after deleting a version", c))?;
+        self.record_version(b_id, key, crate::versions::Event::Remove(id)).map_err(|c| DeleteError::Internal(format!("index error {} after deleting a version", c)))?;
         match late {
-            Some(e) => Err(e),
+            Some(e) => Err(DeleteError::Internal(e)),
             None => Ok(Some(target)),
         }
     }

@@ -19,6 +19,18 @@ fn serialize_delete_objects(req: &DeleteRequest) -> String {
         if let Some(vid) = &obj.version_id {
             out.push_str(&format!("    <VersionId>{}</VersionId>\n", s3_server::xml_escape_exact(vid)));
         }
+        if let Some(etag) = &obj.etag {
+            out.push_str(&format!("    <ETag>{}</ETag>\n", s3_server::xml_escape_exact(etag)));
+        }
+        if let Some(lmt) = obj.last_modified_secs {
+            out.push_str(&format!(
+                "    <LastModifiedTime>{}</LastModifiedTime>\n",
+                s3_server::precondition::format_http_date(lmt)
+            ));
+        }
+        if let Some(sz) = obj.size {
+            out.push_str(&format!("    <Size>{sz}</Size>\n"));
+        }
         out.push_str("  </Object>\n");
     }
     out.push_str("</Delete>");

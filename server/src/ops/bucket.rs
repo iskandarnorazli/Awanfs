@@ -763,9 +763,15 @@ pub async fn delete_objects(
             failed.push((k.clone(), "AccessDenied", "Access Denied".to_string()));
             continue;
         }
+        let conds = crate::precondition::DeleteConditions {
+            if_match: obj.etag.clone(),
+            if_none_match: None,
+            if_match_last_modified_secs: obj.last_modified_secs,
+            if_match_size: obj.size,
+        };
         match vid {
             Some(v) => match crate::versions::parse_id(v) {
-                Some(id) => match state.delete_version(b_id, k, id).await {
+                Some(id) => match state.delete_version_conditional(b_id, k, id, &conds).await {
                     Ok(removed) => {
                         let is_dm = removed.is_some_and(|ver| ver.marker);
                         ok_keys.push(DeletedOutcome {
@@ -775,7 +781,12 @@ pub async fn delete_objects(
                             delete_marker_version_id: if is_dm { Some(v.to_string()) } else { None },
                         });
                     }
-                    Err(e) => failed.push((k.clone(), "InternalError", e)),
+                    Err(crate::s3_api::DeleteError::PreconditionFailed(_)) => failed.push((
+                        k.clone(),
+                        "PreconditionFailed",
+                        "At least one of the pre-conditions you specified did not hold.".to_string(),
+                    )),
+                    Err(crate::s3_api::DeleteError::Internal(e)) => failed.push((k.clone(), "InternalError", e)),
                 },
                 None => failed.push((
                     k.clone(),
@@ -783,7 +794,7 @@ pub async fn delete_objects(
                     "The specified version does not exist.".to_string(),
                 )),
             },
-            None => match state.delete_key(b_id, k).await {
+            None => match state.delete_key_conditional(b_id, k, &conds).await {
                 Ok(dm_vid) => {
                     let is_dm = dm_vid.is_some();
                     ok_keys.push(DeletedOutcome {
@@ -793,7 +804,12 @@ pub async fn delete_objects(
                         delete_marker_version_id: dm_vid,
                     });
                 }
-                Err(e) => failed.push((k.clone(), "InternalError", e)),
+                Err(crate::s3_api::DeleteError::PreconditionFailed(_)) => failed.push((
+                    k.clone(),
+                    "PreconditionFailed",
+                    "At least one of the pre-conditions you specified did not hold.".to_string(),
+                )),
+                Err(crate::s3_api::DeleteError::Internal(e)) => failed.push((k.clone(), "InternalError", e)),
             },
         }
     }
