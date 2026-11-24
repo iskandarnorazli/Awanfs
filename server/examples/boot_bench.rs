@@ -2,17 +2,19 @@
 //! replay of its volumes, and its peak heap and RSS while it does, with N objects.
 //!
 //!   cargo run --release --example boot_bench -- fill --dir <DIR> --objects 10000000
+//!   cargo run --release --example boot_bench -- scan --dir <DIR>
 //!   cargo run --release --example boot_bench -- boot --dir <DIR>
 //!
 //! `fill` writes N small objects through `S3ServiceState::store_object` with `--durability
-//! fast` (setup only: no sync per object), then syncs every volume. `boot` runs in a fresh
-//! process, so its peak RSS and peak heap are the boot's own: it opens the directory with
-//! `S3ServiceState::try_with_data_dir` (the server's boot: bucket manifest, then every volume
-//! replayed, the hot table and the spill index rebuilt) and checks a sample of objects. Each
-//! phase prints one JSON line.
+//! fast` (setup only: no sync per object), then syncs every volume. `scan` opens each volume
+//! in `DIR` and times `VolumeManager::scan_needles` alone, reporting needles per second and
+//! `read_calls`. `boot` runs in a fresh process, so its peak RSS and peak heap are the boot's
+//! own: it opens the directory with `S3ServiceState::try_with_data_dir` (the server's boot:
+//! bucket manifest, then every volume replayed, the hot table and the spill index rebuilt) and
+//! checks a sample of objects. Each phase prints one JSON line.
 
 use bytes::Bytes;
-use s3_server::{compute_md5, Durability, S3ServiceState, AWAN_FLAG_ACTIVE};
+use s3_server::{compute_md5, Durability, S3ServiceState, VolumeManager, AWAN_FLAG_ACTIVE};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -226,6 +228,58 @@ fn boot(dir: &std::path::Path, objects: u64, size: usize) -> Result<(), Box<dyn 
     boot_with(dir, objects, size, &mut std::io::stdout().lock())
 }
 
+fn volume_ids(dir: &std::path::Path) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let mut ids: Vec<u32> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            name.strip_prefix("volume_")?.strip_suffix(".dat")?.parse().ok()
+        })
+        .collect();
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+fn scan(dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    let ids = volume_ids(dir)?;
+    if ids.is_empty() {
+        return Err(format!("no volume_*.dat files in {}", dir.display()).into());
+    }
+    // Open every volume before timing; VolumeManager::open runs an initial recovery scan.
+    let mut volumes = Vec::with_capacity(ids.len());
+    for id in ids {
+        volumes.push(VolumeManager::open(dir, id).map_err(|e| format!("volume {}: {}", id, e))?);
+    }
+    let before_reads: Vec<u64> = volumes
+        .iter()
+        .map(|vm| vm.work_counters().snapshot().disk_reads)
+        .collect();
+
+    let t = Instant::now();
+    let mut needles = 0u64;
+    for vm in &volumes {
+        vm.scan_needles(|_| {
+            needles += 1;
+        })
+        .map_err(|e| format!("scan_needles: {}", e))?;
+    }
+    let secs = t.elapsed().as_secs_f64();
+    let read_calls: u64 = volumes
+        .iter()
+        .zip(before_reads.iter())
+        .map(|(vm, before)| vm.work_counters().snapshot().disk_reads.saturating_sub(*before))
+        .sum();
+    let needles_per_s = needles as f64 / secs.max(1e-9);
+    Ok(format!(
+        "{{\"phase\":\"scan\",\"volumes\":{},\"secs\":{:.3},\"needles\":{},\"needles_per_s\":{:.0},\"read_calls\":{}}}",
+        volumes.len(),
+        secs,
+        needles,
+        needles_per_s,
+        read_calls
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -235,8 +289,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let size: usize = arg("--size", "64").parse()?;
     match args.get(1).map(String::as_str) {
         Some("fill") => fill(&dir, objects, size).await,
+        Some("scan") => {
+            println!("{}", scan(&dir)?);
+            Ok(())
+        }
         Some("boot") => boot(&dir, objects, size),
-        _ => Err("usage: boot_bench fill|boot --dir DIR [--objects N] [--size BYTES]".into()),
+        _ => Err("usage: boot_bench fill|scan|boot --dir DIR [--objects N] [--size BYTES]".into()),
     }
 }
 
@@ -244,6 +302,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[tokio::test]
+    async fn scan_reports_needles_and_read_calls() {
+        let dir = std::env::temp_dir().join(format!(
+            "awan_boot_bench_scan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let objects = 5u64;
+        fill(&dir, objects, 64).await.unwrap();
+
+        let res = scan(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let line = res.unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&line).expect("scan output is valid JSON");
+        assert_eq!(v["phase"], "scan");
+        assert!(v["secs"].as_f64().is_some(), "missing secs in {line}");
+        assert_eq!(v["needles"].as_u64(), Some(objects));
+        assert!(v["needles_per_s"].as_f64().is_some(), "missing needles_per_s in {line}");
+        let read_calls = v["read_calls"].as_u64().expect("missing read_calls");
+        assert!(read_calls >= objects, "read_calls {read_calls} < needles {objects}");
+    }
 
     struct TempDir(PathBuf);
 

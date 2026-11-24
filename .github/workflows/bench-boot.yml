@@ -42,7 +42,7 @@ jobs:
       - name: Build the benchmark
         run: cargo build --locked --release --example boot_bench --manifest-path server/Cargo.toml
 
-      - name: Fill, then boot twice
+      - name: Fill, scan, then boot
         shell: bash
         env:
           # PRs use 1M so follow-up pushes finish fast (#330); dispatches keep the 10M default.
@@ -61,6 +61,7 @@ jobs:
             dir="${DATA}_${n}"
             rm -rf "$dir"
             "$bin" fill --dir "$dir" --objects "$n" --size "$SIZE" | tee -a "$out"
+            "$bin" scan --dir "$dir" | tee -a "$out"
             if [ "$RUNNER_OS" = "Linux" ]; then
               # A cold boot: nothing of the volumes in the page cache.
               sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
