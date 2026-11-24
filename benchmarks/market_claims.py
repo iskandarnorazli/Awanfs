@@ -4,9 +4,9 @@
 Addresses the six methodological requirements for comparing AwanFS against
 MinIO and RustFS on 8+ core NVMe hardware:
 
-1. Synced writes: measures AwanFS in `--durability=group` (default),
-   `--durability=strict`, and `--durability=fast` (labelled `none` / no-sync)
-   alongside MinIO and RustFS, with an explicit per-server durability table.
+1. Synced writes: measures AwanFS at its default, `--durability=group`,
+   alongside MinIO and RustFS at theirs, with an explicit per-server durability
+   table. Other AwanFS modes run only when `--durabilities` names them.
 2. Standard load tool: runs MinIO `warp` (when available) alongside the
    persistent HTTP/1.1 keep-alive harness (`run_warp_benchmark.py`) on the
    same workloads.
@@ -1680,7 +1680,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--warp-bin", help="Path to MinIO warp binary")
     ap.add_argument("--fetch-warp", action="store_true", help="Attempt `go install github.com/minio/warp@latest` if missing")
     ap.add_argument("--awanfs-only", action="store_true", help="Run AwanFS modes only (skip MinIO and RustFS)")
-    ap.add_argument("--durabilities", default="group,strict,none", help="Comma-separated AwanFS durability modes (group,strict,none)")
+    # Benchmarks run every server at its defaults (owner, 2026-11-20): AwanFS in group only,
+    # unless another mode is asked for by name.
+    ap.add_argument("--durabilities", default="group", help="Comma-separated AwanFS durability modes (default: group)")
     ap.add_argument("--profile", choices=["full", "community"], default="full", help="Benchmark profile: full or community")
     ap.add_argument("--runs", type=int, default=3, help="Number of alternating rounds per server (default: 3)")
     ap.add_argument("--duration", default="30", help="Seconds per phase (default: 30)")

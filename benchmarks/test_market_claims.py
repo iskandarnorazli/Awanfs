@@ -131,7 +131,7 @@ class TestDurabilityAndSetup(unittest.TestCase):
         self.assertEqual(args.runs, 3)
         self.assertEqual(mc.parse_duration_seconds(args.duration), 30.0)
         self.assertEqual(args.minio_drives, 4)
-        self.assertEqual(args.durabilities, "group,strict,none")
+        self.assertEqual(args.durabilities, "group")
 
 
 class TestSpreadAndPayloads(unittest.TestCase):

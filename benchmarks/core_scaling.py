@@ -3913,7 +3913,9 @@ def _resolve_profile_config(
     else:
         profile_cores = set(DEFAULT_PROFILE_THREAD_CORES) if auto else set()
     cmp_flag = getattr(a, "compare_fast", None)
-    compare_fast = (cmp_flag if cmp_flag is not None else auto) and (durability != "fast")
+    # Benchmarks run every server at its defaults (owner, 2026-11-20): the fast pass runs only
+    # when asked for by name, never on its own.
+    compare_fast = bool(cmp_flag) and (durability != "fast")
     return durability, profile_cores, compare_fast
 
 
@@ -4150,7 +4152,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--compare-fast", dest="compare_fast", action="store_true", default=None,
                     help="Also measure AwanFS --durability fast on PUT 4 KiB")
     ap.add_argument("--no-compare-fast", dest="compare_fast", action="store_false",
-                    help="Disable automatic --durability fast comparison on 16+ core machines")
+                    help="Do not measure AwanFS --durability fast (the default)")
     ap.add_argument("--profile-threads-cores", default="",
                     help="Comma-separated core counts where AwanFS per-thread CPU is sampled during PUT 4 KiB (default: 4,8 on 16+ core split-client runs)")
     ap.add_argument("--no-fetch-minio", action="store_true", help="Do not auto-fetch missing MinIO/mc binaries from GitHub Releases")

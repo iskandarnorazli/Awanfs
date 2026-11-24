@@ -30,7 +30,8 @@ from run_warp_benchmark import get_free_port, get_process_peak_rss_mb, run_workl
 MIB = 1 << 20
 FILL_OBJECT = 4 * MIB
 SMALL = 64 * 1024
-CONFIGS = [("growing (default)", {}), ("sparse (AWAN_SPARSE_VOLUME=1)", {"AWAN_SPARSE_VOLUME": "1"})]
+# Every server at its defaults (owner, 2026-11-20); the sparse row was measured once (decision 52).
+CONFIGS = [("growing (default)", {})]
 TWO_LISTENERS = ("AwanFS", "MinIO")
 FOUR_LISTENERS = ("bare std", "bare tokio", "s3-server", "MinIO")
 FOUR_ONLY_LISTENERS = ("bare std", "bare tokio", "s3-server")

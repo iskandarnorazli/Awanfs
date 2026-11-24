@@ -1290,6 +1290,15 @@ class DurabilityAndAutoProfileTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 cs._start_awanfs(fake_bin, 4, tmpdir, durability="bogus")
 
+    def test_the_fast_mode_runs_only_when_asked_for_by_name(self):
+        # Every server at its defaults (owner, 2026-11-20): a 16-core run no longer adds an
+        # AwanFS --durability fast pass on its own.
+        a = type("A", (), {"durability": "group", "profile_threads_cores": "", "compare_fast": None})()
+        _, _, fast = cs._resolve_profile_config(a, [1, 2, 4, 8], 16)
+        self.assertFalse(fast)
+        a.compare_fast = True
+        self.assertTrue(cs._resolve_profile_config(a, [1, 2, 4, 8], 16)[2])
+
     def test_start_rustfs_env_matches_durability_labels(self):
         spawned_envs = []
 
