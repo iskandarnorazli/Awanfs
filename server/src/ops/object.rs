@@ -62,7 +62,6 @@ fn finish_put(
     if let Some((prev_off, prev_sz)) = old_info {
         if prev_off > 0 && prev_off != vol_offset {
             state.payload_cache.remove(b_id, prev_off);
-            state.needle_crc_map.write().remove(&(b_id, prev_off));
             let raw_len = 64 + key.len() + prev_sz as usize;
             let dead_bytes = raw_len.div_ceil(4096) as u64 * 4096;
             state.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
@@ -915,7 +914,6 @@ pub async fn copy_object(
     if let Some(prev_off) = old_info {
         if prev_off > 0 && prev_off != vol_offset {
             state.payload_cache.remove(b_id, prev_off);
-            state.needle_crc_map.write().remove(&(b_id, prev_off));
         }
     }
     if let Some(e) = late {
@@ -1514,7 +1512,6 @@ pub async fn put_object(
             }
         }
         drop(ticket);
-        state.needle_crc_map.write().insert((b_id, vol_offset), loc.payload_crc32c);
         state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
         state.hook("put_stored", key);
         let stream_cksum_ref = stream_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
