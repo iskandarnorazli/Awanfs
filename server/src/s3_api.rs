@@ -1211,6 +1211,9 @@ impl S3ServiceState {
             {
                 return Err(DeleteError::PreconditionFailed(facts_opt));
             }
+            if matches!(target, crate::precondition::DeleteTarget::Absent) {
+                return Ok(None);
+            }
         }
         self.hook("delete_start", key);
         if let Some((extra, ts)) = self.version_stamp(b_id, key) {

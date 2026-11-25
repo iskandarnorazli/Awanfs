@@ -553,6 +553,14 @@ async fn conditional_delete_and_delete_objects_by_etag_mtime_size_and_version() 
     // Missing object DELETE with conditions -> 204
     assert_eq!(s.client.delete(&key_url).header(IF_MATCH, "\"bad\"").send().await.unwrap().status(), StatusCode::NO_CONTENT);
 
+    // Versioned bucket: conditional delete on never-written key must not create a delete marker
+    s.enable_versioning("bkt").await;
+    let never_url = format!("{}/bkt/never", s.url);
+    assert_eq!(s.client.delete(&never_url).header(IF_MATCH, "*").send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(s.client.delete(&never_url).header(IF_MATCH, "\"bad\"").send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    let vers_xml = s.client.get(format!("{}/bkt?versions", s.url)).send().await.unwrap().text().await.unwrap();
+    assert!(!vers_xml.contains("<Key>never</Key>"), "absent conditional delete created delete marker: {vers_xml}");
+
     // Versioned bucket: current delete marker vs versionId
     s.enable_versioning("bkt").await;
     let pv = s.client.put(&key_url).body("ver-data").send().await.unwrap();
