@@ -557,9 +557,11 @@ pub(super) fn precondition_failure_response(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn version_get_response(
     state: &S3ServiceState,
     b_id: u32,
+    bucket: &str,
     key: &str,
     vid: Option<&str>,
     head: bool,
@@ -634,7 +636,10 @@ fn version_get_response(
     };
     if let Some(pn) = part_num {
         if v.flags & AWAN_FLAG_MULTIPART != 0 {
-            let extents = match state.multipart.get_completed_extents(b_id, key) {
+            let extents = match state
+                .manifest_extents(b_id, v.vol_offset)
+                .or_else(|| state.multipart.get_completed_extents(b_id, key))
+            {
                 Some(e) => e,
                 None => return internal_error_response(key, "the multipart object's part list is missing"),
             };
@@ -654,6 +659,18 @@ fn version_get_response(
             let ext = &extents[(pn - 1) as usize];
             let body = if head {
                 empty_body()
+            } else if v.size > VERIFY_WHILE_SENDING_MIN {
+                match state.multipart_body(
+                    b_id,
+                    format!("{}/{} part {}", bucket, key, pn),
+                    &extents,
+                    ext.cumulative_end - ext.part_size,
+                    ext.part_size,
+                    true,
+                ) {
+                    Ok(b) => b.boxed(),
+                    Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
+                }
             } else {
                 let b = match state.part_bytes(b_id, ext) {
                     Ok(b) => b,
@@ -689,6 +706,84 @@ fn version_get_response(
                 .unwrap();
         }
     }
+    let tag_count = view.attrs.tag_count();
+    let cksum_mode = checksum_mode_enabled(headers);
+    let is_compressed = v.flags & crate::meta_index::FLAG_COMPRESSED != 0;
+    let is_multipart = v.flags & AWAN_FLAG_MULTIPART != 0;
+    let builder = with_tagging_count(
+        Response::builder()
+            .with_object_metadata(&view, overrides)
+            .header(ETAG, etag_val)
+            .header(ACCEPT_RANGES, "bytes")
+            .header("x-amz-version-id", v.id_string())
+            .header(LAST_MODIFIED, crate::clock::format_http_date(v.modified)),
+        tag_count,
+    );
+    if !head && !is_compressed && v.size > VERIFY_WHILE_SENDING_MIN {
+        let what = format!("{}/{}", bucket, key);
+        if let Some(h) = range {
+            match parse_range_header(h, v.size) {
+                Ok(Some(r)) => {
+                    let len = r.end - r.start + 1;
+                    let body = if is_multipart {
+                        match state
+                            .manifest_extents(b_id, v.vol_offset)
+                            .or_else(|| state.multipart.get_completed_extents(b_id, key))
+                        {
+                            Some(extents) => state.multipart_body(b_id, what, &extents, r.start, len, false),
+                            None => return internal_error_response(key, "the multipart object's part list is missing"),
+                        }
+                    } else {
+                        state.large_payload_body(b_id, what, v.vol_offset, v.size, r.start, len, false)
+                    };
+                    let body = match body {
+                        Ok(b) => b,
+                        Err(e) => return internal_error_response(key, &format!("could not read the version: {:?}", e)),
+                    };
+                    return builder
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(CONTENT_RANGE, format!("bytes {}-{}/{}", r.start, r.end, v.size))
+                        .header(CONTENT_LENGTH, len.to_string())
+                        .body(body.boxed())
+                        .unwrap();
+                }
+                Err(()) => {
+                    return Response::builder()
+                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                        .header(CONTENT_TYPE, "application/xml")
+                        .header(CONTENT_RANGE, format!("bytes */{}", v.size))
+                        .body(full_body(Bytes::from(s3_error_xml(
+                            "InvalidRange",
+                            "The requested range cannot be satisfied.",
+                            key,
+                            "req-range-err",
+                        ))))
+                        .unwrap();
+                }
+                Ok(None) => {}
+            }
+        }
+        let body = if is_multipart {
+            match state
+                .manifest_extents(b_id, v.vol_offset)
+                .or_else(|| state.multipart.get_completed_extents(b_id, key))
+            {
+                Some(extents) => state.multipart_body(b_id, what, &extents, 0, v.size, true),
+                None => return internal_error_response(key, "the multipart object's part list is missing"),
+            }
+        } else {
+            state.large_payload_body(b_id, what, v.vol_offset, v.size, 0, v.size, true)
+        };
+        let body = match body {
+            Ok(b) => b,
+            Err(e) => return internal_error_response(key, &format!("could not read the version: {:?}", e)),
+        };
+        return with_checksum_headers(builder, &view.attrs, cksum_mode)
+            .status(StatusCode::OK)
+            .header(CONTENT_LENGTH, v.size.to_string())
+            .body(body.boxed())
+            .unwrap();
+    }
     let bytes = if head {
         Bytes::new()
     } else {
@@ -697,17 +792,6 @@ fn version_get_response(
             Err(e) => return internal_error_response(key, &format!("could not read the version: {:?}", e)),
         }
     };
-    let tag_count = view.attrs.tag_count();
-    let cksum_mode = checksum_mode_enabled(headers);
-    let builder = with_tagging_count(
-        Response::builder()
-            .with_object_metadata(&view, &overrides)
-            .header(ETAG, etag_val)
-            .header(ACCEPT_RANGES, "bytes")
-            .header("x-amz-version-id", v.id_string())
-            .header(LAST_MODIFIED, crate::clock::format_http_date(v.modified)),
-        tag_count,
-    );
     if let Some(h) = range {
         match parse_range_header(h, v.size) {
             Ok(Some(r)) => {
@@ -810,7 +894,7 @@ pub async fn copy_object(
     };
 
     let src_view: Result<crate::attrs::Attrs, VolumeError>;
-    let read = match (&src_vid, &src_meta) {
+    let (src_vol_offset, src_flags, src_size, src_etag_hi, src_etag_lo, copied_vid, version_opt) = match (&src_vid, &src_meta) {
         (Some(vid), _) => {
             let Some(id) = crate::versions::parse_id(vid) else {
                 return Ok(no_such_version(src_key, false));
@@ -839,9 +923,8 @@ pub async fn copy_object(
                 return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
             }
             src_view = state.object_attrs(v.vol_offset, v.flags);
-            state
-                .read_version_bytes(src_b_id, src_key, &v)
-                .map(|b| (b, v.size, v.etag_hi, v.etag_lo, Some(v.id_string())))
+            let vid_s = v.id_string();
+            (v.vol_offset, v.flags, v.size, v.etag_hi, v.etag_lo, Some(vid_s), Some(v))
         }
         (None, Some(m)) => {
             let flags = unpack_flags(m.bucket_flags);
@@ -854,15 +937,24 @@ pub async fn copy_object(
                 return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
             }
             src_view = state.object_attrs(m.vol_offset, flags);
-            state
-                .read_object_bytes(src_b_id, src_key, m.vol_offset, m.size, flags)
-                .map(|b| (b, m.size, m.etag_hi, m.etag_lo, None))
+            (m.vol_offset, flags, m.size, m.etag_hi, m.etag_lo, None, None)
         }
         (None, None) => unreachable!("src_meta is read whenever no version is named"),
     };
-    let (bytes, src_size, src_etag_hi, src_etag_lo, copied_vid) = match read {
-        Ok(r) => r,
-        Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
+    let stream_copy = src_size > STREAM_PUT_MIN
+        && (src_flags & crate::meta_index::FLAG_COMPRESSED == 0)
+        && !state.compresses(bucket);
+    let bytes = if stream_copy {
+        Bytes::new()
+    } else {
+        let read = match version_opt {
+            Some(v) => state.read_version_bytes(src_b_id, src_key, &v),
+            None => state.read_object_bytes(src_b_id, src_key, src_vol_offset, src_size, src_flags),
+        };
+        match read {
+            Ok(b) => b,
+            Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
+        }
     };
     let replace = match headers.get("x-amz-metadata-directive").and_then(|v| v.to_str().ok()) {
         None => false,
@@ -918,7 +1010,7 @@ pub async fn copy_object(
         Ok(a) => a,
         Err(_) => return Ok(bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key)),
     };
-    let flags = if bytes.is_empty() {
+    let flags = if src_size == 0 {
         AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE
     } else {
         AWAN_FLAG_ACTIVE
@@ -935,10 +1027,29 @@ pub async fn copy_object(
     let stamp = state.version_stamp(b_id, key);
     let flags = flags | stamp.map_or(0, |s| s.0);
     let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
-    let (vol_offset, flags, mut late) = match state
-        .store_object(b_id, bucket, key, &copy_attrs, &bytes, flags, src_etag_hi, src_etag_lo, Some(created_ns))
-        .await
-    {
+    let store_res = if stream_copy {
+        state
+            .stream_copy_object(
+                b_id,
+                key,
+                &copy_attrs,
+                flags,
+                src_b_id,
+                src_key,
+                src_vol_offset,
+                src_size,
+                src_flags,
+                src_etag_hi,
+                src_etag_lo,
+                created_ns,
+            )
+            .await
+    } else {
+        state
+            .store_object(b_id, bucket, key, &copy_attrs, &bytes, flags, src_etag_hi, src_etag_lo, Some(created_ns))
+            .await
+    };
+    let (vol_offset, flags, mut late) = match store_res {
         Ok((o, f)) => (o, f, None),
         // Indexed as on success, then answered 500 (#184, owner decision 4B).
         Err(e) => match S3ServiceState::late_record(&e) {
@@ -1769,7 +1880,7 @@ pub async fn get_or_head_object(
     let vid = query_map.get("versionId").map(|s| s.as_str());
     if vid.is_some() || state.versions.read().has(b_id, key) {
         let range = headers.get("Range").and_then(|v| v.to_str().ok());
-        return Ok(version_get_response(&state, b_id, key, vid, is_head, range, part_num, headers, &overrides));
+        return Ok(version_get_response(&state, b_id, bucket, key, vid, is_head, range, part_num, headers, &overrides));
     }
     let (meta, is_multipart) = {
         let engine = state.engine.read();
@@ -1982,7 +2093,7 @@ pub async fn get_or_head_object(
                     let loaded = if meta.size > VERIFY_WHILE_SENDING_MIN {
                         state.load_payload_unverified(b_id, meta.vol_offset, meta.size as usize).map(|(b, _)| b)
                     } else {
-                        state.load_payload(b_id, meta.vol_offset, meta.size as usize)
+                        state.load_payload_for(b_id, &format!("{}/{}", bucket, key), meta.vol_offset, meta.size as usize)
                     };
                     let full = match loaded {
                         Ok(b) => b,
@@ -2103,7 +2214,9 @@ pub async fn get_or_head_object(
                 if is_compressed {
                     state_for_read.load_compressed(b_id, meta.vol_offset, meta.size).unwrap_or_default()
                 } else {
-                    state_for_read.load_payload(b_id, meta.vol_offset, meta.size as usize).unwrap_or_default()
+                    state_for_read
+                        .load_payload_for(b_id, &format!("{}/{}", bucket, key), meta.vol_offset, meta.size as usize)
+                        .unwrap_or_default()
                 }
             })
             .await

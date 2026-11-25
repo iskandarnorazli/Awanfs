@@ -46,6 +46,7 @@ Options:
       --http-port <PORT>           Plain HTTP listener port when TLS is enabled
       --compaction-rate <MB/S>     Max compaction copy rate in MB/s, 0 = unlimited (default: 50)
       --auto-compaction <on|off>   Background compaction (default: on, or AWANFS_AUTO_COMPACTION)
+      --scrub-mib-per-sec <MIB/S>  Background needle scrub rate in MiB/s, 0 = off (default: 10, or AWANFS_SCRUB_MIB_PER_SEC)
       --otlp-endpoint <URL>        OpenTelemetry OTLP/HTTP trace endpoint (or OTEL_EXPORTER_OTLP_ENDPOINT)
       --access-log <PATH|->        Write S3 access log to file or '-' for stdout (or AWANFS_ACCESS_LOG)
       --config <PATH>              TOML config for users/policies/buckets (or AWANFS_CONFIG)
@@ -80,6 +81,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut tls_key: Option<PathBuf> = std::env::var("AWANFS_TLS_KEY").ok().filter(|s| !s.is_empty()).map(PathBuf::from);
     let mut http_port: Option<u16> = None;
     let mut compaction_mb: Option<u64> = std::env::var("AWANFS_COMPACTION_RATE_MB").ok().and_then(|v| v.parse().ok());
+    let mut scrub_mib_per_sec: u64 = std::env::var("AWANFS_SCRUB_MIB_PER_SEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(s3_server::scrub::DEFAULT_SCRUB_MIB_PER_SEC);
     let mut otlp: Option<String> = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().filter(|s| !s.is_empty());
     let mut auto_compaction = std::env::var("AWANFS_AUTO_COMPACTION").ok().as_deref() != Some("off");
     let mut durability = std::env::var("AWANFS_DURABILITY").unwrap_or_else(|_| "group".to_string());
@@ -116,6 +121,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             http_port = args.next().and_then(|p| p.parse().ok());
         } else if arg == "--compaction-rate" {
             compaction_mb = args.next().and_then(|v| v.parse::<u64>().ok());
+        } else if arg == "--scrub-mib-per-sec" {
+            let Some(v) = args.next() else {
+                eprintln!("--scrub-mib-per-sec requires a non-negative integer");
+                std::process::exit(2);
+            };
+            match v.parse::<u64>() {
+                Ok(n) => scrub_mib_per_sec = n,
+                Err(_) => {
+                    eprintln!("--scrub-mib-per-sec must be a non-negative integer, not {:?}", v);
+                    std::process::exit(2);
+                }
+            }
         } else if arg == "--otlp-endpoint" {
             otlp = args.next();
         } else if arg == "--auto-compaction" {
@@ -295,6 +312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         state.start_auto_compaction(std::time::Duration::from_secs(600), 0.20, 1 << 30);
     }
     state.start_multipart_cleanup(std::time::Duration::from_secs(600), 7 * lifecycle_day_seconds * 1000);
+    state.start_scrub(std::time::Duration::from_secs(600), scrub_mib_per_sec);
 
     // TLS (#30, owner decision 18): with --cert and --key the port serves HTTPS only; plain
     // HTTP needs --http-port.

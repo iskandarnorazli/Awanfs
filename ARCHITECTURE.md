@@ -119,7 +119,17 @@ GETs with 4 clients 1.21-1.38x (runs 43736773027 and 43722345701,
 `measurements/2026-11-16-large-objects-155-step2.md`). The win was reusing read buffers. Reads
 go through the page cache by default: direct reads were slower at every size measured, up to
 256 MiB, so `AWAN_DIRECT_READ_MIN` is off until a larger size shows it helps (owner decision
-1C keeps the setting). The scrub is still to build.
+1C keeps the setting). Step four (PR #401) adds the background scrub
+(`server/src/scrub.rs`, `--scrub-mib-per-sec`, `GET /_awanfs/scrub`, Prometheus metrics and
+alerts), moves versioned GETs, large `CopyObject`/`UploadPartCopy`, and multipart
+`FULL_OBJECT` checksums onto unmapped positioned reads, accounts streaming read buffers
+against `--memory-budget`, and adds `ChunkTransform` for #121. Measured on `bench-large.yml`
+run 45575537280 and `bench-ratio.yml` run 45575543162
+(`measurements/2026-11-25-large-objects-155-step4.md`): peak RSS 50.4 MiB (39.2 MiB heap,
+9.2 MiB file pages, vs MinIO 373.4 MiB), first GET 1.78-2.35x MinIO (0.2-0.5 ms to headers),
+repeat GET 4 clients 1.24-1.32x, multipart GET 1.27-1.62x, 1 MiB range P50 1.1-1.2 ms
+(1.54-2.40x MinIO), 4 KiB GET P99 during 4 large PUTs 0.1-0.3 ms, and 6/6 ratio rows in
+tolerance (103.7 MiB RSS).
 
 **Decision 47 (2026-11-14): the conformance target is S3 behaviour only.** It is `test_s3.py`
 and `test_headers.py` of the ceph suite, without the RGW-only tests and storage classes

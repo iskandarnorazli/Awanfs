@@ -550,6 +550,57 @@ fn scan_journal_max_offset<F: VolFile>(journal: &F, journal_len: u64) -> Result<
     Ok(max_off)
 }
 
+/// Streams the `.idx` journal in `IDX_SCAN_CHUNK` pieces and returns the `total_len` of the
+/// record at `target_offset`, if present.
+fn scan_journal_total_len<F: VolFile>(journal: &F, journal_len: u64, target_offset: u64) -> Result<Option<u64>, VolumeError> {
+    let valid_len = journal_len - (journal_len % IDX_RECORD as u64);
+    if valid_len == 0 {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; IDX_SCAN_CHUNK.min(valid_len as usize)];
+    let mut pos = 0u64;
+    while pos < valid_len {
+        let n = buf.len().min((valid_len - pos) as usize);
+        journal.read_at(pos, &mut buf[..n])?;
+        for r in buf[..n].chunks_exact(IDX_RECORD) {
+            let o = u64::from_le_bytes(r[12..20].try_into().unwrap());
+            if o == target_offset {
+                return Ok(Some(u64::from_le_bytes(r[20..28].try_into().unwrap())));
+            }
+        }
+        pos += n as u64;
+    }
+    Ok(None)
+}
+
+/// Outcome of scrubbing one needle in a volume (#155).
+#[derive(Debug, Clone)]
+pub enum ScrubNeedleResult {
+    Good {
+        offset: u64,
+        key: String,
+        payload_size: u64,
+    },
+    Bad {
+        offset: u64,
+        key: String,
+        payload_size: u64,
+        error: String,
+    },
+}
+
+fn pace_scrub(spent: u64, started: std::time::Instant, rate_bytes_per_sec: u64, stop: &std::sync::atomic::AtomicBool) {
+    if rate_bytes_per_sec == 0 {
+        return;
+    }
+    let mut rem = crate::throttle::delay_for(spent, started.elapsed(), rate_bytes_per_sec);
+    while !rem.is_zero() && !stop.load(Ordering::Relaxed) {
+        let slice = rem.min(std::time::Duration::from_millis(50));
+        std::thread::sleep(slice);
+        rem = crate::throttle::delay_for(spent, started.elapsed(), rate_bytes_per_sec);
+    }
+}
+
 /// Streams the `.idx` journal in `IDX_SCAN_CHUNK` pieces and returns the smallest indexed needle
 /// offset strictly greater than `after` (`>= SECTOR_SIZE`), so recovery can jump over a gap
 /// without retaining every offset in memory.
@@ -1741,5 +1792,238 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         }
 
         Ok(Ok(()))
+    }
+
+    /// Reads and CRC32C-verifies a needle payload using positioned reads (no volume mmap, #155).
+    pub fn read_needle_unmapped_verified(&self, bucket_id: u32, offset: u64) -> Result<Bytes, VolumeError> {
+        let mut hdr_sector = AlignedBuffer::new(SECTOR_SIZE);
+        self.read_aligned(offset, &mut hdr_sector)?;
+        let mut hdr_bytes = [0u8; 64];
+        hdr_bytes.copy_from_slice(&hdr_sector[0..64]);
+        let header = NeedleHeader::decode(&hdr_bytes)?;
+        if header.bucket_id != bucket_id as u16 {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let p_start = header.payload_start() as u64;
+        let len = header.payload_size as usize;
+        let mut out = vec![0u8; len];
+        if len > 0 {
+            self.read_cached(offset + p_start, &mut out)?;
+        }
+        let actual = crc32c::crc32c(&out);
+        self.work.payload_verify(len as u64);
+        if actual != header.payload_crc32c {
+            return Err(VolumeError::CrcMismatch {
+                expected: header.payload_crc32c,
+                actual,
+            });
+        }
+        Ok(Bytes::from(out))
+    }
+
+    /// Reads `len` bytes starting at payload offset `start` of the needle at `offset` via
+    /// positioned reads (no volume mmap, #155).
+    pub fn read_needle_range_unmapped(
+        &self,
+        bucket_id: u32,
+        offset: u64,
+        start: u64,
+        len: u64,
+    ) -> Result<Bytes, VolumeError> {
+        let (payload_at, payload_size, _) = self.payload_extent_with_crc(bucket_id, offset)?;
+        if start.checked_add(len).is_none_or(|end| end > payload_size) {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let mut out = vec![0u8; len as usize];
+        if len > 0 {
+            self.read_cached(payload_at + start, &mut out)?;
+        }
+        Ok(Bytes::from(out))
+    }
+
+    /// Scrubs every committed needle in this volume at up to `rate_bytes_per_sec` (0 = unlimited)
+    /// using positioned 1 MiB reads outside the volume mapping (#155).
+    pub fn scrub_volume<F>(
+        &self,
+        rate_bytes_per_sec: u64,
+        stop: &std::sync::atomic::AtomicBool,
+        mut visitor: F,
+    ) -> Result<(), VolumeError>
+    where
+        F: FnMut(ScrubNeedleResult),
+    {
+        let file_len = self.file.len()?.min(self.current_offset.load(Ordering::SeqCst));
+        let mut scan_offset = SECTOR_SIZE as u64;
+        let mut window = AlignedScanWindow::new(&*self.file, file_len, Some(&self.work));
+        let started = std::time::Instant::now();
+        let mut spent: u64 = 0;
+
+        while scan_offset < file_len && !stop.load(Ordering::Relaxed) {
+            if let Some(len) = self
+                .gaps
+                .lock()
+                .get(&scan_offset)
+                .copied()
+                .or_else(|| self.open_gaps.get(&scan_offset).copied())
+            {
+                if len > 0 {
+                    scan_offset += len;
+                    continue;
+                }
+            }
+
+            let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE)? else {
+                break;
+            };
+            spent = spent.saturating_add(SECTOR_SIZE as u64);
+            pace_scrub(spent, started, rate_bytes_per_sec, stop);
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let mut header_bytes = [0u8; 64];
+            header_bytes.copy_from_slice(&sector[0..64]);
+
+            let hdr = match NeedleHeader::decode(&header_bytes) {
+                Ok(h) => h,
+                Err(e) => {
+                    visitor(ScrubNeedleResult::Bad {
+                        offset: scan_offset,
+                        key: format!("<corrupt-header@{}>", scan_offset),
+                        payload_size: 0,
+                        error: format!("{:?}", e),
+                    });
+                    let j_end = *self.journal_end.lock();
+                    if let Ok(Some(tl)) = scan_journal_total_len(&*self.journal, j_end, scan_offset) {
+                        if tl > 0 && tl % SECTOR_SIZE as u64 == 0 {
+                            scan_offset += tl;
+                            continue;
+                        }
+                    }
+                    match self.jump_gap_after(scan_offset) {
+                        Some(next) => {
+                            scan_offset = next;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+            };
+
+            let total_len = hdr.total_len();
+            if scan_offset.checked_add(total_len).is_none_or(|end| end > file_len) {
+                visitor(ScrubNeedleResult::Bad {
+                    offset: scan_offset,
+                    key: format!("<truncated@{}>", scan_offset),
+                    payload_size: hdr.payload_size,
+                    error: "needle extends past volume end".to_string(),
+                });
+                match self.jump_gap_after(scan_offset) {
+                    Some(next) => {
+                        scan_offset = next;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+
+            let key_end = 64usize + hdr.key_len as usize;
+            let attrs_len = hdr.attrs_len as usize;
+            let p_start = key_end + attrs_len;
+            let Some(p_end) = (p_start as u64).checked_add(hdr.payload_size) else {
+                visitor(ScrubNeedleResult::Bad {
+                    offset: scan_offset,
+                    key: format!("<overflow@{}>", scan_offset),
+                    payload_size: hdr.payload_size,
+                    error: "needle payload size overflow".to_string(),
+                });
+                scan_offset += total_len;
+                continue;
+            };
+            let meta_sectors = p_start.div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
+
+            let mut key_str = if key_end <= SECTOR_SIZE {
+                String::from_utf8_lossy(&sector[64..key_end]).to_string()
+            } else {
+                format!("<offset@{}>", scan_offset)
+            };
+
+            let mut crc = 0u32;
+            let mut pos = 0u64;
+            let mut err: Option<String> = None;
+            while pos < total_len && !stop.load(Ordering::Relaxed) {
+                let remain = ((total_len - pos) as usize).min(SCAN_BATCH_BYTES);
+                let chunk = match window.read_at(scan_offset + pos, remain) {
+                    Ok(Some(c)) => c,
+                    Ok(None) => {
+                        err = Some(format!("short read at offset {}", scan_offset + pos));
+                        break;
+                    }
+                    Err(e) => {
+                        err = Some(format!("read error at offset {}: {}", scan_offset + pos, e));
+                        break;
+                    }
+                };
+                if pos > 0 || remain > SECTOR_SIZE {
+                    let newly_read = if pos == 0 {
+                        (remain - SECTOR_SIZE) as u64
+                    } else {
+                        remain as u64
+                    };
+                    spent = spent.saturating_add(newly_read);
+                    pace_scrub(spent, started, rate_bytes_per_sec, stop);
+                }
+                if pos == 0 {
+                    if remain < meta_sectors {
+                        err = Some("metadata exceeds read chunk".to_string());
+                        break;
+                    }
+                    key_str = String::from_utf8_lossy(&chunk[64..key_end]).to_string();
+                    if xxh3_64(&chunk[64..key_end]) != hdr.key_hash {
+                        err = Some("key hash mismatch".to_string());
+                        break;
+                    }
+                    if attrs_len > 0 && crate::attrs::Attrs::decode(&chunk[key_end..p_start]).is_err() {
+                        err = Some("attributes CRC mismatch".to_string());
+                        break;
+                    }
+                }
+                let lo = (p_start as u64).max(pos);
+                let hi = p_end.min(pos + remain as u64);
+                if lo < hi {
+                    crc = crc32c::crc32c_append(crc, &chunk[(lo - pos) as usize..(hi - pos) as usize]);
+                }
+                pos += remain as u64;
+            }
+
+            if stop.load(Ordering::Relaxed) && pos < total_len && err.is_none() {
+                break;
+            }
+
+            if err.is_none() && crc != hdr.payload_crc32c {
+                err = Some(format!(
+                    "payload CRC32C mismatch: expected {:#010x}, actual {:#010x}",
+                    hdr.payload_crc32c, crc
+                ));
+            }
+
+            match err {
+                None => visitor(ScrubNeedleResult::Good {
+                    offset: scan_offset,
+                    key: key_str,
+                    payload_size: hdr.payload_size,
+                }),
+                Some(error) => visitor(ScrubNeedleResult::Bad {
+                    offset: scan_offset,
+                    key: key_str,
+                    payload_size: hdr.payload_size,
+                    error,
+                }),
+            }
+
+            scan_offset += total_len;
+        }
+
+        Ok(())
     }
 }
