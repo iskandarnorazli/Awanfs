@@ -41,6 +41,10 @@ pub const BUCKET_ALREADY_EXISTS: Refusal = refuse("BucketAlreadyExists", 409);
 pub const BUCKET_NOT_EMPTY: Refusal = refuse("BucketNotEmpty", 409);
 pub const INVALID_BUCKET_NAME: Refusal = refuse("InvalidBucketName", 400);
 pub const KEY_TOO_LONG: Refusal = refuse("KeyTooLongError", 400);
+pub const NO_SUCH_KEY: Refusal = refuse("NoSuchKey", 404);
+pub const NO_SUCH_VERSION: Refusal = refuse("NoSuchVersion", 404);
+pub const METHOD_NOT_ALLOWED_DELETE_MARKER: Refusal =
+    refuse_because("MethodNotAllowed", 405, "target is a delete marker");
 
 /// Bucket versioning (`PUT ?versioning`).
 ///
@@ -1077,6 +1081,242 @@ mod part_pipeline_tests {
     }
 }
 
+/// Latest live `0x200` attribute update location for one `AttrGroup` on one object version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyAttrUpdate {
+    pub group: crate::attrs::AttrGroup,
+    pub created_at_ns: u64,
+    pub vol_offset: u64,
+    pub total_len: u64,
+}
+
+/// Base needle metadata plus any `0x200` attribute updates for one live object version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyObject {
+    /// `0` for unversioned or `null` version; otherwise the version creation timestamp (`ts`).
+    pub version_id: u64,
+    pub created_at_ns: u64,
+    pub vol_offset: u64,
+    pub flags: u16,
+    pub updates: Vec<KeyAttrUpdate>,
+}
+
+impl KeyObject {
+    fn apply_update(&mut self, upd: KeyAttrUpdate) {
+        if upd.created_at_ns <= self.created_at_ns {
+            // Superseded by a newer base object write or copy.
+            return;
+        }
+        if let Some(existing) = self.updates.iter_mut().find(|u| u.group == upd.group) {
+            if (upd.created_at_ns, upd.vol_offset) > (existing.created_at_ns, existing.vol_offset) {
+                *existing = upd;
+            }
+        } else {
+            self.updates.push(upd);
+        }
+    }
+}
+
+/// One entry in a versioned key's history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyVersionEntry {
+    Object(KeyObject),
+    DeleteMarker {
+        version_id: u64,
+        vol_offset: u64,
+    },
+}
+
+impl KeyVersionEntry {
+    pub fn version_id(&self) -> u64 {
+        match self {
+            Self::Object(obj) => obj.version_id,
+            Self::DeleteMarker { version_id, .. } => *version_id,
+        }
+    }
+}
+
+/// Live state of one object key (`ObjectVersions.tla`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyState {
+    Absent,
+    Unversioned(KeyObject),
+    Versioned { versions: Vec<KeyVersionEntry> },
+}
+
+/// One durable log record affecting a key's state or attributes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyRecord {
+    Object {
+        versioned: bool,
+        is_null: bool,
+        created_at_ns: u64,
+        vol_offset: u64,
+        flags: u16,
+    },
+    Tombstone {
+        versioned: bool,
+        is_null: bool,
+        created_at_ns: u64,
+        vol_offset: u64,
+    },
+    VersionDelete {
+        target_version_id: u64,
+    },
+    AttrUpdate {
+        target_version_id: u64,
+        group: crate::attrs::AttrGroup,
+        created_at_ns: u64,
+        vol_offset: u64,
+        total_len: u64,
+    },
+}
+
+fn upsert_version(versions: &mut Vec<KeyVersionEntry>, entry: KeyVersionEntry) {
+    let vid = entry.version_id();
+    if let Some(slot) = versions.iter_mut().find(|e| e.version_id() == vid) {
+        *slot = entry;
+    } else {
+        versions.push(entry);
+    }
+}
+
+/// Pure transition fold for the live state of one object key (#150 stage 2, #203).
+///
+/// Handles object puts, tombstones, version deletes, and `0x200` attribute updates.
+/// Both request handlers (under per-key lock) and boot recovery fold records through this
+/// function. Updating an absent key/version or a delete marker returns a refusal at request
+/// time (`404 NoSuchKey` / `404 NoSuchVersion` / `405 MethodNotAllowed`) and is ignored and
+/// counted during recovery replay so updates never resurrect deleted data.
+pub fn key_step(state: KeyState, record: KeyRecord) -> Result<KeyState, Refusal> {
+    match record {
+        KeyRecord::Object {
+            versioned,
+            is_null,
+            created_at_ns,
+            vol_offset,
+            flags,
+        } => {
+            if !versioned {
+                let obj = KeyObject {
+                    version_id: 0,
+                    created_at_ns,
+                    vol_offset,
+                    flags,
+                    updates: Vec::new(),
+                };
+                match state {
+                    KeyState::Absent | KeyState::Unversioned(_) => Ok(KeyState::Unversioned(obj)),
+                    KeyState::Versioned { mut versions } => {
+                        // Decision #186 null replay: unversioned PUT against existing history updates the null version.
+                        upsert_version(&mut versions, KeyVersionEntry::Object(obj));
+                        Ok(KeyState::Versioned { versions })
+                    }
+                }
+            } else {
+                let vid = if is_null { 0 } else { created_at_ns };
+                let entry = KeyVersionEntry::Object(KeyObject {
+                    version_id: vid,
+                    created_at_ns,
+                    vol_offset,
+                    flags,
+                    updates: Vec::new(),
+                });
+                let mut versions = match state {
+                    KeyState::Absent => Vec::new(),
+                    KeyState::Unversioned(prev) => vec![KeyVersionEntry::Object(prev)],
+                    KeyState::Versioned { versions } => versions,
+                };
+                upsert_version(&mut versions, entry);
+                Ok(KeyState::Versioned { versions })
+            }
+        }
+        KeyRecord::Tombstone {
+            versioned,
+            is_null,
+            created_at_ns,
+            vol_offset,
+        } => {
+            if !versioned {
+                match state {
+                    KeyState::Absent | KeyState::Unversioned(_) => Ok(KeyState::Absent),
+                    KeyState::Versioned { mut versions } => {
+                        versions.retain(|e| e.version_id() != 0);
+                        Ok(KeyState::Versioned { versions })
+                    }
+                }
+            } else {
+                let vid = if is_null { 0 } else { created_at_ns };
+                let dm = KeyVersionEntry::DeleteMarker {
+                    version_id: vid,
+                    vol_offset,
+                };
+                let mut versions = match state {
+                    KeyState::Absent => Vec::new(),
+                    KeyState::Unversioned(prev) => vec![KeyVersionEntry::Object(prev)],
+                    KeyState::Versioned { versions } => versions,
+                };
+                upsert_version(&mut versions, dm);
+                Ok(KeyState::Versioned { versions })
+            }
+        }
+        KeyRecord::VersionDelete { target_version_id } => match state {
+            KeyState::Absent => Err(NO_SUCH_VERSION),
+            KeyState::Unversioned(_) => {
+                if target_version_id == 0 {
+                    Ok(KeyState::Absent)
+                } else {
+                    Err(NO_SUCH_VERSION)
+                }
+            }
+            KeyState::Versioned { mut versions } => {
+                let before = versions.len();
+                versions.retain(|e| e.version_id() != target_version_id);
+                if versions.len() == before {
+                    Err(NO_SUCH_VERSION)
+                } else {
+                    Ok(KeyState::Versioned { versions })
+                }
+            }
+        },
+        KeyRecord::AttrUpdate {
+            target_version_id,
+            group,
+            created_at_ns,
+            vol_offset,
+            total_len,
+        } => {
+            let upd = KeyAttrUpdate {
+                group,
+                created_at_ns,
+                vol_offset,
+                total_len,
+            };
+            match state {
+                KeyState::Absent => Err(NO_SUCH_KEY),
+                KeyState::Unversioned(mut obj) => {
+                    if target_version_id != 0 {
+                        Err(NO_SUCH_VERSION)
+                    } else {
+                        obj.apply_update(upd);
+                        Ok(KeyState::Unversioned(obj))
+                    }
+                }
+                KeyState::Versioned { mut versions } => {
+                    match versions.iter_mut().find(|e| e.version_id() == target_version_id) {
+                        None => Err(NO_SUCH_VERSION),
+                        Some(KeyVersionEntry::DeleteMarker { .. }) => Err(METHOD_NOT_ALLOWED_DELETE_MARKER),
+                        Some(KeyVersionEntry::Object(obj)) => {
+                            obj.apply_update(upd);
+                            Ok(KeyState::Versioned { versions })
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub const SCRUB_ALREADY_CHECKED: Refusal = refuse_because(
     "ScrubAlreadyChecked",
     409,
@@ -1116,6 +1356,244 @@ pub fn scrub_step(state: ScrubState, event: ScrubEvent) -> Result<ScrubState, Re
         (ScrubState::Unchecked, ScrubEvent::VerifiedOk) => Ok(ScrubState::Good),
         (ScrubState::Good | ScrubState::Bad, ScrubEvent::VerifiedOk) => Err(SCRUB_ALREADY_CHECKED),
         (_, ScrubEvent::Corrupted) => Ok(ScrubState::Bad),
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use crate::attrs::AttrGroup;
+
+    fn base_obj(vid: u64, ts: u64, off: u64) -> KeyObject {
+        KeyObject {
+            version_id: vid,
+            created_at_ns: ts,
+            vol_offset: off,
+            flags: 0x0001,
+            updates: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn key_every_pair_is_decided() {
+        let states = [
+            KeyState::Absent,
+            KeyState::Unversioned(base_obj(0, 100, 1)),
+            KeyState::Versioned { versions: Vec::new() },
+            KeyState::Versioned {
+                versions: vec![KeyVersionEntry::Object(base_obj(0, 100, 1))],
+            },
+            KeyState::Versioned {
+                versions: vec![KeyVersionEntry::Object(base_obj(200, 200, 2))],
+            },
+            KeyState::Versioned {
+                versions: vec![KeyVersionEntry::DeleteMarker {
+                    version_id: 300,
+                    vol_offset: 3,
+                }],
+            },
+        ];
+
+        let records = [
+            KeyRecord::Object {
+                versioned: false,
+                is_null: false,
+                created_at_ns: 400,
+                vol_offset: 10,
+                flags: 0x0401,
+            },
+            KeyRecord::Object {
+                versioned: true,
+                is_null: true,
+                created_at_ns: 410,
+                vol_offset: 11,
+                flags: 0x0041,
+            },
+            KeyRecord::Object {
+                versioned: true,
+                is_null: false,
+                created_at_ns: 420,
+                vol_offset: 12,
+                flags: 0x0041,
+            },
+            KeyRecord::Tombstone {
+                versioned: false,
+                is_null: false,
+                created_at_ns: 430,
+                vol_offset: 13,
+            },
+            KeyRecord::Tombstone {
+                versioned: true,
+                is_null: true,
+                created_at_ns: 440,
+                vol_offset: 14,
+            },
+            KeyRecord::Tombstone {
+                versioned: true,
+                is_null: false,
+                created_at_ns: 450,
+                vol_offset: 15,
+            },
+            KeyRecord::VersionDelete { target_version_id: 0 },
+            KeyRecord::VersionDelete { target_version_id: 200 },
+            KeyRecord::VersionDelete { target_version_id: 300 },
+            KeyRecord::VersionDelete { target_version_id: 999 },
+            KeyRecord::AttrUpdate {
+                target_version_id: 0,
+                group: AttrGroup::Tagging,
+                created_at_ns: 500,
+                vol_offset: 20,
+                total_len: 512,
+            },
+            KeyRecord::AttrUpdate {
+                target_version_id: 200,
+                group: AttrGroup::StorageClass,
+                created_at_ns: 510,
+                vol_offset: 21,
+                total_len: 512,
+            },
+            KeyRecord::AttrUpdate {
+                target_version_id: 300,
+                group: AttrGroup::Tagging,
+                created_at_ns: 520,
+                vol_offset: 22,
+                total_len: 512,
+            },
+            KeyRecord::AttrUpdate {
+                target_version_id: 999,
+                group: AttrGroup::Acl,
+                created_at_ns: 530,
+                vol_offset: 23,
+                total_len: 512,
+            },
+        ];
+
+        let mut count = 0usize;
+        for (si, state) in states.iter().enumerate() {
+            for record in &records {
+                let res = key_step(state.clone(), record.clone());
+                match (si, record) {
+                    (0, KeyRecord::AttrUpdate { .. }) => assert_eq!(res, Err(NO_SUCH_KEY)),
+                    (_, KeyRecord::VersionDelete { target_version_id }) => {
+                        let has = match state {
+                            KeyState::Absent => false,
+                            KeyState::Unversioned(_) => *target_version_id == 0,
+                            KeyState::Versioned { versions } => {
+                                versions.iter().any(|e| e.version_id() == *target_version_id)
+                            }
+                        };
+                        assert_eq!(res.is_ok(), has);
+                        if !has {
+                            assert_eq!(res, Err(NO_SUCH_VERSION));
+                        }
+                    }
+                    (_, KeyRecord::AttrUpdate { target_version_id, group, created_at_ns, .. }) => {
+                        match state {
+                            KeyState::Absent => assert_eq!(res, Err(NO_SUCH_KEY)),
+                            KeyState::Unversioned(_) => {
+                                if *target_version_id == 0 {
+                                    let KeyState::Unversioned(obj) = res.unwrap() else {
+                                        panic!("expected Unversioned");
+                                    };
+                                    assert_eq!(obj.updates.len(), 1);
+                                    assert_eq!(obj.updates[0].group, *group);
+                                    assert_eq!(obj.updates[0].created_at_ns, *created_at_ns);
+                                } else {
+                                    assert_eq!(res, Err(NO_SUCH_VERSION));
+                                }
+                            }
+                            KeyState::Versioned { versions } => {
+                                match versions.iter().find(|e| e.version_id() == *target_version_id) {
+                                    None => assert_eq!(res, Err(NO_SUCH_VERSION)),
+                                    Some(KeyVersionEntry::DeleteMarker { .. }) => {
+                                        assert_eq!(res, Err(METHOD_NOT_ALLOWED_DELETE_MARKER))
+                                    }
+                                    Some(KeyVersionEntry::Object(_)) => {
+                                        let KeyState::Versioned { versions: out } = res.unwrap() else {
+                                            panic!("expected Versioned");
+                                        };
+                                        let KeyVersionEntry::Object(obj) = out
+                                            .iter()
+                                            .find(|e| e.version_id() == *target_version_id)
+                                            .unwrap()
+                                        else {
+                                            panic!("expected Object");
+                                        };
+                                        assert!(obj.updates.iter().any(|u| u.group == *group && u.created_at_ns == *created_at_ns));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (_, KeyRecord::Object { .. } | KeyRecord::Tombstone { .. }) => {
+                        assert!(res.is_ok());
+                    }
+                }
+                count += 1;
+            }
+        }
+        assert_eq!(count, states.len() * records.len());
+    }
+
+    #[test]
+    fn key_update_never_resurrects_or_hits_absent_version() {
+        // Update against absent key refuses and does not resurrect.
+        assert_eq!(
+            key_step(
+                KeyState::Absent,
+                KeyRecord::AttrUpdate {
+                    target_version_id: 0,
+                    group: AttrGroup::Tagging,
+                    created_at_ns: 100,
+                    vol_offset: 1,
+                    total_len: 512,
+                },
+            ),
+            Err(NO_SUCH_KEY),
+        );
+
+        // Update whose created_at_ns <= base object ts is ignored as superseded by overwrite.
+        let overwritten = KeyState::Unversioned(base_obj(0, 500, 10));
+        let stale = key_step(
+            overwritten.clone(),
+            KeyRecord::AttrUpdate {
+                target_version_id: 0,
+                group: AttrGroup::StorageClass,
+                created_at_ns: 400,
+                vol_offset: 2,
+                total_len: 512,
+            },
+        )
+        .unwrap();
+        assert_eq!(stale, overwritten);
+
+        // Newest timestamp wins per group regardless of replay offset order (Decision 56).
+        let s1 = key_step(
+            overwritten,
+            KeyRecord::AttrUpdate {
+                target_version_id: 0,
+                group: AttrGroup::StorageClass,
+                created_at_ns: 700,
+                vol_offset: 3,
+                total_len: 512,
+            },
+        )
+        .unwrap();
+        let s2 = key_step(
+            s1,
+            KeyRecord::AttrUpdate {
+                target_version_id: 0,
+                group: AttrGroup::StorageClass,
+                created_at_ns: 600,
+                vol_offset: 99,
+                total_len: 512,
+            },
+        )
+        .unwrap();
+        let KeyState::Unversioned(obj) = s2 else { panic!() };
+        assert_eq!(obj.updates.len(), 1);
+        assert_eq!(obj.updates[0].created_at_ns, 700);
+        assert_eq!(obj.updates[0].vol_offset, 3);
     }
 }
 

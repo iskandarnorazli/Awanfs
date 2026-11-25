@@ -185,7 +185,7 @@ not use the manifest before stage 6.
 | 0..4 | magic `0x41574E33` ("AWN3") |
 | 4..8 | CRC32C of header bytes 8..64 |
 | 8..12 | CRC32C of the payload |
-| 12..14 | flags: 0x1 active, 0x2 tombstone, 0x4 multipart, 0x8 shared, 0x10 zero-byte, 0x20 compressed, 0x40 versioned, 0x80 null version, 0x100 version delete, 0x200 attribute update (reserved, #150), 0x400 has an attributes block (`meta_index.rs`) |
+| 12..14 | flags: 0x1 active, 0x2 tombstone, 0x4 multipart, 0x8 shared, 0x10 zero-byte, 0x20 compressed, 0x40 versioned, 0x80 null version, 0x100 version delete, 0x200 attribute update (#150 stage 2, #203), 0x400 has an attributes block (`meta_index.rs`) |
 | 14..16 | bucket id |
 | 16..18 | key length |
 | 18..20 | attributes block length (format 3); 0 for none |
@@ -221,7 +221,11 @@ A tag number is never reused. 0x8000 and above are for tests.
 | Tag | Name | Group | Owner |
 |---|---|---|---|
 | 0x0001 | Content-Type, as sent | headers (write-time) | #150 |
-| 0x0010 | Object tags (`TagSet`) | tagging (mutable) | #115 |
+| 0x0010 | Object tags (`TagSet`) | tagging (mutable) | #115, #203 |
+| 0x0011 | Object ACL | acl (mutable) | #116, #203 |
+| 0x0012 | Object Lock retention (`Mode` + `RetainUntilDate`) | retention (mutable) | #120, #203 |
+| 0x0013 | Object Lock legal hold (`ON` / `OFF`) | legal hold (mutable) | #120, #203 |
+| 0x0014 | Storage class (`STANDARD`, etc.) | storage class (mutable) | #159, #203 |
 | 0x0020 | Object checksum (`<ALG>:<TYPE>:<base64>`) | checksum (write-time) | #117 |
 | 0x0021 | Multipart part sizes (LE `u64` array) | multipart (write-time) | #117 |
 | 0x0002 | Content-Encoding (with `aws-chunked` stripped) | headers (write-time) | #152 |
@@ -232,6 +236,27 @@ A tag number is never reused. 0x8000 and above are for tests.
 | 0x0007 | x-amz-website-redirect-location | headers (write-time) | #152 |
 | 0x0008 | User metadata (`x-amz-meta-*`) | metadata | #152 |
 | 0x0030 | `TAG_OWNER`: object owner account ID (UTF-8, written only when different from bucket owner) | owner (write-time) | #151 (Decision 3A) |
+
+## Attribute update needle (flag 0x200, format 3, #203)
+
+A mutable attribute change (tags, ACL, retention, legal hold, storage class) appends an
+attribute-update needle (`FLAG_ACTIVE | FLAG_ATTR_UPDATE`, without `FLAG_ATTRS` in the base
+attributes slot; `attrs_len = 0`) instead of rewriting the object's payload needle.
+
+Its payload holds the target version followed by an encoded Attributes block (CRC32C + sorted
+tag entries, identical to flag 0x400's block layout):
+
+| Bytes | Field |
+|---|---|
+| 0..8 | `target_version_id` (`u64` little-endian): version timestamp (`ts`) of the target version, or `0` for an unversioned object or the `null` version |
+| 8.. | Encoded `Attrs` block (4-byte CRC32C of bytes 12.., then sorted `tag \| len \| val` entries) |
+
+Header `created_at_ns` is stamped under the per-key lock (`next_ts` monotonic relative to the
+target and any prior update, decision 56). `payload_crc32c` covers bytes `0..` of this payload,
+and `etag_hi`/`etag_lo` are `0`. Recovery replays base object/tombstone records first and then
+folds surviving `0x200` updates through `fsm::key_step` in `created_at_ns` order. Compaction
+retains only the latest live `0x200` update per `(key, version, group)` and drops updates whose
+version was deleted or overwritten or whose update was superseded.
 
 ## Journal record (`.idx`, 42 bytes)
 

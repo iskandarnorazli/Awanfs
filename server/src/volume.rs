@@ -417,11 +417,16 @@ pub struct ScannedNeedle {
     /// Local offset in the volume.
     pub offset: u64,
     pub payload_size: u64,
+    pub attrs_len: u16,
+    pub total_len: u64,
     pub etag_hi: u64,
     pub etag_lo: u64,
     pub flags: u16,
     pub payload_crc32c: u32,
     pub created_at_ns: u64,
+    /// Verified payload bytes for `FLAG_ATTR_UPDATE` needles, read directly from the
+    /// streaming scan window without faulting the volume memory map at boot (#203).
+    pub attr_update_payload: Option<Vec<u8>>,
 }
 
 /// 64-byte Header of a Needle on disk.
@@ -1242,6 +1247,9 @@ impl<Fs: VolFs> VolumeManager<Fs> {
     /// The flags of a needle with this block, or `VolumeFull` (move to a newer volume) when
     /// this volume is older than format 3, which an older AwanFS would misread.
     fn attrs_flags(&self, attrs: &[u8], flags: u16) -> Result<u16, VolumeError> {
+        if flags & crate::meta_index::FLAG_ATTR_UPDATE != 0 && self.format < 3 {
+            return Err(VolumeError::VolumeFull { offset: self.current_offset.load(Ordering::SeqCst), len: 0 });
+        }
         if attrs.is_empty() {
             return Ok(flags);
         }
@@ -1252,6 +1260,17 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             return Err(VolumeError::VolumeFull { offset: self.current_offset.load(Ordering::SeqCst), len: 0 });
         }
         Ok(flags | crate::meta_index::FLAG_ATTRS)
+    }
+
+    /// Reads and CRC-verifies the 64-byte needle header at `offset` from the mapping.
+    pub fn read_header(&self, offset: u64) -> Result<NeedleHeader, VolumeError> {
+        let mmap = self.get_or_remap(offset + SECTOR_SIZE as u64)?;
+        if offset as usize + 64 > mmap.len() {
+            return Err(VolumeError::TornNeedleAtOffset(offset));
+        }
+        let mut hdr_bytes = [0u8; 64];
+        hdr_bytes.copy_from_slice(&mmap[offset as usize..offset as usize + 64]);
+        NeedleHeader::decode(&hdr_bytes)
     }
 
     /// The attributes block of the needle at `offset` (empty for none), read from the
@@ -1499,12 +1518,37 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         Ok(payload)
     }
 
-    /// Reads a needle payload from the mapping and verifies it against the `payload_crc32c`
+    /// Reads a needle payload from the mapping and verifies `bucket_id` and `payload_crc32c`
     /// stored in its 64-byte CRC-protected header (#323, Decision 7A).
     pub fn read_needle_bytes_verified(&self, bucket_id: u32, offset: u64) -> Result<Bytes, VolumeError> {
+        self.read_needle_bytes_checked(bucket_id, None, offset)
+    }
+
+    /// Reads a needle payload from the mapping and verifies `bucket_id`, `key_hash`, and
+    /// `payload_crc32c` against its CRC-protected header (#203).
+    pub fn read_needle_bytes_for_key(
+        &self,
+        bucket_id: u32,
+        key_hash: u64,
+        offset: u64,
+    ) -> Result<Bytes, VolumeError> {
+        self.read_needle_bytes_checked(bucket_id, Some(key_hash), offset)
+    }
+
+    fn read_needle_bytes_checked(
+        &self,
+        bucket_id: u32,
+        expected_key_hash: Option<u64>,
+        offset: u64,
+    ) -> Result<Bytes, VolumeError> {
         let (header, payload) = self.needle_header_and_payload_unverified(offset)?;
         if header.bucket_id != bucket_id as u16 {
             return Err(VolumeError::CorruptIndex);
+        }
+        if let Some(kh) = expected_key_hash {
+            if header.key_hash != kh {
+                return Err(VolumeError::CorruptIndex);
+            }
         }
         let actual_crc = crc32c::crc32c(&payload);
         self.work.payload_verify(payload.len() as u64);
@@ -1774,16 +1818,37 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 String::from_utf8_lossy(&slice[64..key_end]).to_string()
             };
 
+            let attr_update_payload = if hdr.flags & crate::meta_index::FLAG_ATTR_UPDATE != 0 {
+                let p_start = hdr.payload_start();
+                let p_end = p_start.saturating_add(hdr.payload_size as usize);
+                let need_bytes = p_end.div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
+                if need_bytes <= SCAN_BATCH_BYTES {
+                    window
+                        .read_at(scan_offset, need_bytes)?
+                        .and_then(|slice| {
+                            let bytes = &slice[p_start..p_end];
+                            (crc32c::crc32c(bytes) == hdr.payload_crc32c).then(|| bytes.to_vec())
+                        })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             if let Err(e) = visitor(ScannedNeedle {
                 bucket_id: hdr.bucket_id,
                 key: key_str,
                 offset: scan_offset,
                 payload_size: hdr.payload_size,
+                attrs_len: hdr.attrs_len,
+                total_len,
                 etag_hi: hdr.etag_hi,
                 etag_lo: hdr.etag_lo,
                 flags: hdr.flags,
                 payload_crc32c: hdr.payload_crc32c,
                 created_at_ns: hdr.created_at_ns,
+                attr_update_payload,
             }) {
                 return Ok(Err(e));
             }

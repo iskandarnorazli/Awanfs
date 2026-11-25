@@ -715,24 +715,24 @@ fn lookup_object_owner(
     key: &str,
     vid: Option<&str>,
 ) -> Option<String> {
-    let (vol_offset, flags) = if vid.is_some() || state.versions.read().has(b_id, key) {
+    let (target_vid, vol_offset, flags) = if vid.is_some() || state.versions.read().has(b_id, key) {
         let id = vid.and_then(crate::versions::parse_id);
         if vid.is_some() && id.is_none() {
             return None;
         }
         let v = object::find_version(state, b_id, key, id)?;
-        (v.vol_offset, v.flags)
+        (v.id(), v.vol_offset, v.flags)
     } else {
         let m = state.engine.read().get_object(b_id, key.as_bytes()).ok()?;
-        (m.vol_offset, unpack_flags(m.bucket_flags))
+        (0, m.vol_offset, unpack_flags(m.bucket_flags))
     };
-    if flags & FLAG_ATTRS == 0 {
+    if flags & FLAG_ATTRS == 0 && !state.attr_updates.has_updates() {
         return None;
     }
     state
-        .object_attrs(vol_offset, flags)
+        .object_view_for(b_id, key, target_vid, vol_offset, flags)
         .ok()
-        .and_then(|a| a.owner().map(str::to_string))
+        .and_then(|v| v.attrs.owner().map(str::to_string))
 }
 
 fn bucket_not_found_response(op: Operation, bucket: &str) -> Response<ResponseBody> {
