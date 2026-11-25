@@ -11,6 +11,33 @@ const KEY_SPACE: u64 = 8;
 /// Maximum gap of non-crash operations before a `Crash` is forced ("at least one per 50").
 const MAX_OPS_WITHOUT_CRASH: usize = 49;
 
+/// Maximum gap of storage ops before a `Crash` is forced in end-to-end simulation.
+const MAX_STORAGE_OPS_WITHOUT_CRASH: usize = 35;
+
+/// Extended storage operation for end-to-end `VolumeManager<SimFs>` simulation (#213).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StorageOp {
+    Basic(SimOperation),
+    Copy { src_key: u8, dst_key: u8 },
+    StreamStart { stream_id: u32, key: u8, len: u32, fill: u64 },
+    StreamFinish { stream_id: u32 },
+    StreamAbort { stream_id: u32 },
+    MultipartPut { key: u8, parts: Vec<(u32, u64)>, fill: u64 },
+    Compact { seal_if_single: bool },
+    VerifyRead { key: u8 },
+    ProbeJournalReadFault { fault: SimFault },
+}
+
+/// Deterministic volume span for a simulation seed: mixes small rollover-heavy spans with
+/// multi-chunk (>1 MiB `STREAM_CHUNK`) spans.
+pub fn storage_max_span(seed: u64) -> u64 {
+    if seed % 4 == 0 {
+        2 * 1024 * 1024
+    } else {
+        128 * 1024
+    }
+}
+
 /// Which file of a simulated volume a fault is armed on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SimFileKind {
@@ -248,6 +275,215 @@ pub fn shrink(ops: &[SimOperation], mut still_fails: impl FnMut(&[SimOperation])
             break;
         }
         if !remove_single_ops(&mut cur, &mut still_fails) {
+            break;
+        }
+    }
+    cur
+}
+
+fn storage_stream_len(seed: u64, rng: &mut SimRng) -> u32 {
+    if seed % 4 == 0 && rng.below(4) == 0 {
+        (1 << 20) + 4096
+    } else {
+        random_put_len(rng)
+    }
+}
+
+/// Deterministically generates `len` storage operations from `seed` covering buffered PUTs,
+/// overwrites, deletes, copies, streamed PUTs (including multi-chunk >1 MiB), multipart objects,
+/// online compaction, I/O faults, and crashes.
+pub fn generate_storage(seed: u64, len: usize) -> Vec<StorageOp> {
+    let mut rng = SimRng::new(seed ^ 0x517C_C1B7_2722_0A95);
+    let mut ops = Vec::with_capacity(len);
+    let mut since_crash = 0usize;
+    let mut open_streams: Vec<(u32, u8)> = Vec::new();
+    let mut next_stream_id = 1u32;
+
+    for idx in 0..len {
+        let force_crash = since_crash >= MAX_STORAGE_OPS_WITHOUT_CRASH || idx + 1 == len;
+        if force_crash {
+            ops.push(StorageOp::Basic(SimOperation::Crash { mode: random_crash_mode(&mut rng) }));
+            open_streams.clear();
+            since_crash = 0;
+            continue;
+        }
+
+        let roll = rng.below(100);
+        let op = match roll {
+            // Put / overwrite (32%), biasing toward open stream keys to exercise relocation.
+            0..=31 => {
+                since_crash += 1;
+                let key = if !open_streams.is_empty() && rng.below(2) == 0 {
+                    let i = rng.below(open_streams.len() as u64) as usize;
+                    open_streams[i].1
+                } else {
+                    rng.below(KEY_SPACE) as u8
+                };
+                StorageOp::Basic(SimOperation::Put {
+                    key,
+                    len: random_put_len(&mut rng),
+                    fill: rng.next_u64(),
+                })
+            }
+            // Delete (9%), biasing toward open stream keys as well.
+            32..=40 => {
+                since_crash += 1;
+                let key = if !open_streams.is_empty() && rng.below(2) == 0 {
+                    let i = rng.below(open_streams.len() as u64) as usize;
+                    open_streams[i].1
+                } else {
+                    rng.below(KEY_SPACE) as u8
+                };
+                StorageOp::Basic(SimOperation::Delete { key })
+            }
+            // CopyObject (6%).
+            41..=46 => {
+                since_crash += 1;
+                StorageOp::Copy {
+                    src_key: rng.below(KEY_SPACE) as u8,
+                    dst_key: rng.below(KEY_SPACE) as u8,
+                }
+            }
+            // StreamStart (9%).
+            47..=55 => {
+                since_crash += 1;
+                let key = rng.below(KEY_SPACE) as u8;
+                let id = next_stream_id;
+                next_stream_id = next_stream_id.wrapping_add(1);
+                open_streams.push((id, key));
+                StorageOp::StreamStart {
+                    stream_id: id,
+                    key,
+                    len: storage_stream_len(seed, &mut rng),
+                    fill: rng.next_u64(),
+                }
+            }
+            // StreamFinish (8%) or fallback Put if no stream is open.
+            56..=63 => {
+                since_crash += 1;
+                if open_streams.is_empty() {
+                    StorageOp::Basic(SimOperation::Put {
+                        key: rng.below(KEY_SPACE) as u8,
+                        len: random_put_len(&mut rng),
+                        fill: rng.next_u64(),
+                    })
+                } else {
+                    let i = rng.below(open_streams.len() as u64) as usize;
+                    let (id, _) = open_streams.remove(i);
+                    StorageOp::StreamFinish { stream_id: id }
+                }
+            }
+            // StreamAbort (2%) or fallback VerifyRead.
+            64..=65 => {
+                since_crash += 1;
+                if !open_streams.is_empty() {
+                    let i = rng.below(open_streams.len() as u64) as usize;
+                    let (id, _) = open_streams.remove(i);
+                    StorageOp::StreamAbort { stream_id: id }
+                } else {
+                    StorageOp::VerifyRead { key: rng.below(KEY_SPACE) as u8 }
+                }
+            }
+            // MultipartPut (5%).
+            66..=70 => {
+                since_crash += 1;
+                let part_count = (rng.below(3) + 1) as usize;
+                let mut parts = Vec::with_capacity(part_count);
+                for _ in 0..part_count {
+                    let plen = (rng.below(4096) + 1) as u32;
+                    parts.push((plen, rng.next_u64()));
+                }
+                StorageOp::MultipartPut {
+                    key: rng.below(KEY_SPACE) as u8,
+                    parts,
+                    fill: rng.next_u64(),
+                }
+            }
+            // Compact (6%).
+            71..=76 => {
+                since_crash += 1;
+                StorageOp::Compact { seal_if_single: rng.below(3) == 0 }
+            }
+            // VerifyRead (3%).
+            77..=79 => {
+                since_crash += 1;
+                StorageOp::VerifyRead { key: rng.below(KEY_SPACE) as u8 }
+            }
+            // Sync (10%).
+            80..=89 => {
+                since_crash += 1;
+                StorageOp::Basic(SimOperation::Sync)
+            }
+            // Fault (7%) including ProbeJournalReadFault.
+            90..=96 => {
+                since_crash += 1;
+                match random_fault(&mut rng) {
+                    SimOperation::Fault { file: SimFileKind::Journal, op: SimOp::Read, fault } => {
+                        StorageOp::ProbeJournalReadFault { fault }
+                    }
+                    other => StorageOp::Basic(other),
+                }
+            }
+            // Crash (3%).
+            _ => {
+                open_streams.clear();
+                since_crash = 0;
+                StorageOp::Basic(SimOperation::Crash { mode: random_crash_mode(&mut rng) })
+            }
+        };
+        ops.push(op);
+    }
+
+    ops
+}
+
+/// Delta-debugging shrinker over [`StorageOp`] sequences to produce a minimal failing trace.
+pub fn shrink_storage(ops: &[StorageOp], mut still_fails: impl FnMut(&[StorageOp]) -> bool) -> Vec<StorageOp> {
+    if ops.is_empty() || still_fails(&[]) {
+        return Vec::new();
+    }
+    let mut cur = ops.to_vec();
+    let mut chunk_size = cur.len() / 2;
+    while chunk_size >= 2 && cur.len() > 2 {
+        let mut start = 0;
+        while start < cur.len() {
+            let end = (start + chunk_size).min(cur.len());
+            if end - start < 2 || (start == 0 && end == cur.len()) {
+                break;
+            }
+            let mut candidate = Vec::with_capacity(cur.len() - (end - start));
+            candidate.extend_from_slice(&cur[..start]);
+            candidate.extend_from_slice(&cur[end..]);
+            if still_fails(&candidate) {
+                cur = candidate;
+            } else {
+                start = end;
+            }
+        }
+        if chunk_size == 2 {
+            break;
+        }
+        chunk_size = (chunk_size / 2).max(2);
+    }
+
+    loop {
+        let mut removed = false;
+        let mut i = 0;
+        while i < cur.len() {
+            if cur.len() <= 1 {
+                break;
+            }
+            let mut candidate = Vec::with_capacity(cur.len() - 1);
+            candidate.extend_from_slice(&cur[..i]);
+            candidate.extend_from_slice(&cur[i + 1..]);
+            if still_fails(&candidate) {
+                cur = candidate;
+                removed = true;
+            } else {
+                i += 1;
+            }
+        }
+        if !removed {
             break;
         }
     }
@@ -534,5 +770,20 @@ mod tests {
         };
         let shrunk_interact = shrink(&ops_interact, interact_pred);
         assert_eq!(shrunk_interact, vec![SimOperation::Put { key: 1, len: 0, fill: 0 }]);
+    }
+
+    #[test]
+    fn storage_generator_is_deterministic_and_shrinks() {
+        let a = generate_storage(42, 60);
+        let b = generate_storage(42, 60);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 60);
+        assert!(matches!(a.last(), Some(StorageOp::Basic(SimOperation::Crash { .. }))));
+
+        let shrunk = shrink_storage(&a, |seq| {
+            seq.iter().any(|op| matches!(op, StorageOp::Compact { .. }))
+                && seq.iter().any(|op| matches!(op, StorageOp::Basic(SimOperation::Crash { .. })))
+        });
+        assert_eq!(shrunk.len(), 2);
     }
 }

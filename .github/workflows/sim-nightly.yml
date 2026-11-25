@@ -1,0 +1,33 @@
+name: Nightly storage simulation
+
+on:
+  schedule:
+    - cron: "23 20 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Number of simulation seeds to run"
+        required: false
+        default: "20000"
+
+permissions:
+  contents: read
+
+jobs:
+  sim:
+    name: Storage simulation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Run seeded storage simulation (${{ inputs.seeds || '20000' }} seeds)
+        env:
+          AWAN_SIM_SEEDS: ${{ inputs.seeds || '20000' }}
+        run: cargo test --locked --release --manifest-path server/Cargo.toml --test sim_storage_test -- --nocapture

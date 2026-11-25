@@ -58,6 +58,14 @@ impl KeyState {
     }
 }
 
+/// Whether a key value is required, permitted, or forbidden after a crash (#213).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Survives {
+    Yes,
+    Maybe,
+    No,
+}
+
 /// Pure reference model of which key values may survive a crash and recovery.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SimModel {
@@ -114,6 +122,22 @@ impl SimModel {
             next.insert(key, KeyState::settled(value));
         }
         self.keys = next;
+    }
+
+    /// Classifies `value` for `key` against the current survival set after a crash.
+    pub fn survival(&self, key: u8, value: Option<(u32, u64)>) -> Survives {
+        let allowed = self
+            .keys
+            .get(&key)
+            .map(KeyState::allowed)
+            .unwrap_or_else(|| BTreeSet::from([None]));
+        if !allowed.contains(&value) {
+            Survives::No
+        } else if allowed.len() == 1 {
+            Survives::Yes
+        } else {
+            Survives::Maybe
+        }
     }
 
     /// Ok, or the first key whose found state is not allowed, with both.
@@ -324,6 +348,23 @@ mod tests {
             (1, Some((10, 1))),
             (7, None),
         ])).is_ok(), "untouched key explicitly mapped to None must be accepted");
+    }
+
+    #[test]
+    fn survival_classifies_yes_maybe_and_no() {
+        let mut m = SimModel::new();
+        m.record(&SimOperation::Put { key: 1, len: 10, fill: 1 }, Outcome::Ok);
+        m.record(&SimOperation::Sync, Outcome::Ok);
+        assert_eq!(m.survival(1, Some((10, 1))), Survives::Yes);
+        assert_eq!(m.survival(1, Some((10, 2))), Survives::No);
+        assert_eq!(m.survival(1, None), Survives::No);
+
+        m.record(&SimOperation::Put { key: 1, len: 20, fill: 2 }, Outcome::Ok);
+        assert_eq!(m.survival(1, Some((10, 1))), Survives::Maybe);
+        assert_eq!(m.survival(1, Some((20, 2))), Survives::Maybe);
+        assert_eq!(m.survival(1, None), Survives::No);
+        assert_eq!(m.survival(2, None), Survives::Yes);
+        assert_eq!(m.survival(2, Some((1, 1))), Survives::No);
     }
 
     fn assert_exact_synced_crash(
