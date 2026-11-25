@@ -213,19 +213,31 @@ object's Last-Modified; its ordering time stays 0, so which version is current d
 and no clock reading decides it (decision 63). Not chosen: giving the null version its real time
 as its ordering time and raising the next stamp above it, which reopens the clock-step risk.
 
-**Decision 67 (Claude, 2026-11-19, #213 and #26): a volume reaches its files only through a
-file seam, so a seeded simulation can crash and fail them.** `server/src/vfile.rs` defines
-`VolFile` (aligned and unaligned positioned writes and reads, length, resize, `sync_data`, sparse,
-and the read mapping where there is one) and `VolFs` (open a data file or a journal, exists,
-remove). Production uses `DiskFile` and `DiskFs`, which keep today's three handles per file: the
-write handle, a second open used only to sync (a Windows sync through the write handle stalls
-every writer), and a read-only handle for page-cache reads (#155). `server/src/sim.rs` implements both in memory: a `SimFile` keeps the
+**Decision 67 (Claude, 2026-11-19; completed 2026-11-25, #213 and #26): a volume reaches its files
+only through a file seam, so a seeded simulation can crash and fail them.** `server/src/vfile.rs`
+defines `VolFile` (aligned and unaligned positioned writes and reads, length, resize, `sync_data`,
+sparse, and the read mapping where there is one) and `VolFs` (open a data file, journal, or
+segment, exists, remove). Production uses `DiskFile` and `DiskFs`, which keep today's three
+handles per file: the write handle, a second open used only to sync (a Windows sync through the
+write handle stalls every writer), and a read-only handle for page-cache reads (#155).
+`server/src/sim.rs` implements both in memory (`SimFile` and `SimFs`): a `SimFile` keeps the
 bytes made durable by `sync_data` apart from the writes since, so a crash drops them, keeps a
-seeded prefix in write order, or tears the next one; faults (`EIO`, `ENOSPC`) are armed by name
-per operation. The volume code becomes generic over `VolFs` with `DiskFs` as the default (stage 1b),
-so production is monomorphised and pays nothing; #26's segment files and manifest use the same
-seam from their first commit. Not covered by the simulation: HTTP, real thread interleavings, and
-the mapped read path (`SimFile` has no mapping, so simulated reads use positioned reads; the mapped
+seeded prefix in write order, or tears the next 4 KiB block; faults (`EIO`, `ENOSPC`) are armed
+per file and operation, and `FaultTracker` counts the 32 named `FaultPoint` events. The volume
+code becomes generic over `VolFs` with `DiskFs` as the default (stage 1b), so the production
+`s3-server` binary is monomorphised over `DiskFs` and pays no runtime or dispatch cost on the
+write path; #26's segment files and manifest use the same seam from their first commit.
+`server/src/sim_gen.rs` generates deterministic operation schedules (`StorageOp`: buffered PUT,
+overwrite, DELETE, CopyObject, interleaved streamed PUTs with relocation/late-fail/abandonment,
+multipart extents, compaction, `Sync`, data/journal fault injection, `DropUnsynced` and
+`SeededPrefix` crashes) and shrinks failing traces. `server/src/sim_model.rs` provides the pure
+survival oracle (`SimModel`, `Survives::Yes`, `Maybe`, `No`) aligned with `ObjectVersions.tla`.
+`server/tests/sim_storage_test.rs` runs `VolumeManager<SimFs>` end-to-end across
+`AWAN_SIM_SEEDS` (default 2,000 seeds in CI under 5 minutes; 20,000 seeds nightly via
+`.github/workflows/sim-nightly.yml`, printing failing seeds and shrunk traces), verifies
+byte-for-byte determinism (`xxh3_64` trace hashes), and fails if any `FaultPoint` never fired.
+Not covered by the simulation: HTTP, real OS thread interleavings, and the mapped read path
+(`SimFile` returns `None` from `map()`, so simulated reads use positioned reads; the mapped read
 path keeps its own tests). Not chosen: a whole-server simulation, and `loom` or `shuttle` for
 interleavings (owner, 2026-11-16, option B).
 
