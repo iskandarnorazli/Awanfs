@@ -594,6 +594,49 @@ fn write_pending<F: VolFile>(journal: &F, end: &mut u64, pending: &mut Vec<[u8; 
     result
 }
 
+fn verify_needle_integrity<F: VolFile>(
+    window: &mut AlignedScanWindow<'_, F>,
+    offset: u64,
+    hdr: &NeedleHeader,
+) -> bool {
+    let key_end = 64usize + hdr.key_len as usize;
+    let attrs_len = hdr.attrs_len as usize;
+    let p_start = key_end + attrs_len;
+    let Some(p_end) = (p_start as u64).checked_add(hdr.payload_size) else {
+        return false;
+    };
+    let total_len = p_end.div_ceil(SECTOR_SIZE as u64).saturating_mul(SECTOR_SIZE as u64);
+    if total_len != hdr.total_len() || p_end > total_len {
+        return false;
+    }
+    let meta_sectors = p_start.div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
+    let mut crc = 0u32;
+    let mut pos = 0u64;
+    while pos < total_len {
+        let remain = ((total_len - pos) as usize).min(SCAN_BATCH_BYTES);
+        let Some(chunk) = window.read_at(offset + pos, remain) else {
+            return false;
+        };
+        if pos == 0 {
+            if remain < meta_sectors {
+                return false;
+            }
+            if xxh3_64(&chunk[64..key_end]) != hdr.key_hash {
+                return false;
+            }
+            if attrs_len > 0 && crate::attrs::Attrs::decode(&chunk[key_end..p_start]).is_err() {
+                return false;
+            }
+        }
+        let lo = (p_start as u64).max(pos);
+        let hi = p_end.min(pos + remain as u64);
+        if lo < hi {
+            crc = crc32c::crc32c_append(crc, &chunk[(lo - pos) as usize..(hi - pos) as usize]);
+        }
+        pos += remain as u64;
+    }
+    crc == hdr.payload_crc32c
+}
 /// One write counted in `VolumeManager::writers_in_flight` (#167).
 struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
 
@@ -693,8 +736,13 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         let aligned_file = fs.open(&dat_path, FileKind::Data, true)?;
 
         let journal = fs.open(&idx_path, FileKind::Journal, true)?;
-        // Read the journal, then append after it: a reopen must not overwrite earlier records.
-        let journal_len = journal.len()?;
+        // Truncate any torn trailing bytes so subsequent appends stay IDX_RECORD-aligned.
+        let raw_journal_len = journal.len()?;
+        let journal_len = (raw_journal_len / IDX_RECORD as u64) * IDX_RECORD as u64;
+        if raw_journal_len != journal_len {
+            journal.set_len(journal_len)?;
+            journal.sync_all()?;
+        }
         let max_indexed = scan_journal_max_offset(&*journal, journal_len)?;
         let mut open_gaps: BTreeMap<u64, u64> = BTreeMap::new();
 
@@ -766,6 +814,8 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             };
 
             // Scan valid needles
+            let mut last_valid_end = SECTOR_SIZE as u64;
+            let mut last_unchecked: Option<(u64, u64, NeedleHeader)> = None;
             let mut window = AlignedScanWindow::new(&*aligned_file, file_len, None);
             while let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE) {
                 let mut header_bytes = [0u8; 64];
@@ -796,6 +846,16 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                                 None => break,
                             }
                         }
+                        if max_indexed.is_none_or(|m| scan_offset >= m) {
+                            if !verify_needle_integrity(&mut window, scan_offset, &hdr) {
+                                break;
+                            }
+                            last_unchecked = None;
+                            last_valid_end = scan_offset + total_len;
+                        } else {
+                            last_unchecked = Some((last_valid_end, scan_offset, hdr));
+                            last_valid_end = scan_offset + total_len;
+                        }
                         scan_offset += total_len;
                     }
                     Err(_) => {
@@ -810,6 +870,12 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                     }
                 }
             }
+            if let Some((prev_valid_end, last_off, last_hdr)) = last_unchecked {
+                if !verify_needle_integrity(&mut window, last_off, &last_hdr) {
+                    last_valid_end = prev_valid_end;
+                }
+            }
+            scan_offset = last_valid_end;
 
             if sparse {
                 if file_len > MAX_VOLUME_SPAN {
@@ -828,6 +894,8 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         } else {
             None
         };
+
+        open_gaps.retain(|&off, _| off < scan_offset);
 
         let allocated = if sparse { MAX_VOLUME_SPAN } else { aligned_file.len()? };
         Ok(Self {
@@ -1270,8 +1338,17 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         let written = if self.fail_next_write.swap(false, Ordering::SeqCst) {
             Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected write failure")))
         } else {
-            // Lock-free concurrent positional write directly to disjoint disk offset
-            self.ensure_allocated(offset + total_len).and_then(|()| self.file.write_aligned_at(offset, &buf).map_err(VolumeError::from))
+            // Write payload tail sectors before sector 0 (NeedleHeader) so a crash never leaves
+            // a valid header pointing at unwritten tail sectors (matching NeedleWriter::finish).
+            self.ensure_allocated(offset + total_len).and_then(|()| {
+                if total_len > SECTOR_SIZE as u64 {
+                    self.file.write_aligned_at(offset + SECTOR_SIZE as u64, &buf[SECTOR_SIZE..])?;
+                    self.file.write_aligned_at(offset, &buf[..SECTOR_SIZE])?;
+                } else {
+                    self.file.write_aligned_at(offset, &buf)?;
+                }
+                Ok(())
+            })
         };
         if let Err(e) = written {
             self.gaps.lock().insert(offset, total_len);
