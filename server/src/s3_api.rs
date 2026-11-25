@@ -2312,16 +2312,13 @@ impl S3ServiceState {
                     attempts += 1;
                     self.roll_volume(&vm)?;
                 }
-                Err(e) => {
-                    // The write reserved an offset and may have left a complete record there
-                    // (header written, then the journal or the disk failed). Its offset is
-                    // later than every reservation made before it, so noting the largest
-                    // offset makes a streamed PUT of this key in flight relocate: a spurious
-                    // copy costs time, a missed one lets this failed write win after a
-                    // restart (#184).
-                    self.streams.note_append(b_id, key, u64::MAX);
-                    return Err(e);
+                Err(VolumeError::AfterRecord { loc, flags, cause }) => {
+                    // The needle header is whole on disk (#184, #403), so recovery will
+                    // replay it at `loc.offset`: note that exact global offset.
+                    self.streams.note_append(b_id, key, global_offset(loc.volume_id, loc.offset));
+                    return Err(VolumeError::AfterRecord { loc, flags, cause });
                 }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -2354,11 +2351,7 @@ impl S3ServiceState {
             // The copy is whole in the volume and is the newest record of the key; only its
             // journal append failed (#184, the model's RelocateLateFail).
             Err(VolumeError::AfterRecord { loc, flags, cause }) => (loc, Some(VolumeError::AfterRecord { loc, flags, cause })),
-            Err(e) => {
-                // The header may be on disk (see `write_to_active_at`).
-                self.streams.note_append(b_id, key, u64::MAX);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
         self.streams.note_append(b_id, key, g);
         self.total_volume_bytes.fetch_add(from.total_len, Ordering::Relaxed);

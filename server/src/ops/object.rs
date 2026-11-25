@@ -1631,10 +1631,7 @@ pub async fn put_object(
         let (first_loc, mut late) = match writer.finish(etag_hi, etag_lo) {
             Ok(l) => (l, None),
             Err(VolumeError::AfterRecord { loc, flags, cause }) => (loc, Some(VolumeError::AfterRecord { loc, flags, cause })),
-            Err(e) => {
-                state.streams.note_append(b_id, key, u64::MAX);
-                return Ok(internal_error_response(key, &format!("could not store the object: {:?}", e)));
-            }
+            Err(e) => return Ok(internal_error_response(key, &format!("could not store the object: {:?}", e))),
         };
         state.streams.note_append(b_id, key, first_offset);
         let (vm, loc, vol_offset) = if stamp.is_none() && ticket.appended_after(first_offset) {

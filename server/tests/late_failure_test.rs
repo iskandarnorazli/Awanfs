@@ -6,11 +6,14 @@
 
 use reqwest::header::ETAG;
 use reqwest::StatusCode;
-use s3_server::{start_s3_reactor, S3ServiceState, STREAM_PUT_MIN};
+use s3_server::{global_offset, start_s3_reactor, S3ServiceState, STREAM_PUT_MIN};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -171,4 +174,132 @@ async fn a_multipart_complete_whose_journal_append_fails_shows_the_same_object_b
     let (live, after) = get_live_then_restarted(state, handle, &dir, &url, "/late-bkt/big").await;
     assert!(live.0 == StatusCode::OK && live.1 == whole, "live: the completed object");
     assert!(after.0 == StatusCode::OK && after.1 == whole, "after a restart: the completed object");
+}
+
+struct Stalled {
+    stream: TcpStream,
+    rest: Vec<u8>,
+}
+
+async fn begin_stalled(state: &S3ServiceState, url: &str, path: &str, body: &[u8]) -> Stalled {
+    assert!(body.len() as u64 > STREAM_PUT_MIN);
+    let host = url.trim_start_matches("http://").to_string();
+    let mut stream = TcpStream::connect(&host).await.unwrap();
+    let head = format!(
+        "PUT {} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        path,
+        host,
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let half = body.len() / 2;
+    stream.write_all(&body[..half]).await.unwrap();
+    stream.flush().await.unwrap();
+    for _ in 0..400 {
+        if state.volume_writers_in_flight(1) == Some(1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(state.volume_writers_in_flight(1), Some(1), "the PUT reserved its needle");
+    Stalled {
+        stream,
+        rest: body[half..].to_vec(),
+    }
+}
+
+impl Stalled {
+    async fn finish(mut self) -> u16 {
+        self.stream.write_all(&self.rest).await.unwrap();
+        self.stream.flush().await.unwrap();
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(20), self.stream.read_to_end(&mut buf))
+            .await
+            .expect("no answer")
+            .unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        text.split_whitespace()
+            .nth(1)
+            .unwrap_or_else(|| panic!("no status line in {:?}", text))
+            .parse()
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_pre_header_write_failure_does_not_mark_streamed_put_for_relocation() {
+    let dir = temp_dir("pre_header_stream");
+    let (state, url, handle) = start(&dir).await;
+    let c = reqwest::Client::new();
+    assert_eq!(c.put(format!("{}/late-bkt", url)).send().await.unwrap().status(), StatusCode::OK);
+    let b_id = state.engine.read().lookup_bucket("late-bkt").unwrap();
+    let streamed = pattern(STREAM_PUT_MIN as usize + 4096, 9);
+
+    let stalled = begin_stalled(&state, &url, "/late-bkt/k", &streamed).await;
+    let ticket = state.streams.enter(b_id, "k");
+    state.volume_manager.read().clone().unwrap().fail_next_write();
+    let res = c.put(format!("{}/late-bkt/k", url)).body(pattern(2000, 10)).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    assert!(
+        !ticket.appended_after(0),
+        "pre-header write failure wrote no needle header and must not note an append"
+    );
+    drop(ticket);
+
+    assert_eq!(stalled.finish().await, 200);
+    assert_eq!(
+        state.stream_relocations.load(Ordering::SeqCst),
+        0,
+        "pre-header write failure must not trigger streamed PUT relocation"
+    );
+
+    let (live, after) = get_live_then_restarted(state, handle, &dir, &url, "/late-bkt/k").await;
+    assert_eq!(live.0, StatusCode::OK);
+    assert!(live.1 == streamed, "live: the streamed PUT is the object");
+    assert_eq!(after.0, StatusCode::OK);
+    assert!(after.1 == streamed, "after a restart: the streamed PUT is the object");
+}
+
+#[tokio::test]
+async fn an_after_record_failure_notes_record_offset_and_relocates_streamed_put() {
+    let dir = temp_dir("after_record_stream");
+    let (state, url, handle) = start(&dir).await;
+    let c = reqwest::Client::new();
+    assert_eq!(c.put(format!("{}/late-bkt", url)).send().await.unwrap().status(), StatusCode::OK);
+    let b_id = state.engine.read().lookup_bucket("late-bkt").unwrap();
+    let streamed = pattern(STREAM_PUT_MIN as usize + 4096, 11);
+
+    let stalled = begin_stalled(&state, &url, "/late-bkt/k", &streamed).await;
+    let ticket = state.streams.enter(b_id, "k");
+    let vm = state.volume_manager.read().clone().unwrap();
+    let expected_g = global_offset(vm.id(), vm.offset());
+    vm.fail_next_index();
+    let res = c.put(format!("{}/late-bkt/k", url)).body(pattern(2000, 12)).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    assert!(
+        ticket.appended_after(expected_g - 1),
+        "AfterRecord failure must note the written record offset {}",
+        expected_g
+    );
+    assert!(
+        !ticket.appended_after(expected_g),
+        "AfterRecord failure must note exact offset {} rather than u64::MAX",
+        expected_g
+    );
+    drop(ticket);
+
+    assert_eq!(stalled.finish().await, 200);
+    assert_eq!(
+        state.stream_relocations.load(Ordering::SeqCst),
+        1,
+        "AfterRecord write was noted so the streamed PUT relocated"
+    );
+
+    let (live, after) = get_live_then_restarted(state, handle, &dir, &url, "/late-bkt/k").await;
+    assert_eq!(live.0, StatusCode::OK);
+    assert!(live.1 == streamed, "live: the relocated streamed PUT is the object");
+    assert_eq!(after.0, StatusCode::OK);
+    assert!(after.1 == streamed, "after a restart: the relocated streamed PUT wins over the AfterRecord write");
 }
