@@ -53,3 +53,17 @@ groups:
           severity: ticket
         annotations:
           summary: "AwanFS background task {{ $labels.task }} has not completed a tick in 10 periods on {{ $labels.instance }}"
+      - alert: AwanFSReadChecksumFailures
+        expr: increase(awanfs_read_checksum_failures_total[10m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "AwanFS {{ $labels.instance }} hit read checksum failures"
+          description: "One or more object reads failed header or payload CRC32C verification (decision 46)."
+      - alert: AwanFSCorruptNeedles
+        expr: increase(awanfs_corrupt_needles_total[10m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "AwanFS {{ $labels.instance }} detected corrupt needles"
+          description: "Background scrub or read verification found corrupt needles; inspect GET /_awanfs/scrub."
