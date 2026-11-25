@@ -201,6 +201,13 @@ pub struct Iam {
     compressed: std::collections::HashSet<String>,
 }
 
+fn validate_ident_field(user: &str, field: &str, val: &str) -> Result<(), String> {
+    if val.contains([':', '\n', '\r']) {
+        return Err(format!("user {}: {} contains forbidden character", user, field));
+    }
+    Ok(())
+}
+
 impl Iam {
     /// Whether new objects in `bucket` are compressed (#51).
     pub fn compresses(&self, bucket: &str) -> bool {
@@ -215,6 +222,7 @@ impl Iam {
             if u.name.is_empty() {
                 return Err("user with empty name".to_string());
             }
+            validate_ident_field(&u.name, "name", &u.name)?;
             if u.access_key.is_empty() || u.secret_key.is_empty() {
                 return Err(format!("user {}: empty access_key or secret_key", u.name));
             }
@@ -223,11 +231,13 @@ impl Iam {
                 Some(s) => s,
                 None => crate::auth::sha256_hex(u.name.as_bytes()),
             };
+            validate_ident_field(&u.name, "id", &id)?;
             let account = match u.account {
                 Some(s) if s.is_empty() => return Err(format!("user {}: empty account", u.name)),
                 Some(s) => s,
                 None => u.name.clone(),
             };
+            validate_ident_field(&u.name, "account", &account)?;
             let display_name = u.display_name.filter(|s| !s.is_empty()).unwrap_or_else(|| u.name.clone());
             let email = u.email.filter(|s| !s.is_empty());
             let statements = parse_policy(&u.policy).map_err(|e| format!("user {}: {}", u.name, e))?;

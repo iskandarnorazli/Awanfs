@@ -321,6 +321,20 @@ account = """#] {
         let bad = format!("[[users]]\n{}\naccess_key = \"AK\"\nsecret_key = \"s\"\npolicy = '{{\"Statement\":[]}}'\n", bad_field);
         assert!(Iam::parse(&bad).is_err(), "accepted: {}", bad_field);
     }
+
+    // Colons and line breaks in name, account, or id are rejected (buckets.manifest safety).
+    for bad_char in [":", "\n", "\r"] {
+        for field in ["name", "account", "id"] {
+            let mut toml_fields = format!("name = \"safe\"\n");
+            if field == "name" {
+                toml_fields = format!("name = {:?}\n", format!("a{}b", bad_char));
+            } else {
+                toml_fields.push_str(&format!("{} = {:?}\n", field, format!("a{}b", bad_char)));
+            }
+            let bad = format!("[[users]]\n{}access_key = \"AK\"\nsecret_key = \"s\"\npolicy = '{{\"Statement\":[]}}'\n", toml_fields);
+            assert!(Iam::parse(&bad).is_err(), "accepted forbidden {:?} in {}", bad_char, field);
+        }
+    }
 }
 
 #[tokio::test]

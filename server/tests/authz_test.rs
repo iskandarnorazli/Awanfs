@@ -340,15 +340,9 @@ fn reference_authorize(
 #[test]
 fn decision_table_covers_every_op_row_and_matches_reference() {
     let mut covered_ops = HashSet::new();
-    let mut representatives: Vec<Operation> = Vec::new();
-    let mut seen_classes = Vec::new();
     for s in OPS {
-        let cls = op_class(s.op);
+        let _ = op_class(s.op);
         covered_ops.insert(s.op);
-        if !seen_classes.contains(&cls) {
-            seen_classes.push(cls);
-            representatives.push(s.op);
-        }
     }
     assert_eq!(covered_ops.len(), OPS.len(), "every OPS row must be covered");
     // Ensure ReadAcl/WriteAcl enum variants are exercised conceptually in class coverage too.
@@ -391,8 +385,8 @@ fn decision_table_covers_every_op_row_and_matches_reference() {
         BucketOwnership::ObjectWriter,
     ];
 
-    for &op in &representatives {
-        let sp = spec(op);
+    for sp in OPS {
+        let op = sp.op;
         for &pk in &principals {
             let bucket_owner = if pk == PrincipalKind::Root { "root" } else { "acct-owner" };
             let principal = make_principal(pk, bucket_owner);
@@ -765,21 +759,68 @@ fn monotonicity_adding_deny_or_removing_allow_never_turns_deny_into_allow() {
         let id_pol = if rng.next() & 1 == 1 { PolicyMatch::Allow } else { PolicyMatch::NoOpinion };
         let b_opt = (sp.target != TargetKind::Service).then_some(&bkt);
         let base = authorize(&principal, op, b_opt, None, &AuthzContext { identity_policy: id_pol, _marker: PhantomData });
-        if !base.is_allowed() {
-            // Adding explicit deny in identity policy or bucket policy must stay Deny.
-            assert!(!authorize(&principal, op, b_opt, None, &AuthzContext { identity_policy: PolicyMatch::ExplicitDeny, _marker: PhantomData }).is_allowed());
-            let mut bkt_deny = bkt.clone();
-            bkt_deny.policy.explicit_deny = true;
-            assert!(!authorize(&principal, op, Some(&bkt_deny), None, &AuthzContext { identity_policy: id_pol, _marker: PhantomData }).is_allowed());
-            // Removing allows must stay Deny.
-            let empty_acl = AclGrants::default();
-            let bkt_no_allow = BucketTarget {
-                policy: BucketPolicyDecision::none(),
-                acl: &empty_acl,
-                ..bkt
-            };
-            assert!(!authorize(&principal, op, (sp.target != TargetKind::Service).then_some(&bkt_no_allow), None, &AuthzContext { identity_policy: PolicyMatch::NoOpinion, _marker: PhantomData }).is_allowed());
+        // Adding explicit deny in identity policy or bucket policy must always Deny and never turn Deny into Allow.
+        let id_deny = authorize(&principal, op, b_opt, None, &AuthzContext { identity_policy: PolicyMatch::ExplicitDeny, _marker: PhantomData });
+        assert!(!(id_deny.is_allowed() && !base.is_allowed()), "identity deny flipped Deny->Allow");
+        if matches!(principal, Principal::User { .. }) {
+            assert!(!id_deny.is_allowed(), "identity explicit deny must deny User");
         }
+        let mut bkt_deny = bkt.clone();
+        bkt_deny.policy.explicit_deny = true;
+        let b_deny = authorize(&principal, op, (sp.target != TargetKind::Service).then_some(&bkt_deny), None, &AuthzContext { identity_policy: id_pol, _marker: PhantomData });
+        assert!(!(b_deny.is_allowed() && !base.is_allowed()), "bucket deny flipped Deny->Allow");
+        if sp.target != TargetKind::Service {
+            assert!(!b_deny.is_allowed(), "bucket explicit deny must deny bucket/object op");
+        }
+        // Removing allows must satisfy tightened <= base across both Allow and Deny bases.
+        let empty_acl = AclGrants::default();
+        let bkt_no_allow = BucketTarget {
+            policy: BucketPolicyDecision::none(),
+            acl: &empty_acl,
+            ..bkt
+        };
+        let tightened = authorize(
+            &principal,
+            op,
+            (sp.target != TargetKind::Service).then_some(&bkt_no_allow),
+            None,
+            &AuthzContext { identity_policy: PolicyMatch::NoOpinion, _marker: PhantomData },
+        );
+        assert!(
+            !(tightened.is_allowed() && !base.is_allowed()),
+            "removing allow turned Deny into Allow for {:?} {:?} (base={:?}, tightened={:?})",
+            principal,
+            op,
+            base,
+            tightened
+        );
+        // Adding allows must satisfy base <= loosened (adding Allow never turns Allow into Deny).
+        let all_acl = make_acl(AclKind::AllUsers, &principal, sp.acl_permission);
+        let bkt_allow = BucketTarget {
+            policy: BucketPolicyDecision {
+                explicit_deny: false,
+                allow: true,
+                is_public: false,
+                conditions_hold: true,
+            },
+            acl: &all_acl,
+            ..bkt
+        };
+        let loosened = authorize(
+            &principal,
+            op,
+            (sp.target != TargetKind::Service).then_some(&bkt_allow),
+            None,
+            &AuthzContext { identity_policy: PolicyMatch::Allow, _marker: PhantomData },
+        );
+        assert!(
+            !(base.is_allowed() && !loosened.is_allowed()),
+            "adding allow turned Allow into Deny for {:?} {:?} (base={:?}, loosened={:?})",
+            principal,
+            op,
+            base,
+            loosened
+        );
     }
 }
 
