@@ -815,15 +815,22 @@ impl<Fs: VolFs> VolumeManager<Fs> {
 
             // Scan valid needles
             let mut last_valid_end = SECTOR_SIZE as u64;
-            let mut last_unchecked: Option<(u64, u64, NeedleHeader)> = None;
             let mut window = AlignedScanWindow::new(&*aligned_file, file_len, None);
             while let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE) {
                 let mut header_bytes = [0u8; 64];
                 header_bytes.copy_from_slice(&sector[0..64]);
 
                 let magic = u32::from_le_bytes(header_bytes[0..4].try_into().unwrap());
-                if magic != NEEDLE_MAGIC {
-                    // Unwritten sector: the end of the volume, or a gap the journal can step over.
+                let Some(hdr) = (magic == NEEDLE_MAGIC)
+                    .then(|| NeedleHeader::decode(&header_bytes).ok())
+                    .flatten()
+                    .filter(|hdr| {
+                        let total_len = hdr.total_len();
+                        scan_offset.checked_add(total_len).is_some_and(|end| end <= file_len)
+                            && verify_needle_integrity(&mut window, scan_offset, hdr)
+                    })
+                else {
+                    // Unwritten or torn needle: step over it when the journal knows a later needle.
                     match jump_in_journal(scan_offset, &mut open_gaps)? {
                         Some(next) => {
                             scan_offset = next;
@@ -831,49 +838,11 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                         }
                         None => break,
                     }
-                }
+                };
 
-                match NeedleHeader::decode(&header_bytes) {
-                    Ok(hdr) => {
-                        let total_len = hdr.total_len();
-                        if scan_offset.checked_add(total_len).is_none_or(|end| end > file_len) {
-                            // Incomplete needle written during crash
-                            match jump_in_journal(scan_offset, &mut open_gaps)? {
-                                Some(next) => {
-                                    scan_offset = next;
-                                    continue;
-                                }
-                                None => break,
-                            }
-                        }
-                        if max_indexed.is_none_or(|m| scan_offset >= m) {
-                            if !verify_needle_integrity(&mut window, scan_offset, &hdr) {
-                                break;
-                            }
-                            last_unchecked = None;
-                            last_valid_end = scan_offset + total_len;
-                        } else {
-                            last_unchecked = Some((last_valid_end, scan_offset, hdr));
-                            last_valid_end = scan_offset + total_len;
-                        }
-                        scan_offset += total_len;
-                    }
-                    Err(_) => {
-                        // Torn needle: step over it when the journal knows a later needle.
-                        match jump_in_journal(scan_offset, &mut open_gaps)? {
-                            Some(next) => {
-                                scan_offset = next;
-                                continue;
-                            }
-                            None => break,
-                        }
-                    }
-                }
-            }
-            if let Some((prev_valid_end, last_off, last_hdr)) = last_unchecked {
-                if !verify_needle_integrity(&mut window, last_off, &last_hdr) {
-                    last_valid_end = prev_valid_end;
-                }
+                let total_len = hdr.total_len();
+                last_valid_end = scan_offset + total_len;
+                scan_offset += total_len;
             }
             scan_offset = last_valid_end;
 
@@ -1698,6 +1667,18 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         let mut window = AlignedScanWindow::new(&*self.file, file_len, Some(&self.work));
 
         while let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE) {
+            if let Some(len) = self
+                .gaps
+                .lock()
+                .get(&scan_offset)
+                .copied()
+                .or_else(|| self.open_gaps.get(&scan_offset).copied())
+            {
+                if len > 0 {
+                    scan_offset += len;
+                    continue;
+                }
+            }
             let mut header_bytes = [0u8; 64];
             header_bytes.copy_from_slice(&sector[0..64]);
 

@@ -430,3 +430,144 @@ fn disk_sparse_volume_rejects_torn_multi_sector_needle_on_reopen() {
     assert_eq!(keys, vec!["good"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn idx_has_offset(idx_bytes: &[u8], target: u64) -> bool {
+    idx_bytes
+        .chunks_exact(IDX_RECORD as usize)
+        .any(|rec| u64::from_le_bytes(rec[12..20].try_into().unwrap()) == target)
+}
+
+#[test]
+fn seed_45_torn_mid_volume_streamed_needle_rejected_and_later_indexed_preserved() {
+    let dir = Path::new("sim/seed45_mid_volume");
+    let dat_path = dir.join("volume_0001.dat");
+    let idx_path = dir.join("volume_0001.idx");
+    let fs = SimFs::new();
+    let vm = Arc::new(VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap());
+
+    let p2 = pattern(54_650, 45);
+    let p3 = pattern(17_285, 46);
+
+    let mut w = vm.begin_needle(1, "k2", p2.len() as u64, AWAN_FLAG_ACTIVE).unwrap();
+    assert_eq!(w.offset(), 4096);
+    w.write(&p2).unwrap();
+
+    let loc3 = vm.write_needle(1, "k3", &p3, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+    assert_eq!(loc3.offset, 61_440);
+
+    w.finish(0, 0).unwrap();
+
+    let p2_crc = crc32c::crc32c(&p2);
+    let mut saw_torn_mid_volume = false;
+    for seed in 0..1000u64 {
+        let after = fs.crashed(CrashMode::SeededPrefix, &mut SimRng::new(seed));
+        let dat_bytes = after.file(&dat_path).unwrap().contents();
+        let idx_bytes = after.file(&idx_path).unwrap().contents();
+        let k2_hdr_ok = dat_bytes.len() >= 4096 + 64
+            && NeedleHeader::decode(dat_bytes[4096..4096 + 64].try_into().unwrap()).is_ok();
+        let k2_payload_ok = dat_bytes.len() >= 4096 + 66 + p2.len()
+            && &dat_bytes[4096 + 64..4096 + 66] == b"k2"
+            && crc32c::crc32c(&dat_bytes[4096 + 66..4096 + 66 + p2.len()]) == p2_crc;
+        let k2_in_idx = idx_has_offset(&idx_bytes, 4096);
+        let k3_in_idx = idx_has_offset(&idx_bytes, 61_440);
+
+        let reopened = VolumeManager::open_with(&after, dir, 1, false, clock()).unwrap();
+        let needles = scan_all(&reopened);
+        for n in &needles {
+            let got = read_via_copy_payload(&reopened, n);
+            match n.key.as_str() {
+                "k2" => assert_eq!(got, p2, "seed {}: torn k2 exposed", seed),
+                "k3" => assert_eq!(got, p3, "seed {}: k3 corrupted", seed),
+                other => panic!("seed {}: unexpected key {:?}", seed, other),
+            }
+        }
+
+        if k2_hdr_ok && !k2_payload_ok && !k2_in_idx && k3_in_idx && dat_bytes.len() >= 81_920 {
+            saw_torn_mid_volume = true;
+            let keys: Vec<&str> = needles.iter().map(|n| n.key.as_str()).collect();
+            assert_eq!(
+                keys,
+                vec!["k3"],
+                "seed {}: torn mid-volume k2 at 4096 must be skipped while preserving k3 at 61440",
+                seed
+            );
+
+            let reopened2 = VolumeManager::open_with(&after, dir, 1, false, clock()).unwrap();
+            let needles2 = scan_all(&reopened2);
+            let keys2: Vec<&str> = needles2.iter().map(|n| n.key.as_str()).collect();
+            assert_eq!(
+                keys2,
+                vec!["k3"],
+                "seed {}: second reopen must still skip torn mid-volume k2 and keep k3",
+                seed
+            );
+            assert_eq!(read_via_copy_payload(&reopened2, &needles2[0]), p3);
+        }
+    }
+    assert!(
+        saw_torn_mid_volume,
+        "expected seeded crash sweep to hit torn sector 0 at 4096 with k3 indexed at 61440"
+    );
+}
+
+#[test]
+fn torn_mid_volume_sector_zero_key_or_payload_survives_two_reopens() {
+    for (name, tear_at) in [("sim/torn_mid_key", 65usize), ("sim/torn_mid_payload", 128usize)] {
+        let dir = Path::new(name);
+        let dat_path = dir.join("volume_0001.dat");
+        let idx_path = dir.join("volume_0001.idx");
+        let fs = SimFs::new();
+
+        let p2 = pattern(54_650, 71);
+        let p3 = pattern(17_285, 72);
+        let p4 = pattern(5_000, 73);
+
+        let vm = Arc::new(VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap());
+        let mut w = vm.begin_needle(1, "k2", p2.len() as u64, AWAN_FLAG_ACTIVE).unwrap();
+        assert_eq!(w.offset(), 4096);
+        w.write(&p2).unwrap();
+        let loc3 = vm.write_needle(1, "k3", &p3, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+        assert_eq!(loc3.offset, 61_440);
+        w.finish(0, 0).unwrap();
+        vm.sync_now().unwrap();
+        drop(vm);
+
+        // Tear sector 0 of offset 4096 after byte `tear_at` (leaving NeedleHeader intact)
+        // and drop k2's journal record so only k3 (61440) remains in .idx.
+        let mut dat = fs.file(&dat_path).unwrap().contents();
+        dat[4096 + tear_at..4096 + SECTOR_SIZE].fill(0);
+        let dat_file = fs.open(&dat_path, FileKind::Data, false).unwrap();
+        dat_file.write_aligned_at(0, &dat).unwrap();
+        dat_file.sync_data().unwrap();
+
+        let idx = fs.file(&idx_path).unwrap().contents();
+        let kept_idx: Vec<u8> = idx
+            .chunks_exact(IDX_RECORD as usize)
+            .filter(|rec| u64::from_le_bytes(rec[12..20].try_into().unwrap()) == 61_440)
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(kept_idx.len(), IDX_RECORD as usize);
+        let idx_file = fs.open(&idx_path, FileKind::Journal, false).unwrap();
+        idx_file.write_at(0, &kept_idx).unwrap();
+        idx_file.set_len(IDX_RECORD).unwrap();
+        idx_file.sync_data().unwrap();
+
+        let vm1 = VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap();
+        assert_eq!(vm1.offset(), 81_920);
+        let n1 = scan_all(&vm1);
+        assert_eq!(n1.iter().map(|n| n.key.as_str()).collect::<Vec<_>>(), vec!["k3"]);
+        assert_eq!(read_via_copy_payload(&vm1, &n1[0]), p3);
+
+        let loc4 = vm1.write_needle(1, "k4", &p4, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+        assert_eq!(loc4.offset, 81_920);
+        vm1.sync_now().unwrap();
+        drop(vm1);
+
+        let vm2 = VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap();
+        let n2 = scan_all(&vm2);
+        assert_eq!(n2.iter().map(|n| n.key.as_str()).collect::<Vec<_>>(), vec!["k3", "k4"]);
+        assert_eq!(read_via_copy_payload(&vm2, &n2[0]), p3);
+        assert_eq!(read_via_copy_payload(&vm2, &n2[1]), p4);
+    }
+}
