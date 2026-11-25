@@ -353,6 +353,7 @@ fn wall_clock_ms() -> u64 {
 
 impl StorageEngine {
     pub fn new(max_objects: usize, key_arena_bytes: usize, slab_bytes: usize) -> Self {
+        let _heap_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::HotTable);
         Self {
             max_objects,
             key_arena: Vec::with_capacity(key_arena_bytes),
@@ -393,6 +394,7 @@ impl StorageEngine {
     }
 
     pub fn restore_bucket(&mut self, id: u32, name: &str) {
+        let _heap_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::HotTable);
         if id >= self.next_bucket_id {
             self.next_bucket_id = id + 1;
         }
@@ -571,6 +573,7 @@ impl StorageEngine {
         flags: u16,
         now_ms: u64,
     ) -> Result<(), i32> {
+        let _heap_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::HotTable);
         if key.is_empty() || key.len() > 1024 {
             return Err(ERR_INVALID_ARG);
         }
@@ -697,6 +700,7 @@ impl StorageEngine {
     }
 
     pub fn delete_object(&mut self, bucket_id: u32, key: &[u8]) -> Result<(), i32> {
+        let _heap_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::HotTable);
         let bucket = self.buckets.get_mut(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
         let row_idx_opt = bucket.key_index.remove(key);
 

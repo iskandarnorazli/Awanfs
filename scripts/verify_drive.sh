@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Drives a fresh s3-server the way a user does (aws CLI) and keeps the evidence.
-#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart (default: all)
+#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional (default: all)
 # Needs: a built server (cargo build --release --manifest-path server/Cargo.toml), the aws CLI, curl.
 # Evidence: verification/evidence/<UTC timestamp>/ (kept after cleanup). Exit 0 only if every journey passed.
 set -uo pipefail
@@ -281,6 +281,26 @@ j_quickstart() { local qd qpid; qd="$EVID/qs" && mkdir -p "$qd/server/target/rel
     aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://quickstart-bkt/hello.txt &&
     aws --endpoint-url http://127.0.0.1:9000 s3 rb s3://quickstart-bkt
 ); }
+j_conditional() { local et1 et2 et_k2 id p1;
+  S3 create-bucket --bucket verify-cond &&
+  echo "cond-v1" >"$EVID/cond1.bin" && echo "cond-v2" >"$EVID/cond2.bin" &&
+  ! S3 put-object --bucket verify-cond --key missing --body "$EVID/cond1.bin" --if-match "*" 2>"$EVID/cond-404.err" && grep -q NoSuchKey "$EVID/cond-404.err" &&
+  et1=$(S3 put-object --bucket verify-cond --key k --body "$EVID/cond1.bin" --if-none-match "*" --query ETag --output text) &&
+  [ "$et1" = "$(md5q "$EVID/cond1.bin")" ] &&
+  ! S3 put-object --bucket verify-cond --key k --body "$EVID/cond2.bin" --if-none-match "*" 2>"$EVID/cond-inm.err" && grep -q PreconditionFailed "$EVID/cond-inm.err" &&
+  ! S3 put-object --bucket verify-cond --key k --body "$EVID/cond2.bin" --if-match '"0000"' 2>"$EVID/cond-im.err" && grep -q PreconditionFailed "$EVID/cond-im.err" &&
+  et2=$(S3 put-object --bucket verify-cond --key k --body "$EVID/cond2.bin" --if-match "$et1" --query ETag --output text) &&
+  [ "$et2" = "$(md5q "$EVID/cond2.bin")" ] &&
+  ! S3 delete-object --bucket verify-cond --key k --if-match '"0000"' 2>"$EVID/cond-del.err" && grep -q PreconditionFailed "$EVID/cond-del.err" &&
+  S3 delete-object --bucket verify-cond --key k --if-match "$et2" &&
+  ! S3 head-object --bucket verify-cond --key k 2>/dev/null &&
+  et_k2=$(S3 put-object --bucket verify-cond --key k2 --body "$EVID/cond1.bin" --query ETag --output text) &&
+  S3 delete-objects --bucket verify-cond --delete '{"Objects":[{"Key":"k2","ETag":"\"0000\""}]}' --query 'Errors[0].Code' --output text | grep -qx PreconditionFailed &&
+  S3 delete-objects --bucket verify-cond --delete "{\"Objects\":[{\"Key\":\"k2\",\"ETag\":$et_k2}]}" --query 'Deleted[0].Key' --output text | grep -qx k2 &&
+  id=$(S3 create-multipart-upload --bucket verify-cond --key mp-cond --query UploadId --output text) &&
+  p1=$(S3 upload-part --bucket verify-cond --key mp-cond --part-number 1 --upload-id "$id" --body "$EVID/cond1.bin" --query ETag --output text) &&
+  S3 complete-multipart-upload --bucket verify-cond --key mp-cond --upload-id "$id" --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$p1}]}" --if-none-match "*" >/dev/null &&
+  S3 head-object --bucket verify-cond --key mp-cond >/dev/null; }
 
 # Refuse to run a journey whose && chain is split by a `local x;` (see the note above md5q).
 masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:]]+local [^;]*;|&& *local ' || true)
@@ -288,7 +308,7 @@ masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:
 
 start || exit 1
 check doctor doctor
-features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart)
+features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional)
 [[ " ${features[*]} " == *" buckets "* ]] || check buckets j_buckets
 for f in "${features[@]}"; do check "$f" "j_$f"; done
 ls -la "$DATA" >"$EVID/data-dir.txt" 2>&1

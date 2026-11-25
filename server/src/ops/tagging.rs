@@ -136,19 +136,12 @@ fn read_stored_needle_bytes(
         .get(&vol_id)
         .cloned()
         .ok_or(VolumeError::CorruptIndex)?;
-    let crc = state
-        .needle_crc_map
-        .read()
-        .get(&(b_id, target.vol_offset))
-        .copied()
-        .ok_or(VolumeError::CorruptIndex)?;
-    vm.read_needle_bytes(vol_id, local, crc)
+    vm.read_needle_bytes_verified(b_id, local)
 }
 
 fn retire_old_needle(state: &S3ServiceState, b_id: u32, key: &str, old_offset: u64, new_offset: u64, size: u64) {
     if old_offset > 0 && old_offset != new_offset {
         state.payload_cache.remove(b_id, old_offset);
-        state.needle_crc_map.write().remove(&(b_id, old_offset));
         let raw_len = 64 + key.len() + size as usize;
         let dead_bytes = raw_len.div_ceil(4096) as u64 * 4096;
         state.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);

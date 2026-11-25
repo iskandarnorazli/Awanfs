@@ -73,14 +73,22 @@ Switches, so the same model checks the current code and the fixes:
                     began: a PUT becomes the null version at time 0, a DELETE removes it. Without
                     it recovery adds the record as a null version at its own creation time, which
                     can be later than the versioned write the client saw become current.
+  CondWriters       subset of Writers that send If-None-Match: * (commit only if key is absent, #112).
+  CheckCondUnderLock
+                    the fix for #112: conditional writers evaluate ~Visible(engine).present under
+                    the key lock at commit (Acquire, after any streamed body). Without it they
+                    check before acquiring the lock, so two racing creators can both pass.
 *)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Writers, Deleters, UseKeyLock, WriteCanFail, RecoverSkipsGaps, DeleteLogsFirst,
           Streamers, Relocate, Compactor, CompactWaitsForWriters,
-          FailLeavesRecord, IndexAfterLateFail, Versioning, ClockStepsBack, NullReplay
+          FailLeavesRecord, IndexAfterLateFail, Versioning, ClockStepsBack, NullReplay,
+          CondWriters, CheckCondUnderLock
 
 ASSUME Streamers \subseteq Writers
+ASSUME CondWriters \subseteq Writers
+ASSUME CheckCondUnderLock \in BOOLEAN
 
 Procs == Writers \cup Deleters
 Gone == [present |-> FALSE, val |-> "none"]
@@ -127,10 +135,10 @@ Steps(p) == IF p \in Deleters /\ ~DeleteLogsFirst
             THEN <<"write", "relocate", "index">>
             ELSE <<"reserve", "write", "index">>
 
-VARIABLES pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning
+VARIABLES pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning, condWon
 
-vars == <<pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning>>
-procVars == <<pc, step, off, nextOff, log, engine, lock>>
+vars == <<pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning, condWon>>
+procVars == <<pc, step, off, nextOff, log, engine, lock, condWon>>
 cVars == <<cpc, cut, snap, clock, versioning>>
 Dropped == cpc = "done"
 
@@ -175,24 +183,39 @@ Init ==
     /\ snap = {}
     /\ clock = 1
     /\ versioning = FALSE
+    /\ condWon = [p \in CondWriters |-> FALSE]
+
+\* Broken variant (#112): condition checked BEFORE taking the key lock.
+PreCheck(p) ==
+    /\ p \in CondWriters
+    /\ ~CheckCondUnderLock
+    /\ pc[p] = "start"
+    /\ pc' = [pc EXCEPT ![p] = IF Visible(engine).present THEN "done" ELSE "checked"]
+    /\ UNCHANGED <<step, off, nextOff, log, engine, lock, condWon>>
+    /\ UNCHANGED cVars
 
 \* A streamer reserves before it has the lock: the body arrives next, for as long as the
 \* client takes. Nothing is in the log yet (the header sector is written last).
 StreamReserve(p) ==
     /\ p \in Streamers
-    /\ pc[p] = "start"
+    /\ pc[p] = IF p \in CondWriters /\ ~CheckCondUnderLock THEN "checked" ELSE "start"
     /\ off' = [off EXCEPT ![p] = nextOff]
     /\ nextOff' = nextOff + 1
     /\ pc' = [pc EXCEPT ![p] = "body"]
-    /\ UNCHANGED <<step, log, engine, lock>>
+    /\ UNCHANGED <<step, log, engine, lock, condWon>>
     /\ UNCHANGED cVars
 
 Acquire(p) ==
-    /\ pc[p] = IF p \in Streamers THEN "body" ELSE "start"
+    /\ pc[p] = IF p \in Streamers THEN "body"
+               ELSE IF p \in CondWriters /\ ~CheckCondUnderLock THEN "checked"
+               ELSE "start"
     /\ IF UseKeyLock THEN lock = "free" /\ lock' = p ELSE UNCHANGED lock
-    /\ step' = [step EXCEPT ![p] = 1]
-    /\ pc' = [pc EXCEPT ![p] = Steps(p)[1]]
-    /\ UNCHANGED <<off, nextOff, log, engine>>
+    /\ IF p \in CondWriters /\ CheckCondUnderLock /\ Visible(engine).present
+       THEN /\ pc' = [pc EXCEPT ![p] = "release"]
+            /\ UNCHANGED step
+       ELSE /\ step' = [step EXCEPT ![p] = 1]
+            /\ pc' = [pc EXCEPT ![p] = Steps(p)[1]]
+    /\ UNCHANGED <<off, nextOff, log, engine, condWon>>
     /\ UNCHANGED cVars
 
 Reserve(p) ==
@@ -200,7 +223,7 @@ Reserve(p) ==
     /\ off' = [off EXCEPT ![p] = nextOff]
     /\ nextOff' = nextOff + 1
     /\ Advance(p)
-    /\ UNCHANGED <<log, engine, lock>>
+    /\ UNCHANGED <<log, engine, lock, condWon>>
     /\ UNCHANGED cVars
 
 Write(p) ==
@@ -210,14 +233,14 @@ Write(p) ==
               ELSE log \cup {[o |-> off[p], kind |-> IF p \in Writers THEN "put" ELSE "tomb", val |-> p,
                                ver |-> versioning, ts |-> IF versioning THEN Stamp ELSE clock]}
     /\ Advance(p)
-    /\ UNCHANGED <<off, nextOff, engine, lock>>
+    /\ UNCHANGED <<off, nextOff, engine, lock, condWon>>
     /\ UNCHANGED cVars
 
 Fail(p) ==
     /\ WriteCanFail
     /\ pc[p] = "write"
     /\ pc' = [pc EXCEPT ![p] = "release"]
-    /\ UNCHANGED <<step, off, nextOff, log, engine, lock>>
+    /\ UNCHANGED <<step, off, nextOff, log, engine, lock, condWon>>
     /\ UNCHANGED cVars
 
 \* Under the lock, after the streamer's own record is in the log: a record of this key at a
@@ -235,7 +258,7 @@ RelocateStep(p) ==
             /\ log' = log \cup {CopyOf(p)}
        ELSE UNCHANGED <<off, nextOff, log>>
     /\ Advance(p)
-    /\ UNCHANGED <<engine, lock>>
+    /\ UNCHANGED <<engine, lock, condWon>>
     /\ UNCHANGED cVars
 
 RelocateFail(p) ==
@@ -243,7 +266,7 @@ RelocateFail(p) ==
     /\ pc[p] = "relocate"
     /\ Relocate /\ LaterRecord(p)
     /\ pc' = [pc EXCEPT ![p] = "release"]
-    /\ UNCHANGED <<step, off, nextOff, log, engine, lock>>
+    /\ UNCHANGED <<step, off, nextOff, log, engine, lock, condWon>>
     /\ UNCHANGED cVars
 
 
@@ -255,7 +278,7 @@ LateFail(p) ==
     /\ \E r \in log : r.o = off[p]
     /\ engine' = IF IndexAfterLateFail THEN LiveApply(engine, RecOf(p)) ELSE engine
     /\ pc' = [pc EXCEPT ![p] = "release"]
-    /\ UNCHANGED <<step, off, nextOff, log, lock>>
+    /\ UNCHANGED <<step, off, nextOff, log, lock, condWon>>
     /\ UNCHANGED cVars
 
 \* A streamer's copy reaches the log, then the same failure: the copy is the newest record.
@@ -268,12 +291,13 @@ RelocateLateFail(p) ==
     /\ log' = log \cup {CopyOf(p)}
     /\ engine' = IF IndexAfterLateFail THEN LiveApply(engine, CopyOf(p)) ELSE engine
     /\ pc' = [pc EXCEPT ![p] = "release"]
-    /\ UNCHANGED <<step, lock>>
+    /\ UNCHANGED <<step, lock, condWon>>
     /\ UNCHANGED cVars
 
 Index(p) ==
     /\ pc[p] = "index"
     /\ engine' = LiveApply(engine, RecOf(p))
+    /\ condWon' = IF p \in CondWriters THEN [condWon EXCEPT ![p] = TRUE] ELSE condWon
     /\ Advance(p)
     /\ UNCHANGED <<off, nextOff, log, lock>>
     /\ UNCHANGED cVars
@@ -282,7 +306,7 @@ Release(p) ==
     /\ pc[p] = "release"
     /\ IF UseKeyLock THEN lock' = "free" ELSE UNCHANGED lock
     /\ pc' = [pc EXCEPT ![p] = "done"]
-    /\ UNCHANGED <<step, off, nextOff, log, engine>>
+    /\ UNCHANGED <<step, off, nextOff, log, engine, condWon>>
     /\ UNCHANGED cVars
 
 \* The compaction pass (#167).
@@ -309,12 +333,12 @@ CCopy ==
             /\ nextOff' = nextOff + 1
        ELSE UNCHANGED <<log, nextOff>>
     /\ cpc' = "copied"
-    /\ UNCHANGED <<cut, snap, pc, step, off, engine, lock, clock, versioning>>
+    /\ UNCHANGED <<cut, snap, pc, step, off, engine, lock, clock, versioning, condWon>>
 CDrop ==
     /\ cpc = "copied"
     /\ log' = {r \in log : r.o >= cut}
     /\ cpc' = "done"
-    /\ UNCHANGED <<cut, snap, pc, step, off, nextOff, engine, lock, clock, versioning>>
+    /\ UNCHANGED <<cut, snap, pc, step, off, nextOff, engine, lock, clock, versioning, condWon>>
 
 \* PutBucketVersioning: no key lock.
 VersionOn ==
@@ -333,6 +357,7 @@ AllDone == (\A p \in Procs : pc[p] = "done") /\ cpc \in {"idle", "done"}
 Finished == AllDone /\ UNCHANGED vars
 
 Next ==
+    \/ \E p \in Procs : PreCheck(p)
     \/ \E p \in Procs : StreamReserve(p)
     \/ \E p \in Procs : Acquire(p)
     \/ \E p \in Procs : RelocateStep(p)
@@ -352,14 +377,19 @@ Spec == Init /\ [][Next]_vars
 
 AckedStateSurvivesRestart == AllDone => Visible(Recovered) = Visible(engine)
 
+\* Two conditional creates (If-None-Match: *) cannot both succeed when no deleter runs (#112).
+AtMostOneConditionalCreateWins ==
+    Deleters = {} => Cardinality({p \in CondWriters : condWon[p]}) <= 1
+
 \* ListObjectVersions shows the same history before and after a restart.
 HistorySurvivesRestart == AllDone => Recovered.hist = engine.hist /\ Recovered.store = engine.store
 
 TypeOK ==
-    /\ pc \in [Procs -> {"start", "body", "reserve", "write", "relocate", "index", "release", "done"}]
+    /\ pc \in [Procs -> {"start", "checked", "body", "reserve", "write", "relocate", "index", "release", "done"}]
     /\ step \in [Procs -> 0..4]
     /\ nextOff \in 1..(Cardinality(Procs) + Cardinality(Streamers) + 2)
     /\ cpc \in {"idle", "sealed", "scanned", "copied", "done"}
     /\ clock \in Ts
     /\ versioning \in BOOLEAN
+    /\ condWon \in [CondWriters -> BOOLEAN]
 ====

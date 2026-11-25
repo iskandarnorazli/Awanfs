@@ -653,7 +653,6 @@ pub struct S3ServiceState {
     pub volumes: Arc<RwLock<BTreeMap<u32, Arc<VolumeManager>>>>,
     /// Held while a full volume is sealed and the next one opened.
     roll_lock: Arc<parking_lot::Mutex<()>>,
-    pub needle_crc_map: Arc<RwLock<HashMap<(u32, u64), u32>>>,
     pub payload_cache: Arc<PayloadCache>,
     /// Byte-budget admission controller for buffered in-flight request bodies (#128).
     pub body_budget: Arc<crate::memory::BodyBudget>,
@@ -736,6 +735,12 @@ impl Default for OpenLimits {
     }
 }
 
+#[derive(Debug)]
+pub enum DeleteError {
+    PreconditionFailed(Option<crate::precondition::ObjectFacts>),
+    Internal(String),
+}
+
 impl S3ServiceState {
     pub fn new() -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -777,7 +782,6 @@ impl S3ServiceState {
             volumes: Arc::new(RwLock::new(vol_mgr.iter().map(|vm| (vm.id(), Arc::clone(vm))).collect())),
             roll_lock: Arc::new(parking_lot::Mutex::new(())),
             volume_manager: Arc::new(RwLock::new(vol_mgr)),
-            needle_crc_map: Arc::new(RwLock::new(HashMap::new())),
             payload_cache: Arc::new(PayloadCache::new(crate::memory::split_cache(crate::memory::effective().cache).1.min(usize::MAX as u64) as usize)),
             body_budget: Arc::new(crate::memory::BodyBudget::new(crate::memory::effective().bodies)),
             next_vol_offset: Arc::new(RwLock::new(4096)),
@@ -871,7 +875,6 @@ impl S3ServiceState {
         // checkpoint comes next in #26.
         spill.clear().map_err(|e| format!("metadata segments: {}", e))?;
         engine.attach_spill_index(spill);
-        let needle_crc_map = Arc::new(RwLock::new(HashMap::new()));
         let mut initial_vol_offset = 4096;
 
         // 1. Replay buckets manifest
@@ -902,18 +905,16 @@ impl S3ServiceState {
         let mut mp_extents: HashMap<(u32, u64), Vec<PartExtent>> = HashMap::new();
         for vm in volumes.values() {
             initial_vol_offset = vm.offset().max(4096);
-            let mut crcs = needle_crc_map.write();
-            // Collect the log first: a multipart manifest needle is read back from the volume,
-            // and the events are applied in log order so later writes win.
-            let mut events = Vec::new();
-            let _ = vm.scan_needles(|n| events.push(n));
-            for n in events {
+            let _records_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::NeedleRecords);
+            // Stream needles directly into replay in offset order so later writes win without
+            // buffering a volume's records in memory (#323, Decision 7A).
+            let res = vm.try_scan_needles(|n| -> Result<(), String> {
                 let created_at_ms = n.created_at_ns / 1_000_000;
                 let (b_id, key, local, size, etag_hi, etag_lo, flags, crc32c) = (n.bucket_id, n.key, n.offset, n.payload_size, n.etag_hi, n.etag_lo, n.flags, n.payload_crc32c);
                 let offset = global_offset(vm.id(), local);
-                crcs.insert((b_id as u32, offset), crc32c);
                 // Keys with a version history replay through the version store (#31).
                 if flags & (crate::meta_index::FLAG_VERSIONED | crate::meta_index::FLAG_VERSION_DELETE) != 0 || version_store.has(b_id as u32, &key) {
+                    let _other_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::Other);
                     let b = b_id as u32;
                     if !version_store.has(b, &key) {
                         let before = engine.get_object(b, key.as_bytes()).ok().map(|m| null_version_of(&m));
@@ -941,7 +942,7 @@ impl S3ServiceState {
                     } else if flags & crate::meta_index::FLAG_VERSION_DELETE != 0 {
                         match vm.read_needle_bytes(vm.id(), local, crc32c) {
                             Ok(p) if p.len() == 8 => crate::versions::Event::Remove(u64::from_le_bytes(p[..8].try_into().unwrap())),
-                            _ => continue,
+                            _ => return Ok(()),
                         }
                     } else if flags & AWAN_FLAG_TOMBSTONE != 0 {
                         crate::versions::Event::Put(crate::versions::Version { ts, modified, null, marker: true, vol_offset: offset, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags })
@@ -959,12 +960,12 @@ impl S3ServiceState {
                                         key, found, supported
                                     ))
                                 }
-                                _ => continue,
+                                _ => return Ok(()),
                             }
                         } else if flags & crate::meta_index::FLAG_COMPRESSED != 0 {
                             match vm.payload_prefix(local, key.len(), crate::compress::PREFIX_LEN).ok().and_then(|p| crate::compress::logical_size(&p)) {
                                 Some(n) => (n, 0),
-                                None => continue,
+                                None => return Ok(()),
                             }
                         } else {
                             (size, 0)
@@ -986,7 +987,7 @@ impl S3ServiceState {
                         }
                     }
                     version_store.tidy(b, &key);
-                    continue;
+                    return Ok(());
                 }
                 if flags & AWAN_FLAG_TOMBSTONE != 0 {
                     let _ = engine.delete_object(b_id as u32, key.as_bytes());
@@ -1023,7 +1024,7 @@ impl S3ServiceState {
                     let size = if flags & crate::meta_index::FLAG_COMPRESSED != 0 {
                         match vm.payload_prefix(local, key.len(), crate::compress::PREFIX_LEN).ok().and_then(|p| crate::compress::logical_size(&p)) {
                             Some(n) => n,
-                            None => continue,
+                            None => return Ok(()),
                         }
                     } else {
                         size
@@ -1040,6 +1041,10 @@ impl S3ServiceState {
                         created_at_ms,
                     );
                 }
+                Ok(())
+            });
+            if let Ok(Err(e)) = res {
+                return Err(e);
             }
         }
 
@@ -1061,7 +1066,6 @@ impl S3ServiceState {
             volumes: Arc::new(RwLock::new(volumes)),
             roll_lock: Arc::new(parking_lot::Mutex::new(())),
             volume_manager: Arc::new(RwLock::new(vol_mgr)),
-            needle_crc_map,
             payload_cache: Arc::new(PayloadCache::new(crate::memory::split_cache(crate::memory::effective().cache).1.min(usize::MAX as u64) as usize)),
             body_budget: Arc::new(crate::memory::BodyBudget::new(crate::memory::effective().bodies)),
             next_vol_offset: Arc::new(RwLock::new(initial_vol_offset)),
@@ -1133,13 +1137,88 @@ impl S3ServiceState {
     /// Deletes a key: removes it, or in a versioned bucket writes a delete marker, whose
     /// version id it returns (#31).
     pub async fn delete_key(&self, b_id: u32, key: &str) -> Result<Option<String>, String> {
+        let conds = crate::precondition::DeleteConditions::default();
+        self.delete_key_conditional(b_id, key, &conds)
+            .await
+            .map_err(|e| match e {
+                DeleteError::PreconditionFailed(_) => "PreconditionFailed".to_string(),
+                DeleteError::Internal(s) => s,
+            })
+    }
+
+    pub async fn delete_key_conditional(
+        &self,
+        b_id: u32,
+        key: &str,
+        conds: &crate::precondition::DeleteConditions,
+    ) -> Result<Option<String>, DeleteError> {
         let _key_guard = self.lock_key(b_id, key).await;
+        if !conds.is_empty() {
+            let (target, facts_opt) = {
+                let vs = self.versions.read();
+                if vs.has(b_id, key) {
+                    match vs.current(b_id, key) {
+                        None => (crate::precondition::DeleteTarget::Absent, None),
+                        Some(v) if v.marker => (
+                            crate::precondition::DeleteTarget::DeleteMarker {
+                                last_modified_secs: crate::ops::object::last_modified_secs_from_ns(v.modified),
+                            },
+                            None,
+                        ),
+                        Some(v) => {
+                            let etag = crate::ops::object::version_etag(&v);
+                            let lm = crate::ops::object::last_modified_secs_from_ns(v.modified);
+                            (
+                                crate::precondition::DeleteTarget::Object {
+                                    etag: etag.clone(),
+                                    last_modified_secs: lm,
+                                    size: v.size,
+                                },
+                                Some(crate::precondition::ObjectFacts { etag, last_modified_secs: lm }),
+                            )
+                        }
+                    }
+                } else {
+                    drop(vs);
+                    match self.engine.read().get_object(b_id, key.as_bytes()) {
+                        Ok(m) => {
+                            let flags = unpack_flags(m.bucket_flags);
+                            let is_mp = flags & AWAN_FLAG_MULTIPART != 0;
+                            let etag = crate::ops::object::format_object_etag(
+                                m.etag_hi,
+                                m.etag_lo,
+                                is_mp,
+                                unpack_part_count(m.bucket_flags),
+                            );
+                            let lm = crate::ops::object::last_modified_secs_from_ms(m.created_at);
+                            (
+                                crate::precondition::DeleteTarget::Object {
+                                    etag: etag.clone(),
+                                    last_modified_secs: lm,
+                                    size: m.size,
+                                },
+                                Some(crate::precondition::ObjectFacts { etag, last_modified_secs: lm }),
+                            )
+                        }
+                        Err(_) => (crate::precondition::DeleteTarget::Absent, None),
+                    }
+                }
+            };
+            if crate::precondition::delete_precondition(conds, &target)
+                == crate::precondition::PreconditionOutcome::PreconditionFailed
+            {
+                return Err(DeleteError::PreconditionFailed(facts_opt));
+            }
+            if matches!(target, crate::precondition::DeleteTarget::Absent) {
+                return Ok(None);
+            }
+        }
         self.hook("delete_start", key);
         if let Some((extra, ts)) = self.version_stamp(b_id, key) {
             let flags = AWAN_FLAG_TOMBSTONE | extra;
             // A marker whole in the volume is replayed by recovery: it takes effect here too,
             // and the request still answers an error (#184, owner decision 4B).
-            let (loc, g, late) = match self.write_to_active_at(b_id, key, &[], flags, 0, 0, Some(ts)) {
+            let (_loc, g, late) = match self.write_to_active_at(b_id, key, &[], flags, 0, 0, Some(ts)) {
                 Ok((vm, loc, g)) => {
                     self.hook("delete_marker_written", key);
                     self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
@@ -1151,14 +1230,13 @@ impl S3ServiceState {
                     self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                     (loc, global_offset(loc.volume_id, loc.offset), Some(format!("could not record the delete: {}", cause)))
                 }
-                Err(e) => return Err(format!("could not record the delete: {:?}", e)),
+                Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
             };
-            self.needle_crc_map.write().insert((b_id, g), loc.payload_crc32c);
             self.mvcc.tombstone(b_id, key);
             let v = crate::versions::Version { ts, modified: ts, null: flags & crate::meta_index::FLAG_NULL_ID != 0, marker: true, vol_offset: g, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags };
-            self.record_version(b_id, key, crate::versions::Event::Put(v)).map_err(|c| format!("index error {} for the delete marker", c))?;
+            self.record_version(b_id, key, crate::versions::Event::Put(v)).map_err(|c| DeleteError::Internal(format!("index error {} for the delete marker", c)))?;
             if let Some(e) = late {
-                return Err(e);
+                return Err(DeleteError::Internal(e));
             }
             return Ok(Some(v.id_string()));
         }
@@ -1177,7 +1255,7 @@ impl S3ServiceState {
                 self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                 Some(format!("could not record the delete: {}", cause))
             }
-            Err(e) => return Err(format!("could not record the delete: {:?}", e)),
+            Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
         };
         self.mvcc.tombstone(b_id, key);
         let old_info = {
@@ -1189,14 +1267,13 @@ impl S3ServiceState {
         if let Some((off, sz)) = old_info {
             if off > 0 {
                 self.payload_cache.remove(b_id, off);
-                self.needle_crc_map.write().remove(&(b_id, off));
                 let raw_len = 64 + key.len() + sz as usize;
                 let dead_bytes = raw_len.div_ceil(4096) as u64 * 4096;
                 self.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
             }
         }
         match late {
-            Some(e) => Err(e),
+            Some(e) => Err(DeleteError::Internal(e)),
             None => Ok(None),
         }
     }
@@ -1204,31 +1281,76 @@ impl S3ServiceState {
     /// `DELETE ?versionId=`: removes one version for good (#31). Returns it, or `None` when the
     /// key has no such version.
     pub async fn delete_version(&self, b_id: u32, key: &str, id: u64) -> Result<Option<crate::versions::Version>, String> {
+        let conds = crate::precondition::DeleteConditions::default();
+        self.delete_version_conditional(b_id, key, id, &conds)
+            .await
+            .map_err(|e| match e {
+                DeleteError::PreconditionFailed(_) => "PreconditionFailed".to_string(),
+                DeleteError::Internal(s) => s,
+            })
+    }
+
+    pub async fn delete_version_conditional(
+        &self,
+        b_id: u32,
+        key: &str,
+        id: u64,
+        conds: &crate::precondition::DeleteConditions,
+    ) -> Result<Option<crate::versions::Version>, DeleteError> {
         let _key_guard = self.lock_key(b_id, key).await;
         let before = self.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| null_version_of(&m));
-        let (target, uncovers_object) = {
-            let mut vs = self.versions.write();
+        let (target, uncovers_object, needs_start) = {
+            let vs = self.versions.read();
             if !vs.has(b_id, key) {
                 // The object of a key with no history is its null version.
                 if id != 0 || before.is_none() {
                     return Ok(None);
                 }
-                vs.start(b_id, key, before);
+                (before, false, true)
+            } else {
+                let target = vs.find(b_id, key, id);
+                let uncovers = vs
+                    .versions(b_id, key)
+                    .and_then(|l| l.iter().find(|x| x.id() != id))
+                    .is_some_and(|next| !next.marker);
+                (target, uncovers, false)
             }
-            let target = vs.find(b_id, key, id);
-            let uncovers = vs
-                .versions(b_id, key)
-                .and_then(|l| l.iter().find(|x| x.id() != id))
-                .is_some_and(|next| !next.marker);
-            (target, uncovers)
         };
         let Some(target) = target else {
-            self.versions.write().tidy(b_id, key);
             return Ok(None);
         };
+        if !conds.is_empty() {
+            let (del_target, facts_opt) = if target.marker {
+                (
+                    crate::precondition::DeleteTarget::DeleteMarker {
+                        last_modified_secs: crate::ops::object::last_modified_secs_from_ns(target.modified),
+                    },
+                    None,
+                )
+            } else {
+                let etag = crate::ops::object::version_etag(&target);
+                let lm = crate::ops::object::last_modified_secs_from_ns(target.modified);
+                (
+                    crate::precondition::DeleteTarget::Object {
+                        etag: etag.clone(),
+                        last_modified_secs: lm,
+                        size: target.size,
+                    },
+                    Some(crate::precondition::ObjectFacts { etag, last_modified_secs: lm }),
+                )
+            };
+            if crate::precondition::delete_precondition(conds, &del_target)
+                == crate::precondition::PreconditionOutcome::PreconditionFailed
+            {
+                return Err(DeleteError::PreconditionFailed(facts_opt));
+            }
+        }
+        if needs_start {
+            self.versions.write().start(b_id, key, before);
+        }
         if uncovers_object {
             if let Err(code) = self.engine.read().has_room_for(b_id, key.as_bytes()) {
-                return Err(format!("index error {} before deleting a version", code));
+                return Err(DeleteError::Internal(format!("index error {} before deleting a version", code)));
             }
         }
         let flags = AWAN_FLAG_TOMBSTONE | crate::meta_index::FLAG_VERSION_DELETE;
@@ -1245,11 +1367,11 @@ impl S3ServiceState {
                 self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                 Some(format!("could not record the delete: {}", cause))
             }
-            Err(e) => return Err(format!("could not record the delete: {:?}", e)),
+            Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
         };
-        self.record_version(b_id, key, crate::versions::Event::Remove(id)).map_err(|c| format!("index error {} after deleting a version", c))?;
+        self.record_version(b_id, key, crate::versions::Event::Remove(id)).map_err(|c| DeleteError::Internal(format!("index error {} after deleting a version", c)))?;
         match late {
-            Some(e) => Err(e),
+            Some(e) => Err(DeleteError::Internal(e)),
             None => Ok(Some(target)),
         }
     }
@@ -1353,7 +1475,6 @@ impl S3ServiceState {
         for v in dead {
             if v.vol_offset > 0 {
                 self.payload_cache.remove(b_id, v.vol_offset);
-                self.needle_crc_map.write().remove(&(b_id, v.vol_offset));
                 let dead_bytes = (64 + key.len() as u64 + v.size).div_ceil(4096) * 4096;
                 self.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
             }
@@ -1556,11 +1677,6 @@ impl S3ServiceState {
                     return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("index error {} while moving {}", code, key))));
                 }
             }
-            {
-                let mut crcs = self.needle_crc_map.write();
-                crcs.remove(&(b_id, g_old));
-                crcs.insert((b_id, g_new), loc.payload_crc32c);
-            }
             self.payload_cache.remove(b_id, g_old);
             report.live_needles_copied += 1;
             report.new_locations.insert(key, loc);
@@ -1682,14 +1798,13 @@ impl S3ServiceState {
         Ok((self.store_payload_with(b_id, key, attrs, data, flags, etag_hi, etag_lo, created_at).await?, flags))
     }
 
-    /// The payload bytes as stored, verified against their CRC.
+    /// The payload bytes as stored, verified against the CRC in its needle header.
     fn read_stored(&self, b_id: u32, vol_offset: u64) -> Result<Bytes, VolumeError> {
         if vol_offset == 0 {
             return Err(VolumeError::CorruptIndex);
         }
         let (vm, local) = self.volume_for(vol_offset)?;
-        let crc = self.needle_crc_map.read().get(&(b_id, vol_offset)).copied().ok_or(VolumeError::CorruptIndex)?;
-        vm.read_needle_bytes(vm.id(), local, crc)
+        vm.read_needle_bytes_verified(b_id, local)
     }
 
     /// Bytes `start..=end` of a compressed object, decoding only the blocks they overlap.
@@ -1774,10 +1889,8 @@ impl S3ServiceState {
         }
     }
 
-    /// Bookkeeping for a needle now in the volume: its payload CRC, which reads verify against,
-    /// and the volume bytes it uses.
-    pub fn note_record(&self, b_id: u32, loc: &NeedleLocation) {
-        self.needle_crc_map.write().insert((b_id, global_offset(loc.volume_id, loc.offset)), loc.payload_crc32c);
+    /// Bookkeeping for a needle now in the volume: the volume bytes it uses.
+    pub fn note_record(&self, _b_id: u32, loc: &NeedleLocation) {
         self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
     }
 
@@ -2020,13 +2133,7 @@ impl S3ServiceState {
             return Ok(cached);
         }
         let (vm, local) = self.volume_for(vol_offset)?;
-        let expected_crc = self
-            .needle_crc_map
-            .read()
-            .get(&(b_id, vol_offset))
-            .copied()
-            .ok_or(VolumeError::CorruptIndex)?;
-        let bytes = vm.read_needle_bytes(vm.id(), local, expected_crc)?;
+        let bytes = vm.read_needle_bytes_verified(b_id, local)?;
         if bytes.len() != expected_size {
             return Err(VolumeError::CorruptIndex);
         }
@@ -2046,8 +2153,7 @@ impl S3ServiceState {
             return Err(VolumeError::CorruptIndex);
         }
         let (vm, local) = self.volume_for(vol_offset)?;
-        let expected_crc = self.needle_crc_map.read().get(&(b_id, vol_offset)).copied().ok_or(VolumeError::CorruptIndex)?;
-        let (payload_at, stored) = vm.payload_extent(local)?;
+        let (payload_at, stored, expected_crc) = vm.payload_extent_with_crc(b_id, local)?;
         if stored != size {
             return Err(VolumeError::CorruptIndex);
         }
@@ -2092,15 +2198,11 @@ impl S3ServiceState {
                 }
                 None => {
                     let (vm, local) = self.volume_for(ext.vol_offset)?;
-                    let (payload_at, stored) = vm.payload_extent(local)?;
+                    let (payload_at, stored, expected_crc) = vm.payload_extent_with_crc(b_id, local)?;
                     if stored != ext.part_size {
                         return Err(VolumeError::CorruptIndex);
                     }
-                    let check = if verify && whole {
-                        Some(self.needle_crc_map.read().get(&(b_id, ext.vol_offset)).copied().ok_or(VolumeError::CorruptIndex)?)
-                    } else {
-                        None
-                    };
+                    let check = (verify && whole).then_some(expected_crc);
                     let direct = seg_len >= self.direct_read_min.load(Ordering::Relaxed);
                     Segment { source: Source::Volume { vm, direct }, at: payload_at + in_part, len: seg_len, verify: check }
                 }
@@ -2121,12 +2223,11 @@ impl S3ServiceState {
             return Err(VolumeError::CorruptIndex);
         }
         let (vm, local) = self.volume_for(vol_offset)?;
-        let expected_crc = self.needle_crc_map.read().get(&(b_id, vol_offset)).copied().ok_or(VolumeError::CorruptIndex)?;
-        let bytes = vm.needle_payload_unverified(local)?;
-        if bytes.len() != expected_size {
+        let (header, bytes) = vm.needle_header_and_payload_unverified(local)?;
+        if header.bucket_id != b_id as u16 || bytes.len() != expected_size {
             return Err(VolumeError::CorruptIndex);
         }
-        Ok((bytes, expected_crc))
+        Ok((bytes, header.payload_crc32c))
     }
 
     pub fn allocate_offset(&self, size: usize) -> u64 {
