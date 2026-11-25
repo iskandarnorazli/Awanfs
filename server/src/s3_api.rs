@@ -2559,12 +2559,16 @@ impl S3ServiceState {
         flags: u16,
         etag_hi: u64,
         etag_lo: u64,
+        created_at: Option<u64>,
     ) -> Result<(Arc<VolumeManager>, NeedleLocation, u64), VolumeError> {
         // Read in chunks, not through the mapping (#185); a CRC mismatch drops the writer
         // before its header is written, so the copy leaves only a gap. The copy carries the
         // same attributes block, byte for byte (#150).
         let attrs = from_vm.read_attrs(from.offset)?.encode().map_err(|_| VolumeError::CorruptIndex)?;
         let mut writer = self.begin_needle_on_active(b_id, key, &attrs, from.payload_size, flags)?;
+        if let Some(ts) = created_at {
+            writer.set_created_at(ts);
+        }
         from_vm.copy_payload(from.offset, from.payload_crc32c, |piece| writer.write(piece))?;
         let vm = Arc::clone(writer.volume());
         let g = global_offset(vm.id(), writer.offset());
@@ -2686,7 +2690,7 @@ impl S3ServiceState {
                 }
                 last_off = u.vol_offset;
                 let (vm, local) = self.volume_for(u.vol_offset)?;
-                let payload = vm.read_needle_bytes_verified(b_id, local)?;
+                let payload = vm.read_needle_bytes_for_key(b_id, key_hash_of(key), local)?;
                 let (upd_vid, upd_attrs) =
                     crate::attrs::decode_attr_update(&payload).map_err(|_| VolumeError::CorruptIndex)?;
                 if upd_vid != target_version_id {
@@ -2841,7 +2845,19 @@ impl S3ServiceState {
                             });
                             (ks, 0u64, Some("null".to_string()), upper, None)
                         }
-                        (Some(_), _) => (crate::fsm::KeyState::Absent, parsed_vid.unwrap(), None, 0, None),
+                        (Some(req_vid), Some(m)) => {
+                            let updates = self.attr_updates.get(b_id, key, 0);
+                            let upper = (m.created_at + 1).saturating_mul(1_000_000);
+                            let ks = crate::fsm::KeyState::Unversioned(crate::fsm::KeyObject {
+                                version_id: 0,
+                                created_at_ns: m.created_at.saturating_mul(1_000_000),
+                                vol_offset: m.vol_offset,
+                                flags: unpack_flags(m.bucket_flags),
+                                updates,
+                            });
+                            (ks, req_vid, None, upper, None)
+                        }
+                        (Some(req_vid), None) => (crate::fsm::KeyState::Absent, req_vid, None, 0, None),
                         (None, None) => (crate::fsm::KeyState::Absent, 0, None, 0, None),
                     }
                 } else {

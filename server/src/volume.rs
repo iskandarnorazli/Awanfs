@@ -1467,12 +1467,37 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         Ok(payload)
     }
 
-    /// Reads a needle payload from the mapping and verifies it against the `payload_crc32c`
+    /// Reads a needle payload from the mapping and verifies `bucket_id` and `payload_crc32c`
     /// stored in its 64-byte CRC-protected header (#323, Decision 7A).
     pub fn read_needle_bytes_verified(&self, bucket_id: u32, offset: u64) -> Result<Bytes, VolumeError> {
+        self.read_needle_bytes_checked(bucket_id, None, offset)
+    }
+
+    /// Reads a needle payload from the mapping and verifies `bucket_id`, `key_hash`, and
+    /// `payload_crc32c` against its CRC-protected header (#203).
+    pub fn read_needle_bytes_for_key(
+        &self,
+        bucket_id: u32,
+        key_hash: u64,
+        offset: u64,
+    ) -> Result<Bytes, VolumeError> {
+        self.read_needle_bytes_checked(bucket_id, Some(key_hash), offset)
+    }
+
+    fn read_needle_bytes_checked(
+        &self,
+        bucket_id: u32,
+        expected_key_hash: Option<u64>,
+        offset: u64,
+    ) -> Result<Bytes, VolumeError> {
         let (header, payload) = self.needle_header_and_payload_unverified(offset)?;
         if header.bucket_id != bucket_id as u16 {
             return Err(VolumeError::CorruptIndex);
+        }
+        if let Some(kh) = expected_key_hash {
+            if header.key_hash != kh {
+                return Err(VolumeError::CorruptIndex);
+            }
         }
         let actual_crc = crc32c::crc32c(&payload);
         self.work.payload_verify(payload.len() as u64);

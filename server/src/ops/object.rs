@@ -848,8 +848,13 @@ pub async fn copy_object(
             if precondition(headers, Some(&src_facts), true) != PreconditionOutcome::Proceed {
                 return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
             }
+            let target_vid = state
+                .versions
+                .read()
+                .current(src_b_id, src_key)
+                .map_or(0, |v| v.id());
             src_view = state
-                .object_view_for(src_b_id, src_key, 0, m.vol_offset, flags)
+                .object_view_for(src_b_id, src_key, target_vid, m.vol_offset, flags)
                 .map(|view| view.attrs);
             state
                 .read_object_bytes(src_b_id, src_key, m.vol_offset, m.size, flags)
@@ -1536,7 +1541,10 @@ pub async fn put_object(
             }
             let moved = {
                 let (st, k, fvm) = (Arc::clone(&state), key.to_string(), Arc::clone(&first_vm));
-                tokio::task::spawn_blocking(move || st.relocate_needle(b_id, &k, &fvm, &first_loc, flags, etag_hi, etag_lo)).await
+                tokio::task::spawn_blocking(move || {
+                    st.relocate_needle(b_id, &k, &fvm, &first_loc, flags, etag_hi, etag_lo, Some(created_ns))
+                })
+                .await
             };
             match moved {
                 Ok(Ok(moved)) => moved,
