@@ -814,15 +814,44 @@ pub async fn complete_multipart_upload(
                     part_raws.push(raw);
                 }
                 let computed = if cksum_type == "FULL_OBJECT" {
-                    let mut full_hasher = crate::checksum::Checksum::new(alg);
-                    for ext in &extents {
-                        let bytes = match state.part_bytes(b_id, ext) {
-                            Ok(b) => b,
-                            Err(e) => return Ok(internal_error_response(key, &format!("could not read part for checksum: {:?}", e))),
-                        };
-                        full_hasher.update(&bytes);
+                    let state_c = Arc::clone(&state);
+                    let extents_c = extents.clone();
+                    let key_c = key.to_string();
+                    let res = tokio::task::spawn_blocking(move || -> Result<String, crate::volume::VolumeError> {
+                        let mut full_hasher = crate::checksum::Checksum::new(alg);
+                        let chunk_len = crate::stream_read::read_chunk();
+                        let mut buf = vec![0u8; chunk_len];
+                        for ext in &extents_c {
+                            if total_size <= crate::s3_api::VERIFY_WHILE_SENDING_MIN
+                                && ext.part_size <= crate::s3_api::VERIFY_WHILE_SENDING_MIN
+                            {
+                                let bytes = state_c.part_bytes(b_id, ext)?;
+                                full_hasher.update(&bytes);
+                                continue;
+                            }
+                            if let Some(ref path) = ext.staged_path {
+                                let file = std::fs::File::open(path)?;
+                                let mut pos = 0u64;
+                                while pos < ext.part_size {
+                                    let n = (chunk_len as u64).min(ext.part_size - pos) as usize;
+                                    state_c.work.disk_read();
+                                    crate::direct_io::read_exact_at(&file, pos, &mut buf[..n])?;
+                                    full_hasher.update(&buf[..n]);
+                                    pos += n as u64;
+                                }
+                            } else {
+                                let bytes = state_c.read_part_unmapped(b_id, &key_c, ext)?;
+                                full_hasher.update(&bytes);
+                            }
+                        }
+                        Ok(full_hasher.finish_base64())
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => return Ok(internal_error_response(key, &format!("could not read part for checksum: {:?}", e))),
+                        Err(e) => return Ok(internal_error_response(key, &format!("checksum task failed: {:?}", e))),
                     }
-                    full_hasher.finish_base64()
                 } else {
                     crate::checksum::composite(alg, &part_raws)
                 };
@@ -1162,23 +1191,39 @@ pub async fn upload_part_copy(
         }
     }
 
-    let bytes = match (version_opt, src_meta) {
-        (Some(v), _) => state.read_version_bytes(src_b_id, src_key, &v),
-        (None, Some(m)) => {
-            let flags = unpack_flags(m.bucket_flags);
-            state.read_object_bytes(src_b_id, src_key, m.vol_offset, m.size, flags)
+    let part_bytes = if src_size > crate::s3_api::VERIFY_WHILE_SENDING_MIN {
+        let (vol_offset, flags) = match (version_opt, src_meta) {
+            (Some(v), _) => (v.vol_offset, v.flags),
+            (None, Some(m)) => (m.vol_offset, unpack_flags(m.bucket_flags)),
+            _ => unreachable!(),
+        };
+        let (start, len) = match range_req {
+            Some((s, e)) => (s, e - s + 1),
+            None => (0, src_size),
+        };
+        match state.read_object_range_unmapped(src_b_id, src_key, vol_offset, src_size, flags, start, len) {
+            Ok(b) => b,
+            Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
         }
-        _ => unreachable!(),
+    } else {
+        let bytes = match (version_opt, src_meta) {
+            (Some(v), _) => state.read_version_bytes(src_b_id, src_key, &v),
+            (None, Some(m)) => {
+                let flags = unpack_flags(m.bucket_flags);
+                state.read_object_bytes(src_b_id, src_key, m.vol_offset, m.size, flags)
+            }
+            _ => unreachable!(),
+        };
+        let bytes = match bytes {
+            Ok(b) => b,
+            Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
+        };
+        match range_req {
+            Some((start, end)) => bytes.slice(start as usize..=(end as usize).min(bytes.len().saturating_sub(1))),
+            None => bytes,
+        }
     };
-    let bytes = match bytes {
-        Ok(b) => b,
-        Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
-    };
-
-    let part_slice: &[u8] = match range_req {
-        Some((start, end)) => &bytes[start as usize..=(end as usize).min(bytes.len().saturating_sub(1))],
-        None => &bytes[..],
-    };
+    let part_slice: &[u8] = &part_bytes[..];
 
     let (hi, lo, hex, raw_md5) = compute_md5(part_slice);
     let staged_path = match state.multipart.write_staged_part(upload_id, part_num, part_slice) {

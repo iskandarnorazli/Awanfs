@@ -723,6 +723,8 @@ pub struct S3ServiceState {
     /// `0x200` attribute-update needles ignored during recovery because their target was
     /// absent, deleted, or a delete marker.
     pub attr_updates_ignored: Arc<AtomicU64>,
+    /// Background needle scrub state and last pass report (#155).
+    pub scrub: Arc<crate::scrub::ScrubManager>,
 }
 
 #[inline]
@@ -1025,6 +1027,7 @@ impl S3ServiceState {
             region: "us-east-1".to_string(),
             attr_updates: Arc::new(AttrUpdateStore::default()),
             attr_updates_ignored: Arc::new(AtomicU64::new(0)),
+            scrub: Arc::new(crate::scrub::ScrubManager::new()),
         }
     }
 
@@ -1529,6 +1532,7 @@ impl S3ServiceState {
             region: "us-east-1".to_string(),
             attr_updates,
             attr_updates_ignored: Arc::new(AtomicU64::new(ignored_attr_updates)),
+            scrub: Arc::new(crate::scrub::ScrubManager::new()),
         })
     }
 
@@ -1960,20 +1964,54 @@ impl S3ServiceState {
     }
 
     /// The part list in the manifest needle at `vol_offset`.
-    fn manifest_extents(&self, b_id: u32, vol_offset: u64) -> Option<Vec<PartExtent>> {
+    pub fn manifest_extents(&self, b_id: u32, vol_offset: u64) -> Option<Vec<PartExtent>> {
         let bytes = self.read_stored(b_id, vol_offset).ok()?;
         decode_extents_manifest(&self.multipart.staging_dir, &bytes).ok().map(|(_, e)| e)
     }
 
-    /// The bytes of one version (#31).
+    /// Reads one multipart part without creating an mmap in `staged_mmaps` (#155).
+    pub fn read_part_unmapped(&self, b_id: u32, key: &str, ext: &PartExtent) -> Result<Bytes, VolumeError> {
+        if let Some(ref path) = ext.staged_path {
+            let file = std::fs::File::open(path)?;
+            let mut out = vec![0u8; ext.part_size as usize];
+            if !out.is_empty() {
+                self.work.disk_read();
+                crate::direct_io::read_exact_at(&file, 0, &mut out)?;
+            }
+            return Ok(Bytes::from(out));
+        }
+        if ext.vol_offset == 0 {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let (vm, local) = self.volume_for(ext.vol_offset)?;
+        match vm.read_needle_unmapped_verified(b_id, local) {
+            Ok(bytes) => {
+                if bytes.len() as u64 != ext.part_size {
+                    return Err(VolumeError::CorruptIndex);
+                }
+                Ok(bytes)
+            }
+            Err(e) => {
+                self.record_read_corruption(ext.vol_offset, key, &e);
+                Err(e)
+            }
+        }
+    }
+
+    /// The bytes of one version (#31). Large multipart/single objects read without mapping (#155).
     pub fn read_version_bytes(&self, b_id: u32, key: &str, v: &crate::versions::Version) -> Result<Bytes, VolumeError> {
         if v.flags & AWAN_FLAG_MULTIPART == 0 {
             return self.read_object_bytes(b_id, key, v.vol_offset, v.size, v.flags);
         }
         let extents = self.manifest_extents(b_id, v.vol_offset).ok_or(VolumeError::CorruptIndex)?;
+        let large = v.size > VERIFY_WHILE_SENDING_MIN;
         let mut out = Vec::with_capacity(v.size as usize);
         for ext in extents {
-            let chunk = self.part_bytes(b_id, &ext)?;
+            let chunk = if large || ext.part_size > VERIFY_WHILE_SENDING_MIN {
+                self.read_part_unmapped(b_id, key, &ext)?
+            } else {
+                self.part_bytes(b_id, &ext)?
+            };
             let n = (ext.part_size as usize).min(chunk.len());
             out.extend_from_slice(&chunk[..n]);
         }
@@ -2105,6 +2143,29 @@ impl S3ServiceState {
             let now_ms = state.clock.now_ns() / 1_000_000;
             let (_removed, more) = state.multipart.cleanup_expired(now_ms, max_age_ms, budget);
             Ok(more)
+        });
+    }
+
+    /// Runs one complete background scrub pass across all open volumes (#155).
+    pub fn scrub_pass(&self) -> crate::scrub::ScrubReport {
+        let vols: Vec<Arc<VolumeManager>> = self.volumes.read().values().cloned().collect();
+        let rate = self.scrub.rate_mib_per_sec();
+        let stop = self.scheduler.shutdown_flag();
+        self.scrub.run_pass(&vols, rate, &stop)
+    }
+
+    /// Registers the periodic background needle scrub on the scheduler (#155).
+    /// `mib_per_sec == 0` disables background scrubbing.
+    pub fn start_scrub(self: &Arc<Self>, every: std::time::Duration, mib_per_sec: u64) {
+        self.scrub.set_rate_mib_per_sec(mib_per_sec);
+        if mib_per_sec == 0 {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        self.scheduler.register("scrub", every, move |_budget| {
+            let Some(state) = weak.upgrade() else { return Ok(false) };
+            let _report = state.scrub_pass();
+            Ok(false)
         });
     }
 
@@ -2288,23 +2349,139 @@ impl S3ServiceState {
         }
     }
 
+    /// Records a read-path header or payload CRC32C failure in metrics, logs, and scrub (#155).
+    pub fn record_read_corruption(&self, vol_offset: u64, key: &str, err: &VolumeError) {
+        let is_checksum = matches!(
+            err,
+            VolumeError::CrcMismatch { .. }
+                | VolumeError::HeaderCrcMismatch { .. }
+                | VolumeError::InvalidMagic { .. }
+        );
+        if !is_checksum {
+            return;
+        }
+        let (vol_id, local) = split_offset(vol_offset);
+        self.read_checksum_failures.fetch_add(1, Ordering::SeqCst);
+        tracing::error!(
+            object = %key,
+            volume_id = vol_id,
+            offset = local,
+            error = ?err,
+            "checksum mismatch on read"
+        );
+        self.scrub.mark_bad(vol_id, local, key, format!("{:?}", err));
+    }
+
     /// The bytes of an object, single or multipart, verified.
     pub fn read_object_bytes(&self, b_id: u32, key: &str, vol_offset: u64, size: u64, flags: u16) -> Result<Bytes, VolumeError> {
         if flags & crate::meta_index::FLAG_COMPRESSED != 0 {
             return self.load_compressed(b_id, vol_offset, size);
         }
         if flags & AWAN_FLAG_MULTIPART == 0 {
-            return self.load_payload(b_id, vol_offset, size as usize);
+            if size > VERIFY_WHILE_SENDING_MIN {
+                if vol_offset == 0 {
+                    return Err(VolumeError::CorruptIndex);
+                }
+                let (vm, local) = self.volume_for(vol_offset)?;
+                return match vm.read_needle_unmapped_verified(b_id, local) {
+                    Ok(b) if b.len() as u64 == size => Ok(b),
+                    Ok(_) => Err(VolumeError::CorruptIndex),
+                    Err(e) => {
+                        self.record_read_corruption(vol_offset, key, &e);
+                        Err(e)
+                    }
+                };
+            }
+            return self.load_payload_for(b_id, key, vol_offset, size as usize);
         }
         let extents = self.multipart.get_completed_extents(b_id, key).ok_or(VolumeError::CorruptIndex)?;
+        let large = size > VERIFY_WHILE_SENDING_MIN;
         let mut out = Vec::with_capacity(size as usize);
         for ext in extents {
-            let chunk = self.part_bytes(b_id, &ext)?;
+            let chunk = if large || ext.part_size > VERIFY_WHILE_SENDING_MIN {
+                self.read_part_unmapped(b_id, key, &ext)?
+            } else {
+                self.part_bytes(b_id, &ext)?
+            };
             let n = (ext.part_size as usize).min(chunk.len());
             self.work.payload_copy(n as u64);
             out.extend_from_slice(&chunk[..n]);
         }
         if out.len() as u64 != size {
+            return Err(VolumeError::CorruptIndex);
+        }
+        Ok(Bytes::from(out))
+    }
+
+    /// Reads an inclusive-exclusive byte range `[start, start + len)` of a single or multipart
+    /// object using positioned reads (never mapping large parts or volumes, #155).
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_object_range_unmapped(
+        &self,
+        b_id: u32,
+        key: &str,
+        vol_offset: u64,
+        size: u64,
+        flags: u16,
+        start: u64,
+        len: u64,
+    ) -> Result<Bytes, VolumeError> {
+        if start.checked_add(len).is_none_or(|end| end > size) {
+            return Err(VolumeError::CorruptIndex);
+        }
+        if flags & crate::meta_index::FLAG_COMPRESSED != 0 {
+            let full = self.load_compressed(b_id, vol_offset, size)?;
+            return Ok(full.slice(start as usize..(start + len) as usize));
+        }
+        if flags & AWAN_FLAG_MULTIPART == 0 {
+            if vol_offset == 0 {
+                return Err(VolumeError::CorruptIndex);
+            }
+            let (vm, local) = self.volume_for(vol_offset)?;
+            return match vm.read_needle_range_unmapped(b_id, local, start, len) {
+                Ok(b) => Ok(b),
+                Err(e) => {
+                    self.record_read_corruption(vol_offset, key, &e);
+                    Err(e)
+                }
+            };
+        }
+        let extents = self
+            .manifest_extents(b_id, vol_offset)
+            .or_else(|| self.multipart.get_completed_extents(b_id, key))
+            .ok_or(VolumeError::CorruptIndex)?;
+        let end = start + len;
+        let mut out = Vec::with_capacity(len as usize);
+        for ext in &extents {
+            let p_start = ext.cumulative_end - ext.part_size;
+            let (lo, hi) = (start.max(p_start), end.min(ext.cumulative_end));
+            if lo >= hi {
+                continue;
+            }
+            let in_part = lo - p_start;
+            let take = (hi - lo) as usize;
+            let mut buf = vec![0u8; take];
+            match &ext.staged_path {
+                Some(path) => {
+                    let file = std::fs::File::open(path)?;
+                    self.work.disk_read();
+                    crate::direct_io::read_exact_at(&file, in_part, &mut buf)?;
+                }
+                None => {
+                    let (vm, local) = self.volume_for(ext.vol_offset)?;
+                    let slice = match vm.read_needle_range_unmapped(b_id, local, in_part, take as u64) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            self.record_read_corruption(ext.vol_offset, key, &e);
+                            return Err(e);
+                        }
+                    };
+                    buf.copy_from_slice(&slice);
+                }
+            }
+            out.extend_from_slice(&buf);
+        }
+        if out.len() as u64 != len {
             return Err(VolumeError::CorruptIndex);
         }
         Ok(Bytes::from(out))
@@ -2352,6 +2529,163 @@ impl S3ServiceState {
         self.iam.read().as_ref().map(|i| i.current().compresses(bucket)).unwrap_or(false)
     }
 
+    /// Copies a large object (> 4 MiB, single or multipart) into a new needle on the active
+    /// volume using 1 MiB positioned reads and writes, without mapping parts or buffering the
+    /// whole payload on the heap (#155).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream_copy_object(
+        self: &Arc<Self>,
+        dst_b_id: u32,
+        dst_key: &str,
+        dst_attrs: &[u8],
+        dst_flags: u16,
+        src_b_id: u32,
+        src_key: &str,
+        src_vol_offset: u64,
+        src_size: u64,
+        src_flags: u16,
+        etag_hi: u64,
+        etag_lo: u64,
+        created_at: u64,
+    ) -> Result<(u64, u16), VolumeError> {
+        let eff_flags = if dst_attrs.is_empty() {
+            dst_flags
+        } else {
+            dst_flags | crate::meta_index::FLAG_ATTRS
+        };
+        let state = Arc::clone(self);
+        let dst_key_s = dst_key.to_string();
+        let src_key_s = src_key.to_string();
+        let attrs_vec = dst_attrs.to_vec();
+        let res = tokio::task::spawn_blocking(move || -> Result<(Arc<VolumeManager>, NeedleLocation, u64), VolumeError> {
+            let mut writer = state.begin_needle_on_active(dst_b_id, &dst_key_s, &attrs_vec, src_size, eff_flags)?;
+            writer.set_created_at(created_at);
+
+            let copy_res: Result<(), VolumeError> = if src_flags & AWAN_FLAG_MULTIPART == 0 {
+                let (src_vm, src_local) = state.volume_for(src_vol_offset)?;
+                let (_, stored_sz, expected_crc) = match src_vm.payload_extent_with_crc(src_b_id, src_local) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        state.record_read_corruption(src_vol_offset, &src_key_s, &e);
+                        return Err(e);
+                    }
+                };
+                if stored_sz != src_size {
+                    return Err(VolumeError::CorruptIndex);
+                }
+                if let Err(e) = src_vm.copy_payload(src_local, expected_crc, |piece| writer.write(piece)) {
+                    state.record_read_corruption(src_vol_offset, &src_key_s, &e);
+                    Err(e)
+                } else {
+                    Ok(())
+                }
+            } else {
+                let extents = state
+                    .manifest_extents(src_b_id, src_vol_offset)
+                    .or_else(|| state.multipart.get_completed_extents(src_b_id, &src_key_s))
+                    .ok_or(VolumeError::CorruptIndex)?;
+                let mut copied = 0u64;
+                let mut buf = vec![0u8; crate::volume::STREAM_CHUNK];
+                let mut res = Ok(());
+                for ext in &extents {
+                    if let Some(ref path) = ext.staged_path {
+                        let file = match std::fs::File::open(path) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                res = Err(VolumeError::Io(e));
+                                break;
+                            }
+                        };
+                        let mut pos = 0u64;
+                        while pos < ext.part_size {
+                            let n = (crate::volume::STREAM_CHUNK as u64).min(ext.part_size - pos) as usize;
+                            state.work.disk_read();
+                            if let Err(e) = crate::direct_io::read_exact_at(&file, pos, &mut buf[..n]) {
+                                res = Err(VolumeError::Io(e));
+                                break;
+                            }
+                            if let Err(e) = writer.write(&buf[..n]) {
+                                res = Err(e);
+                                break;
+                            }
+                            pos += n as u64;
+                            copied += n as u64;
+                        }
+                        if res.is_err() {
+                            break;
+                        }
+                    } else {
+                        let (part_vm, part_local) = match state.volume_for(ext.vol_offset) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                res = Err(e);
+                                break;
+                            }
+                        };
+                        let (_, stored_sz, expected_crc) = match part_vm.payload_extent_with_crc(src_b_id, part_local) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                state.record_read_corruption(ext.vol_offset, &src_key_s, &e);
+                                res = Err(e);
+                                break;
+                            }
+                        };
+                        if stored_sz != ext.part_size {
+                            res = Err(VolumeError::CorruptIndex);
+                            break;
+                        }
+                        if let Err(e) = part_vm.copy_payload(part_local, expected_crc, |piece| writer.write(piece)) {
+                            state.record_read_corruption(ext.vol_offset, &src_key_s, &e);
+                            res = Err(e);
+                            break;
+                        }
+                        copied += ext.part_size;
+                    }
+                }
+                if res.is_ok() && copied != src_size {
+                    res = Err(VolumeError::CorruptIndex);
+                }
+                res
+            };
+
+            copy_res?;
+            let vm = Arc::clone(writer.volume());
+            let g = global_offset(vm.id(), writer.offset());
+            match writer.finish(etag_hi, etag_lo) {
+                Ok(l) => {
+                    state.streams.note_append(dst_b_id, &dst_key_s, g);
+                    Ok((vm, l, g))
+                }
+                Err(VolumeError::AfterRecord { loc, flags, cause }) => {
+                    state.streams.note_append(dst_b_id, &dst_key_s, g);
+                    Err(VolumeError::AfterRecord { loc, flags, cause })
+                }
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .map_err(|e| VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+
+        let (vm, loc, g) = match res {
+            Ok(x) => x,
+            Err(VolumeError::AfterRecord { loc, flags, cause }) => {
+                self.note_record(dst_b_id, &loc);
+                return Err(VolumeError::AfterRecord { loc, flags, cause });
+            }
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = self.make_durable(&vm, loc.seq).await {
+            self.note_record(dst_b_id, &loc);
+            return Err(VolumeError::AfterRecord {
+                loc,
+                flags: eff_flags,
+                cause: format!("could not sync the object: {:?}", e),
+            });
+        }
+        self.note_record(dst_b_id, &loc);
+        Ok((g, eff_flags))
+    }
+
     /// `store_payload` for a whole object: compressed when its bucket asks for it and the
     /// bytes shrink (#51). Returns the offset and the flags the needle was written with.
     #[allow(clippy::too_many_arguments)]
@@ -2374,12 +2708,21 @@ impl S3ServiceState {
             return Err(VolumeError::CorruptIndex);
         }
         let (vm, local) = self.volume_for(vol_offset)?;
-        vm.read_needle_bytes_verified(b_id, local)
+        match vm.read_needle_bytes_verified(b_id, local) {
+            Ok(b) => Ok(b),
+            Err(e) => {
+                self.record_read_corruption(vol_offset, &format!("bucket:{}/offset:{}", b_id, local), &e);
+                Err(e)
+            }
+        }
     }
 
     /// Bytes `start..=end` of a compressed object, decoding only the blocks they overlap.
     pub fn load_compressed_range(&self, b_id: u32, vol_offset: u64, size: u64, start: u64, end: u64) -> Result<Bytes, VolumeError> {
-        if let Some(cached) = self.payload_cache.get(b_id, vol_offset) {
+        let (vol_id, local_off) = crate::split_offset(vol_offset);
+        if self.scrub.is_bad(vol_id, local_off) {
+            self.payload_cache.remove(b_id, vol_offset);
+        } else if let Some(cached) = self.payload_cache.get(b_id, vol_offset) {
             let e = ((end + 1) as usize).min(cached.len());
             return Ok(cached.slice((start as usize).min(e)..e));
         }
@@ -2393,7 +2736,10 @@ impl S3ServiceState {
 
     /// A whole compressed object; cached as object bytes up to 4 MiB.
     pub fn load_compressed(&self, b_id: u32, vol_offset: u64, size: u64) -> Result<Bytes, VolumeError> {
-        if let Some(cached) = self.payload_cache.get(b_id, vol_offset) {
+        let (vol_id, local_off) = crate::split_offset(vol_offset);
+        if self.scrub.is_bad(vol_id, local_off) {
+            self.payload_cache.remove(b_id, vol_offset);
+        } else if let Some(cached) = self.payload_cache.get(b_id, vol_offset) {
             return Ok(cached);
         }
         let stored = self.read_stored(b_id, vol_offset)?;
@@ -2531,16 +2877,13 @@ impl S3ServiceState {
                     attempts += 1;
                     self.roll_volume(&vm)?;
                 }
-                Err(e) => {
-                    // The write reserved an offset and may have left a complete record there
-                    // (header written, then the journal or the disk failed). Its offset is
-                    // later than every reservation made before it, so noting the largest
-                    // offset makes a streamed PUT of this key in flight relocate: a spurious
-                    // copy costs time, a missed one lets this failed write win after a
-                    // restart (#184).
-                    self.streams.note_append(b_id, key, u64::MAX);
-                    return Err(e);
+                Err(VolumeError::AfterRecord { loc, flags, cause }) => {
+                    // The needle header is whole on disk (#184, #403), so recovery will
+                    // replay it at `loc.offset`: note that exact global offset.
+                    self.streams.note_append(b_id, key, global_offset(loc.volume_id, loc.offset));
+                    return Err(VolumeError::AfterRecord { loc, flags, cause });
                 }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -2577,11 +2920,7 @@ impl S3ServiceState {
             // The copy is whole in the volume and is the newest record of the key; only its
             // journal append failed (#184, the model's RelocateLateFail).
             Err(VolumeError::AfterRecord { loc, flags, cause }) => (loc, Some(VolumeError::AfterRecord { loc, flags, cause })),
-            Err(e) => {
-                // The header may be on disk (see `write_to_active_at`).
-                self.streams.note_append(b_id, key, u64::MAX);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
         self.streams.note_append(b_id, key, g);
         self.total_volume_bytes.fetch_add(from.total_len, Ordering::Relaxed);
@@ -2655,7 +2994,13 @@ impl S3ServiceState {
             return Ok(crate::attrs::Attrs::new());
         }
         let (vm, local) = self.volume_for(vol_offset)?;
-        vm.read_attrs(local)
+        match vm.read_attrs(local) {
+            Ok(a) => Ok(a),
+            Err(e) => {
+                self.record_read_corruption(vol_offset, &format!("offset:{}", local), &e);
+                Err(e)
+            }
+        }
     }
 
     /// The `ObjectView` of an object, from its index row's offset and flags (base attributes only).
@@ -3082,17 +3427,31 @@ impl S3ServiceState {
     /// Reads and verifies a payload. An error means the bytes could not be read or failed
     /// their CRC; callers answer 500, never a body of zeros.
     pub fn load_payload(&self, b_id: u32, vol_offset: u64, expected_size: usize) -> Result<Bytes, VolumeError> {
+        self.load_payload_for(b_id, &format!("bucket:{}/offset:{}", b_id, vol_offset), vol_offset, expected_size)
+    }
+
+    /// Reads and verifies a payload, attributing any checksum mismatch to `key` in logs and scrub.
+    pub fn load_payload_for(&self, b_id: u32, key: &str, vol_offset: u64, expected_size: usize) -> Result<Bytes, VolumeError> {
         if expected_size == 0 {
             return Ok(Bytes::new());
         }
         if vol_offset == 0 {
             return Err(VolumeError::CorruptIndex);
         }
-        if let Some(cached) = self.payload_cache.get(b_id, vol_offset) {
+        let (vol_id, local_off) = crate::split_offset(vol_offset);
+        if self.scrub.is_bad(vol_id, local_off) {
+            self.payload_cache.remove(b_id, vol_offset);
+        } else if let Some(cached) = self.payload_cache.get(b_id, vol_offset) {
             return Ok(cached);
         }
         let (vm, local) = self.volume_for(vol_offset)?;
-        let bytes = vm.read_needle_bytes_verified(b_id, local)?;
+        let bytes = match vm.read_needle_bytes_verified(b_id, local) {
+            Ok(b) => b,
+            Err(e) => {
+                self.record_read_corruption(vol_offset, key, &e);
+                return Err(e);
+            }
+        };
         if bytes.len() != expected_size {
             return Err(VolumeError::CorruptIndex);
         }
@@ -3112,21 +3471,40 @@ impl S3ServiceState {
             return Err(VolumeError::CorruptIndex);
         }
         let (vm, local) = self.volume_for(vol_offset)?;
-        let (payload_at, stored, expected_crc) = vm.payload_extent_with_crc(b_id, local)?;
+        let (payload_at, stored, expected_crc) = match vm.payload_extent_with_crc(b_id, local) {
+            Ok(x) => x,
+            Err(e) => {
+                self.record_read_corruption(vol_offset, &what, &e);
+                return Err(e);
+            }
+        };
         if stored != size {
             return Err(VolumeError::CorruptIndex);
         }
-        let range = crate::stream_read::PayloadRange {
-            vm,
-            local,
-            start,
+        let scrub = Arc::clone(&self.scrub);
+        let vol_id = vm.id();
+        let what_corrupt = what.clone();
+        let on_corrupt: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |err_msg: &str| {
+            scrub.mark_bad(vol_id, local, &what_corrupt, err_msg.to_string());
+        });
+        let segment = crate::stream_read::Segment {
+            source: crate::stream_read::Source::Volume {
+                vm,
+                direct: len >= self.direct_read_min.load(Ordering::Relaxed),
+            },
+            at: payload_at + start,
             len,
-            direct: len >= self.direct_read_min.load(Ordering::Relaxed),
             verify: verify.then_some(expected_crc),
+            transform: None,
+        };
+        Ok(crate::stream_read::PreadBody::from_job(crate::stream_read::Job {
+            segments: vec![segment],
             what,
             failures: Arc::clone(&self.read_checksum_failures),
-        };
-        Ok(crate::stream_read::PreadBody::new(range, payload_at))
+            work: Arc::clone(&self.work),
+            body_budget: Some(Arc::clone(&self.body_budget)),
+            on_corrupt: Some(on_corrupt),
+        }))
     }
 
     /// A body that sends `len` bytes from offset `start` of a multipart object with positioned
@@ -3153,17 +3531,23 @@ impl S3ServiceState {
                     if file.metadata()?.len() < ext.part_size {
                         return Err(VolumeError::CorruptIndex);
                     }
-                    Segment { source: Source::File(Arc::new(file)), at: in_part, len: seg_len, verify: None }
+                    Segment { source: Source::File(Arc::new(file)), at: in_part, len: seg_len, verify: None, transform: None }
                 }
                 None => {
                     let (vm, local) = self.volume_for(ext.vol_offset)?;
-                    let (payload_at, stored, expected_crc) = vm.payload_extent_with_crc(b_id, local)?;
+                    let (payload_at, stored, expected_crc) = match vm.payload_extent_with_crc(b_id, local) {
+                        Ok(x) => x,
+                        Err(e) => {
+                            self.record_read_corruption(ext.vol_offset, &what, &e);
+                            return Err(e);
+                        }
+                    };
                     if stored != ext.part_size {
                         return Err(VolumeError::CorruptIndex);
                     }
                     let check = (verify && whole).then_some(expected_crc);
                     let direct = seg_len >= self.direct_read_min.load(Ordering::Relaxed);
-                    Segment { source: Source::Volume { vm, direct }, at: payload_at + in_part, len: seg_len, verify: check }
+                    Segment { source: Source::Volume { vm, direct }, at: payload_at + in_part, len: seg_len, verify: check, transform: None }
                 }
             };
             segments.push(segment);
@@ -3171,7 +3555,14 @@ impl S3ServiceState {
         if segments.iter().map(|s| s.len).sum::<u64>() != len {
             return Err(VolumeError::CorruptIndex);
         }
-        Ok(PreadBody::from_job(Job { segments, what, failures: Arc::clone(&self.read_checksum_failures), work: Arc::clone(&self.work) }))
+        Ok(PreadBody::from_job(Job {
+            segments,
+            what,
+            failures: Arc::clone(&self.read_checksum_failures),
+            work: Arc::clone(&self.work),
+            body_budget: Some(Arc::clone(&self.body_budget)),
+            on_corrupt: None,
+        }))
     }
 
     /// A large object's payload from the mapping, unread and unchecked, with the checksum it
@@ -3307,6 +3698,14 @@ fn admin_response(state: &S3ServiceState, method: &Method, path: &str) -> Respon
             .header(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
             .body(full_body(Bytes::from(render_metrics(state))))
             .unwrap(),
+        "/_awanfs/scrub" => {
+            let body = serde_json::to_string_pretty(&state.scrub.report()).unwrap_or_else(|_| "{}".to_string());
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(full_body(Bytes::from(body)))
+                .unwrap()
+        }
         _ => plain(StatusCode::NOT_FOUND, "no such endpoint"),
     }
 }
@@ -3325,7 +3724,7 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
     let (hits, misses) = state.payload_cache.hit_counts();
     let w = state.work.snapshot();
     let budget = crate::memory::effective();
-    let gauges: [(&str, &str, &str, u64); 27] = [
+    let gauges: &[(&str, &str, &str, u64)] = &[
         ("awanfs_volume_used_bytes", "gauge", "Bytes written into all open volumes, including dead needles.", used),
         ("awanfs_volume_free_span_bytes", "gauge", "Span left in the active volume before it rolls over.", free),
         ("awanfs_volumes_open", "gauge", "Open volumes.", state.volumes.read().len() as u64),
@@ -3351,8 +3750,14 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
         (
             "awanfs_read_checksum_failures_total",
             "counter",
-            "Full GETs cut because the bytes read failed their payload checksum (decision 46).",
+            "Reads that failed their header or payload checksum (decision 46).",
             state.read_checksum_failures.load(Ordering::Relaxed),
+        ),
+        (
+            "awanfs_corrupt_needles_total",
+            "counter",
+            "Corrupt needles detected by background scrub or read verification (#155).",
+            state.scrub.corrupt_needles_total(),
         ),
         (
             "awanfs_stream_relocations_total",
@@ -3382,6 +3787,11 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
     for (name, kind, help, v) in gauges {
         let _ = writeln!(out, "# HELP {} {}\n# TYPE {} {}\n{} {}", name, help, name, kind, name, v);
     }
+    let _ = writeln!(
+        out,
+        "# HELP awanfs_scrub_pass_duration_seconds Duration of the last completed background scrub pass in seconds.\n# TYPE awanfs_scrub_pass_duration_seconds gauge\nawanfs_scrub_pass_duration_seconds {:.6}",
+        state.scrub.last_pass_duration_seconds()
+    );
     out
 }
 

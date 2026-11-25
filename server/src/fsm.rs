@@ -1317,6 +1317,48 @@ pub fn key_step(state: KeyState, record: KeyRecord) -> Result<KeyState, Refusal>
     }
 }
 
+pub const SCRUB_ALREADY_CHECKED: Refusal = refuse_because(
+    "ScrubAlreadyChecked",
+    409,
+    "needle was already checked or marked bad in this scrub pass",
+);
+
+/// Scrub state of one needle during a pass (`STATE_MACHINES.md`, #155).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrubState {
+    /// Not yet checked in the current pass.
+    Unchecked,
+    /// Header and payload CRCs matched in the current pass.
+    Good,
+    /// Header, key/attrs, or payload CRC failed in the current pass (or on a read).
+    Bad,
+}
+
+/// Events driving [`scrub_step`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrubEvent {
+    /// A new scrub pass started: resets the needle to `Unchecked`.
+    NewPass,
+    /// Scrub verified header and payload CRCs as valid.
+    VerifiedOk,
+    /// Scrub or a read detected a CRC or integrity mismatch.
+    Corrupted,
+}
+
+/// Pure transition function for needle scrub state (#155).
+///
+/// - `NewPass` resets any state to `Unchecked`.
+/// - `Unchecked + VerifiedOk -> Good`; `Good` and `Bad` refuse `VerifiedOk` within the same pass.
+/// - `Corrupted` moves `Unchecked | Good | Bad -> Bad`.
+pub fn scrub_step(state: ScrubState, event: ScrubEvent) -> Result<ScrubState, Refusal> {
+    match (state, event) {
+        (_, ScrubEvent::NewPass) => Ok(ScrubState::Unchecked),
+        (ScrubState::Unchecked, ScrubEvent::VerifiedOk) => Ok(ScrubState::Good),
+        (ScrubState::Good | ScrubState::Bad, ScrubEvent::VerifiedOk) => Err(SCRUB_ALREADY_CHECKED),
+        (_, ScrubEvent::Corrupted) => Ok(ScrubState::Bad),
+    }
+}
+
 #[cfg(test)]
 mod key_tests {
     use super::*;
@@ -1552,5 +1594,31 @@ mod key_tests {
         assert_eq!(obj.updates.len(), 1);
         assert_eq!(obj.updates[0].created_at_ns, 700);
         assert_eq!(obj.updates[0].vol_offset, 3);
+    }
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::*;
+
+    #[test]
+    fn scrub_every_pair_is_decided() {
+        use ScrubEvent::{Corrupted, NewPass, VerifiedOk};
+        use ScrubState::{Bad, Good, Unchecked};
+        let table = [
+            (Unchecked, NewPass, Ok(Unchecked)),
+            (Unchecked, VerifiedOk, Ok(Good)),
+            (Unchecked, Corrupted, Ok(Bad)),
+            (Good, NewPass, Ok(Unchecked)),
+            (Good, VerifiedOk, Err(SCRUB_ALREADY_CHECKED)),
+            (Good, Corrupted, Ok(Bad)),
+            (Bad, NewPass, Ok(Unchecked)),
+            (Bad, VerifiedOk, Err(SCRUB_ALREADY_CHECKED)),
+            (Bad, Corrupted, Ok(Bad)),
+        ];
+        for (state, event, want) in table {
+            assert_eq!(scrub_step(state, event), want, "{:?} + {:?}", state, event);
+        }
+        assert_eq!(table.len(), 3 * 3, "every state against every event");
     }
 }

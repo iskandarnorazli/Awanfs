@@ -45,6 +45,11 @@ impl Scheduler {
         }
     }
 
+    /// Shared shutdown signal checked by long-running background ticks such as scrub.
+    pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown)
+    }
+
     /// Registers a periodic task and starts its loop if a Tokio runtime is active.
     pub fn register<F>(&self, name: impl Into<String>, period: Duration, tick_fn: F)
     where

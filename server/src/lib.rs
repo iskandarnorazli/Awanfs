@@ -42,6 +42,7 @@ pub mod throttle;
 pub mod trace;
 pub mod s3_api;
 pub mod scheduler;
+pub mod scrub;
 pub mod segment;
 pub mod segment_set;
 pub mod sigv4;

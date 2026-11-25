@@ -256,6 +256,8 @@ struct BodyBudgetInner {
     rejected: AtomicU64,
     wait_timeout: Duration,
     notify: tokio::sync::Notify,
+    wait_lock: std::sync::Mutex<()>,
+    condvar: std::sync::Condvar,
 }
 
 /// Byte-budget admission controller for in-flight request bodies (#128, decision 36).
@@ -279,6 +281,19 @@ impl AdmissionGuard {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
+
+    /// Splits `amount` bytes off this guard into a new guard without changing `in_use`.
+    /// Returns `None` if `self.bytes < amount`.
+    pub fn split_off(&mut self, amount: u64) -> Option<Self> {
+        if self.bytes < amount {
+            return None;
+        }
+        self.bytes -= amount;
+        Some(AdmissionGuard {
+            inner: Arc::clone(&self.inner),
+            bytes: amount,
+        })
+    }
 }
 
 impl Drop for AdmissionGuard {
@@ -286,6 +301,8 @@ impl Drop for AdmissionGuard {
         if self.bytes > 0 {
             self.inner.in_use.fetch_sub(self.bytes, Ordering::AcqRel);
             self.inner.notify.notify_waiters();
+            let _g = self.inner.wait_lock.lock();
+            self.inner.condvar.notify_all();
         }
     }
 }
@@ -303,7 +320,35 @@ impl BodyBudget {
                 rejected: AtomicU64::new(0),
                 wait_timeout,
                 notify: tokio::sync::Notify::new(),
+                wait_lock: std::sync::Mutex::new(()),
+                condvar: std::sync::Condvar::new(),
             }),
+        }
+    }
+
+    /// Blocking acquire for background reader threads (#155): waits until `bytes` fit or
+    /// `cancelled()` returns true. Never increments `rejected`.
+    pub fn acquire_blocking_until<F>(&self, bytes: u64, cancelled: F) -> Option<AdmissionGuard>
+    where
+        F: Fn() -> bool,
+    {
+        if let Some(g) = self.try_acquire(bytes) {
+            return Some(g);
+        }
+        let mut lock = self.inner.wait_lock.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(g) = self.try_acquire(bytes) {
+                return Some(g);
+            }
+            if cancelled() {
+                return None;
+            }
+            let (guard, _) = self
+                .inner
+                .condvar
+                .wait_timeout(lock, Duration::from_millis(20))
+                .unwrap_or_else(|e| e.into_inner());
+            lock = guard;
         }
     }
 

@@ -872,3 +872,196 @@ fn verify_matches_oracle(
         }
     }
 }
+
+
+#[tokio::test]
+async fn copy_object_without_version_id_on_versioned_object_carries_0x200_tag_updates_and_deletes() {
+    let td = TempDir(temp_dir("copy_ver_no_vid"));
+    let dir = &td.0;
+    let c = reqwest::Client::new();
+    let (state, url, handle) = start(dir).await;
+
+    assert_eq!(c.put(format!("{}/vcopy", url)).send().await.unwrap().status(), StatusCode::OK);
+    let vcfg = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    assert_eq!(
+        c.put(format!("{}/vcopy?versioning", url))
+            .body(vcfg)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    let payload = b"versioned-body-for-copy".to_vec();
+    let put = c
+        .put(format!("{}/vcopy/src", url))
+        .header("x-amz-tagging", "k0=v0")
+        .body(payload.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    let vid = put.headers().get("x-amz-version-id").unwrap().to_str().unwrap().to_string();
+    assert_ne!(vid, "null");
+
+    // Update tags via 0x200 delta needle on the current non-null version.
+    assert_eq!(
+        c.put(format!("{}/vcopy/src?tagging", url))
+            .body(tag_xml(&[("a", "1"), ("b", "2")]))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    // CopyObject WITHOUT ?versionId= must resolve the current version and carry 0x200 tags.
+    assert_eq!(
+        c.put(format!("{}/vcopy/dst1", url))
+            .header("x-amz-copy-source", "/vcopy/src")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let dst1_tags = c.get(format!("{}/vcopy/dst1?tagging", url)).send().await.unwrap().text().await.unwrap();
+    assert!(dst1_tags.contains("<Key>a</Key>") && dst1_tags.contains("<Value>1</Value>"), "{dst1_tags}");
+    assert!(dst1_tags.contains("<Key>b</Key>") && dst1_tags.contains("<Value>2</Value>"), "{dst1_tags}");
+    assert!(!dst1_tags.contains("k0"), "{dst1_tags}");
+
+    // Delete tags via 0x200 delta needle, then CopyObject without ?versionId= must copy zero tags.
+    assert_eq!(
+        c.delete(format!("{}/vcopy/src?tagging", url)).send().await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        c.put(format!("{}/vcopy/dst2", url))
+            .header("x-amz-copy-source", "/vcopy/src")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let dst2_tags = c.get(format!("{}/vcopy/dst2?tagging", url)).send().await.unwrap().text().await.unwrap();
+    assert!(!dst2_tags.contains("<Tag>"), "{dst2_tags}");
+
+    // Verify copies survive restart identically.
+    state.sync_all_volumes().unwrap();
+    handle.shutdown();
+    drop(state);
+    let (_state, url, handle2) = start(dir).await;
+    let dst1_after = c.get(format!("{}/vcopy/dst1?tagging", url)).send().await.unwrap().text().await.unwrap();
+    let dst2_after = c.get(format!("{}/vcopy/dst2?tagging", url)).send().await.unwrap().text().await.unwrap();
+    assert!(dst1_after.contains("<Key>a</Key>") && dst1_after.contains("<Key>b</Key>"), "{dst1_after}");
+    assert!(!dst2_after.contains("<Tag>"), "{dst2_after}");
+    handle2.shutdown();
+}
+
+#[tokio::test]
+async fn streamed_put_relocation_preserves_monotonic_created_at_over_concurrent_tag_update() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let td = TempDir(temp_dir("relocate_ts"));
+    let dir = &td.0;
+    let clock = Arc::new(ManualClock::new(1_000_200_000));
+    let state = Arc::new(S3ServiceState::try_with_data_dir_and_clock(dir, Arc::clone(&clock) as Arc<dyn Clock>).unwrap());
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let handle = start_s3_reactor(addr, Arc::clone(&state)).await.unwrap();
+    let url = format!("http://{}", handle.local_addr);
+    let host = handle.local_addr.to_string();
+    let c = reqwest::Client::new();
+
+    assert_eq!(c.put(format!("{}/rbkt", url)).send().await.unwrap().status(), StatusCode::OK);
+
+    // Start a stalled streamed PUT (> STREAM_PUT_MIN) on /rbkt/k.
+    let streamed_len = s3_server::STREAM_PUT_MIN as usize + 4096;
+    let streamed_body = vec![0x5Au8; streamed_len];
+    let mut stream = TcpStream::connect(&host).await.unwrap();
+    let req_head = format!(
+        "PUT /rbkt/k HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        host, streamed_len
+    );
+    stream.write_all(req_head.as_bytes()).await.unwrap();
+    let half = streamed_len / 2;
+    stream.write_all(&streamed_body[..half]).await.unwrap();
+    stream.flush().await.unwrap();
+    for _ in 0..400 {
+        if state.volume_writers_in_flight(1) == Some(1) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(state.volume_writers_in_flight(1), Some(1));
+
+    // Concurrent PUT + 0x200 tag update while ManualClock is at 1_000_500_000 ns (1000 ms).
+    // Tag update sets created_at_ns = (1000 + 1) * 1_000_000 + 1 = 1_001_000_001 > clock.now_ns().
+    assert_eq!(
+        c.put(format!("{}/rbkt/k", url)).body(b"concurrent-base".to_vec()).send().await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        c.put(format!("{}/rbkt/k?tagging", url))
+            .body(tag_xml(&[("stale", "tag")]))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    // Streamed PUT commits while clock is STILL 1_000_200_000 (< u1.created_at_ns = 1_001_000_001).
+    // Relocation must preserve created_ns (1_001_000_002), not fall back to clock.now_ns().
+    stream.write_all(&streamed_body[half..]).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut resp_buf = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(20), stream.read_to_end(&mut resp_buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let resp_text = String::from_utf8_lossy(&resp_buf);
+    assert!(resp_text.starts_with("HTTP/1.1 200 OK"), "{resp_text}");
+    assert_eq!(state.stream_relocations.load(Ordering::SeqCst), 1);
+
+    let live_tags = c.get(format!("{}/rbkt/k?tagging", url)).send().await.unwrap().text().await.unwrap();
+    assert!(!live_tags.contains("stale"), "live must not keep retired tags: {live_tags}");
+
+    state.sync_all_volumes().unwrap();
+    handle.shutdown();
+    drop(state);
+
+    let (_state2, url2, handle2) = start(dir).await;
+    let after_tags = c.get(format!("{}/rbkt/k?tagging", url2)).send().await.unwrap().text().await.unwrap();
+    assert!(
+        !after_tags.contains("stale"),
+        "restarted replay must not resurrect retired 0x200 tag over relocated needle: {after_tags}"
+    );
+    let after_body = c.get(format!("{}/rbkt/k", url2)).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(&after_body[..], &streamed_body[..]);
+    handle2.shutdown();
+}
+
+#[tokio::test]
+async fn put_tagging_with_nonexistent_version_id_on_unversioned_key_returns_nosuchversion() {
+    let td = TempDir(temp_dir("unver_nosuchver"));
+    let dir = &td.0;
+    let c = reqwest::Client::new();
+    let (_state, url, handle) = start(dir).await;
+
+    assert_eq!(c.put(format!("{}/ubkt", url)).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(c.put(format!("{}/ubkt/k", url)).body(b"hello".to_vec()).send().await.unwrap().status(), StatusCode::OK);
+
+    let res = c
+        .put(format!("{}/ubkt/k?tagging&versionId=999999999999999", url))
+        .body(tag_xml(&[("k", "v")]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let body = res.text().await.unwrap();
+    assert!(body.contains("<Code>NoSuchVersion</Code>"), "expected NoSuchVersion, got: {body}");
+    handle.shutdown();
+}
