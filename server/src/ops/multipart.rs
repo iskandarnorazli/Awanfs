@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ffi_bridge::{AWAN_FLAG_ACTIVE, AWAN_FLAG_MULTIPART};
-use crate::iam::Iam;
 use crate::meta_index::{unpack_flags, unpack_part_count};
 use crate::multipart::{
     complete_multipart_upload_result_xml_with_checksum, copy_part_result_xml, encode_extents_manifest,
@@ -165,6 +164,8 @@ pub async fn create_multipart_upload(
     bucket: &str,
     key: &str,
     headers: &HeaderMap,
+    writer_account: &str,
+    bucket_owner: &str,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let req_cksum = match crate::checksum::requested_checksum(headers) {
         Ok(Some(c)) => Some(c),
@@ -188,10 +189,11 @@ pub async fn create_multipart_upload(
     } else {
         None
     };
-    let attrs = match super::object::request_attrs_map(headers, key, None) {
+    let mut attrs = match super::object::request_attrs_map(headers, key, None) {
         Ok(a) => a,
         Err(resp) => return Ok(resp),
     };
+    super::object::apply_owner_attr(&mut attrs, writer_account, bucket_owner);
     let tag_set = match crate::ops::tagging::parse_tagging_header_from(headers, key) {
         Ok(t) => t,
         Err(resp) => return Ok(resp),
@@ -221,13 +223,14 @@ pub async fn create_multipart_upload(
     Ok(resp.body(full_body(Bytes::from(xml))).unwrap())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_part(
     state: Arc<S3ServiceState>,
     key: &str,
     path: &str,
     query_map: &HashMap<String, String>,
     headers: &HeaderMap,
-    iam: Option<Arc<Iam>>,
+    mut chunk_verifier: Option<crate::auth::ChunkVerifier>,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let upload_id = &query_map["uploadId"];
@@ -322,7 +325,7 @@ pub async fn upload_part(
         let mut body = body;
         let cache = &state.sigv4_cache;
         let mut decoder = is_chunked.then(|| {
-            let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
+            let mut verifier = chunk_verifier.take();
             crate::aws_chunked::ChunkedDecoder::new(move |sha: &str, sig: Option<&str>| {
                 verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))
             })
@@ -609,7 +612,7 @@ pub async fn upload_part(
             .unwrap());
     }
     let decoded_bytes = if is_chunked {
-        let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
+        let mut verifier = chunk_verifier.take();
         let cache = &state.sigv4_cache;
         match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |sha, sig| {
             verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))

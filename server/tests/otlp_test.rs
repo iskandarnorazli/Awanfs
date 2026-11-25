@@ -93,6 +93,7 @@ async fn a_put_exports_a_request_span_with_write_and_sync_children() {
     assert_eq!(field(&req, "parentSpanId"), Some("00f067aa0ba902b7"));
     assert!(req.contains("\"key\":\"operation\",\"value\":{\"stringValue\":\"PutObject\"}"), "{}", req);
     assert!(req.contains("\"key\":\"status\",\"value\":{\"stringValue\":\"200\"}"), "{}", req);
+    assert!(req.contains("\"key\":\"authz_reason\",\"value\":{\"stringValue\":\"allow-anonymous\"}"), "{}", req);
     assert!(children.len() >= 2, "{:?}", children);
 }
 

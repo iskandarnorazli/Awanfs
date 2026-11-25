@@ -15,7 +15,6 @@ use crate::ffi_bridge::{
     unpack_flags, unpack_part_count, CapacityReservation, AWAN_FLAG_ACTIVE, AWAN_FLAG_MULTIPART,
     AWAN_FLAG_ZERO_BYTE,
 };
-use crate::iam::Iam;
 use crate::precondition::{
     format_http_date, precondition, ObjectFacts, PreconditionOutcome, DEFAULT_LAST_MODIFIED_SECS,
 };
@@ -211,12 +210,26 @@ pub(crate) fn request_attrs_map(
     Ok(attrs)
 }
 
+pub(super) fn apply_owner_attr(attrs: &mut crate::attrs::Attrs, writer_account: &str, bucket_owner: &str) {
+    let eff_bucket = if bucket_owner.is_empty() { crate::iam::ROOT_ACCOUNT } else { bucket_owner };
+    let eff_writer = if writer_account.is_empty() { crate::iam::ROOT_ACCOUNT } else { writer_account };
+    if eff_writer != eff_bucket {
+        attrs.set_owner(eff_writer);
+    } else {
+        attrs.clear_owner();
+    }
+}
+
 fn request_attrs_with_checksum(
     headers: &HeaderMap,
     key: &str,
     checksum: Option<(crate::checksum::ChecksumAlgorithm, &str, &str)>,
+    writer_account: &str,
+    bucket_owner: &str,
 ) -> Result<Vec<u8>, Response<ResponseBody>> {
-    request_attrs_map(headers, key, checksum)?
+    let mut attrs = request_attrs_map(headers, key, checksum)?;
+    apply_owner_attr(&mut attrs, writer_account, bucket_owner);
+    attrs
         .encode()
         .map_err(|_| bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key))
 }
@@ -230,7 +243,7 @@ fn with_tagging_count(b: hyper::http::response::Builder, count: usize) -> hyper:
 }
 
 fn request_attrs(headers: &HeaderMap, key: &str) -> Result<Vec<u8>, Response<ResponseBody>> {
-    request_attrs_with_checksum(headers, key, None)
+    request_attrs_with_checksum(headers, key, None, "", "")
 }
 
 pub(crate) fn checksum_mode_enabled(headers: &HeaderMap) -> bool {
@@ -684,12 +697,15 @@ fn version_get_response(
         .unwrap()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn copy_object(
     state: Arc<S3ServiceState>,
     b_id: u32,
     bucket: &str,
     key: &str,
     headers: &HeaderMap,
+    writer_account: &str,
+    bucket_owner: &str,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let copy_source = headers.get("x-amz-copy-source").expect("CopyObject requires x-amz-copy-source");
     let copy_source_raw = copy_source.to_str().unwrap_or("");
@@ -847,6 +863,7 @@ pub async fn copy_object(
             None => copy_attrs_obj.remove(crate::attrs::TAG_TAGGING),
         }
     }
+    apply_owner_attr(&mut copy_attrs_obj, writer_account, bucket_owner);
     let copy_attrs = match copy_attrs_obj.encode() {
         Ok(a) => a,
         Err(_) => return Ok(bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key)),
@@ -1057,6 +1074,7 @@ impl StreamPipeline {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn put_object(
     state: Arc<S3ServiceState>,
     b_id: u32,
@@ -1064,7 +1082,9 @@ pub async fn put_object(
     key: &str,
     path: &str,
     headers: &HeaderMap,
-    iam: Option<Arc<Iam>>,
+    writer_account: &str,
+    bucket_owner: &str,
+    mut chunk_verifier: Option<crate::auth::ChunkVerifier>,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let if_none_match_star = headers
@@ -1134,6 +1154,8 @@ pub async fn put_object(
         &signed_headers,
         key,
         req_checksum.as_ref().and_then(|(alg, exp)| exp.as_deref().map(|v| (*alg, "FULL_OBJECT", v))),
+        writer_account,
+        bucket_owner,
     ) {
         Ok(a) => a,
         Err(resp) => return Ok(resp),
@@ -1179,9 +1201,9 @@ pub async fn put_object(
         let mut digest = Some(crate::digest::StreamingDigest::new_md5_only());
         let mut cksum_hasher = req_checksum.as_ref().map(|(alg, _)| crate::checksum::Checksum::new(*alg));
         let mut body = body;
-        let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
         let cache = &state.sigv4_cache;
         let mut decoder = is_chunked.then(|| {
+            let mut verifier = chunk_verifier.take();
             crate::aws_chunked::ChunkedDecoder::new(move |sha: &str, sig: Option<&str>| {
                 verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))
             })
@@ -1566,7 +1588,7 @@ pub async fn put_object(
     }
 
     let decoded_bytes = if is_chunked {
-        let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
+        let mut verifier = chunk_verifier.take();
         let cache = &state.sigv4_cache;
         match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |sha, sig| {
             verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))
@@ -1653,6 +1675,8 @@ pub async fn put_object(
         &signed_headers,
         key,
         buf_cksum_out.as_ref().map(|(a, v)| (*a, "FULL_OBJECT", v.as_str())),
+        writer_account,
+        bucket_owner,
     ) {
         Ok(a) => a,
         Err(resp) => return Ok(resp),

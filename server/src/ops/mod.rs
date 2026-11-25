@@ -13,12 +13,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 
-use crate::iam::{Iam, Principal};
+use crate::authz::{
+    AclGrants, AuthzContext, BucketOwnership, BucketPolicyDecision, BucketTarget, Decision,
+    ObjectTarget, PolicyMatch, PublicAccessBlock, DEFAULT_BUCKET_OWNERSHIP,
+};
+use crate::bucket_config::BucketConfig;
+use crate::ffi_bridge::unpack_flags;
+use crate::iam::{Iam, Principal, ROOT_ACCOUNT};
+use crate::meta_index::FLAG_ATTRS;
 use crate::s3_api::{
     body_limit_for, empty_body, entity_too_large, full_body, parse_s3_target, percent_decode,
     percent_decode_path, percent_decode_path_bytes, raw_s3_key, validate_s3_key, ParsedTarget, ResponseBody, S3ServiceState,
 };
 use crate::xml::s3_error_xml;
+use std::marker::PhantomData;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Operation {
@@ -586,9 +594,19 @@ pub struct Authenticated {
     pub iam: Option<Arc<Iam>>,
 }
 
+pub struct CopySourceResolved {
+    pub bucket: String,
+    pub key: String,
+    pub bucket_cfg: Option<Arc<BucketConfig>>,
+    pub object_owner: Option<String>,
+}
+
 pub struct Resolved {
     pub auth: Authenticated,
     pub b_id: Option<u32>,
+    pub bucket_cfg: Option<Arc<BucketConfig>>,
+    pub object_owner: Option<String>,
+    pub copy_source: Option<CopySourceResolved>,
 }
 
 pub struct Authorized {
@@ -691,56 +709,365 @@ pub fn authenticate(state: &S3ServiceState, c: Classified) -> Result<Authenticat
     Ok(Authenticated { classified: c, principal, iam })
 }
 
+fn lookup_object_owner(
+    state: &S3ServiceState,
+    b_id: u32,
+    key: &str,
+    vid: Option<&str>,
+) -> Option<String> {
+    let (vol_offset, flags) = if vid.is_some() || state.versions.read().has(b_id, key) {
+        let id = vid.and_then(crate::versions::parse_id);
+        if vid.is_some() && id.is_none() {
+            return None;
+        }
+        let v = object::find_version(state, b_id, key, id)?;
+        (v.vol_offset, v.flags)
+    } else {
+        let m = state.engine.read().get_object(b_id, key.as_bytes()).ok()?;
+        (m.vol_offset, unpack_flags(m.bucket_flags))
+    };
+    if flags & FLAG_ATTRS == 0 {
+        return None;
+    }
+    state
+        .object_attrs(vol_offset, flags)
+        .ok()
+        .and_then(|a| a.owner().map(str::to_string))
+}
+
+fn bucket_not_found_response(op: Operation, bucket: &str) -> Response<ResponseBody> {
+    if op == Operation::HeadBucket {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(CONTENT_LENGTH, "0")
+            .body(empty_body())
+            .unwrap();
+    }
+    let xml = s3_error_xml("NoSuchBucket", "The specified bucket does not exist", bucket, "req-bucket");
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(CONTENT_TYPE, "application/xml")
+        .body(full_body(Bytes::from(xml)))
+        .unwrap()
+}
+
 pub fn resolve_bucket(state: &S3ServiceState, a: Authenticated) -> Result<Resolved, Response<ResponseBody>> {
     let s = spec(a.classified.op);
     if !s.requires_existing_bucket {
-        return Ok(Resolved { auth: a, b_id: None });
+        return Ok(Resolved {
+            auth: a,
+            b_id: None,
+            bucket_cfg: None,
+            object_owner: None,
+            copy_source: None,
+        });
     }
     let bucket = a.classified.bucket.as_deref().expect("bucket op requires bucket");
     let b_id = match state.engine.read().lookup_bucket(bucket) {
         Ok(id) => id,
-        Err(_) => {
-            if a.classified.op == Operation::HeadBucket {
-                return Err(Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .header(CONTENT_LENGTH, "0")
-                    .body(empty_body())
-                    .unwrap());
-            }
-            let xml = s3_error_xml("NoSuchBucket", "The specified bucket does not exist", bucket, "req-bucket");
-            return Err(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header(CONTENT_TYPE, "application/xml")
-                .body(full_body(Bytes::from(xml)))
-                .unwrap());
-        }
+        Err(_) => return Err(bucket_not_found_response(a.classified.op, bucket)),
     };
-    Ok(Resolved { auth: a, b_id: Some(b_id) })
+    let bucket_cfg = state.bucket_config_reader.load_bucket(b_id);
+    let ownership = bucket_cfg
+        .as_ref()
+        .map_or(DEFAULT_BUCKET_OWNERSHIP, |c| c.ownership());
+    let object_owner = if ownership != BucketOwnership::BucketOwnerEnforced
+        && s.target == TargetKind::Object
+        && matches!(
+            a.classified.op,
+            Operation::GetObject
+                | Operation::HeadObject
+                | Operation::GetObjectAttributes
+                | Operation::DeleteObject
+                | Operation::GetObjectTagging
+                | Operation::PutObjectTagging
+                | Operation::DeleteObjectTagging
+        ) {
+        let vid = a.classified.query_map.get("versionId").map(String::as_str);
+        a.classified
+            .key
+            .as_deref()
+            .and_then(|k| lookup_object_owner(state, b_id, k, vid))
+    } else {
+        None
+    };
+
+    let copy_source = if matches!(
+        a.classified.op,
+        Operation::CopyObject | Operation::UploadPartCopy
+    ) {
+        if let Some(raw) = a
+            .classified
+            .parts
+            .headers
+            .get("x-amz-copy-source")
+            .and_then(|v| v.to_str().ok())
+        {
+            let (copy_path, copy_query) = raw.split_once('?').unwrap_or((raw, ""));
+            let src_vid = copy_query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("versionId="))
+                .map(percent_decode_path);
+            let decoded = percent_decode_path(copy_path);
+            let trimmed = decoded.trim_start_matches('/');
+            if let Some((src_bucket, src_key)) = trimmed.split_once('/') {
+                if !src_bucket.is_empty() && !src_key.is_empty() {
+                    let src_b_id = match state.engine.read().lookup_bucket(src_bucket) {
+                        Ok(id) => id,
+                        Err(_) => {
+                            let xml = s3_error_xml(
+                                "NoSuchBucket",
+                                "Source bucket does not exist",
+                                src_bucket,
+                                "req-cp",
+                            );
+                            return Err(Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .header(CONTENT_TYPE, "application/xml")
+                                .body(full_body(Bytes::from(xml)))
+                                .unwrap());
+                        }
+                    };
+                    let src_cfg = state.bucket_config_reader.load_bucket(src_b_id);
+                    let src_ownership = src_cfg
+                        .as_ref()
+                        .map_or(DEFAULT_BUCKET_OWNERSHIP, |c| c.ownership());
+                    let src_obj_owner = if src_ownership != BucketOwnership::BucketOwnerEnforced {
+                        lookup_object_owner(state, src_b_id, src_key, src_vid.as_deref())
+                    } else {
+                        None
+                    };
+                    Some(CopySourceResolved {
+                        bucket: src_bucket.to_string(),
+                        key: src_key.to_string(),
+                        bucket_cfg: src_cfg,
+                        object_owner: src_obj_owner,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(Resolved {
+        auth: a,
+        b_id: Some(b_id),
+        bucket_cfg,
+        object_owner,
+        copy_source,
+    })
 }
 
-pub fn authorize(r: Resolved) -> Result<Authorized, Response<ResponseBody>> {
-    let c = &r.auth.classified;
-    let copy_src = c.parts.headers.get("x-amz-copy-source").and_then(|v| v.to_str().ok());
-    for (action, resource) in iam_requirements(c.op, c.bucket.as_deref(), c.key.as_deref(), copy_src) {
-        let allowed = match &r.auth.principal {
-            Principal::User(ak) => r.auth.iam.as_ref().is_some_and(|i| i.allows(ak, action, &resource)),
-            _ => true,
+fn record_authz_reason(reason: &'static str) {
+    crate::request_log::note_authz_reason(reason);
+    tracing::Span::current().record("authz_reason", reason);
+}
+
+fn identity_policy_for(
+    principal: &Principal,
+    iam: Option<&Iam>,
+    op: Operation,
+    bucket: Option<&str>,
+    key: Option<&str>,
+) -> PolicyMatch {
+    let Principal::User { name, .. } = principal else {
+        return PolicyMatch::NoOpinion;
+    };
+    let Some(iam) = iam else {
+        return PolicyMatch::NoOpinion;
+    };
+    if op == Operation::DeleteObjects {
+        return match bucket {
+            Some(b) => iam.may_delete_in_bucket(name, b),
+            None => PolicyMatch::NoOpinion,
         };
-        if !allowed {
-            let xml = s3_error_xml(
-                "AccessDenied",
-                &format!("Access Denied: {} on {}", action, resource),
-                c.parts.uri.path(),
-                "req-iam",
-            );
-            return Err(Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .header(CONTENT_TYPE, "application/xml")
-                .body(full_body(Bytes::from(xml)))
-                .unwrap());
+    }
+    let s = spec(op);
+    let Some(action) = s.iam_action else {
+        return PolicyMatch::NoOpinion;
+    };
+    let resource = match (s.target, bucket, key) {
+        (TargetKind::Service, _, _) => "arn:aws:s3:::*".to_string(),
+        (TargetKind::Bucket, Some(b), _) => format!("arn:aws:s3:::{}", b),
+        (TargetKind::Object, Some(b), Some(k)) => format!("arn:aws:s3:::{}/{}", b, k),
+        _ => return PolicyMatch::NoOpinion,
+    };
+    iam.evaluate_user(name, action, &resource)
+}
+
+fn bucket_target_for<'a>(
+    name: &'a str,
+    cfg: Option<&'a BucketConfig>,
+    empty_acl: &'a AclGrants,
+) -> BucketTarget<'a> {
+    match cfg {
+        Some(c) => BucketTarget {
+            name,
+            owner_account: c.effective_owner(),
+            ownership: c.ownership(),
+            public_access_block: c.public_access_block(),
+            policy: c.policy_decision(),
+            acl: empty_acl,
+        },
+        None => BucketTarget {
+            name,
+            owner_account: ROOT_ACCOUNT,
+            ownership: DEFAULT_BUCKET_OWNERSHIP,
+            public_access_block: PublicAccessBlock::default(),
+            policy: BucketPolicyDecision::none(),
+            acl: empty_acl,
+        },
+    }
+}
+
+fn access_denied_response(path: &str) -> Response<ResponseBody> {
+    let xml = s3_error_xml("AccessDenied", "Access Denied", path, "req-authz");
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(CONTENT_TYPE, "application/xml")
+        .body(full_body(Bytes::from(xml)))
+        .unwrap()
+}
+
+pub fn authorize(state: &S3ServiceState, r: Resolved) -> Result<Authorized, Response<ResponseBody>> {
+    let c = &r.auth.classified;
+    if c.op == Operation::CorsPreflight {
+        record_authz_reason("cors-preflight");
+        return Ok(Authorized { resolved: r });
+    }
+    if state.auth.allow_anonymous
+        && matches!(r.auth.principal, Principal::Anonymous)
+        && r.auth.iam.as_deref().is_none_or(|i| i.is_empty())
+    {
+        record_authz_reason("allow-anonymous");
+        return Ok(Authorized { resolved: r });
+    }
+
+    let empty_acl = AclGrants::default();
+    let bucket_target = if r.b_id.is_some() {
+        c.bucket
+            .as_deref()
+            .map(|b| bucket_target_for(b, r.bucket_cfg.as_deref(), &empty_acl))
+    } else {
+        None
+    };
+    let object_target = if spec(c.op).target == TargetKind::Object {
+        c.key.as_deref().map(|k| ObjectTarget {
+            key: k,
+            owner_account: r
+                .object_owner
+                .as_deref()
+                .or_else(|| bucket_target.as_ref().map(|b| b.owner_account))
+                .unwrap_or(ROOT_ACCOUNT),
+            acl: &empty_acl,
+        })
+    } else {
+        None
+    };
+    let id_pol = identity_policy_for(
+        &r.auth.principal,
+        r.auth.iam.as_deref(),
+        c.op,
+        c.bucket.as_deref(),
+        c.key.as_deref(),
+    );
+    let ctx = AuthzContext {
+        identity_policy: id_pol,
+        _marker: PhantomData,
+    };
+    let decision = crate::authz::authorize(
+        &r.auth.principal,
+        c.op,
+        bucket_target.as_ref(),
+        object_target.as_ref(),
+        &ctx,
+    );
+    record_authz_reason(decision.reason().as_str());
+    if matches!(decision, Decision::Deny { .. }) {
+        return Err(access_denied_response(c.parts.uri.path()));
+    }
+
+    if let Some(ref src) = r.copy_source {
+        let src_bucket = bucket_target_for(&src.bucket, src.bucket_cfg.as_deref(), &empty_acl);
+        let src_object = ObjectTarget {
+            key: &src.key,
+            owner_account: src.object_owner.as_deref().unwrap_or(src_bucket.owner_account),
+            acl: &empty_acl,
+        };
+        let src_pol = identity_policy_for(
+            &r.auth.principal,
+            r.auth.iam.as_deref(),
+            Operation::GetObject,
+            Some(&src.bucket),
+            Some(&src.key),
+        );
+        let src_ctx = AuthzContext {
+            identity_policy: src_pol,
+            _marker: PhantomData,
+        };
+        let src_dec = crate::authz::authorize(
+            &r.auth.principal,
+            Operation::GetObject,
+            Some(&src_bucket),
+            Some(&src_object),
+            &src_ctx,
+        );
+        if matches!(src_dec, Decision::Deny { .. }) {
+            record_authz_reason(src_dec.reason().as_str());
+            return Err(access_denied_response(c.parts.uri.path()));
         }
     }
+
     Ok(Authorized { resolved: r })
+}
+
+fn authorize_delete_key(
+    state: &S3ServiceState,
+    principal: &Principal,
+    iam: Option<&Iam>,
+    b_id: u32,
+    bucket_cfg: Option<&BucketConfig>,
+    bucket: &str,
+    key: &str,
+) -> bool {
+    if state.auth.allow_anonymous
+        && matches!(principal, Principal::Anonymous)
+        && iam.is_none_or(|i| i.is_empty())
+    {
+        return true;
+    }
+    let empty_acl = AclGrants::default();
+    let b_target = bucket_target_for(bucket, bucket_cfg, &empty_acl);
+    let obj_owner = if b_target.ownership != BucketOwnership::BucketOwnerEnforced {
+        lookup_object_owner(state, b_id, key, None)
+    } else {
+        None
+    };
+    let o_target = ObjectTarget {
+        key,
+        owner_account: obj_owner.as_deref().unwrap_or(b_target.owner_account),
+        acl: &empty_acl,
+    };
+    let id_pol = identity_policy_for(principal, iam, Operation::DeleteObject, Some(bucket), Some(key));
+    let ctx = AuthzContext {
+        identity_policy: id_pol,
+        _marker: PhantomData,
+    };
+    crate::authz::authorize(
+        principal,
+        Operation::DeleteObject,
+        Some(&b_target),
+        Some(&o_target),
+        &ctx,
+    )
+    .is_allowed()
 }
 
 pub fn validate(a: Authorized) -> Result<Validated, Response<ResponseBody>> {
@@ -793,6 +1120,11 @@ pub fn validate(a: Authorized) -> Result<Validated, Response<ResponseBody>> {
 pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Response<ResponseBody>, hyper::Error> {
     let resolved = v.authorized.resolved;
     let b_id = resolved.b_id;
+    let bucket_cfg = resolved.bucket_cfg;
+    let bucket_owner = bucket_cfg
+        .as_deref()
+        .map(|cfg| cfg.effective_owner().to_string())
+        .unwrap_or_else(|| ROOT_ACCOUNT.to_string());
     let auth = resolved.auth;
     let principal = auth.principal;
     let iam = auth.iam;
@@ -800,10 +1132,11 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
     let path = c.parts.uri.path().to_string();
     let bucket = c.bucket.as_deref().unwrap_or("");
     let key = c.key.as_deref().unwrap_or("");
+    let writer_account = principal.account().unwrap_or("");
 
     match c.op {
-        Operation::ListBuckets => service::list_buckets(state, &c.query_map).await,
-        Operation::CreateBucket => bucket::create_bucket(state, bucket, &path, &principal, c.body).await,
+        Operation::ListBuckets => service::list_buckets(state, &c.query_map, principal.account()).await,
+        Operation::CreateBucket => bucket::create_bucket(state, bucket, &path, writer_account, c.body).await,
         Operation::DeleteBucket => bucket::delete_bucket(state, b_id.unwrap(), bucket).await,
         Operation::HeadBucket => bucket::head_bucket().await,
         Operation::ListObjects => bucket::list_objects(state, b_id.unwrap(), bucket, &c.query_map, false).await,
@@ -824,12 +1157,37 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         Operation::CorsPreflight => cors::preflight(state, b_id.unwrap(), &path, &c.parts.headers).await,
         Operation::ListMultipartUploads => multipart::list_multipart_uploads(state, bucket, &c.query_map).await,
         Operation::DeleteObjects => {
-            bucket::delete_objects(state, b_id.unwrap(), bucket, &path, &principal, iam.as_deref(), c.body).await
+            let bid = b_id.unwrap();
+            let st_for_del = Arc::clone(&state);
+            let p_for_del = principal.clone();
+            let iam_for_del = iam.clone();
+            let cfg_for_del = bucket_cfg.clone();
+            let b_name = bucket.to_string();
+            bucket::delete_objects(
+                state,
+                bid,
+                bucket,
+                &path,
+                move |k| {
+                    authorize_delete_key(
+                        &st_for_del,
+                        &p_for_del,
+                        iam_for_del.as_deref(),
+                        bid,
+                        cfg_for_del.as_deref(),
+                        &b_name,
+                        k,
+                    )
+                },
+                c.body,
+            )
+            .await
         }
         Operation::PutObject => {
-            object::put_object(state, b_id.unwrap(), bucket, key, &path, &c.parts.headers, iam, c.body).await
+            let verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &c.parts.headers);
+            object::put_object(state, b_id.unwrap(), bucket, key, &path, &c.parts.headers, writer_account, &bucket_owner, verifier, c.body).await
         }
-        Operation::CopyObject => object::copy_object(state, b_id.unwrap(), bucket, key, &c.parts.headers).await,
+        Operation::CopyObject => object::copy_object(state, b_id.unwrap(), bucket, key, &c.parts.headers, writer_account, &bucket_owner).await,
         Operation::GetObject => {
             let auth_enabled = state.auth.credentials.is_some() || iam.as_deref().is_some_and(|i| !i.is_empty());
             let is_anon_with_auth = auth_enabled && matches!(principal, Principal::Anonymous);
@@ -845,10 +1203,11 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         }
         Operation::DeleteObject => object::delete_object(state, b_id.unwrap(), key, &c.query_map).await,
         Operation::CreateMultipartUpload => {
-            multipart::create_multipart_upload(state, b_id.unwrap(), bucket, key, &c.parts.headers).await
+            multipart::create_multipart_upload(state, b_id.unwrap(), bucket, key, &c.parts.headers, writer_account, &bucket_owner).await
         }
         Operation::UploadPart => {
-            multipart::upload_part(state, key, &path, &c.query_map, &c.parts.headers, iam, c.body).await
+            let verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &c.parts.headers);
+            multipart::upload_part(state, key, &path, &c.query_map, &c.parts.headers, verifier, c.body).await
         }
         Operation::UploadPartCopy => {
             multipart::upload_part_copy(state, key, &c.query_map, &c.parts.headers).await

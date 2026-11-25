@@ -1,14 +1,21 @@
-# Users for the ceph s3-tests run (#47). The main user is the root key from the environment;
-# alt and tenant sign with their own keys (#53). AwanFS has no bucket owners, so both may do
-# everything: tests that expect one user to be kept out of another's bucket fail, as they should.
+# Users for the ceph s3-tests run (#47, #53, #151). The main user is the root key from the environment;
+# alt and tenant live in separate accounts with explicit self-account identity actions (no blanket s3:*).
 [[users]]
 name = "alt"
+account = "alt"
+id = "alt"
+display_name = "alt"
+email = "alt@example.com"
 access_key = "AWANFSALTKEY00000000"
 secret_key = "awanfs-alt-secret-for-s3-tests-00000000000"
-policy = '{"Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}}'
+policy = '{"Statement": {"Effect": "Allow", "Action": ["s3:CreateBucket", "s3:DeleteBucket", "s3:ListBucket", "s3:ListAllMyBuckets", "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:PutBucketCors", "s3:GetBucketCors"], "Resource": "*"}}'
 
 [[users]]
 name = "tenant"
+account = "tenant"
+id = "tenant"
+display_name = "tenant"
+email = "tenant@example.com"
 access_key = "AWANFSTENANTKEY00000"
 secret_key = "awanfs-tenant-secret-for-s3-tests-0000000"
-policy = '{"Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}}'
+policy = '{"Statement": {"Effect": "Allow", "Action": ["s3:CreateBucket", "s3:DeleteBucket", "s3:ListBucket", "s3:ListAllMyBuckets", "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:PutBucketCors", "s3:GetBucketCors"], "Resource": "*"}}'

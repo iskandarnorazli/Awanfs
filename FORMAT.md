@@ -231,6 +231,7 @@ A tag number is never reused. 0x8000 and above are for tests.
 | 0x0006 | Expires | headers (write-time) | #152 |
 | 0x0007 | x-amz-website-redirect-location | headers (write-time) | #152 |
 | 0x0008 | User metadata (`x-amz-meta-*`) | metadata | #152 |
+| 0x0030 | `TAG_OWNER`: object owner account ID (UTF-8, written only when different from bucket owner) | owner (write-time) | #151 (Decision 3A) |
 
 ## Journal record (`.idx`, 42 bytes)
 
@@ -295,7 +296,7 @@ Text log, one record per line (`\n`-terminated). Writes append and `sync_all` be
 
 | Prefix | Format | Meaning |
 |---|---|---|
-| `+` | `+<id>:<name>[:<created_ns>[:<owner>[:<namespace>]]]` | Bucket created; trailing fields after `<name>` are optional when reading older manifests. |
+| `+` | `+<id>:<name>[:<created_ns>[:<owner>[:<namespace>]]]` | Bucket created; trailing fields after `<name>` are optional when reading older manifests, and an absent or empty `<owner>` defaults to `"root"`. |
 | `-` | `-<id>:<name>` | Bucket deleted; drops all configurations for `<id>`. |
 | `~` | `~<id>:<Enabled\|Suspended>` | Bucket versioning status (#31); also populates kind `versioning`. |
 | `=` | `=<id>:<kind>:<base64>` | Sets configuration `<kind>` for bucket `<id>` to the decoded document bytes. |

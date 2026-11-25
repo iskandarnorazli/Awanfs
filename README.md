@@ -134,10 +134,14 @@ AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
 - Access log (off by default): `--access-log <file>` or `--access-log -` for stdout (or `AWANFS_ACCESS_LOG`) writes one line per request in the Amazon S3 server access log format: requester access key, operation, bucket, key, status, error code, bytes, time, request ID. It is written by a background thread through a bounded queue, so a slow or full log target never stalls requests: lines that do not fit are dropped and counted in `awanfs_log_lines_dropped_total`. It is a log, not an audit record.
 - Traces (off by default): `--otlp-endpoint http://collector:4318` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) exports a span per request, with child spans for volume writes and syncs, over OTLP/HTTP JSON to Tempo, Jaeger or an OpenTelemetry Collector. A W3C `traceparent` header continues the caller's trace.
 - Stopping: Ctrl-C or SIGTERM (Ctrl-Break, console close or system shutdown on Windows) marks the server not ready, stops accepting connections, lets requests in flight finish (up to 30 s), syncs every volume and exits 0.
-- Several users with policies: `--config awanfs.toml` (or `AWANFS_CONFIG`). The file holds secrets, so on Unix the server refuses it unless only its owner can read it (`chmod 600`). Each user has an AWS-style policy (Effect Allow/Deny, Action and Resource with `*` and `?`; Condition, Principal and NotAction are refused rather than ignored). Explicit Deny wins. The file reloads within 60 s of a change, or on SIGHUP. The `AWANFS_ACCESS_KEY` pair, if set, keeps full access.
+- Several users with policies: `--config awanfs.toml` (or `AWANFS_CONFIG`). The file holds secrets, so on Unix the server refuses it unless only its owner can read it (`chmod 600`). Each user has an AWS-style policy (Effect Allow/Deny, Action and Resource with `*` and `?`; Condition, Principal and NotAction are refused rather than ignored) and belongs to an `account` (defaulting to `name`, so two users with the same `account` share bucket/object ownership, and removing a user leaves account-owned data intact). Optional `id` (defaults to SHA-256 of `name`), `display_name`, and `email` fields identify the user in S3 responses and test configs. Explicit Deny wins. The file reloads within 60 s of a change, or on SIGHUP. The `AWANFS_ACCESS_KEY` pair, if set, acts as the `"root"` account.
   ```toml
   [[users]]
   name = "reader"
+  account = "team-a" # optional; defaults to name
+  id = "reader-id" # optional; defaults to SHA-256 of name
+  display_name = "Reader" # optional
+  email = "reader@example.com" # optional
   access_key = "AKREADER"
   secret_key = "change-me"
   policy = '''{"Statement": [{"Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"],

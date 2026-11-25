@@ -11,6 +11,7 @@ use crate::xml::list_buckets_xml;
 pub async fn list_buckets(
     state: Arc<S3ServiceState>,
     query_map: &HashMap<String, String>,
+    caller_account: Option<&str>,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let max_buckets = match query_map.get("max-buckets") {
         Some(s) => match s.parse::<i32>() {
@@ -45,8 +46,18 @@ pub async fn list_buckets(
 
     let engine = state.engine.read();
     let created_map = state.bucket_created_ns.read();
+    let cfg_snap = state.bucket_config_reader.snapshot();
     let mut entries: Vec<(String, String)> = Vec::new();
     for (name, &b_id) in &engine.bucket_names {
+        if let Some(acct) = caller_account {
+            let owner = cfg_snap
+                .get(&b_id)
+                .map(|c| c.effective_owner())
+                .unwrap_or("root");
+            if owner != acct {
+                continue;
+            }
+        }
         if let Some(pfx) = prefix {
             if !name.starts_with(pfx) {
                 continue;

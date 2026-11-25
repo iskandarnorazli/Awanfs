@@ -47,6 +47,7 @@ pub mod segment_set;
 pub mod sigv4;
 pub mod spill;
 pub mod auth;
+pub mod authz;
 pub mod sim;
 pub mod sim_gen;
 pub mod sim_model;

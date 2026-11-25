@@ -2365,6 +2365,7 @@ pub async fn handle_s3_request(
         method = %req.method(),
         operation = op,
         traceparent = %traceparent,
+        authz_reason = tracing::field::Empty,
         status = tracing::field::Empty
     );
     let audit = state.audit_log.read().clone().map(|sink| {
@@ -2377,7 +2378,7 @@ pub async fn handle_s3_request(
         let uri = format!("{} {} {:?}", req.method(), req.uri(), req.version());
         (sink, crate::request_log::claimed_access_key(h.get("authorization").and_then(|v| v.to_str().ok()), query), remote, uri, get("user-agent"), get("host"), signed, presigned)
     });
-    let (resp, error_code) = crate::request_log::with_request_id(request_id.clone(), handle_s3_inner(Arc::clone(&state), req)).instrument(span.clone()).await;
+    let (resp, error_code, authz_reason) = crate::request_log::with_request_id(request_id.clone(), handle_s3_inner(Arc::clone(&state), req)).instrument(span.clone()).await;
     let mut resp = resp?;
     if matches!(method, Method::GET | Method::PUT | Method::POST | Method::DELETE | Method::HEAD)
         && !bucket.is_empty()
@@ -2417,6 +2418,7 @@ pub async fn handle_s3_request(
             bytes_in,
             bytes_out,
             duration_us: elapsed.as_micros() as u64,
+            authz_reason,
         };
         sink(&rec.to_json());
     }
@@ -2473,7 +2475,7 @@ async fn handle_s3_inner(
         Ok(r) => r,
         Err(resp) => return Ok(resp),
     };
-    let authorized = match crate::ops::authorize(resolved) {
+    let authorized = match crate::ops::authorize(&state, resolved) {
         Ok(a) => a,
         Err(resp) => return Ok(resp),
     };

@@ -16,7 +16,7 @@ This document states the exact `s3-server` and client configuration that `tests/
 | `AWANFS_ACCESS_KEY` | `AWANFSMAINKEY0000000` | none | All (`[s3 main]` in `s3tests.conf`) | No (public test credential) |
 | `AWANFS_SECRET_KEY` | `awanfs-main-secret-for-s3-tests-0000000000` | none | All (`[s3 main]` in `s3tests.conf`) | No (public test credential) |
 | `AWANFS_LOG` | `off` | `on` (JSON line per request on stderr) | All (keeps `/tmp/awanfs.log` bounded) | Optional (keep `on` for request audit logs) |
-| `tests/s3tests/users.toml` | `alt` and `tenant` users with `Allow s3:*` policy | none | Multi-user tests (`*_alt`, `*_tenant`) | No (wildcard `s3:*` and public test credentials) |
+| `tests/s3tests/users.toml` | `alt` and `tenant` in isolated accounts (`id`, `display_name`, `email`) with explicit self-account S3 actions | none | Multi-user tests (`*_alt`, `*_tenant`) | Yes (isolated per-account principals; explicit actions replace `s3:*`) |
 | `tests/s3tests/s3tests.conf` | `[DEFAULT]`, `[fixtures]`, `[s3 main]`, `[s3 alt]`, `[s3 tenant]`, `[iam*]` | none | All (`S3TEST_CONF`) | N/A (client test config) |
 
 ## Skips
@@ -42,4 +42,4 @@ Area issues that add new profile settings update `start_server.sh` and the **Set
 - `#122`: default object ownership (`D5`, ACLs enabled on new buckets for the suite)
 - `#121`: `--sse-master-key-file` and `kms_keyid` in `s3tests.conf`
 - `#140`: `--region` matching `api_name`
-- `#151`: users with `user_id`, `display_name`, and `email`
+- `#151`: implemented: `users.toml` sets `account`, `id`, `display_name`, and `email` matching `s3tests.conf`, with explicit self-account S3 actions instead of `s3:*`
