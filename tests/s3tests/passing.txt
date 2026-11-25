@@ -276,6 +276,7 @@ test_s3::test_object_copy_16m
 test_s3::test_object_copy_bucket_not_found
 test_s3::test_object_copy_diff_bucket
 test_s3::test_object_copy_key_not_found
+test_s3::test_object_copy_not_owned_bucket
 test_s3::test_object_copy_replacing_metadata
 test_s3::test_object_copy_retaining_metadata
 test_s3::test_object_copy_same_bucket
