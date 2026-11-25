@@ -8,7 +8,8 @@ AwanFS is an S3-compatible object store in Rust (`server/`). The plan of record 
 GitHub milestones and [`ROADMAP_AND_DEPENDENCIES.md`](ROADMAP_AND_DEPENDENCIES.md);
 decisions are numbered in [`ARCHITECTURE.md`](ARCHITECTURE.md); stored bytes are in
 [`FORMAT.md`](FORMAT.md); the conformance plan is
-[`CONFORMANCE_DESIGN.md`](CONFORMANCE_DESIGN.md). `AUTONOMOUS_EXECUTION_RUNBOOK.md` and
+[`CONFORMANCE_DESIGN.md`](CONFORMANCE_DESIGN.md); the verification map is
+[`VERIFICATION.md`](VERIFICATION.md). `AUTONOMOUS_EXECUTION_RUNBOOK.md` and
 `HYBRID_POC_SPECIFICATION.md` describe the finished PoC and are not instructions.
 
 ## Which issues
