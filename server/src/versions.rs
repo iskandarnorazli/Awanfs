@@ -126,12 +126,30 @@ pub enum Event {
     Remove(u64),
 }
 
+use crate::meta_index::BucketUsage;
+
 #[derive(Default, Debug)]
 pub struct VersionStore {
     keys: HashMap<(u32, String), Vec<Version>>,
+    noncurrent_by_bucket: HashMap<u32, BucketUsage>,
 }
 
 impl VersionStore {
+    fn list_noncurrent_usage(list: &[Version]) -> (u64, u64) {
+        let mut objects = 0u64;
+        let mut bytes = 0u64;
+        for v in list.iter().skip(1) {
+            if !v.marker {
+                objects += 1;
+                bytes += v.size;
+            }
+        }
+        (objects, bytes)
+    }
+
+    pub fn noncurrent_usage(&self, b_id: u32) -> BucketUsage {
+        self.noncurrent_by_bucket.get(&b_id).copied().unwrap_or_default()
+    }
     pub fn has(&self, b_id: u32, key: &str) -> bool {
         self.keys.contains_key(&(b_id, key.to_string()))
     }
@@ -164,32 +182,56 @@ impl VersionStore {
     /// Applies an event; returns the versions it made unreachable (their needles are dead).
     /// Starts the history if the key has none.
     pub fn apply(&mut self, b_id: u32, key: &str, ev: Event) -> Vec<Version> {
-        let list = self.keys.entry((b_id, key.to_string())).or_default();
-        match ev {
-            Event::Remove(id) => match list.iter().position(|x| x.id() == id) {
-                Some(i) => vec![list.remove(i)],
-                None => Vec::new(),
-            },
-            Event::Put(v) => {
-                // The same version twice: a compaction copy next to its original after a crash.
-                if let Some(i) = list.iter().position(|x| x.ts == v.ts && x.null == v.null) {
-                    list[i] = v;
-                    return Vec::new();
-                }
-                let mut gone = Vec::new();
-                if v.null {
-                    if let Some(i) = list.iter().position(|x| x.null) {
-                        if list[i].ts > v.ts {
-                            return vec![v];
+        let map_key = (b_id, key.to_string());
+        let (old_objs, old_bytes) = self
+            .keys
+            .get(&map_key)
+            .map(|l| Self::list_noncurrent_usage(l))
+            .unwrap_or((0, 0));
+        let (gone, new_objs, new_bytes) = {
+            let list = self.keys.entry(map_key).or_default();
+            let gone = match ev {
+                Event::Remove(id) => match list.iter().position(|x| x.id() == id) {
+                    Some(i) => vec![list.remove(i)],
+                    None => Vec::new(),
+                },
+                Event::Put(v) => {
+                    // The same version twice: a compaction copy next to its original after a crash.
+                    if let Some(i) = list.iter().position(|x| x.ts == v.ts && x.null == v.null) {
+                        list[i] = v;
+                        Vec::new()
+                    } else {
+                        let mut gone = Vec::new();
+                        if v.null {
+                            if let Some(i) = list.iter().position(|x| x.null) {
+                                if list[i].ts > v.ts {
+                                    vec![v]
+                                } else {
+                                    gone.push(list.remove(i));
+                                    let at = list.iter().position(|x| x.ts < v.ts).unwrap_or(list.len());
+                                    list.insert(at, v);
+                                    gone
+                                }
+                            } else {
+                                let at = list.iter().position(|x| x.ts < v.ts).unwrap_or(list.len());
+                                list.insert(at, v);
+                                gone
+                            }
+                        } else {
+                            let at = list.iter().position(|x| x.ts < v.ts).unwrap_or(list.len());
+                            list.insert(at, v);
+                            gone
                         }
-                        gone.push(list.remove(i));
                     }
                 }
-                let at = list.iter().position(|x| x.ts < v.ts).unwrap_or(list.len());
-                list.insert(at, v);
-                gone
-            }
-        }
+            };
+            let (no, nb) = Self::list_noncurrent_usage(list);
+            (gone, no, nb)
+        };
+        let entry = self.noncurrent_by_bucket.entry(b_id).or_default();
+        entry.objects = entry.objects.saturating_sub(old_objs) + new_objs;
+        entry.bytes = entry.bytes.saturating_sub(old_bytes) + new_bytes;
+        gone
     }
 
     /// Compaction moved a needle.
@@ -214,6 +256,7 @@ impl VersionStore {
 
     pub fn remove_bucket(&mut self, b_id: u32) {
         self.keys.retain(|(b, _), _| *b != b_id);
+        self.noncurrent_by_bucket.remove(&b_id);
     }
 
     /// Drops a key whose history is empty.

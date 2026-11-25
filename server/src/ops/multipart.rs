@@ -933,7 +933,22 @@ pub async fn complete_multipart_upload(
             }
             let mut version_id = None;
             if let Some((extra, ts)) = stamp {
-                match finish_version_put(&state, b_id, key, ts, mp_flags, manifest_offset, total_size, hi, lo, extents.len() as u16, reservation) {
+                match finish_version_put(
+                    &state,
+                    b_id,
+                    key,
+                    ts,
+                    mp_flags,
+                    manifest_offset,
+                    total_size,
+                    hi,
+                    lo,
+                    extents.len() as u16,
+                    reservation,
+                    crate::events::CommitKind::MultipartComplete,
+                    &composite_etag,
+                    late.is_none(),
+                ) {
                     Ok(v) => {
                         if extra & crate::meta_index::FLAG_NULL_ID == 0 {
                             version_id = Some(v);
@@ -942,28 +957,25 @@ pub async fn complete_multipart_upload(
                     Err(r) => return Ok(r),
                 }
             } else {
-                if let Err(code) = reservation.commit_put_at(
-                    &state.engine,
+                if let Err(code) = state.commit_unversioned_put(
                     b_id,
-                    key.as_bytes(),
+                    bucket,
+                    key,
                     manifest_offset,
                     total_size,
                     hi,
                     lo,
                     extents.len() as u16,
                     mp_flags,
-                    created_ns / 1_000_000,
+                    created_ns,
+                    old_info,
+                    crate::events::CommitKind::MultipartComplete,
+                    &composite_etag,
+                    late.is_none(),
+                    reservation,
                 ) {
                     return Ok(engine_error_response(code, key));
                 }
-                state.retire_unversioned_overwrite(
-                    b_id,
-                    key,
-                    old_info,
-                    manifest_offset,
-                    created_ns,
-                    mp_flags,
-                );
             }
 
             let location = format!("http://127.0.0.1:9000/{}/{}", bucket, key);

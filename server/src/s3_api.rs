@@ -725,6 +725,10 @@ pub struct S3ServiceState {
     pub attr_updates_ignored: Arc<AtomicU64>,
     /// Background needle scrub state and last pass report (#155).
     pub scrub: Arc<crate::scrub::ScrubManager>,
+    /// In-process commit event subscribers and per-bucket sequence numbers (#159).
+    pub events: Arc<crate::events::CommitEventBus>,
+    /// Allows emitting per-bucket usage gauges even above `PER_BUCKET_METRICS_CARDINALITY_CAP` (#159).
+    pub per_bucket_metrics: Arc<AtomicBool>,
 }
 
 #[inline]
@@ -929,6 +933,27 @@ pub struct SetAttrOutcome {
     pub created_at_ns: u64,
 }
 
+/// Per-bucket live usage counters reported by `S3ServiceState::bucket_usage` (#159).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BucketUsageReport {
+    pub current: crate::meta_index::BucketUsage,
+    pub all_versions: crate::meta_index::BucketUsage,
+}
+
+/// Optional commit event metadata supplied on a versioned commit (#159).
+#[derive(Clone, Debug)]
+pub(crate) struct VersionCommitEventSpec {
+    pub time: u64,
+    pub version: Option<String>,
+    pub kind: crate::events::CommitKind,
+    pub size: u64,
+    pub etag: String,
+    pub acked: bool,
+}
+
+/// Maximum number of buckets for which `awanfs_bucket_*` gauges emit automatically (#159).
+pub const PER_BUCKET_METRICS_CARDINALITY_CAP: usize = 1000;
+
 /// What `S3ServiceState::try_with_data_dir_limits` keeps in memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenLimits {
@@ -1028,6 +1053,8 @@ impl S3ServiceState {
             attr_updates: Arc::new(AttrUpdateStore::default()),
             attr_updates_ignored: Arc::new(AtomicU64::new(0)),
             scrub: Arc::new(crate::scrub::ScrubManager::new()),
+            events: Arc::new(crate::events::CommitEventBus::new()),
+            per_bucket_metrics: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1101,7 +1128,7 @@ impl S3ServiceState {
         let mut bucket_created_ns: HashMap<u32, u64> = HashMap::new();
         let mut version_store = crate::versions::VersionStore::default();
         for (&id, cfg) in bucket_store.snapshot().iter() {
-            engine.restore_bucket(id, &cfg.name);
+            engine.restore_bucket_in(id, &cfg.namespace, &cfg.name);
             if cfg.versioning != crate::versions::Versioning::Unset {
                 versioning_map.insert(id, cfg.versioning);
             }
@@ -1533,6 +1560,8 @@ impl S3ServiceState {
             attr_updates,
             attr_updates_ignored: Arc::new(AtomicU64::new(ignored_attr_updates)),
             scrub: Arc::new(crate::scrub::ScrubManager::new()),
+            events: Arc::new(crate::events::CommitEventBus::new()),
+            per_bucket_metrics: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1667,7 +1696,16 @@ impl S3ServiceState {
             };
             self.mvcc.tombstone(b_id, key);
             let v = crate::versions::Version { ts, modified: ts, null: flags & crate::meta_index::FLAG_NULL_ID != 0, marker: true, vol_offset: g, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags };
-            self.record_version(b_id, key, crate::versions::Event::Put(v)).map_err(|c| DeleteError::Internal(format!("index error {} for the delete marker", c)))?;
+            let ev_spec = VersionCommitEventSpec {
+                time: ts,
+                version: Some(v.id_string()),
+                kind: crate::events::CommitKind::DeleteMarker,
+                size: 0,
+                etag: String::new(),
+                acked: late.is_none(),
+            };
+            self.record_version_commit(b_id, key, crate::versions::Event::Put(v), None, Some(ev_spec))
+                .map_err(|c| DeleteError::Internal(format!("index error {} for the delete marker", c)))?;
             if let Some(e) = late {
                 return Err(DeleteError::Internal(e));
             }
@@ -1709,7 +1747,7 @@ impl S3ServiceState {
                 }),
                 None => crate::fsm::KeyState::Absent,
             };
-            match crate::fsm::key_step(
+            let deleted = match crate::fsm::key_step(
                 prev_state,
                 crate::fsm::KeyRecord::Tombstone {
                     versioned: false,
@@ -1718,12 +1756,21 @@ impl S3ServiceState {
                     vol_offset: tomb_g,
                 },
             ) {
-                Ok(crate::fsm::KeyState::Absent) | Err(_) => {
-                    let _ = engine.delete_object(b_id, key.as_bytes());
-                }
-                Ok(_) => {
-                    let _ = engine.delete_object(b_id, key.as_bytes());
-                }
+                Ok(crate::fsm::KeyState::Absent) | Err(_) => engine.delete_object(b_id, key.as_bytes()).is_ok(),
+                Ok(_) => engine.delete_object(b_id, key.as_bytes()).is_ok(),
+            };
+            if deleted && late.is_none() && self.events.has_subscribers() {
+                let bname = engine.buckets.get(&b_id).map(|b| b.name.as_str()).unwrap_or("");
+                self.emit_commit_event_for(
+                    b_id,
+                    bname,
+                    tomb_ts,
+                    key,
+                    None,
+                    crate::events::CommitKind::Delete,
+                    info.map_or(0, |x| x.1),
+                    "",
+                );
             }
             info
         };
@@ -1833,7 +1880,16 @@ impl S3ServiceState {
             }
             Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
         };
-        self.record_version(b_id, key, crate::versions::Event::Remove(id)).map_err(|c| DeleteError::Internal(format!("index error {} after deleting a version", c)))?;
+        let ev_spec = VersionCommitEventSpec {
+            time: self.clock.now_ns(),
+            version: Some(target.id_string()),
+            kind: crate::events::CommitKind::VersionDelete,
+            size: target.size,
+            etag: String::new(),
+            acked: late.is_none(),
+        };
+        self.record_version_commit(b_id, key, crate::versions::Event::Remove(id), None, Some(ev_spec))
+            .map_err(|c| DeleteError::Internal(format!("index error {} after deleting a version", c)))?;
         match late {
             Some(e) => Err(DeleteError::Internal(e)),
             None => Ok(Some(target)),
@@ -1867,7 +1923,7 @@ impl S3ServiceState {
     /// Records a durable version event: updates the history, drops the needles it made
     /// unreachable, and points the index row at the current version (#31).
     pub fn record_version(&self, b_id: u32, key: &str, ev: crate::versions::Event) -> Result<(), i32> {
-        self.record_version_with_reservation(b_id, key, ev, None)
+        self.record_version_commit(b_id, key, ev, None, None)
     }
 
     /// Variant of `record_version` that checks capacity before mutating `versions` and
@@ -1877,7 +1933,20 @@ impl S3ServiceState {
         b_id: u32,
         key: &str,
         ev: crate::versions::Event,
+        reservation: Option<CapacityReservation>,
+    ) -> Result<(), i32> {
+        self.record_version_commit(b_id, key, ev, reservation, None)
+    }
+
+    /// Single versioned index commit path: mutates `versions` and `engine` under lock and,
+    /// when `event` has `acked = true`, emits one `CommitEvent` before releasing locks (#159).
+    pub(crate) fn record_version_commit(
+        &self,
+        b_id: u32,
+        key: &str,
+        ev: crate::versions::Event,
         mut reservation: Option<CapacityReservation>,
+        event: Option<VersionCommitEventSpec>,
     ) -> Result<(), i32> {
         let mut restore_multipart = None;
         let dead = {
@@ -1938,6 +2007,21 @@ impl S3ServiceState {
                 }
                 _ => {
                     let _ = engine.delete_object(b_id, key.as_bytes());
+                }
+            }
+            if let Some(spec) = event {
+                if spec.acked && self.events.has_subscribers() {
+                    let bname = engine.buckets.get(&b_id).map(|b| b.name.as_str()).unwrap_or("");
+                    self.emit_commit_event_for(
+                        b_id,
+                        bname,
+                        spec.time,
+                        key,
+                        spec.version,
+                        spec.kind,
+                        spec.size,
+                        &spec.etag,
+                    );
                 }
             }
             dead
@@ -2021,6 +2105,117 @@ impl S3ServiceState {
         Ok(Bytes::from(out))
     }
 
+    /// Enables or disables unbounded per-bucket usage Prometheus gauges (#159).
+    pub fn set_per_bucket_metrics(&self, enabled: bool) {
+        self.per_bucket_metrics.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Returns current and all-version usage counters for bucket `b_id` (#159).
+    pub fn bucket_usage(&self, b_id: u32) -> Option<BucketUsageReport> {
+        let engine = self.engine.read();
+        let current = engine.bucket_usage(b_id)?;
+        let noncurrent = self.versions.read().noncurrent_usage(b_id);
+        Some(BucketUsageReport {
+            current,
+            all_versions: crate::meta_index::BucketUsage {
+                objects: current.objects + noncurrent.objects,
+                bytes: current.bytes + noncurrent.bytes,
+            },
+        })
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_commit_event_for(
+        &self,
+        b_id: u32,
+        bucket: &str,
+        time: u64,
+        key: &str,
+        version: Option<String>,
+        kind: crate::events::CommitKind,
+        size: u64,
+        etag: &str,
+    ) {
+        if !self.events.has_subscribers() {
+            return;
+        }
+        let principal = crate::request_log::current_principal().unwrap_or_default();
+        let request_id = crate::request_log::current_request_id().unwrap_or_default();
+        self.events.emit_with(b_id, |seq| crate::events::CommitEvent {
+            seq,
+            time,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version,
+            kind,
+            size,
+            etag: etag.to_string(),
+            principal,
+            request_id,
+        });
+    }
+
+    /// Emits a commit event for a durable bucket-level configuration change (#159).
+    pub(crate) fn emit_bucket_config_event(
+        &self,
+        b_id: u32,
+        bucket: &str,
+        key: &str,
+        kind: crate::events::CommitKind,
+        size: u64,
+    ) {
+        if !self.events.has_subscribers() {
+            return;
+        }
+        let now = self.clock.now_ns();
+        self.emit_commit_event_for(b_id, bucket, now, key, None, kind, size, "");
+    }
+
+    /// Single unversioned object commit point: updates the index under `engine.write()`,
+    /// emits one commit event when `acked` is true, and retires superseded state (#154, #159).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_unversioned_put(
+        &self,
+        b_id: u32,
+        bucket: &str,
+        key: &str,
+        vol_offset: u64,
+        size: u64,
+        etag_hi: u64,
+        etag_lo: u64,
+        part_count: u16,
+        flags: u16,
+        created_ns: u64,
+        old_info: Option<(u64, u64, u16)>,
+        kind: crate::events::CommitKind,
+        etag: &str,
+        acked: bool,
+        reservation: CapacityReservation,
+    ) -> Result<(), i32> {
+        {
+            let mut engine = self.engine.write();
+            let mut res = reservation;
+            res.release_in(&mut engine);
+            engine.put_object_at(
+                b_id,
+                key.as_bytes(),
+                vol_offset,
+                size,
+                etag_hi,
+                etag_lo,
+                part_count,
+                flags,
+                created_ns / 1_000_000,
+            )?;
+            if acked && self.events.has_subscribers() {
+                self.emit_commit_event_for(b_id, bucket, created_ns, key, None, kind, size, etag);
+            }
+        }
+        self.retire_unversioned_overwrite(b_id, key, old_info, vol_offset, created_ns, flags);
+        Ok(())
+    }
+
     /// Records a bucket's versioning status in the manifest and in memory (#31).
     pub fn set_versioning(&self, b_id: u32, status: crate::versions::Versioning) -> std::io::Result<()> {
         self.bucket_configs
@@ -2028,6 +2223,21 @@ impl S3ServiceState {
             .apply_versioning(b_id, status)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         self.versioning.write().insert(b_id, status);
+        if self.events.has_subscribers() {
+            let bucket = self
+                .bucket_config_reader
+                .load_bucket(b_id)
+                .map(|c| c.name.clone())
+                .or_else(|| self.engine.read().buckets.get(&b_id).map(|b| b.name.clone()))
+                .unwrap_or_default();
+            self.emit_bucket_config_event(
+                b_id,
+                &bucket,
+                "versioning",
+                crate::events::CommitKind::BucketVersioning,
+                status.as_str().len() as u64,
+            );
+        }
         Ok(())
     }
 
@@ -3386,6 +3596,25 @@ impl S3ServiceState {
                 after_record: true,
             });
         }
+        if self.events.has_subscribers() {
+            let bname = self
+                .engine
+                .read()
+                .buckets
+                .get(&b_id)
+                .map(|b| b.name.clone())
+                .unwrap_or_default();
+            self.emit_commit_event_for(
+                b_id,
+                &bname,
+                created_ns,
+                key,
+                resp_vid.clone(),
+                crate::events::CommitKind::AttrUpdate,
+                payload.len() as u64,
+                "",
+            );
+        }
         Ok(SetAttrOutcome {
             version_id: resp_vid,
             vol_offset: g,
@@ -3716,6 +3945,52 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
     let mut out = String::with_capacity(8192);
     state.metrics.render(&mut out);
     state.bucket_config_metrics.render(&mut out);
+    state.events.render_metrics(&mut out);
+    {
+        let mut usage_rows = Vec::new();
+        {
+            let engine = state.engine.read();
+            let emit = engine.buckets.len() <= PER_BUCKET_METRICS_CARDINALITY_CAP
+                || state.per_bucket_metrics.load(Ordering::Relaxed);
+            if emit {
+                let versions = state.versions.read();
+                for (&b_id, entry) in &engine.buckets {
+                    let cur = crate::meta_index::BucketUsage {
+                        objects: entry.current_objects,
+                        bytes: entry.current_bytes,
+                    };
+                    let noncur = versions.noncurrent_usage(b_id);
+                    let all_ver = crate::meta_index::BucketUsage {
+                        objects: cur.objects + noncur.objects,
+                        bytes: cur.bytes + noncur.bytes,
+                    };
+                    let labels = if entry.namespace.is_empty() {
+                        format!("bucket=\"{}\"", entry.name)
+                    } else {
+                        format!("namespace=\"{}\",bucket=\"{}\"", entry.namespace, entry.name)
+                    };
+                    usage_rows.push((entry.namespace.clone(), entry.name.clone(), labels, cur, all_ver));
+                }
+            }
+        }
+        usage_rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        out.push_str("# HELP awanfs_bucket_objects Current live objects in the bucket.\n# TYPE awanfs_bucket_objects gauge\n");
+        for (_, _, labels, cur, _) in &usage_rows {
+            let _ = writeln!(out, "awanfs_bucket_objects{{{}}} {}", labels, cur.objects);
+        }
+        out.push_str("# HELP awanfs_bucket_bytes Current live payload bytes in the bucket.\n# TYPE awanfs_bucket_bytes gauge\n");
+        for (_, _, labels, cur, _) in &usage_rows {
+            let _ = writeln!(out, "awanfs_bucket_bytes{{{}}} {}", labels, cur.bytes);
+        }
+        out.push_str("# HELP awanfs_bucket_all_versions_objects Total live non-marker object versions in the bucket.\n# TYPE awanfs_bucket_all_versions_objects gauge\n");
+        for (_, _, labels, _, all_ver) in &usage_rows {
+            let _ = writeln!(out, "awanfs_bucket_all_versions_objects{{{}}} {}", labels, all_ver.objects);
+        }
+        out.push_str("# HELP awanfs_bucket_all_versions_bytes Total live non-marker object version bytes in the bucket.\n# TYPE awanfs_bucket_all_versions_bytes gauge\n");
+        for (_, _, labels, _, all_ver) in &usage_rows {
+            let _ = writeln!(out, "awanfs_bucket_all_versions_bytes{{{}}} {}", labels, all_ver.bytes);
+        }
+    }
     let used: u64 = state.volumes.read().values().map(|v| v.offset()).sum();
     let (free, active_id) = match state.volume_manager.read().clone() {
         Some(vm) => (vm.max_span().saturating_sub(vm.offset()), vm.id()),

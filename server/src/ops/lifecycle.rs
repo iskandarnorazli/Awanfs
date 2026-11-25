@@ -21,6 +21,9 @@ pub async fn put_bucket_lifecycle(
     match parse_lifecycle_xml(&body_str) {
         Ok(rules) => {
             state.lifecycle.set_rules(bucket, rules);
+            if let Ok(b_id) = state.engine.read().lookup_bucket(bucket) {
+                state.emit_bucket_config_event(b_id, bucket, "lifecycle", crate::events::CommitKind::BucketConfig, body_str.len() as u64);
+            }
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_LENGTH, "0")
@@ -67,6 +70,9 @@ pub async fn delete_bucket_lifecycle(
     bucket: &str,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     state.lifecycle.delete_rules(bucket);
+    if let Ok(b_id) = state.engine.read().lookup_bucket(bucket) {
+        state.emit_bucket_config_event(b_id, bucket, "lifecycle", crate::events::CommitKind::BucketConfig, 0);
+    }
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
         .header(CONTENT_LENGTH, "0")

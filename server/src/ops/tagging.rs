@@ -194,11 +194,14 @@ pub async fn put_bucket_tagging(
         .lock()
         .put_config(b_id, ConfigKind::Tagging, &body_bytes);
     match res {
-        Ok(()) => Ok(Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .header(CONTENT_LENGTH, "0")
-            .body(empty_body())
-            .unwrap()),
+        Ok(()) => {
+            state.emit_bucket_config_event(b_id, bucket, "tagging", crate::events::CommitKind::BucketConfig, body_bytes.len() as u64);
+            Ok(Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header(CONTENT_LENGTH, "0")
+                .body(empty_body())
+                .unwrap())
+        }
         Err(e) => {
             let status = StatusCode::from_u16(e.status()).unwrap_or(StatusCode::BAD_REQUEST);
             Ok(xml_error(status, e.code(), &e.to_string(), bucket))
@@ -252,11 +255,14 @@ pub async fn delete_bucket_tagging(
         .lock()
         .delete_config(b_id, ConfigKind::Tagging);
     match res {
-        Ok(()) => Ok(Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .header(CONTENT_LENGTH, "0")
-            .body(empty_body())
-            .unwrap()),
+        Ok(()) => {
+            state.emit_bucket_config_event(b_id, bucket, "tagging", crate::events::CommitKind::BucketConfig, 0);
+            Ok(Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header(CONTENT_LENGTH, "0")
+                .body(empty_body())
+                .unwrap())
+        }
         Err(e) => {
             let status = StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             Ok(xml_error(status, e.code(), &e.to_string(), bucket))

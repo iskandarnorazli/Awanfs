@@ -89,12 +89,13 @@ Switches, so the same model checks the current code and the fixes:
                     compaction moving a base needle past an update makes recovery ignore the
                     update or overwrite it with the base attributes.
 *)
-EXTENDS Naturals, FiniteSets
+EXTENDS Naturals, FiniteSets, Sequences
 
 CONSTANTS Writers, Deleters, Updaters, UseKeyLock, WriteCanFail, RecoverSkipsGaps, DeleteLogsFirst,
           Streamers, Relocate, Compactor, CompactWaitsForWriters,
           FailLeavesRecord, IndexAfterLateFail, Versioning, ClockStepsBack, NullReplay,
-          CondWriters, CheckCondUnderLock, ReplayAppliesAttrUpdates, AttrReplayByTime
+          CondWriters, CheckCondUnderLock, ReplayAppliesAttrUpdates, AttrReplayByTime,
+          EmitOnCommit
 
 ASSUME Streamers \subseteq Writers
 ASSUME CondWriters \subseteq Writers
@@ -102,6 +103,7 @@ ASSUME Updaters \cap (Writers \cup Deleters) = {}
 ASSUME CheckCondUnderLock \in BOOLEAN
 ASSUME ReplayAppliesAttrUpdates \in BOOLEAN
 ASSUME AttrReplayByTime \in BOOLEAN
+ASSUME EmitOnCommit \in BOOLEAN
 
 Procs == Writers \cup Deleters \cup Updaters
 Gone == [present |-> FALSE, val |-> "none", attr |-> "none"]
@@ -168,11 +170,11 @@ Steps(p) == IF p \in Deleters /\ ~DeleteLogsFirst
             THEN <<"write", "relocate", "index">>
             ELSE <<"reserve", "write", "index">>
 
-VARIABLES pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning, condWon, utarget
+VARIABLES pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning, condWon, utarget, seq, events, commits
 
-vars == <<pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning, condWon, utarget>>
+vars == <<pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning, condWon, utarget, seq, events, commits>>
 procVars == <<pc, step, off, nextOff, log, engine, lock, condWon, utarget>>
-cVars == <<cpc, cut, snap, clock, versioning>>
+cVars == <<cpc, cut, snap, clock, versioning, seq, events, commits>>
 Dropped == cpc = "done"
 
 \* Moves p to its next step, or to release after the last one.
@@ -268,6 +270,9 @@ Init ==
     /\ versioning = FALSE
     /\ condWon = [p \in CondWriters |-> FALSE]
     /\ utarget = [p \in Updaters |-> 0]
+    /\ seq = 0
+    /\ events = <<>>
+    /\ commits = <<>>
 
 \* Broken variant (#112): condition checked BEFORE taking the key lock.
 PreCheck(p) ==
@@ -392,11 +397,16 @@ RelocateLateFail(p) ==
 
 Index(p) ==
     /\ pc[p] = "index"
-    /\ engine' = LiveApply(engine, RecOf(p))
+    /\ LET nextEng == LiveApply(engine, RecOf(p))
+           nextSeq == seq + 1
+           ev == [seq |-> nextSeq, op |-> p, state |-> nextEng]
+       IN /\ engine' = nextEng
+          /\ seq' = nextSeq
+          /\ commits' = Append(commits, ev)
+          /\ events' = IF EmitOnCommit THEN Append(events, ev) ELSE events
     /\ condWon' = IF p \in CondWriters THEN [condWon EXCEPT ![p] = TRUE] ELSE condWon
     /\ Advance(p)
-    /\ UNCHANGED <<off, nextOff, log, lock, utarget>>
-    /\ UNCHANGED cVars
+    /\ UNCHANGED <<off, nextOff, log, lock, utarget, cpc, cut, snap, clock, versioning>>
 
 Release(p) ==
     /\ pc[p] = "release"
@@ -421,13 +431,13 @@ CSeal ==
     /\ Compactor /\ cpc = "idle"
     /\ cut' = nextOff
     /\ cpc' = "sealed"
-    /\ UNCHANGED <<snap, clock, versioning>> /\ UNCHANGED procVars
+    /\ UNCHANGED <<snap, clock, versioning, seq, events, commits>> /\ UNCHANGED procVars
 CScan ==
     /\ cpc = "sealed"
     /\ CompactWaitsForWriters => ~InFlightBelowCut
     /\ snap' = {r \in log : r.o < cut}
     /\ cpc' = "scanned"
-    /\ UNCHANGED <<cut, clock, versioning>> /\ UNCHANGED procVars
+    /\ UNCHANGED <<cut, clock, versioning, seq, events, commits>> /\ UNCHANGED procVars
 CCopy ==
     /\ cpc = "scanned"
     /\ UseKeyLock => lock = "free"
@@ -439,24 +449,24 @@ CCopy ==
        IN /\ log' = log \cup bases \cup copiedAttrs
           /\ nextOff' = offBase + Cardinality(liveAttrs)
     /\ cpc' = "copied"
-    /\ UNCHANGED <<cut, snap, pc, step, off, engine, lock, clock, versioning, condWon, utarget>>
+    /\ UNCHANGED <<cut, snap, pc, step, off, engine, lock, clock, versioning, condWon, utarget, seq, events, commits>>
 CDrop ==
     /\ cpc = "copied"
     /\ log' = {r \in log : r.o >= cut}
     /\ cpc' = "done"
-    /\ UNCHANGED <<cut, snap, pc, step, off, nextOff, engine, lock, clock, versioning, condWon, utarget>>
+    /\ UNCHANGED <<cut, snap, pc, step, off, nextOff, engine, lock, clock, versioning, condWon, utarget, seq, events, commits>>
 
 \* PutBucketVersioning: no key lock.
 VersionOn ==
     /\ Versioning /\ ~versioning
     /\ versioning' = TRUE
-    /\ UNCHANGED <<procVars, cpc, cut, snap, clock>>
+    /\ UNCHANGED <<procVars, cpc, cut, snap, clock, seq, events, commits>>
 
 \* The wall clock moves; it only matters to versioned writes.
 Tick ==
     /\ Versioning
     /\ clock' \in (IF ClockStepsBack THEN Ts \ {clock} ELSE {c \in Ts : c > clock})
-    /\ UNCHANGED <<procVars, cpc, cut, snap, versioning>>
+    /\ UNCHANGED <<procVars, cpc, cut, snap, versioning, seq, events, commits>>
 
 AllDone == (\A p \in Procs : pc[p] = "done") /\ cpc \in {"idle", "done"}
 
@@ -497,6 +507,8 @@ UpdateNeverResurrects ==
     /\ { [val |-> v.val, ts |-> v.ts, null |-> v.null, marker |-> v.marker] : v \in Recovered.store }
        = { [val |-> v.val, ts |-> v.ts, null |-> v.null, marker |-> v.marker] : v \in BaseRecovered.store }
 
+EventsMatchCommits == events = commits
+
 TypeOK ==
     /\ pc \in [Procs -> {"start", "checked", "body", "reserve", "write", "relocate", "index", "release", "done"}]
     /\ step \in [Procs -> 0..4]
@@ -506,4 +518,5 @@ TypeOK ==
     /\ versioning \in BOOLEAN
     /\ condWon \in [CondWriters -> BOOLEAN]
     /\ utarget \in [Updaters -> Nat]
+    /\ seq \in Nat
 ====
