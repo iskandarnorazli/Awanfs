@@ -21,6 +21,7 @@
 | Suspended bucket omits PutObject VersionId | `suspended` | [versioning.md](versioning.md) |
 | Object metadata & overrides | `metadata` | [metadata.md](metadata.md) |
 | Restart keeps data | `restart` | [restart.md](restart.md) |
+| Conditional writes and deletes | `conditional` | [conditional.md](conditional.md) |
 
 Signatures are checked on every journey: `doctor` proves an unsigned request gets 403 and a signed one 200, and every journey runs signed with the keys the script gives the server.
 

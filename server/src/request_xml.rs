@@ -23,6 +23,9 @@ const INVALID_PART_ORDER: Refusal = refuse("InvalidPartOrder", 400);
 pub struct DeleteObject {
     pub key: String,
     pub version_id: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified_secs: Option<u64>,
+    pub size: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -59,7 +62,12 @@ fn cdata_text(c: quick_xml::events::BytesCData<'_>) -> Result<String, Refusal> {
 fn is_delete_leaf(path: &[String]) -> bool {
     matches!(
         path.iter().map(|s| s.as_str()).collect::<Vec<_>>().as_slice(),
-        ["Delete", "Quiet"] | ["Delete", "Object", "Key"] | ["Delete", "Object", "VersionId"]
+        ["Delete", "Quiet"]
+            | ["Delete", "Object", "Key"]
+            | ["Delete", "Object", "VersionId"]
+            | ["Delete", "Object", "ETag"]
+            | ["Delete", "Object", "LastModifiedTime"]
+            | ["Delete", "Object", "Size"]
     )
 }
 
@@ -68,12 +76,18 @@ fn push_delete_text(
     quiet: &mut Option<String>,
     cur_key: &mut Option<String>,
     cur_vid: &mut Option<String>,
+    cur_etag: &mut Option<String>,
+    cur_lmt: &mut Option<String>,
+    cur_size: &mut Option<String>,
     v: &str,
 ) -> Result<(), Refusal> {
     let slot = match path.iter().map(|s| s.as_str()).collect::<Vec<_>>().as_slice() {
         ["Delete", "Quiet"] => quiet,
         ["Delete", "Object", "Key"] => cur_key,
         ["Delete", "Object", "VersionId"] => cur_vid,
+        ["Delete", "Object", "ETag"] => cur_etag,
+        ["Delete", "Object", "LastModifiedTime"] => cur_lmt,
+        ["Delete", "Object", "Size"] => cur_size,
         _ => {
             if !v.trim().is_empty() {
                 return Err(MALFORMED_XML);
@@ -93,6 +107,9 @@ pub fn parse_delete_objects(body: &str) -> Result<DeleteRequest, Refusal> {
     let mut objects: Vec<DeleteObject> = Vec::new();
     let mut cur_key: Option<String> = None;
     let mut cur_vid: Option<String> = None;
+    let mut cur_etag: Option<String> = None;
+    let mut cur_lmt: Option<String> = None;
+    let mut cur_size: Option<String> = None;
     let mut in_object = false;
 
     loop {
@@ -121,6 +138,9 @@ pub fn parse_delete_objects(body: &str) -> Result<DeleteRequest, Refusal> {
                         in_object = true;
                         cur_key = None;
                         cur_vid = None;
+                        cur_etag = None;
+                        cur_lmt = None;
+                        cur_size = None;
                     }
                     ["Delete", "Object", "Key"] => {
                         if cur_key.is_some() {
@@ -133,6 +153,24 @@ pub fn parse_delete_objects(body: &str) -> Result<DeleteRequest, Refusal> {
                             return Err(MALFORMED_XML);
                         }
                         cur_vid = Some(String::new());
+                    }
+                    ["Delete", "Object", "ETag"] => {
+                        if cur_etag.is_some() {
+                            return Err(MALFORMED_XML);
+                        }
+                        cur_etag = Some(String::new());
+                    }
+                    ["Delete", "Object", "LastModifiedTime"] => {
+                        if cur_lmt.is_some() {
+                            return Err(MALFORMED_XML);
+                        }
+                        cur_lmt = Some(String::new());
+                    }
+                    ["Delete", "Object", "Size"] => {
+                        if cur_size.is_some() {
+                            return Err(MALFORMED_XML);
+                        }
+                        cur_size = Some(String::new());
                     }
                     _ => {
                         if path.len() > 2 && is_delete_leaf(&path[..path.len() - 1]) {
@@ -161,22 +199,61 @@ pub fn parse_delete_objects(body: &str) -> Result<DeleteRequest, Refusal> {
                         }
                         cur_vid = Some(String::new());
                     }
+                    ["Delete", "Object", "ETag"] => {
+                        if cur_etag.is_some() {
+                            return Err(MALFORMED_XML);
+                        }
+                        cur_etag = Some(String::new());
+                    }
                     _ => {}
                 }
                 path.pop();
             }
             Ok(Event::Text(t)) => {
                 let v = unescape_text(&t)?;
-                push_delete_text(&path, &mut quiet, &mut cur_key, &mut cur_vid, &v)?;
+                push_delete_text(
+                    &path,
+                    &mut quiet,
+                    &mut cur_key,
+                    &mut cur_vid,
+                    &mut cur_etag,
+                    &mut cur_lmt,
+                    &mut cur_size,
+                    &v,
+                )?;
             }
             Ok(Event::CData(c)) => {
                 let v = cdata_text(c)?;
-                push_delete_text(&path, &mut quiet, &mut cur_key, &mut cur_vid, &v)?;
+                push_delete_text(
+                    &path,
+                    &mut quiet,
+                    &mut cur_key,
+                    &mut cur_vid,
+                    &mut cur_etag,
+                    &mut cur_lmt,
+                    &mut cur_size,
+                    &v,
+                )?;
             }
             Ok(Event::End(_)) => {
                 if in_object && path.len() == 2 && path[1] == "Object" {
                     let key = cur_key.take().filter(|k| !k.is_empty()).ok_or(MALFORMED_XML)?;
-                    objects.push(DeleteObject { key, version_id: cur_vid.take() });
+                    let etag = cur_etag.take();
+                    let last_modified_secs = match cur_lmt.take() {
+                        Some(raw) => Some(crate::precondition::parse_http_date_or_iso(&raw).ok_or(MALFORMED_XML)?),
+                        None => None,
+                    };
+                    let size = match cur_size.take() {
+                        Some(raw) => Some(raw.trim().parse::<i64>().map_err(|_| MALFORMED_XML)?),
+                        None => None,
+                    };
+                    objects.push(DeleteObject {
+                        key,
+                        version_id: cur_vid.take(),
+                        etag,
+                        last_modified_secs,
+                        size,
+                    });
                     in_object = false;
                 }
                 path.pop();
@@ -476,6 +553,15 @@ mod tests {
             if let Some(vid) = &obj.version_id {
                 out.push_str(&format!("    <VersionId>{}</VersionId>\n", crate::xml::xml_escape_exact(vid)));
             }
+            if let Some(etag) = &obj.etag {
+                out.push_str(&format!("    <ETag>{}</ETag>\n", crate::xml::xml_escape_exact(etag)));
+            }
+            if let Some(lmt) = obj.last_modified_secs {
+                out.push_str(&format!("    <LastModifiedTime>{}</LastModifiedTime>\n", crate::precondition::format_http_date(lmt)));
+            }
+            if let Some(sz) = obj.size {
+                out.push_str(&format!("    <Size>{sz}</Size>\n"));
+            }
             out.push_str("  </Object>\n");
         }
         out.push_str("</Delete>");
@@ -491,8 +577,8 @@ mod tests {
                 DeleteRequest {
                     quiet: false,
                     objects: vec![
-                        DeleteObject { key: "k1".into(), version_id: None },
-                        DeleteObject { key: "a&b".into(), version_id: None },
+                        DeleteObject { key: "k1".into(), version_id: None, etag: None, last_modified_secs: None, size: None },
+                        DeleteObject { key: "a&b".into(), version_id: None, etag: None, last_modified_secs: None, size: None },
                     ],
                 },
             ),
@@ -502,8 +588,8 @@ mod tests {
                 DeleteRequest {
                     quiet: false,
                     objects: vec![
-                        DeleteObject { key: "a".into(), version_id: Some("null".into()) },
-                        DeleteObject { key: "b/c".into(), version_id: Some("null".into()) },
+                        DeleteObject { key: "a".into(), version_id: Some("null".into()), etag: None, last_modified_secs: None, size: None },
+                        DeleteObject { key: "b/c".into(), version_id: Some("null".into()), etag: None, last_modified_secs: None, size: None },
                     ],
                 },
             ),
@@ -522,6 +608,9 @@ mod tests {
                     objects: vec![DeleteObject {
                         key: "dir/file <1>.txt".into(),
                         version_id: Some("v123".into()),
+                        etag: None,
+                        last_modified_secs: None,
+                        size: None,
                     }],
                 },
             ),
@@ -530,7 +619,21 @@ mod tests {
                 "<Delete><Object><Key> spaced </Key></Object></Delete>",
                 DeleteRequest {
                     quiet: false,
-                    objects: vec![DeleteObject { key: " spaced ".into(), version_id: None }],
+                    objects: vec![DeleteObject { key: " spaced ".into(), version_id: None, etag: None, last_modified_secs: None, size: None }],
+                },
+            ),
+            // Conditional DeleteObjects fields: ETag, LastModifiedTime, Size
+            (
+                "<Delete><Object><Key>cond</Key><ETag>\"abc\"</ETag><LastModifiedTime>Wed, 11 Nov 2026 00:00:00 GMT</LastModifiedTime><Size>42</Size></Object></Delete>",
+                DeleteRequest {
+                    quiet: false,
+                    objects: vec![DeleteObject {
+                        key: "cond".into(),
+                        version_id: None,
+                        etag: Some("\"abc\"".into()),
+                        last_modified_secs: Some(1_794_355_200),
+                        size: Some(42),
+                    }],
                 },
             ),
         ];

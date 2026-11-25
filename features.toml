@@ -608,7 +608,7 @@ mint = [
 [[feature]]
 id = "conditional"
 name = "Conditional GET, HEAD, PUT, CopyObject, and DELETE (If-Match, If-None-Match, dates)"
-status = "partial"
+status = "done"
 issue = "#112"
 area = "conditional"
 design_section = "6.3"
@@ -617,7 +617,9 @@ operations = [
   "HeadObject (conditional)",
   "PutObject (conditional)",
   "CopyObject (conditional)",
+  "CompleteMultipartUpload (conditional)",
   "DeleteObject (conditional)",
+  "DeleteObjects (conditional)",
 ]
 ceph = [
   "test_s3::test_get_object_ifmatch_good",
@@ -676,8 +678,8 @@ mint = [
   "minio-py:test_copy_object_negative_etag_match",
   "minio-py:test_copy_object_unmodified_since",
 ]
-server_tests = ["server/tests/precondition_test.rs", "server/tests/edge_cases_test.rs"]
-drive = ["objects"]
+server_tests = ["server/tests/precondition_test.rs", "server/tests/edge_cases_test.rs", "server/tests/conditional_writes_test.rs"]
+drive = ["objects", "conditional"]
 
 [[feature]]
 id = "multipart"
