@@ -20,8 +20,10 @@ pub async fn put_bucket_lifecycle(
     let body_str = String::from_utf8_lossy(&body_bytes);
     match parse_lifecycle_xml(&body_str) {
         Ok(rules) => {
-            state.lifecycle.set_rules(bucket, rules);
-            if let Ok(b_id) = state.engine.read().lookup_bucket(bucket) {
+            let b_id = state.engine.read().lookup_bucket(bucket).ok();
+            let mut configs = state.lifecycle.configs.write();
+            configs.insert(bucket.to_string(), rules);
+            if let Some(b_id) = b_id {
                 state.emit_bucket_config_event(b_id, bucket, "lifecycle", crate::events::CommitKind::BucketConfig, body_str.len() as u64);
             }
             Ok(Response::builder()
@@ -69,9 +71,12 @@ pub async fn delete_bucket_lifecycle(
     state: Arc<S3ServiceState>,
     bucket: &str,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
-    state.lifecycle.delete_rules(bucket);
-    if let Ok(b_id) = state.engine.read().lookup_bucket(bucket) {
-        state.emit_bucket_config_event(b_id, bucket, "lifecycle", crate::events::CommitKind::BucketConfig, 0);
+    let b_id = state.engine.read().lookup_bucket(bucket).ok();
+    let mut configs = state.lifecycle.configs.write();
+    if configs.remove(bucket).is_some() {
+        if let Some(b_id) = b_id {
+            state.emit_bucket_config_event(b_id, bucket, "lifecycle", crate::events::CommitKind::BucketConfig, 0);
+        }
     }
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)

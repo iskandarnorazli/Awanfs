@@ -72,19 +72,20 @@ pub async fn put_bucket_cors(
             bucket,
         ));
     }
-    let res = state
-        .bucket_configs
-        .lock()
-        .put_config(b_id, ConfigKind::Cors, &body_bytes);
-    match res {
-        Ok(()) => {
+    let res = {
+        let mut bc = state.bucket_configs.lock();
+        let res = bc.put_config(b_id, ConfigKind::Cors, &body_bytes);
+        if res.is_ok() {
             state.emit_bucket_config_event(b_id, bucket, "cors", crate::events::CommitKind::BucketConfig, body_bytes.len() as u64);
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_LENGTH, "0")
-                .body(empty_body())
-                .unwrap())
         }
+        res
+    };
+    match res {
+        Ok(()) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_LENGTH, "0")
+            .body(empty_body())
+            .unwrap()),
         Err(e) => {
             let status = StatusCode::from_u16(e.status()).unwrap_or(StatusCode::BAD_REQUEST);
             Ok(xml_error(status, e.code(), &e.to_string(), bucket))
@@ -125,19 +126,20 @@ pub async fn delete_bucket_cors(
     b_id: u32,
     bucket: &str,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
-    let res = state
-        .bucket_configs
-        .lock()
-        .delete_config(b_id, ConfigKind::Cors);
-    match res {
-        Ok(()) => {
+    let res = {
+        let mut bc = state.bucket_configs.lock();
+        let res = bc.delete_config(b_id, ConfigKind::Cors);
+        if res.is_ok() {
             state.emit_bucket_config_event(b_id, bucket, "cors", crate::events::CommitKind::BucketConfig, 0);
-            Ok(Response::builder()
-                .status(StatusCode::NO_CONTENT)
-                .header(CONTENT_LENGTH, "0")
-                .body(empty_body())
-                .unwrap())
         }
+        res
+    };
+    match res {
+        Ok(()) => Ok(Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header(CONTENT_LENGTH, "0")
+            .body(empty_body())
+            .unwrap()),
         Err(e) => {
             let status = StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             Ok(xml_error(status, e.code(), &e.to_string(), bucket))

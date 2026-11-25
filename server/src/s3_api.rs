@@ -2218,18 +2218,12 @@ impl S3ServiceState {
 
     /// Records a bucket's versioning status in the manifest and in memory (#31).
     pub fn set_versioning(&self, b_id: u32, status: crate::versions::Versioning) -> std::io::Result<()> {
-        self.bucket_configs
-            .lock()
-            .apply_versioning(b_id, status)
+        let mut bc = self.bucket_configs.lock();
+        bc.apply_versioning(b_id, status)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         self.versioning.write().insert(b_id, status);
         if self.events.has_subscribers() {
-            let bucket = self
-                .bucket_config_reader
-                .load_bucket(b_id)
-                .map(|c| c.name.clone())
-                .or_else(|| self.engine.read().buckets.get(&b_id).map(|b| b.name.clone()))
-                .unwrap_or_default();
+            let bucket = bc.load_bucket(b_id).map(|c| c.name.clone()).unwrap_or_default();
             self.emit_bucket_config_event(
                 b_id,
                 &bucket,
@@ -3947,11 +3941,17 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
     state.bucket_config_metrics.render(&mut out);
     state.events.render_metrics(&mut out);
     {
+        let mut total_objects = 0u64;
+        let mut total_bytes = 0u64;
         let mut usage_rows = Vec::new();
         {
             let engine = state.engine.read();
             let emit = engine.buckets.len() <= PER_BUCKET_METRICS_CARDINALITY_CAP
                 || state.per_bucket_metrics.load(Ordering::Relaxed);
+            for entry in engine.buckets.values() {
+                total_objects += entry.current_objects;
+                total_bytes += entry.current_bytes;
+            }
             if emit {
                 let versions = state.versions.read();
                 for (&b_id, entry) in &engine.buckets {
@@ -3967,13 +3967,28 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
                     let labels = if entry.namespace.is_empty() {
                         format!("bucket=\"{}\"", entry.name)
                     } else {
-                        format!("namespace=\"{}\",bucket=\"{}\"", entry.namespace, entry.name)
+                        let escaped_ns = entry
+                            .namespace
+                            .replace('\\', "\\\\")
+                            .replace('"', "\\\"")
+                            .replace('\n', "\\n");
+                        format!("namespace=\"{}\",bucket=\"{}\"", escaped_ns, entry.name)
                     };
                     usage_rows.push((entry.namespace.clone(), entry.name.clone(), labels, cur, all_ver));
                 }
             }
         }
         usage_rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        let _ = writeln!(
+            out,
+            "# HELP awanfs_objects_total Current live objects across all buckets.\n# TYPE awanfs_objects_total gauge\nawanfs_objects_total {}",
+            total_objects
+        );
+        let _ = writeln!(
+            out,
+            "# HELP awanfs_bytes_total Current live payload bytes across all buckets.\n# TYPE awanfs_bytes_total gauge\nawanfs_bytes_total {}",
+            total_bytes
+        );
         out.push_str("# HELP awanfs_bucket_objects Current live objects in the bucket.\n# TYPE awanfs_bucket_objects gauge\n");
         for (_, _, labels, cur, _) in &usage_rows {
             let _ = writeln!(out, "awanfs_bucket_objects{{{}}} {}", labels, cur.objects);

@@ -510,7 +510,15 @@ async fn namespace_round_trips_through_restart_and_reads_legacy_manifest() {
     let manifest_path = dir.join("buckets.manifest");
     std::fs::write(
         &manifest_path,
-        "+1:legacy-bkt\n+2:shared-name:1000:root:tenant-a\n+3:shared-name:2000:root:tenant-b\n",
+        concat!(
+            "+1:legacy-bkt\n",
+            "+2:shared-name:1000:root:tenant-a\n",
+            "+3:shared-name:2000:root:tenant-b\n",
+            "+4:no-ts-bkt::owner-4:tenant-c\n",
+            "+91:tmp1\n-91:tmp1\n",
+            "+92:tmp2\n-92:tmp2\n",
+            "+93:tmp3\n-93:tmp3\n",
+        ),
     )
     .unwrap();
 
@@ -520,8 +528,10 @@ async fn namespace_round_trips_through_restart_and_reads_legacy_manifest() {
     assert_eq!(engine.buckets[&1].namespace, "");
     assert_eq!(engine.lookup_bucket_in("tenant-a", "shared-name"), Ok(2));
     assert_eq!(engine.lookup_bucket_in("tenant-b", "shared-name"), Ok(3));
+    assert_eq!(engine.lookup_bucket_in("tenant-c", "no-ts-bkt"), Ok(4));
     assert_eq!(engine.buckets[&2].namespace, "tenant-a");
     assert_eq!(engine.buckets[&3].namespace, "tenant-b");
+    assert_eq!(engine.buckets[&4].namespace, "tenant-c");
     drop(engine);
 
     state.engine.write().put_object(2, b"k", 4096, 11, 0, 0, 0, 0).unwrap();
@@ -530,16 +540,21 @@ async fn namespace_round_trips_through_restart_and_reads_legacy_manifest() {
     assert_eq!(state.engine.read().bucket_usage(3).unwrap().bytes, 22);
     drop(state);
 
-    // Force compaction of manifest (2 dead lines vs 3 live? add one delete+create or reload twice)
+    // Reload after initial manifest compaction (6 dead lines > 4 live lines) and verify
+    // namespace + owner survived compaction, including when created_ns is None.
     let reopened = Arc::new(S3ServiceState::try_with_data_dir(&dir).unwrap());
     let engine = reopened.engine.read();
     assert_eq!(engine.lookup_bucket("legacy-bkt"), Ok(1));
     assert_eq!(engine.buckets[&1].namespace, "");
     assert_eq!(engine.lookup_bucket_in("tenant-a", "shared-name"), Ok(2));
     assert_eq!(engine.lookup_bucket_in("tenant-b", "shared-name"), Ok(3));
+    assert_eq!(engine.lookup_bucket_in("tenant-c", "no-ts-bkt"), Ok(4));
     assert_eq!(reopened.bucket_config_reader.load_bucket(1).unwrap().namespace, "");
     assert_eq!(reopened.bucket_config_reader.load_bucket(2).unwrap().namespace, "tenant-a");
     assert_eq!(reopened.bucket_config_reader.load_bucket(3).unwrap().namespace, "tenant-b");
+    let cfg4 = reopened.bucket_config_reader.load_bucket(4).unwrap();
+    assert_eq!(cfg4.namespace, "tenant-c");
+    assert_eq!(cfg4.owner, "owner-4");
     drop(engine);
     drop(reopened);
 
@@ -553,6 +568,8 @@ fn prometheus_bucket_metrics_respect_cardinality_cap_and_flag() {
     state.engine.write().put_object(b1, b"k1", 4096, 123, 0, 0, 0, 0).unwrap();
 
     let txt = render_metrics(&state);
+    assert!(txt.contains("awanfs_objects_total 1"));
+    assert!(txt.contains("awanfs_bytes_total 123"));
     assert!(txt.contains("awanfs_bucket_objects{bucket=\"alpha-bkt\"} 1"));
     assert!(txt.contains("awanfs_bucket_bytes{bucket=\"alpha-bkt\"} 123"));
     assert!(txt.contains("awanfs_bucket_all_versions_objects{bucket=\"alpha-bkt\"} 1"));
@@ -565,14 +582,60 @@ fn prometheus_bucket_metrics_respect_cardinality_cap_and_flag() {
         }
     }
     let capped = render_metrics(&state);
+    assert!(capped.contains("awanfs_objects_total 1"));
+    assert!(capped.contains("awanfs_bytes_total 123"));
     assert!(
-        !capped.contains("awanfs_bucket_objects{bucket=\""),
+        !capped.contains("awanfs_bucket_objects{"),
         "default cap should omit per-bucket series past {}",
         PER_BUCKET_METRICS_CARDINALITY_CAP
     );
 
     state.set_per_bucket_metrics(true);
     let enabled = render_metrics(&state);
+    assert!(enabled.contains("awanfs_objects_total 1"));
+    assert!(enabled.contains("awanfs_bytes_total 123"));
     assert!(enabled.contains("awanfs_bucket_objects{bucket=\"alpha-bkt\"} 1"));
     assert!(enabled.contains("awanfs_bucket_objects{bucket=\"many-0000\"} 0"));
+}
+
+#[tokio::test]
+async fn late_failure_after_record_emits_no_commit_event() {
+    let dir = temp_dir("late_failure_events");
+    let state = Arc::new(S3ServiceState::try_with_data_dir(&dir).unwrap());
+    let (_server, addr) = start_server(Arc::clone(&state)).await;
+    assert_eq!(raw_http(addr, "PUT", "/lf-bkt", &[], &[]).await.0, 200);
+    assert_eq!(raw_http(addr, "PUT", "/lf-bkt/k1", &[], b"seed").await.0, 200);
+
+    let sub = state.events.subscribe("lf-watch");
+    let vm = state.volume_manager.read().clone().unwrap();
+
+    // 1. AfterRecord failure on PUT sync emits 0 events even though live index updates.
+    vm.fail_next_sync();
+    let (st, _, _) = raw_http(addr, "PUT", "/lf-bkt/k1", &[], b"updated-val").await;
+    assert_eq!(st, 500);
+    assert!(sub.drain().is_empty(), "500 AfterRecord PUT must emit zero commit events");
+
+    // 2. AfterRecord failure on PutObjectTagging journal write emits 0 events.
+    vm.fail_next_index();
+    let tag_xml = "<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>";
+    let (st, _, _) = raw_http(addr, "PUT", "/lf-bkt/k1?tagging", &[], tag_xml.as_bytes()).await;
+    assert_eq!(st, 500);
+    assert!(sub.drain().is_empty(), "500 AfterRecord AttrUpdate must emit zero commit events");
+
+    // 3. AfterRecord failure on DELETE sync emits 0 events.
+    vm.fail_next_sync();
+    let (st, _, _) = raw_http(addr, "DELETE", "/lf-bkt/k1", &[], &[]).await;
+    assert_eq!(st, 500);
+    assert!(sub.drain().is_empty(), "500 AfterRecord DELETE must emit zero commit events");
+
+    let b_id = state.engine.read().lookup_bucket("lf-bkt").unwrap();
+    assert_eq!(state.bucket_usage(b_id).unwrap(), scan_usage_oracle(&state, b_id));
+
+    drop(sub);
+    drop(_server);
+    drop(state);
+    let reopened = Arc::new(S3ServiceState::try_with_data_dir(&dir).unwrap());
+    let rb = reopened.engine.read().lookup_bucket("lf-bkt").unwrap();
+    assert_eq!(reopened.bucket_usage(rb).unwrap(), scan_usage_oracle(&reopened, rb));
+    let _ = std::fs::remove_dir_all(&dir);
 }
