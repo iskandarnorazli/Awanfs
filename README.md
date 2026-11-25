@@ -185,7 +185,7 @@ python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB,10GiB --concurre
 - **`server/src/direct_io.rs`**: Sector-aligned buffer allocations (`AlignedBuffer`), Windows `FSCTL_SET_SPARSE` direct controls, and lock-free positional I/O (`seek_read` / `seek_write`).
 - **`server/src/multipart.rs`**: High-concurrency S3 Multipart Upload manager tracking parallel staged part files (`.staging/<upload-id>/part_<num>.dat`), memory-mapped extent caches, and zero-copy part concatenation.
 - **`server/src/digest.rs`**: Real-time dual-hasher pipeline concurrently calculating MD5 and Castagnoli CRC32C over streaming TCP frames with AVX2/SSE4.2 detection and software table fallback.
-- **`server/src/s3_api.rs`**: S3 REST API router supporting Virtual-Host and Path-Style routing, bucket operations, object CRUD (PUT, GET, HEAD, DELETE, batch POST delete), RFC 9110 Range GETs, and atomic conditional mutexes (`If-None-Match: *`).
+- **`server/src/s3_api.rs`**: S3 REST API router supporting Virtual-Host and Path-Style routing, bucket operations, object CRUD (PUT, GET, HEAD, DELETE, batch POST delete), RFC 9110 Range GETs, and commit-time key-locked conditional writes and deletes (`If-Match`, `If-None-Match`, last-modified, size).
 - **`server/src/sigv4.rs`**: AWS Signature Version 4 HMAC-SHA256 signature calculator, chunked streaming decoder, and presigned URL validator.
 - **`server/src/compaction.rs`**: Automated volume garbage collection copying live needles into fresh volume files to reclaim tombstoned storage.
 - **`server/src/mvcc.rs`**: Multi-version concurrency control providing read-isolation for in-flight requests while new versions are written.

@@ -87,6 +87,7 @@ impl SpillIndex {
     }
 
     pub fn open_with(dir: &Path, cache_bytes: usize, policy: Policy) -> Result<Self, SpillError> {
+        let _heap_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::SpillIndex);
         std::fs::create_dir_all(dir.join("meta"))?;
         let work = Arc::new(WorkCounters::default());
         let store = MetaStore::open(Arc::new(DiskFs), dir, Arc::clone(&work))?;
@@ -111,6 +112,7 @@ impl SpillIndex {
     /// Empties the index: the memtable, the segments and the manifest. The server does this at
     /// boot and rebuilds the index from the volume replay.
     pub fn clear(&self) -> Result<(), SpillError> {
+        let _heap_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::SpillIndex);
         let mut st = self.state.write();
         st.mem.clear();
         st.mem_bytes = 0;
@@ -171,11 +173,13 @@ impl SpillIndex {
 
     /// Flushes the memtable now (a benchmark's build, before it reopens the index).
     pub fn flush(&self) -> Result<(), SpillError> {
+        let _heap_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::SpillIndex);
         let mut st = self.state.write();
         self.flush_locked(&mut st)
     }
 
     pub fn put(&self, bucket_id: u32, key: &[u8], meta: &ObjectMeta) -> Result<(), SpillError> {
+        let _heap_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::SpillIndex);
         let mut st = self.state.write();
         self.insert(&mut st, sort_key(bucket_id, key), Entry::Row(*meta))
     }
@@ -209,12 +213,14 @@ impl SpillIndex {
     }
 
     pub fn get(&self, bucket_id: u32, key: &[u8]) -> Result<Option<ObjectMeta>, SpillError> {
+        let _heap_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::SpillIndex);
         let st = self.state.read();
         Self::get_locked(&st, &sort_key(bucket_id, key))
     }
 
     /// Deletes the key; returns whether it was there.
     pub fn delete(&self, bucket_id: u32, key: &[u8]) -> Result<bool, SpillError> {
+        let _heap_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::SpillIndex);
         let k = sort_key(bucket_id, key);
         let mut st = self.state.write();
         if Self::get_locked(&st, &k)?.is_none() {

@@ -16,7 +16,8 @@ use crate::ffi_bridge::{
     AWAN_FLAG_ZERO_BYTE,
 };
 use crate::precondition::{
-    format_http_date, precondition, ObjectFacts, PreconditionOutcome, DEFAULT_LAST_MODIFIED_SECS,
+    format_http_date, parse_delete_conditions, precondition, write_precondition, ObjectFacts,
+    PreconditionOutcome, WritePreconditionOutcome, DEFAULT_LAST_MODIFIED_SECS,
 };
 use crate::s3_api::{
     bad_request, drain_body, empty_body, engine_error_response, full_body,
@@ -61,7 +62,6 @@ fn finish_put(
     if let Some((prev_off, prev_sz)) = old_info {
         if prev_off > 0 && prev_off != vol_offset {
             state.payload_cache.remove(b_id, prev_off);
-            state.needle_crc_map.write().remove(&(b_id, prev_off));
             let raw_len = 64 + key.len() + prev_sz as usize;
             let dead_bytes = raw_len.div_ceil(4096) as u64 * 4096;
             state.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
@@ -447,7 +447,7 @@ pub(crate) fn find_version(state: &S3ServiceState, b_id: u32, key: &str, id: Opt
     }
 }
 
-pub(super) fn last_modified_secs_from_ms(ms: u64) -> u64 {
+pub(crate) fn last_modified_secs_from_ms(ms: u64) -> u64 {
     if ms == 0 {
         DEFAULT_LAST_MODIFIED_SECS
     } else {
@@ -455,7 +455,7 @@ pub(super) fn last_modified_secs_from_ms(ms: u64) -> u64 {
     }
 }
 
-pub(super) fn last_modified_secs_from_ns(ns: u64) -> u64 {
+pub(crate) fn last_modified_secs_from_ns(ns: u64) -> u64 {
     if ns == 0 {
         DEFAULT_LAST_MODIFIED_SECS
     } else {
@@ -463,12 +463,62 @@ pub(super) fn last_modified_secs_from_ns(ns: u64) -> u64 {
     }
 }
 
-pub(super) fn format_object_etag(etag_hi: u64, etag_lo: u64, is_multipart: bool, part_count: u16) -> String {
+pub(crate) fn format_object_etag(etag_hi: u64, etag_lo: u64, is_multipart: bool, part_count: u16) -> String {
     let hex = md5_to_etag_hex(etag_hi, etag_lo);
     if is_multipart {
         format!("\"{}-{}\"", hex, part_count)
     } else {
         format!("\"{}\"", hex)
+    }
+}
+
+pub(crate) fn live_object_facts(state: &S3ServiceState, b_id: u32, key: &str) -> Option<ObjectFacts> {
+    let vs = state.versions.read();
+    if vs.has(b_id, key) {
+        let v = vs.current(b_id, key)?;
+        if v.marker {
+            return None;
+        }
+        return Some(ObjectFacts {
+            etag: version_etag(&v),
+            last_modified_secs: last_modified_secs_from_ns(v.modified),
+        });
+    }
+    drop(vs);
+    let m = state.engine.read().get_object(b_id, key.as_bytes()).ok()?;
+    let flags = unpack_flags(m.bucket_flags);
+    let is_mp = flags & AWAN_FLAG_MULTIPART != 0;
+    Some(ObjectFacts {
+        etag: format_object_etag(m.etag_hi, m.etag_lo, is_mp, unpack_part_count(m.bucket_flags)),
+        last_modified_secs: last_modified_secs_from_ms(m.created_at),
+    })
+}
+
+pub(crate) fn check_write_precondition(
+    state: &S3ServiceState,
+    b_id: u32,
+    key: &str,
+    headers: &HeaderMap,
+) -> Option<Response<ResponseBody>> {
+    let current = live_object_facts(state, b_id, key);
+    match write_precondition(headers, current.as_ref()) {
+        WritePreconditionOutcome::Proceed => None,
+        WritePreconditionOutcome::PreconditionFailed => Some(precondition_failure_response(
+            PreconditionOutcome::PreconditionFailed,
+            current.as_ref(),
+            key,
+            false,
+        )),
+        WritePreconditionOutcome::NoSuchKey => {
+            let xml = s3_error_xml("NoSuchKey", "The specified key does not exist.", key, "req-precond");
+            Some(
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(full_body(Bytes::from(xml)))
+                    .unwrap(),
+            )
+        }
     }
 }
 
@@ -874,6 +924,9 @@ pub async fn copy_object(
         AWAN_FLAG_ACTIVE
     };
     let _key_guard = state.lock_key(b_id, key).await;
+    if let Some(resp) = check_write_precondition(&state, b_id, key, headers) {
+        return Ok(resp);
+    }
     let reservation = match CapacityReservation::acquire(&state.engine, b_id, key.as_bytes()) {
         Ok(r) => r,
         Err(code) => return Ok(engine_error_response(code, key)),
@@ -932,7 +985,6 @@ pub async fn copy_object(
     if let Some(prev_off) = old_info {
         if prev_off > 0 && prev_off != vol_offset {
             state.payload_cache.remove(b_id, prev_off);
-            state.needle_crc_map.write().remove(&(b_id, prev_off));
         }
     }
     if let Some(e) = late {
@@ -1087,23 +1139,6 @@ pub async fn put_object(
     mut chunk_verifier: Option<crate::auth::ChunkVerifier>,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
-    let if_none_match_star = headers
-        .get("If-None-Match")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim() == "*")
-        .unwrap_or(false);
-    if if_none_match_star {
-        let engine = state.engine.read();
-        if engine.get_object(b_id, key.as_bytes()).is_ok() {
-            let xml = s3_error_xml("PreconditionFailed", "At least one of the pre-conditions you specified did not hold.", key, "req-inm");
-            return Ok(Response::builder()
-                .status(StatusCode::PRECONDITION_FAILED)
-                .header(CONTENT_TYPE, "application/xml")
-                .body(full_body(Bytes::from(xml)))
-                .unwrap());
-        }
-    }
-
     let expected_len = headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok());
     let is_chunked = crate::auth::is_aws_chunked(headers);
     let has_te_chunked = headers
@@ -1174,14 +1209,6 @@ pub async fn put_object(
         } else {
             AWAN_FLAG_ACTIVE
         };
-        if if_none_match_star && state.engine.read().get_object(b_id, key.as_bytes()).is_ok() {
-            let xml = s3_error_xml("PreconditionFailed", "At least one of the pre-conditions you specified did not hold.", key, "req-inm");
-            return Ok(Response::builder()
-                .status(StatusCode::PRECONDITION_FAILED)
-                .header(CONTENT_TYPE, "application/xml")
-                .body(full_body(Bytes::from(xml)))
-                .unwrap());
-        }
         let mut reservation = match CapacityReservation::acquire(&state.engine, b_id, key.as_bytes()) {
             Ok(r) => r,
             Err(code) => return Ok(engine_error_response(code, key)),
@@ -1467,17 +1494,8 @@ pub async fn put_object(
         }
         let (mut writer, etag_hi, etag_lo, etag_hex, stream_cksum_out) = outcome.expect("Done guarantees outcome");
         let _key_guard = state.lock_key(b_id, key).await;
-        if if_none_match_star && state.engine.read().get_object(b_id, key.as_bytes()).is_ok() {
-            return Ok(Response::builder()
-                .status(StatusCode::PRECONDITION_FAILED)
-                .header(CONTENT_TYPE, "application/xml")
-                .body(full_body(Bytes::from(s3_error_xml(
-                    "PreconditionFailed",
-                    "At least one of the pre-conditions you specified did not hold.",
-                    key,
-                    "req-inm",
-                ))))
-                .unwrap());
+        if let Some(resp) = check_write_precondition(&state, b_id, key, &signed_headers) {
+            return Ok(resp);
         }
         if let Err(code) = reservation.ensure_room(&state.engine, b_id, key.as_bytes()) {
             return Ok(engine_error_response(code, key));
@@ -1536,7 +1554,6 @@ pub async fn put_object(
             }
         }
         drop(ticket);
-        state.needle_crc_map.write().insert((b_id, vol_offset), loc.payload_crc32c);
         state.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
         state.hook("put_stored", key);
         let stream_cksum_ref = stream_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
@@ -1641,13 +1658,8 @@ pub async fn put_object(
     };
 
     let _key_guard = state.lock_key(b_id, key).await;
-    if if_none_match_star && state.engine.read().get_object(b_id, key.as_bytes()).is_ok() {
-        let xml = s3_error_xml("PreconditionFailed", "At least one of the pre-conditions you specified did not hold.", key, "req-inm");
-        return Ok(Response::builder()
-            .status(StatusCode::PRECONDITION_FAILED)
-            .header(CONTENT_TYPE, "application/xml")
-            .body(full_body(Bytes::from(xml)))
-            .unwrap());
+    if let Some(resp) = check_write_precondition(&state, b_id, key, &signed_headers) {
+        return Ok(resp);
     }
     let reservation = match CapacityReservation::acquire(&state.engine, b_id, key.as_bytes()) {
         Ok(r) => r,
@@ -2117,12 +2129,17 @@ pub async fn delete_object(
     b_id: u32,
     key: &str,
     query_map: &HashMap<String, String>,
+    headers: &HeaderMap,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
+    let conds = match parse_delete_conditions(headers) {
+        Ok(c) => c,
+        Err((code, msg)) => return Ok(bad_request(code, msg, key)),
+    };
     if let Some(vid) = query_map.get("versionId") {
         let Some(id) = crate::versions::parse_id(vid) else {
             return Ok(no_such_version(key, false));
         };
-        return Ok(match state.delete_version(b_id, key, id).await {
+        return Ok(match state.delete_version_conditional(b_id, key, id, &conds).await {
             Ok(removed) => {
                 let mut b = Response::builder()
                     .status(StatusCode::NO_CONTENT)
@@ -2133,12 +2150,23 @@ pub async fn delete_object(
                 }
                 b.body(empty_body()).unwrap()
             }
-            Err(e) => internal_error_response(key, &e),
+            Err(crate::s3_api::DeleteError::PreconditionFailed(facts)) => {
+                precondition_failure_response(PreconditionOutcome::PreconditionFailed, facts.as_ref(), key, false)
+            }
+            Err(crate::s3_api::DeleteError::Internal(e)) => internal_error_response(key, &e),
         });
     }
-    let marker = match state.delete_key(b_id, key).await {
+    let marker = match state.delete_key_conditional(b_id, key, &conds).await {
         Ok(m) => m,
-        Err(e) => return Ok(internal_error_response(key, &e)),
+        Err(crate::s3_api::DeleteError::PreconditionFailed(facts)) => {
+            return Ok(precondition_failure_response(
+                PreconditionOutcome::PreconditionFailed,
+                facts.as_ref(),
+                key,
+                false,
+            ));
+        }
+        Err(crate::s3_api::DeleteError::Internal(e)) => return Ok(internal_error_response(key, &e)),
     };
     let mut b = Response::builder().status(StatusCode::NO_CONTENT).header(CONTENT_LENGTH, "0");
     if let Some(m) = marker {

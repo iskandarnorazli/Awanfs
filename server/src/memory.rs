@@ -179,12 +179,59 @@ pub fn configure(b: Budget) -> Result<(), Budget> {
     CONFIGURED.set(b).map_err(|_| effective())
 }
 
-/// The budget in force: what `configure` was given, or `AWANFS_MEMORY_BUDGET` and detection.
+/// Configured memory budget (`--memory-budget`, `AWANFS_MEMORY_BUDGET`, or detected).
 pub fn effective() -> Budget {
     *CONFIGURED.get_or_init(|| {
         let env = std::env::var("AWANFS_MEMORY_BUDGET").ok();
         resolve(None, env.as_deref(), detect()).unwrap_or_else(|_| default_budget(detect()))
     })
+}
+
+/// Logical boot-time heap owner for `boot_bench` per-part allocation accounting (#323).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BootHeapPart {
+    Other = 0,
+    NeedleRecords = 1,
+    ChecksumMap = 2,
+    HotTable = 3,
+    SpillIndex = 4,
+}
+
+pub const BOOT_HEAP_PARTS: usize = 5;
+
+std::thread_local! {
+    static BOOT_HEAP_PART: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns the current thread's active `BootHeapPart` index (`0..BOOT_HEAP_PARTS`).
+#[inline]
+pub fn current_boot_heap_part() -> usize {
+    BOOT_HEAP_PART.try_with(|c| c.get() as usize).unwrap_or(0)
+}
+
+/// RAII scope guard setting the active `BootHeapPart` for allocations on the current thread.
+pub struct BootHeapGuard(u8);
+
+impl BootHeapGuard {
+    #[inline]
+    pub fn enter(part: BootHeapPart) -> Self {
+        let prev = BOOT_HEAP_PART
+            .try_with(|c| {
+                let prev = c.get();
+                c.set(part as u8);
+                prev
+            })
+            .unwrap_or(0);
+        Self(prev)
+    }
+}
+
+impl Drop for BootHeapGuard {
+    #[inline]
+    fn drop(&mut self) {
+        let _ = BOOT_HEAP_PART.try_with(|c| c.set(self.0));
+    }
 }
 
 /// Default bounded wait before rejecting an over-budget request with `503 SlowDown`.

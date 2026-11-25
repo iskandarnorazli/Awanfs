@@ -43,3 +43,7 @@ Area issues that add new profile settings update `start_server.sh` and the **Set
 - `#121`: `--sse-master-key-file` and `kms_keyid` in `s3tests.conf`
 - `#140`: `--region` matching `api_name`
 - `#151`: implemented: `users.toml` sets `account`, `id`, `display_name`, and `email` matching `s3tests.conf`, with explicit self-account S3 actions instead of `s3:*`
+
+## Suite expectations differing from AWS
+
+- `#112` (conditional deletes): `ceph/s3-tests` marks conditional delete tests `fails_on_aws`. For `PUT` and `CompleteMultipartUpload`, a delete marker counts as absent (`If-Match` returns `404 NoSuchKey`, `If-None-Match` succeeds). For `DeleteObject` and `DeleteObjects`, missing keys/versions succeed (`204` / `<Deleted>`), while a delete marker is treated as an existing entry (`If-Match: *` succeeds; mismatched `ETag`, `LastModifiedTime`, or `Size` returns `PreconditionFailed`). No extra server flag is required.

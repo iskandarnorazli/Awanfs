@@ -862,6 +862,9 @@ pub async fn complete_multipart_upload(
             let hi = u64::from_str_radix(hex_prefix.get(0..16).unwrap_or("0"), 16).unwrap_or(0);
             let lo = u64::from_str_radix(hex_prefix.get(16..32).unwrap_or("0"), 16).unwrap_or(0);
             let _key_guard = state.lock_key(b_id, key).await;
+            if let Some(resp) = super::object::check_write_precondition(&state, b_id, key, headers) {
+                return Ok(resp);
+            }
             let reservation = match crate::meta_index::CapacityReservation::acquire(&state.engine, b_id, key.as_bytes()) {
                 Ok(r) => r,
                 Err(code) => return Ok(engine_error_response(code, key)),

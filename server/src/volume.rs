@@ -1,7 +1,7 @@
 //! awan-storage/server/src/volume.rs
 //! 32 GiB WORM Needle Volume Slab Storage Engine and Crash Recovery Journal (#470)
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -522,9 +522,58 @@ impl AsRef<[u8]> for MmapOwner {
 /// Bytes per `.idx` journal record (key hash, volume id, offset, total length, payload size,
 /// flags, payload CRC).
 const IDX_RECORD: usize = 42;
+/// Streaming buffer size for `.idx` journal scans (~688 KiB, an exact multiple of `IDX_RECORD`).
+const IDX_SCAN_CHUNK: usize = IDX_RECORD * 16_384;
 
-/// The next needle offset the journal knows about after `after`: recovery jumps there over a
-/// gap left by a failed or interrupted write (#38).
+/// Streams the `.idx` journal in `IDX_SCAN_CHUNK` pieces and returns the highest indexed needle
+/// offset (`>= SECTOR_SIZE`), or `None` when the journal has no valid offset.
+fn scan_journal_max_offset<F: VolFile>(journal: &F, journal_len: u64) -> Result<Option<u64>, VolumeError> {
+    let valid_len = journal_len - (journal_len % IDX_RECORD as u64);
+    if valid_len == 0 {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; IDX_SCAN_CHUNK.min(valid_len as usize)];
+    let mut pos = 0u64;
+    let mut max_off: Option<u64> = None;
+    while pos < valid_len {
+        let n = buf.len().min((valid_len - pos) as usize);
+        journal.read_at(pos, &mut buf[..n])?;
+        for r in buf[..n].chunks_exact(IDX_RECORD) {
+            let o = u64::from_le_bytes(r[12..20].try_into().unwrap());
+            if o >= SECTOR_SIZE as u64 {
+                max_off = Some(max_off.map_or(o, |m| m.max(o)));
+            }
+        }
+        pos += n as u64;
+    }
+    Ok(max_off)
+}
+
+/// Streams the `.idx` journal in `IDX_SCAN_CHUNK` pieces and returns the smallest indexed needle
+/// offset strictly greater than `after` (`>= SECTOR_SIZE`), so recovery can jump over a gap
+/// without retaining every offset in memory.
+fn next_indexed_in_journal<F: VolFile>(journal: &F, journal_len: u64, after: u64) -> Result<Option<u64>, VolumeError> {
+    let valid_len = journal_len - (journal_len % IDX_RECORD as u64);
+    if valid_len == 0 {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; IDX_SCAN_CHUNK.min(valid_len as usize)];
+    let mut pos = 0u64;
+    let mut best: Option<u64> = None;
+    while pos < valid_len {
+        let n = buf.len().min((valid_len - pos) as usize);
+        journal.read_at(pos, &mut buf[..n])?;
+        for r in buf[..n].chunks_exact(IDX_RECORD) {
+            let o = u64::from_le_bytes(r[12..20].try_into().unwrap());
+            if o >= SECTOR_SIZE as u64 && o > after {
+                best = Some(best.map_or(o, |b| b.min(o)));
+            }
+        }
+        pos += n as u64;
+    }
+    Ok(best)
+}
+
 /// Appends the pending journal records in order. A write that fails is cut back off the file,
 /// so a partly written record never shifts the records after it, and it and the ones after
 /// it stay pending.
@@ -543,10 +592,6 @@ fn write_pending<F: VolFile>(journal: &F, end: &mut u64, pending: &mut Vec<[u8; 
     }
     pending.drain(..written);
     result
-}
-
-fn next_indexed(indexed: &BTreeSet<u64>, after: u64) -> Option<u64> {
-    indexed.range(after + 1..).next().copied()
 }
 
 /// One write counted in `VolumeManager::writers_in_flight` (#167).
@@ -604,8 +649,11 @@ pub struct VolumeManager<Fs: VolFs = DiskFs> {
     /// at open, so without this a scan stopped at such a gap and compaction did not list the
     /// needles after it (#167). Offset to length; one entry per streamed PUT in flight.
     gaps: parking_lot::Mutex<std::collections::BTreeMap<u64, u64>>,
-    /// Needle offsets from the `.idx` journal at open time.
-    indexed: BTreeSet<u64>,
+    /// Gaps discovered at open time (`gap_offset -> gap_len`) from the `.idx` journal.
+    open_gaps: BTreeMap<u64, u64>,
+    /// Highest offset in the `.idx` journal at open time, and the journal byte length then.
+    max_indexed_at_open: Option<u64>,
+    journal_len_at_open: u64,
     /// Format version in the superblock: what the needles of this volume may use (FORMAT.md).
     format: u32,
     durability: std::sync::atomic::AtomicU8,
@@ -647,15 +695,8 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         let journal = fs.open(&idx_path, FileKind::Journal, true)?;
         // Read the journal, then append after it: a reopen must not overwrite earlier records.
         let journal_len = journal.len()?;
-        let mut idx_bytes = vec![0u8; journal_len as usize];
-        if journal_len > 0 {
-            journal.read_at(0, &mut idx_bytes)?;
-        }
-        let indexed: BTreeSet<u64> = idx_bytes
-            .chunks_exact(IDX_RECORD)
-            .map(|r| u64::from_le_bytes(r[12..20].try_into().unwrap()))
-            .filter(|&o| o >= SECTOR_SIZE as u64)
-            .collect();
+        let max_indexed = scan_journal_max_offset(&*journal, journal_len)?;
+        let mut open_gaps: BTreeMap<u64, u64> = BTreeMap::new();
 
         let mut file_len = aligned_file.len()?;
         if file_len >= MAX_VOLUME_SPAN {
@@ -713,6 +754,17 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             }
             format = found;
 
+            let jump_in_journal = |at: u64, open_gaps: &mut BTreeMap<u64, u64>| -> Result<Option<u64>, VolumeError> {
+                if !max_indexed.is_some_and(|m| at < m) {
+                    return Ok(None);
+                }
+                let next = next_indexed_in_journal(&*journal, journal_len, at)?;
+                if let Some(n) = next {
+                    open_gaps.insert(at, n - at);
+                }
+                Ok(next)
+            };
+
             // Scan valid needles
             let mut window = AlignedScanWindow::new(&*aligned_file, file_len, None);
             while let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE) {
@@ -722,7 +774,7 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 let magic = u32::from_le_bytes(header_bytes[0..4].try_into().unwrap());
                 if magic != NEEDLE_MAGIC {
                     // Unwritten sector: the end of the volume, or a gap the journal can step over.
-                    match next_indexed(&indexed, scan_offset) {
+                    match jump_in_journal(scan_offset, &mut open_gaps)? {
                         Some(next) => {
                             scan_offset = next;
                             continue;
@@ -736,7 +788,7 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                         let total_len = hdr.total_len();
                         if scan_offset.checked_add(total_len).is_none_or(|end| end > file_len) {
                             // Incomplete needle written during crash
-                            match next_indexed(&indexed, scan_offset) {
+                            match jump_in_journal(scan_offset, &mut open_gaps)? {
                                 Some(next) => {
                                     scan_offset = next;
                                     continue;
@@ -748,7 +800,7 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                     }
                     Err(_) => {
                         // Torn needle: step over it when the journal knows a later needle.
-                        match next_indexed(&indexed, scan_offset) {
+                        match jump_in_journal(scan_offset, &mut open_gaps)? {
                             Some(next) => {
                                 scan_offset = next;
                                 continue;
@@ -804,7 +856,9 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             writers_in_flight: std::sync::atomic::AtomicUsize::new(0),
             sealed: std::sync::atomic::AtomicBool::new(false),
             gaps: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
-            indexed,
+            open_gaps,
+            max_indexed_at_open: max_indexed,
+            journal_len_at_open: journal_len,
             format,
             clock,
         })
@@ -1342,6 +1396,24 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         Ok(payload)
     }
 
+    /// Reads a needle payload from the mapping and verifies it against the `payload_crc32c`
+    /// stored in its 64-byte CRC-protected header (#323, Decision 7A).
+    pub fn read_needle_bytes_verified(&self, bucket_id: u32, offset: u64) -> Result<Bytes, VolumeError> {
+        let (header, payload) = self.needle_header_and_payload_unverified(offset)?;
+        if header.bucket_id != bucket_id as u16 {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let actual_crc = crc32c::crc32c(&payload);
+        self.work.payload_verify(payload.len() as u64);
+        if actual_crc != header.payload_crc32c {
+            return Err(VolumeError::CrcMismatch {
+                expected: header.payload_crc32c,
+                actual: actual_crc,
+            });
+        }
+        Ok(payload)
+    }
+
     /// Where the payload of the needle at `local` starts in the file, and its length, from
     /// one aligned read of its header sector: no mapping (#155).
     pub fn payload_extent(&self, local: u64) -> Result<(u64, u64), VolumeError> {
@@ -1351,6 +1423,20 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         hdr_bytes.copy_from_slice(&buf[0..64]);
         let header = NeedleHeader::decode(&hdr_bytes)?;
         Ok((local + header.payload_start() as u64, header.payload_size))
+    }
+
+    /// Like `payload_extent`, also returning the header's `payload_crc32c` and checking
+    /// `bucket_id` from the same aligned header-sector read (#323, Decision 7A).
+    pub fn payload_extent_with_crc(&self, bucket_id: u32, local: u64) -> Result<(u64, u64, u32), VolumeError> {
+        let mut buf = AlignedBuffer::new(SECTOR_SIZE);
+        self.read_aligned(local, &mut buf)?;
+        let mut hdr_bytes = [0u8; 64];
+        hdr_bytes.copy_from_slice(&buf[0..64]);
+        let header = NeedleHeader::decode(&hdr_bytes)?;
+        if header.bucket_id != bucket_id as u16 {
+            return Err(VolumeError::CorruptIndex);
+        }
+        Ok((local + header.payload_start() as u64, header.payload_size, header.payload_crc32c))
     }
 
     /// A positioned read of `buf.len()` bytes at `offset` through the page cache: any offset
@@ -1417,11 +1503,9 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         Ok(header.payload_size)
     }
 
-    /// A needle's payload as a slice of the mapping, with its header checked and its bytes
-    /// not: nothing of the payload is read. For objects above 4 MiB, which are checksummed
-    /// while they are sent, and for ranges of them, which are not checksummed (#155,
-    /// decision 46). Everything else reads through `read_needle_bytes`.
-    pub fn needle_payload_unverified(&self, offset: u64) -> Result<Bytes, VolumeError> {
+    /// Decodes the CRC-protected 64-byte needle header and returns it alongside an unverified
+    /// slice of the volume mapping covering the payload (#323).
+    pub fn needle_header_and_payload_unverified(&self, offset: u64) -> Result<(NeedleHeader, Bytes), VolumeError> {
         let mmap = self.get_or_remap(offset + SECTOR_SIZE as u64)?;
         if (offset as usize + 64) > mmap.len() {
             return Err(VolumeError::TornNeedleAtOffset(offset));
@@ -1445,7 +1529,15 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         }
 
         let full_bytes = Bytes::from_owner(MmapOwner(mmap));
-        Ok(full_bytes.slice(p_start..p_end))
+        Ok((header, full_bytes.slice(p_start..p_end)))
+    }
+
+    /// A needle's payload as a slice of the mapping, with its header checked and its bytes
+    /// not: nothing of the payload is read. For objects above 4 MiB, which are checksummed
+    /// while they are sent, and for ranges of them, which are not checksummed (#155,
+    /// decision 46). Everything else reads through `read_needle_bytes`.
+    pub fn needle_payload_unverified(&self, offset: u64) -> Result<Bytes, VolumeError> {
+        self.needle_header_and_payload_unverified(offset).map(|(_, payload)| payload)
     }
 
     /// Whether `p` points into this volume's current mapping. A payload the write path never
@@ -1491,6 +1583,37 @@ impl<Fs: VolFs> VolumeManager<Fs> {
     where
         F: FnMut(ScannedNeedle),
     {
+        match self.try_scan_needles(|n| {
+            visitor(n);
+            Ok::<(), std::convert::Infallible>(())
+        })? {
+            Ok(()) => Ok(()),
+            Err(never) => match never {},
+        }
+    }
+
+    fn jump_gap_after(&self, scan_offset: u64) -> Option<u64> {
+        if let Some(len) = self.gaps.lock().get(&scan_offset).copied() {
+            return Some(scan_offset + len);
+        }
+        if let Some(len) = self.open_gaps.get(&scan_offset).copied() {
+            return Some(scan_offset + len);
+        }
+        let j_end = *self.journal_end.lock();
+        if self.max_indexed_at_open.is_some_and(|m| scan_offset < m) || j_end > self.journal_len_at_open {
+            if let Ok(Some(next)) = next_indexed_in_journal(&*self.journal, j_end, scan_offset) {
+                return Some(next);
+            }
+        }
+        None
+    }
+
+    /// Streams needles in exact offset order directly to `visitor`, propagating any visitor error
+    /// without buffering the volume's records in memory (#323).
+    pub fn try_scan_needles<E, F>(&self, mut visitor: F) -> Result<Result<(), E>, VolumeError>
+    where
+        F: FnMut(ScannedNeedle) -> Result<(), E>,
+    {
         // The written end, not the file's length: a growing volume holds up to one growth
         // step of zeros past it (#178).
         let file_len = self.file.len()?.min(self.current_offset.load(Ordering::SeqCst));
@@ -1503,25 +1626,19 @@ impl<Fs: VolFs> VolumeManager<Fs> {
 
             let hdr = match NeedleHeader::decode(&header_bytes) {
                 Ok(h) => h,
-                Err(_) => {
-                    if let Some(len) = self.gaps.lock().get(&scan_offset).copied() {
-                        scan_offset += len;
+                Err(_) => match self.jump_gap_after(scan_offset) {
+                    Some(next) => {
+                        scan_offset = next;
                         continue;
                     }
-                    match next_indexed(&self.indexed, scan_offset) {
-                        Some(next) => {
-                            scan_offset = next;
-                            continue;
-                        }
-                        None => break,
-                    }
-                }
+                    None => break,
+                },
             };
 
             let total_len = hdr.total_len();
 
             if scan_offset.checked_add(total_len).is_none_or(|end| end > file_len) {
-                match next_indexed(&self.indexed, scan_offset) {
+                match self.jump_gap_after(scan_offset) {
                     Some(next) => {
                         scan_offset = next;
                         continue;
@@ -1542,7 +1659,7 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 String::from_utf8_lossy(&slice[64..key_end]).to_string()
             };
 
-            visitor(ScannedNeedle {
+            if let Err(e) = visitor(ScannedNeedle {
                 bucket_id: hdr.bucket_id,
                 key: key_str,
                 offset: scan_offset,
@@ -1552,11 +1669,13 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 flags: hdr.flags,
                 payload_crc32c: hdr.payload_crc32c,
                 created_at_ns: hdr.created_at_ns,
-            });
+            }) {
+                return Ok(Err(e));
+            }
 
             scan_offset += total_len;
         }
 
-        Ok(())
+        Ok(Ok(()))
     }
 }

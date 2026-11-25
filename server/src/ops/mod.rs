@@ -1201,7 +1201,7 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
             let is_anon_with_auth = auth_enabled && matches!(principal, Principal::Anonymous);
             object::get_or_head_object(state, b_id.unwrap(), bucket, key, &c.query_map, &c.parts.headers, true, is_anon_with_auth).await
         }
-        Operation::DeleteObject => object::delete_object(state, b_id.unwrap(), key, &c.query_map).await,
+        Operation::DeleteObject => object::delete_object(state, b_id.unwrap(), key, &c.query_map, &c.parts.headers).await,
         Operation::CreateMultipartUpload => {
             multipart::create_multipart_upload(state, b_id.unwrap(), bucket, key, &c.parts.headers, writer_account, &bucket_owner).await
         }

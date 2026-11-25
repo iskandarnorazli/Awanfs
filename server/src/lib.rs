@@ -70,6 +70,7 @@ pub use direct_io::*;
 pub use erasure::*;
 pub use error::*;
 pub use lifecycle::*;
+pub use memory::{current_boot_heap_part, BootHeapGuard, BootHeapPart, BOOT_HEAP_PARTS};
 pub use meta_index::*;
 pub use multipart::*;
 pub use mvcc::*;

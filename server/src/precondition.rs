@@ -13,12 +13,53 @@ pub struct ObjectFacts {
     pub last_modified_secs: u64,
 }
 
-/// Outcome of evaluating conditional request headers.
+/// Outcome of evaluating conditional request headers for read / copy-source requests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreconditionOutcome {
     Proceed,
     NotModified,
     PreconditionFailed,
+}
+
+/// Outcome of evaluating conditional request headers for write requests
+/// (`PutObject`, `CompleteMultipartUpload`, destination `CopyObject`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WritePreconditionOutcome {
+    Proceed,
+    PreconditionFailed,
+    NoSuchKey,
+}
+
+/// Conditions supported on `DeleteObject` headers and `DeleteObjects` XML entries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeleteConditions {
+    pub if_match: Option<String>,
+    pub if_none_match: Option<String>,
+    pub if_match_last_modified_secs: Option<u64>,
+    pub if_match_size: Option<i64>,
+}
+
+impl DeleteConditions {
+    pub fn is_empty(&self) -> bool {
+        self.if_match.is_none()
+            && self.if_none_match.is_none()
+            && self.if_match_last_modified_secs.is_none()
+            && self.if_match_size.is_none()
+    }
+}
+
+/// Target state for conditional `DeleteObject` / `DeleteObjects` evaluation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeleteTarget {
+    Absent,
+    Object {
+        etag: String,
+        last_modified_secs: u64,
+        size: u64,
+    },
+    DeleteMarker {
+        last_modified_secs: u64,
+    },
 }
 
 /// Default fallback timestamp (`RFC 7231 fallback instant (1794268800)`) when a legacy
@@ -83,33 +124,189 @@ pub fn precondition(
     PreconditionOutcome::Proceed
 }
 
-fn etag_matches(headers: &HeaderMap, name: &str, target_etag: &str, strong: bool) -> bool {
+/// Evaluate S3 write preconditions (`If-Match`, `If-None-Match`, `If-Unmodified-Since`,
+/// `If-Modified-Since`) against the current live object at commit time.
+///
+/// A delete marker counts as `None` (absent) for writes. On `If-Match` when no live
+/// object exists, S3 returns `404 NoSuchKey`; on any other mismatch, `412 PreconditionFailed`.
+pub fn write_precondition(
+    headers: &HeaderMap,
+    current: Option<&ObjectFacts>,
+) -> WritePreconditionOutcome {
+    if headers.contains_key("if-match") {
+        match current {
+            None => return WritePreconditionOutcome::NoSuchKey,
+            Some(facts) if etag_matches(headers, "if-match", &facts.etag, true) => {}
+            Some(_) => return WritePreconditionOutcome::PreconditionFailed,
+        }
+    } else if let Some(since) = parse_date_header(headers, "if-unmodified-since") {
+        if let Some(facts) = current {
+            if facts.last_modified_secs > since {
+                return WritePreconditionOutcome::PreconditionFailed;
+            }
+        }
+    }
+
+    if headers.contains_key("if-none-match") {
+        if let Some(facts) = current {
+            if etag_matches(headers, "if-none-match", &facts.etag, false) {
+                return WritePreconditionOutcome::PreconditionFailed;
+            }
+        }
+        return WritePreconditionOutcome::Proceed;
+    }
+
+    if let Some(since) = parse_date_header(headers, "if-modified-since") {
+        if let Some(facts) = current {
+            if facts.last_modified_secs <= since {
+                return WritePreconditionOutcome::PreconditionFailed;
+            }
+        }
+    }
+
+    WritePreconditionOutcome::Proceed
+}
+
+/// Parse conditional delete headers from a `DeleteObject` request.
+pub fn parse_delete_conditions(headers: &HeaderMap) -> Result<DeleteConditions, (&'static str, &'static str)> {
+    let join_all = |name: &str| -> Option<String> {
+        let mut parts = Vec::new();
+        for v in headers.get_all(name) {
+            if let Ok(s) = v.to_str() {
+                parts.push(s.to_string());
+            }
+        }
+        if parts.is_empty() { None } else { Some(parts.join(", ")) }
+    };
+    let if_match = join_all("if-match");
+    let if_none_match = join_all("if-none-match");
+    let if_match_last_modified_secs = match headers.get("x-amz-if-match-last-modified-time") {
+        Some(v) => {
+            let s = v
+                .to_str()
+                .map_err(|_| ("InvalidArgument", "Invalid x-amz-if-match-last-modified-time header"))?;
+            let secs = parse_http_date_or_iso(s)
+                .ok_or(("InvalidArgument", "Invalid x-amz-if-match-last-modified-time header"))?;
+            Some(secs)
+        }
+        None => None,
+    };
+    let if_match_size = match headers.get("x-amz-if-match-size") {
+        Some(v) => {
+            let s = v
+                .to_str()
+                .map_err(|_| ("InvalidArgument", "Invalid x-amz-if-match-size header"))?;
+            let sz = s
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| ("InvalidArgument", "Invalid x-amz-if-match-size header"))?;
+            Some(sz)
+        }
+        None => None,
+    };
+    Ok(DeleteConditions {
+        if_match,
+        if_none_match,
+        if_match_last_modified_secs,
+        if_match_size,
+    })
+}
+
+/// Evaluate conditional delete preconditions against `target`.
+///
+/// Missing objects (`DeleteTarget::Absent`) proceed with no error (204 / `<Deleted>`).
+/// Live objects and delete markers check ETag (`*` matches any existing entry),
+/// `last_modified_secs`, and `size` (0 for delete markers).
+pub fn delete_precondition(conds: &DeleteConditions, target: &DeleteTarget) -> PreconditionOutcome {
+    match target {
+        DeleteTarget::Absent => PreconditionOutcome::Proceed,
+        DeleteTarget::Object { etag, last_modified_secs, size } => {
+            if let Some(ref raw) = conds.if_match {
+                if !etag_str_matches(raw, etag, true) {
+                    return PreconditionOutcome::PreconditionFailed;
+                }
+            }
+            if let Some(ref raw) = conds.if_none_match {
+                if etag_str_matches(raw, etag, false) {
+                    return PreconditionOutcome::PreconditionFailed;
+                }
+            }
+            if let Some(want_ts) = conds.if_match_last_modified_secs {
+                if *last_modified_secs != want_ts {
+                    return PreconditionOutcome::PreconditionFailed;
+                }
+            }
+            if let Some(want_sz) = conds.if_match_size {
+                if (*size as i128) != (want_sz as i128) {
+                    return PreconditionOutcome::PreconditionFailed;
+                }
+            }
+            PreconditionOutcome::Proceed
+        }
+        DeleteTarget::DeleteMarker { last_modified_secs } => {
+            if let Some(ref raw) = conds.if_match {
+                if !etag_str_is_wildcard(raw) {
+                    return PreconditionOutcome::PreconditionFailed;
+                }
+            }
+            if let Some(ref raw) = conds.if_none_match {
+                if etag_str_is_wildcard(raw) {
+                    return PreconditionOutcome::PreconditionFailed;
+                }
+            }
+            if let Some(want_ts) = conds.if_match_last_modified_secs {
+                if *last_modified_secs != want_ts {
+                    return PreconditionOutcome::PreconditionFailed;
+                }
+            }
+            if let Some(want_sz) = conds.if_match_size {
+                if want_sz != 0 {
+                    return PreconditionOutcome::PreconditionFailed;
+                }
+            }
+            PreconditionOutcome::Proceed
+        }
+    }
+}
+
+fn etag_str_is_wildcard(s: &str) -> bool {
+    s.split(',').map(str::trim).any(|item| item == "*")
+}
+
+fn etag_str_matches(s: &str, target_etag: &str, strong: bool) -> bool {
     let target = target_etag.trim().trim_matches('"');
+    for raw_item in s.split(',') {
+        let item = raw_item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if item == "*" {
+            return true;
+        }
+        if strong {
+            if item.starts_with("W/") || item.starts_with("w/") {
+                continue;
+            }
+            if item.trim_matches('"') == target {
+                return true;
+            }
+        } else {
+            let stripped = item.strip_prefix("W/").or_else(|| item.strip_prefix("w/")).unwrap_or(item);
+            if stripped.trim_matches('"') == target {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn etag_matches(headers: &HeaderMap, name: &str, target_etag: &str, strong: bool) -> bool {
     for val in headers.get_all(name) {
         let Ok(s) = val.to_str() else {
             continue;
         };
-        for raw_item in s.split(',') {
-            let item = raw_item.trim();
-            if item.is_empty() {
-                continue;
-            }
-            if item == "*" {
-                return true;
-            }
-            if strong {
-                if item.starts_with("W/") || item.starts_with("w/") {
-                    continue;
-                }
-                if item.trim_matches('"') == target {
-                    return true;
-                }
-            } else {
-                let stripped = item.strip_prefix("W/").or_else(|| item.strip_prefix("w/")).unwrap_or(item);
-                if stripped.trim_matches('"') == target {
-                    return true;
-                }
-            }
+        if etag_str_matches(s, target_etag, strong) {
+            return true;
         }
     }
     false
@@ -182,6 +379,29 @@ pub fn parse_http_date(raw: &str) -> Option<u64> {
         return to_unix_secs(year, month, day, hh, mm, ss);
     }
     None
+}
+
+/// Parse an HTTP-date or an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SS(.fff)?Z`) into Unix seconds.
+pub fn parse_http_date_or_iso(raw: &str) -> Option<u64> {
+    if let Some(secs) = parse_http_date(raw) {
+        return Some(secs);
+    }
+    let s = raw.trim();
+    let body = s
+        .strip_suffix('Z')
+        .or_else(|| s.strip_suffix('z'))
+        .or_else(|| s.strip_suffix("+00:00"))?;
+    let (date_part, time_part) = body.split_once('T').or_else(|| body.split_once('t'))?;
+    let mut ymd = date_part.split('-');
+    let year: i64 = ymd.next()?.parse().ok()?;
+    let month: u32 = ymd.next()?.parse().ok()?;
+    let day: u32 = ymd.next()?.parse().ok()?;
+    if ymd.next().is_some() {
+        return None;
+    }
+    let hms_part = time_part.split('.').next()?;
+    let (hh, mm, ss) = parse_hms(hms_part)?;
+    to_unix_secs(year, month, day, hh, mm, ss)
 }
 
 fn parse_month(s: &str) -> Option<u32> {
@@ -428,5 +648,227 @@ mod tests {
         h2.insert("if-none-match", HeaderValue::from_static("*"));
         assert_eq!(precondition(&h2, Some(&facts), false), PreconditionOutcome::NotModified);
         assert_eq!(precondition(&h2, None, false), PreconditionOutcome::Proceed);
+    }
+
+    fn expected_write_outcome(
+        if_match: HdrState,
+        if_unmod: HdrState,
+        if_none_match: HdrState,
+        if_mod: HdrState,
+        obj: ObjState,
+    ) -> WritePreconditionOutcome {
+        let exists = matches!(obj, ObjState::Exists);
+        match if_match {
+            HdrState::True => {
+                if !exists {
+                    return WritePreconditionOutcome::NoSuchKey;
+                }
+            }
+            HdrState::False => {
+                if !exists {
+                    return WritePreconditionOutcome::NoSuchKey;
+                }
+                return WritePreconditionOutcome::PreconditionFailed;
+            }
+            HdrState::Absent => {
+                if exists && matches!(if_unmod, HdrState::False) {
+                    return WritePreconditionOutcome::PreconditionFailed;
+                }
+            }
+        }
+        match if_none_match {
+            HdrState::True => {
+                if exists {
+                    WritePreconditionOutcome::PreconditionFailed
+                } else {
+                    WritePreconditionOutcome::Proceed
+                }
+            }
+            HdrState::False => WritePreconditionOutcome::Proceed,
+            HdrState::Absent => {
+                if exists && matches!(if_mod, HdrState::False) {
+                    WritePreconditionOutcome::PreconditionFailed
+                } else {
+                    WritePreconditionOutcome::Proceed
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exhaustive_write_precondition_table_243_cases() {
+        let ts = 1_794_268_800u64;
+        let facts = ObjectFacts {
+            etag: "\"abc123\"".to_string(),
+            last_modified_secs: ts,
+        };
+        let mut count = 0;
+        for &obj in &ALL_OBJ {
+            let current = match obj {
+                ObjState::Exists => Some(&facts),
+                ObjState::DeleteMarker | ObjState::Missing => None,
+            };
+            for &im in &ALL_HDR {
+                for &ius in &ALL_HDR {
+                    for &inm in &ALL_HDR {
+                        for &ims in &ALL_HDR {
+                            let mut headers = HeaderMap::new();
+                            match im {
+                                HdrState::Absent => {}
+                                HdrState::True => {
+                                    headers.insert("if-match", HeaderValue::from_static("\"abc123\""));
+                                }
+                                HdrState::False => {
+                                    headers.insert("if-match", HeaderValue::from_static("\"other\""));
+                                }
+                            }
+                            match ius {
+                                HdrState::Absent => {}
+                                HdrState::True => {
+                                    headers.insert("if-unmodified-since", HeaderValue::from_str(&format_http_date(ts)).unwrap());
+                                }
+                                HdrState::False => {
+                                    headers.insert("if-unmodified-since", HeaderValue::from_str(&format_http_date(ts - 10)).unwrap());
+                                }
+                            }
+                            match inm {
+                                HdrState::Absent => {}
+                                HdrState::True => {
+                                    headers.insert("if-none-match", HeaderValue::from_static("\"abc123\""));
+                                }
+                                HdrState::False => {
+                                    headers.insert("if-none-match", HeaderValue::from_static("\"other\""));
+                                }
+                            }
+                            match ims {
+                                HdrState::Absent => {}
+                                HdrState::True => {
+                                    headers.insert("if-modified-since", HeaderValue::from_str(&format_http_date(ts - 10)).unwrap());
+                                }
+                                HdrState::False => {
+                                    headers.insert("if-modified-since", HeaderValue::from_str(&format_http_date(ts)).unwrap());
+                                }
+                            }
+                            let got = write_precondition(&headers, current);
+                            let want = expected_write_outcome(im, ius, inm, ims, obj);
+                            assert_eq!(got, want, "obj={obj:?} im={im:?} ius={ius:?} inm={inm:?} ims={ims:?}");
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(count, 3 * 81);
+    }
+
+    #[test]
+    fn exhaustive_delete_precondition_table() {
+        #[derive(Clone, Copy, Debug)]
+        enum MatchKind {
+            Absent,
+            Wildcard,
+            Match,
+            Mismatch,
+        }
+        let ts = 1_794_268_800u64;
+        let targets = [
+            (ObjState::Missing, DeleteTarget::Absent),
+            (
+                ObjState::Exists,
+                DeleteTarget::Object {
+                    etag: "\"abc123\"".to_string(),
+                    last_modified_secs: ts,
+                    size: 42,
+                },
+            ),
+            (
+                ObjState::DeleteMarker,
+                DeleteTarget::DeleteMarker {
+                    last_modified_secs: ts,
+                },
+            ),
+        ];
+        let mut count = 0;
+        for (obj_kind, target) in &targets {
+            for &im in &[MatchKind::Absent, MatchKind::Wildcard, MatchKind::Match, MatchKind::Mismatch] {
+                for &lmt in &[HdrState::Absent, HdrState::True, HdrState::False] {
+                    for &sz in &[HdrState::Absent, HdrState::True, HdrState::False] {
+                        let conds = DeleteConditions {
+                            if_match: match im {
+                                MatchKind::Absent => None,
+                                MatchKind::Wildcard => Some("*".to_string()),
+                                MatchKind::Match => Some("\"abc123\"".to_string()),
+                                MatchKind::Mismatch => Some("\"other\"".to_string()),
+                            },
+                            if_none_match: None,
+                            if_match_last_modified_secs: match lmt {
+                                HdrState::Absent => None,
+                                HdrState::True => Some(ts),
+                                HdrState::False => Some(ts - 10),
+                            },
+                            if_match_size: match sz {
+                                HdrState::Absent => None,
+                                HdrState::True => Some(match obj_kind {
+                                    ObjState::DeleteMarker => 0,
+                                    _ => 42,
+                                }),
+                                HdrState::False => Some(999),
+                            },
+                        };
+                        let got = delete_precondition(&conds, target);
+                        let want = match obj_kind {
+                            ObjState::Missing => PreconditionOutcome::Proceed,
+                            ObjState::Exists => {
+                                let ok_im = !matches!(im, MatchKind::Mismatch);
+                                let ok_lmt = !matches!(lmt, HdrState::False);
+                                let ok_sz = !matches!(sz, HdrState::False);
+                                if ok_im && ok_lmt && ok_sz {
+                                    PreconditionOutcome::Proceed
+                                } else {
+                                    PreconditionOutcome::PreconditionFailed
+                                }
+                            }
+                            ObjState::DeleteMarker => {
+                                let ok_im = matches!(im, MatchKind::Absent | MatchKind::Wildcard);
+                                let ok_lmt = !matches!(lmt, HdrState::False);
+                                let ok_sz = !matches!(sz, HdrState::False);
+                                if ok_im && ok_lmt && ok_sz {
+                                    PreconditionOutcome::Proceed
+                                } else {
+                                    PreconditionOutcome::PreconditionFailed
+                                }
+                            }
+                        };
+                        assert_eq!(got, want, "obj={obj_kind:?} im={im:?} lmt={lmt:?} sz={sz:?}");
+                        count += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(count, 3 * 4 * 3 * 3);
+    }
+
+    #[test]
+    fn parse_delete_conditions_and_iso_dates() {
+        assert_eq!(parse_http_date_or_iso("2026-11-11T00:00:00Z"), Some(1_794_355_200));
+        assert_eq!(parse_http_date_or_iso("2026-11-11T00:00:00.123Z"), Some(1_794_355_200));
+        assert_eq!(parse_http_date_or_iso("Wed, 11 Nov 2026 00:00:00 GMT"), Some(1_794_355_200));
+
+        let mut h = HeaderMap::new();
+        h.insert("if-match", HeaderValue::from_static("\"e1\""));
+        h.insert("x-amz-if-match-last-modified-time", HeaderValue::from_static("Wed, 11 Nov 2026 00:00:00 GMT"));
+        h.insert("x-amz-if-match-size", HeaderValue::from_static("128"));
+        let conds = parse_delete_conditions(&h).unwrap();
+        assert_eq!(conds.if_match.as_deref(), Some("\"e1\""));
+        assert_eq!(conds.if_match_last_modified_secs, Some(1_794_355_200));
+        assert_eq!(conds.if_match_size, Some(128));
+
+        let mut bad = HeaderMap::new();
+        bad.insert("x-amz-if-match-size", HeaderValue::from_static("not-a-number"));
+        assert!(parse_delete_conditions(&bad).is_err());
+
+        let mut bad_dt = HeaderMap::new();
+        bad_dt.insert("x-amz-if-match-last-modified-time", HeaderValue::from_static("bad-date"));
+        assert!(parse_delete_conditions(&bad_dt).is_err());
     }
 }
