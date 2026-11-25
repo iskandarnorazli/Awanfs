@@ -321,7 +321,7 @@ Text log, one record per line (`\n`-terminated). Writes append and `sync_all` be
 
 | Prefix | Format | Meaning |
 |---|---|---|
-| `+` | `+<id>:<name>[:<created_ns>[:<owner>[:<namespace>]]]` | Bucket created; trailing fields after `<name>` are optional when reading older manifests, and an absent or empty `<owner>` defaults to `"root"`. |
+| `+` | `+<id>:<name>[:<created_ns>[:<owner>[:<namespace>]]]` | Bucket created (#159 adds `<namespace>` for tenant isolation); empty for all requests today, lookup is by `(namespace, name)`, trailing fields after `<name>` are optional on older manifests, and absent/empty `<owner>` defaults to `"root"`. |
 | `-` | `-<id>:<name>` | Bucket deleted; drops all configurations for `<id>`. |
 | `~` | `~<id>:<Enabled\|Suspended>` | Bucket versioning status (#31); also populates kind `versioning`. |
 | `=` | `=<id>:<kind>:<base64>` | Sets configuration `<kind>` for bucket `<id>` to the decoded document bytes. |

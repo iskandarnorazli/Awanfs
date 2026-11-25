@@ -33,6 +33,7 @@ use crate::xml::{copy_object_result_xml, s3_error_xml};
 fn finish_put(
     state: &S3ServiceState,
     b_id: u32,
+    bucket: &str,
     key: &str,
     old_info: Option<(u64, u64, u16)>,
     vol_offset: u64,
@@ -44,22 +45,27 @@ fn finish_put(
     created_ns: u64,
     checksum: Option<(crate::checksum::ChecksumAlgorithm, &str)>,
     reservation: CapacityReservation,
+    acked: bool,
 ) -> Response<ResponseBody> {
-    if let Err(code) = reservation.commit_put_at(
-        &state.engine,
+    if let Err(code) = state.commit_unversioned_put(
         b_id,
-        key.as_bytes(),
+        bucket,
+        key,
         vol_offset,
         payload_len,
         etag_hi,
         etag_lo,
         0,
         flags,
-        created_ns / 1_000_000,
+        created_ns,
+        old_info,
+        crate::events::CommitKind::Put,
+        etag_hex,
+        acked,
+        reservation,
     ) {
         return engine_error_response(code, key);
     }
-    state.retire_unversioned_overwrite(b_id, key, old_info, vol_offset, created_ns, flags);
     let mut b = Response::builder()
         .status(StatusCode::OK)
         .header(ETAG, format!("\"{}\"", etag_hex))
@@ -410,6 +416,9 @@ pub(crate) fn finish_version_put(
     etag_lo: u64,
     part_count: u16,
     reservation: CapacityReservation,
+    kind: crate::events::CommitKind,
+    etag: &str,
+    acked: bool,
 ) -> Result<String, Response<ResponseBody>> {
     let v = crate::versions::Version {
         ts,
@@ -423,7 +432,15 @@ pub(crate) fn finish_version_put(
         part_count,
         flags,
     };
-    match state.record_version_with_reservation(b_id, key, crate::versions::Event::Put(v), Some(reservation)) {
+    let ev_spec = crate::s3_api::VersionCommitEventSpec {
+        time: ts,
+        version: Some(v.id_string()),
+        kind,
+        size,
+        etag: etag.to_string(),
+        acked,
+    };
+    match state.record_version_commit(b_id, key, crate::versions::Event::Put(v), Some(reservation), Some(ev_spec)) {
         Ok(()) => Ok(v.id_string()),
         Err(code) => Err(engine_error_response(code, key)),
     }
@@ -1064,15 +1081,30 @@ pub async fn copy_object(
             None => return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e))),
         },
     };
+    let etag_hex = md5_to_etag_hex(src_etag_hi, src_etag_lo);
     if let Some((_, ts)) = stamp {
-        let vid = match finish_version_put(&state, b_id, key, ts, flags, vol_offset, src_size, src_etag_hi, src_etag_lo, 0, reservation) {
+        let vid = match finish_version_put(
+            &state,
+            b_id,
+            key,
+            ts,
+            flags,
+            vol_offset,
+            src_size,
+            src_etag_hi,
+            src_etag_lo,
+            0,
+            reservation,
+            crate::events::CommitKind::Copy,
+            &etag_hex,
+            late.is_none(),
+        ) {
             Ok(v) => v,
             Err(r) => return Ok(r),
         };
         if let Some(e) = late.take() {
             return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e)));
         }
-        let etag_hex = md5_to_etag_hex(src_etag_hi, src_etag_lo);
         let resp = Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/xml")
@@ -1086,26 +1118,28 @@ pub async fn copy_object(
             .body(full_body(Bytes::from(copy_object_result_xml(&etag_hex, &crate::versions::iso8601(ts)))))
             .unwrap());
     }
-    if let Err(code) = reservation.commit_put_at(
-        &state.engine,
+    if let Err(code) = state.commit_unversioned_put(
         b_id,
-        key.as_bytes(),
+        bucket,
+        key,
         vol_offset,
         src_size,
         src_etag_hi,
         src_etag_lo,
         0,
         flags,
-        created_ns / 1_000_000,
+        created_ns,
+        old_info,
+        crate::events::CommitKind::Copy,
+        &etag_hex,
+        late.is_none(),
+        reservation,
     ) {
         return Ok(engine_error_response(code, key));
     }
-    state.retire_unversioned_overwrite(b_id, key, old_info, vol_offset, created_ns, flags);
     if let Some(e) = late {
         return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e)));
     }
-
-    let etag_hex = md5_to_etag_hex(src_etag_hi, src_etag_lo);
     let xml = copy_object_result_xml(&etag_hex, &crate::versions::iso8601(created_ns));
     let resp = Response::builder()
         .status(StatusCode::OK)
@@ -1677,7 +1711,22 @@ pub async fn put_object(
         state.hook("put_stored", key);
         let stream_cksum_ref = stream_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
         let answer = if let Some((extra, ts)) = stamp {
-            match finish_version_put(&state, b_id, key, ts, flags, vol_offset, len, etag_hi, etag_lo, 0, reservation) {
+            match finish_version_put(
+                &state,
+                b_id,
+                key,
+                ts,
+                flags,
+                vol_offset,
+                len,
+                etag_hi,
+                etag_lo,
+                0,
+                reservation,
+                crate::events::CommitKind::Put,
+                &etag_hex,
+                late.is_none(),
+            ) {
                 Ok(vid) => {
                     let resp_vid = (extra & crate::meta_index::FLAG_NULL_ID == 0).then_some(vid.as_str());
                     put_ok_response(&etag_hex, resp_vid, stream_cksum_ref)
@@ -1685,7 +1734,7 @@ pub async fn put_object(
                 Err(r) => r,
             }
         } else {
-            finish_put(&state, b_id, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns, stream_cksum_ref, reservation)
+            finish_put(&state, b_id, bucket, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns, stream_cksum_ref, reservation, late.is_none())
         };
         return Ok(after_late_failure(key, late, answer));
     }
@@ -1831,7 +1880,22 @@ pub async fn put_object(
     state.hook("put_stored", key);
     let buf_cksum_ref = buf_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
     let answer = if let Some((extra, ts)) = stamp {
-        match finish_version_put(&state, b_id, key, ts, flags, vol_offset, payload_len, etag_hi, etag_lo, 0, reservation) {
+        match finish_version_put(
+            &state,
+            b_id,
+            key,
+            ts,
+            flags,
+            vol_offset,
+            payload_len,
+            etag_hi,
+            etag_lo,
+            0,
+            reservation,
+            crate::events::CommitKind::Put,
+            &final_etag_hex,
+            late.is_none(),
+        ) {
             Ok(vid) => {
                 let resp_vid = (extra & crate::meta_index::FLAG_NULL_ID == 0).then_some(vid.as_str());
                 put_ok_response(&final_etag_hex, resp_vid, buf_cksum_ref)
@@ -1839,7 +1903,7 @@ pub async fn put_object(
             Err(r) => r,
         }
     } else {
-        finish_put(&state, b_id, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns, buf_cksum_ref, reservation)
+        finish_put(&state, b_id, bucket, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns, buf_cksum_ref, reservation, late.is_none())
     };
     Ok(after_late_failure(key, late, answer))
 }

@@ -17,6 +17,7 @@ pub mod digest;
 pub mod direct_io;
 pub mod erasure;
 pub mod error;
+pub mod events;
 pub mod ffi_bridge;
 pub mod form_upload;
 pub mod fsm;

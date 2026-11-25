@@ -72,10 +72,14 @@ pub async fn put_bucket_cors(
             bucket,
         ));
     }
-    let res = state
-        .bucket_configs
-        .lock()
-        .put_config(b_id, ConfigKind::Cors, &body_bytes);
+    let res = {
+        let mut bc = state.bucket_configs.lock();
+        let res = bc.put_config(b_id, ConfigKind::Cors, &body_bytes);
+        if res.is_ok() {
+            state.emit_bucket_config_event(b_id, bucket, "cors", crate::events::CommitKind::BucketConfig, body_bytes.len() as u64);
+        }
+        res
+    };
     match res {
         Ok(()) => Ok(Response::builder()
             .status(StatusCode::OK)
@@ -122,10 +126,14 @@ pub async fn delete_bucket_cors(
     b_id: u32,
     bucket: &str,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
-    let res = state
-        .bucket_configs
-        .lock()
-        .delete_config(b_id, ConfigKind::Cors);
+    let res = {
+        let mut bc = state.bucket_configs.lock();
+        let res = bc.delete_config(b_id, ConfigKind::Cors);
+        if res.is_ok() {
+            state.emit_bucket_config_event(b_id, bucket, "cors", crate::events::CommitKind::BucketConfig, 0);
+        }
+        res
+    };
     match res {
         Ok(()) => Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)

@@ -965,6 +965,9 @@ fn compact_manifest_file(path: &Path, map: &BucketConfigMap) -> std::io::Result<
             Some(ns) => {
                 buf.push_str(&format!("+{}:{}:{}\n", cfg.id, cfg.name, ns));
             }
+            None if !cfg.owner.is_empty() || !cfg.namespace.is_empty() => {
+                buf.push_str(&format!("+{}:{}::{}:{}\n", cfg.id, cfg.name, cfg.owner, cfg.namespace));
+            }
             None => {
                 buf.push_str(&format!("+{}:{}\n", cfg.id, cfg.name));
             }

@@ -189,10 +189,14 @@ pub async fn put_bucket_tagging(
             bucket,
         ));
     }
-    let res = state
-        .bucket_configs
-        .lock()
-        .put_config(b_id, ConfigKind::Tagging, &body_bytes);
+    let res = {
+        let mut bc = state.bucket_configs.lock();
+        let res = bc.put_config(b_id, ConfigKind::Tagging, &body_bytes);
+        if res.is_ok() {
+            state.emit_bucket_config_event(b_id, bucket, "tagging", crate::events::CommitKind::BucketConfig, body_bytes.len() as u64);
+        }
+        res
+    };
     match res {
         Ok(()) => Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -247,10 +251,14 @@ pub async fn delete_bucket_tagging(
     b_id: u32,
     bucket: &str,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
-    let res = state
-        .bucket_configs
-        .lock()
-        .delete_config(b_id, ConfigKind::Tagging);
+    let res = {
+        let mut bc = state.bucket_configs.lock();
+        let res = bc.delete_config(b_id, ConfigKind::Tagging);
+        if res.is_ok() {
+            state.emit_bucket_config_event(b_id, bucket, "tagging", crate::events::CommitKind::BucketConfig, 0);
+        }
+        res
+    };
     match res {
         Ok(()) => Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)

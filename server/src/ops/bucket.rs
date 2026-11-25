@@ -234,6 +234,7 @@ pub async fn create_bucket(
             let created_ns = state.clock.now_ns();
             state.bucket_created_ns.write().insert(id, created_ns);
             let _ = state.bucket_configs.lock().apply_bucket_create(id, bucket, created_ns, caller_owner, "");
+            state.emit_bucket_config_event(id, bucket, "", crate::events::CommitKind::BucketCreate, 0);
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_LENGTH, "0")
@@ -283,9 +284,11 @@ pub async fn delete_bucket(
     }
     match engine.delete_bucket(b_id) {
         Ok(()) => {
+            state.versions.write().remove_bucket(b_id);
             state.versioning.write().remove(&b_id);
             state.bucket_created_ns.write().remove(&b_id);
             let _ = state.bucket_configs.lock().apply_bucket_delete(b_id, bucket, true);
+            state.emit_bucket_config_event(b_id, bucket, "", crate::events::CommitKind::BucketDelete, 0);
             Ok(Response::builder()
                 .status(StatusCode::NO_CONTENT)
                 .header(CONTENT_LENGTH, "0")

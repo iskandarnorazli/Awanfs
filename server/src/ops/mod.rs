@@ -706,6 +706,18 @@ pub fn authenticate(state: &S3ServiceState, c: Classified) -> Result<Authenticat
                 .unwrap());
         }
     };
+    let principal_label = match &principal {
+        Principal::Root => ROOT_ACCOUNT.to_string(),
+        Principal::User { account, name, .. } => {
+            if account == name {
+                name.clone()
+            } else {
+                format!("{}:{}", account, name)
+            }
+        }
+        Principal::Anonymous => "anonymous".to_string(),
+    };
+    crate::request_log::note_principal(principal_label);
     Ok(Authenticated { classified: c, principal, iam })
 }
 

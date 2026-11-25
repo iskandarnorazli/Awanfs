@@ -56,6 +56,7 @@ Options:
       --region <NAME>              Server region (default: us-east-1, or AWANFS_REGION)
       --allow-anonymous            Allow unsigned requests (or AWANFS_ALLOW_ANONYMOUS=1)
       --allow-small-parts          Allow multipart non-final parts under 5 MiB (off by default; for benchmarks)
+      --per-bucket-metrics         Always emit awanfs_bucket_* Prometheus gauges even above 1000 buckets (or AWANFS_PER_BUCKET_METRICS=1)
   -h, --help                       Print this help message and exit"
     );
 }
@@ -93,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut body_idle_timeout = s3_server::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT;
     let mut region = std::env::var("AWANFS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let mut allow_small_parts = false;
+    let mut per_bucket_metrics = std::env::var("AWANFS_PER_BUCKET_METRICS").ok().as_deref() == Some("1");
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -168,6 +170,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             allow_anonymous = true;
         } else if arg == "--allow-small-parts" {
             allow_small_parts = true;
+        } else if arg == "--per-bucket-metrics" {
+            per_bucket_metrics = true;
         } else if arg == "--data-dir" || arg == "-d" {
             if let Some(d_str) = args.next() {
                 data_dir = Some(PathBuf::from(d_str));
@@ -262,6 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Compaction copies at most this many MB/s (#28, decision 24); 0 = no limit.
     state.compaction_rate.store(compaction_mb.unwrap_or(50) * 1_000_000, std::sync::atomic::Ordering::Relaxed);
     state.lifecycle_day_seconds.store(lifecycle_day_seconds, std::sync::atomic::Ordering::Relaxed);
+    state.set_per_bucket_metrics(per_bucket_metrics);
     if lifecycle_day_seconds != 86_400 {
         eprintln!("WARNING: --lifecycle-day-seconds {} is set (default 86400); for test use only", lifecycle_day_seconds);
     }
