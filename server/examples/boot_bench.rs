@@ -14,26 +14,58 @@
 //! checks a sample of objects. Each phase prints one JSON line.
 
 use bytes::Bytes;
-use s3_server::{compute_md5, Durability, S3ServiceState, VolumeManager, AWAN_FLAG_ACTIVE};
+use s3_server::{
+    compute_md5, current_boot_heap_part, BootHeapPart, Durability, S3ServiceState, VolumeManager,
+    AWAN_FLAG_ACTIVE, BOOT_HEAP_PARTS,
+};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Counts the heap this process holds, so a boot can tell heap from the rest of its RSS.
+/// Counts the heap this process holds, both in total and by boot part, so a boot can tell
+/// heap from the rest of its RSS and identify which structure dominates.
 struct Counting;
 
 static HEAP_LIVE: AtomicUsize = AtomicUsize::new(0);
 static HEAP_PEAK: AtomicUsize = AtomicUsize::new(0);
+static PART_LIVE: [AtomicIsize; BOOT_HEAP_PARTS] = [
+    AtomicIsize::new(0),
+    AtomicIsize::new(0),
+    AtomicIsize::new(0),
+    AtomicIsize::new(0),
+    AtomicIsize::new(0),
+];
+static PART_PEAK: [AtomicUsize; BOOT_HEAP_PARTS] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 
 fn heap_grew(by: usize) {
     let now = HEAP_LIVE.fetch_add(by, Ordering::Relaxed) + by;
     HEAP_PEAK.fetch_max(now, Ordering::Relaxed);
 }
 
+fn part_grew(part: usize, by: usize) {
+    let prev = PART_LIVE[part].fetch_add(by as isize, Ordering::Relaxed);
+    let now = (prev + by as isize).max(0) as usize;
+    PART_PEAK[part].fetch_max(now, Ordering::Relaxed);
+}
+
+fn part_shrank(part: usize, by: usize) {
+    PART_LIVE[part].fetch_sub(by as isize, Ordering::Relaxed);
+}
+
 fn reset_heap_peak() {
     HEAP_PEAK.store(HEAP_LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+    for i in 0..BOOT_HEAP_PARTS {
+        let live = PART_LIVE[i].load(Ordering::Relaxed).max(0) as usize;
+        PART_PEAK[i].store(live, Ordering::Relaxed);
+    }
 }
 
 // SAFETY: every call goes to the system allocator unchanged; this only counts bytes.
@@ -42,6 +74,7 @@ unsafe impl GlobalAlloc for Counting {
         let p = System.alloc(layout);
         if !p.is_null() {
             heap_grew(layout.size());
+            part_grew(current_boot_heap_part(), layout.size());
         }
         p
     }
@@ -49,20 +82,27 @@ unsafe impl GlobalAlloc for Counting {
         let p = System.alloc_zeroed(layout);
         if !p.is_null() {
             heap_grew(layout.size());
+            part_grew(current_boot_heap_part(), layout.size());
         }
         p
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         System.dealloc(ptr, layout);
         HEAP_LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        part_shrank(current_boot_heap_part(), layout.size());
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let p = System.realloc(ptr, layout, new_size);
         if !p.is_null() {
+            let part = current_boot_heap_part();
             if new_size >= layout.size() {
-                heap_grew(new_size - layout.size());
+                let delta = new_size - layout.size();
+                heap_grew(delta);
+                part_grew(part, delta);
             } else {
-                HEAP_LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+                let delta = layout.size() - new_size;
+                HEAP_LIVE.fetch_sub(delta, Ordering::Relaxed);
+                part_shrank(part, delta);
             }
         }
         p
@@ -183,6 +223,14 @@ async fn fill(dir: &std::path::Path, objects: u64, size: usize) -> Result<(), Bo
     Ok(())
 }
 
+fn part_peak_mib(part: BootHeapPart) -> f64 {
+    mib(PART_PEAK[part as usize].load(Ordering::Relaxed))
+}
+
+fn part_after_mib(part: BootHeapPart) -> f64 {
+    mib(PART_LIVE[part as usize].load(Ordering::Relaxed).max(0) as usize)
+}
+
 fn boot_with(dir: &std::path::Path, objects: u64, size: usize, out: &mut dyn std::io::Write) -> Result<(), Box<dyn std::error::Error>> {
     reset_heap_peak();
     let t = Instant::now();
@@ -208,13 +256,23 @@ fn boot_with(dir: &std::path::Path, objects: u64, size: usize, out: &mut dyn std
     }
     writeln!(
         out,
-        "{{\"phase\":\"boot\",\"objects\":{},\"secs\":{:.3},\"objects_per_s\":{:.0},\"peak_rss_mib\":{},\"peak_heap_mib\":{:.3},\"heap_after_mib\":{:.3},\"checked\":{},\"wrong\":{}}}",
+        "{{\"phase\":\"boot\",\"objects\":{},\"secs\":{:.3},\"objects_per_s\":{:.0},\"peak_rss_mib\":{},\"peak_heap_mib\":{:.3},\"heap_after_mib\":{:.3},\"heap_parts_mib\":{{\"needle_records\":{:.3},\"checksum_map\":{:.3},\"hot_table\":{:.3},\"spill_index\":{:.3},\"other\":{:.3}}},\"heap_parts_after_mib\":{{\"needle_records\":{:.3},\"checksum_map\":{:.3},\"hot_table\":{:.3},\"spill_index\":{:.3},\"other\":{:.3}}},\"checked\":{},\"wrong\":{}}}",
         objects,
         secs,
         objects as f64 / secs,
         json_num(rss),
         mib(peak_heap),
         mib(heap_after),
+        part_peak_mib(BootHeapPart::NeedleRecords),
+        part_peak_mib(BootHeapPart::ChecksumMap),
+        part_peak_mib(BootHeapPart::HotTable),
+        part_peak_mib(BootHeapPart::SpillIndex),
+        part_peak_mib(BootHeapPart::Other),
+        part_after_mib(BootHeapPart::NeedleRecords),
+        part_after_mib(BootHeapPart::ChecksumMap),
+        part_after_mib(BootHeapPart::HotTable),
+        part_after_mib(BootHeapPart::SpillIndex),
+        part_after_mib(BootHeapPart::Other),
         checked,
         wrong
     )?;
@@ -370,6 +428,11 @@ mod tests {
         assert_eq!(json["phase"], "boot");
         assert_eq!(json["objects"], 16);
         assert_eq!(json["wrong"], 0);
+        let parts = json["heap_parts_mib"].as_object().expect("boot JSON line missing heap_parts_mib");
+        for k in ["needle_records", "checksum_map", "hot_table", "spill_index", "other"] {
+            assert!(parts.get(k).and_then(|v| v.as_f64()).is_some(), "missing heap_parts_mib.{k} in {line}");
+        }
+        assert!(parts["hot_table"].as_f64().unwrap() > 0.0, "expected hot_table > 0.0 in {line}");
         let peak = json["peak_heap_mib"].as_f64().expect("boot JSON line missing numeric peak_heap_mib");
         let after = json["heap_after_mib"].as_f64().expect("boot JSON line missing numeric heap_after_mib");
         assert!(peak > 0.0, "expected peak_heap_mib > 0.0, got {}", peak);
