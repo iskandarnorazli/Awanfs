@@ -1,4 +1,4 @@
-`$bin = "server/target/release/examples/boot_bench.exe"; & $bin fill --dir $d --objects 1000000 --size 64; & $bin boot --dir $d --objects 1000000 --size 64` (Windows local Step 1 baseline on commit 2f56dab; CI 10M `bench-boot.yml` runs recorded below once completed)
+`gh workflow run bench-boot.yml --ref issue/323-boot-memory -f objects=10000000 -f size=64` (run [45423742777](https://github.com/iskandarnorazli/Awanfs/actions/runs/45423742777) on commit 5df9cd0); local Windows Step 1 baseline command: `$bin = "server/target/release/examples/boot_bench.exe"; & $bin fill --dir $d --objects 1000000 --size 64; & $bin boot --dir $d --objects 1000000 --size 64`
 
 # Boot memory breakdown by part (#323)
 
@@ -52,6 +52,44 @@ Raw JSON lines (after, local Windows):
 
 At 1,000,000 objects locally on Windows, `peak_rss_mib` dropped from `204.148 MiB` to `61.344 MiB` (`-69.9%`) and `peak_heap_mib` dropped from `197.415 MiB` to `65.659 MiB` (`-66.7%`). `needle_records` stays flat at `1.000 MiB` (`AlignedScanWindow`), `checksum_map` is `0.000 MiB`, `hot_table` stays flat at `25.871 MiB`, and `other` stays flat at `34.127 MiB`.
 
-## CI 10M `bench-boot.yml` (Linux and Windows)
+## CI 10M `bench-boot.yml` (Linux and Windows, run [45423742777](https://github.com/iskandarnorazli/Awanfs/actions/runs/45423742777))
 
-Pending PR dispatch.
+| 10M objects of 64 bytes | Linux ([job](https://github.com/iskandarnorazli/Awanfs/actions/runs/45423742777/job/138549957297)) | Windows ([job](https://github.com/iskandarnorazli/Awanfs/actions/runs/45423742777/job/138549957962)) |
+|---|---|---|
+| fill, s | 184.830 | 152.919 |
+| fill, objects per second | 54,104 | 65,394 |
+| volumes | 2 | 2 |
+| bytes on disk | 41,637,609,768 | 41,637,609,768 |
+| scan, s (`open_secs` / `read_calls`) | 80.484 (79.578 / 39,063) | 71.931 (72.412 / 39,063) |
+| boot after dropping the page cache, s | 172.094 | not measured (no cache drop on Windows) |
+| boot, s | 166.270 | 198.454 |
+| boot, objects per second | 60,143 | 50,390 |
+| peak RSS while booting, MiB | 77.484 (cold: 77.457) | 76.816 |
+| peak heap while booting, MiB | 78.950 (cold: 78.950) | 78.963 |
+| retained heap after boot, MiB | 78.950 | 78.963 |
+| `needle_records` peak (after), MiB | 1.000 (0.000) | 1.000 (0.000) |
+| `checksum_map` peak (after), MiB | 0.000 (0.000) | 0.000 (0.000) |
+| `hot_table` peak (after), MiB | 25.871 (25.871) | 25.871 (25.871) |
+| `spill_index` peak (after), MiB | 41.504 (19.025) | 41.504 (19.025) |
+| `other` peak (after), MiB | 34.077 (34.054) | 34.087 (34.066) |
+| sampled objects wrong after boot | 0 of 1,000 | 0 of 1,000 |
+
+Raw JSON lines (CI 10M, run `45423742777`):
+
+```text
+ubuntu-latest:
+{"phase":"fill","objects":10000000,"size":64,"secs":184.830,"objects_per_s":54104,"volumes":2,"bytes_on_disk":41637609768}
+{"phase":"scan","volumes":2,"open_secs":79.578,"secs":80.484,"needles":10000000,"needles_per_s":124249,"read_calls":39063}
+{"phase":"boot_cold","objects":10000000,"secs":172.094,"objects_per_s":58108,"peak_rss_mib":77.457,"peak_heap_mib":78.950,"heap_after_mib":78.950,"heap_parts_mib":{"needle_records":1.000,"checksum_map":0.000,"hot_table":25.871,"spill_index":41.504,"other":34.077},"heap_parts_after_mib":{"needle_records":0.000,"checksum_map":0.000,"hot_table":25.871,"spill_index":19.025,"other":34.054},"checked":1000,"wrong":0}
+{"phase":"boot","objects":10000000,"secs":166.270,"objects_per_s":60143,"peak_rss_mib":77.484,"peak_heap_mib":78.950,"heap_after_mib":78.950,"heap_parts_mib":{"needle_records":1.000,"checksum_map":0.000,"hot_table":25.871,"spill_index":41.504,"other":34.077},"heap_parts_after_mib":{"needle_records":0.000,"checksum_map":0.000,"hot_table":25.871,"spill_index":19.025,"other":34.054},"checked":1000,"wrong":0}
+
+windows-latest:
+{"phase":"fill","objects":10000000,"size":64,"secs":152.919,"objects_per_s":65394,"volumes":2,"bytes_on_disk":41637609768}
+{"phase":"scan","volumes":2,"open_secs":72.412,"secs":71.931,"needles":10000000,"needles_per_s":139021,"read_calls":39063}
+{"phase":"boot","objects":10000000,"secs":198.454,"objects_per_s":50390,"peak_rss_mib":76.816,"peak_heap_mib":78.963,"heap_after_mib":78.963,"heap_parts_mib":{"needle_records":1.000,"checksum_map":0.000,"hot_table":25.871,"spill_index":41.504,"other":34.087},"heap_parts_after_mib":{"needle_records":0.000,"checksum_map":0.000,"hot_table":25.871,"spill_index":19.025,"other":34.066},"checked":1000,"wrong":0}
+```
+
+Compared against `measurements/2026-11-20-boot-full-replay.md` (run `44664190258`):
+- Linux peak RSS dropped from `1,594.766 MiB` (`1,594.660 MiB` cold) to `77.484 MiB` (`77.457 MiB` cold), within `--memory-budget` (`256 MiB`), and warm boot time dropped from `254.904 s` to `166.270 s`.
+- Windows peak RSS dropped from `1,244.559 MiB` to `76.816 MiB`, within `--memory-budget` (`256 MiB`), and boot time dropped from `3,391.760 s` to `198.454 s`.
+- Sampled objects wrong after boot: `0 of 1,000` on both platforms.
