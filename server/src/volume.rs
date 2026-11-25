@@ -134,44 +134,45 @@ impl<'a, F: VolFile> AlignedScanWindow<'a, F> {
 
     /// Returns at least `need_bytes` sector-aligned bytes starting at `offset`, refilling up to
     /// `SCAN_BATCH_BYTES` clamped to whole sectors inside `file_len`.
-    fn read_at(&mut self, offset: u64, need_bytes: usize) -> Option<&[u8]> {
+    /// Returns `Ok(None)` only at EOF/overflow; propagates underlying read I/O errors.
+    fn read_at(&mut self, offset: u64, need_bytes: usize) -> Result<Option<&[u8]>, io::Error> {
         debug_assert_eq!(offset % SECTOR_SIZE as u64, 0);
         debug_assert!(need_bytes > 0 && need_bytes % SECTOR_SIZE == 0);
         if need_bytes > self.buf.len() {
             self.buf = AlignedBuffer::new(need_bytes);
             self.buf_len = 0;
         }
-        let end = offset.checked_add(need_bytes as u64)?;
+        let Some(end) = offset.checked_add(need_bytes as u64) else {
+            return Ok(None);
+        };
         if end > self.file_len {
-            return None;
+            return Ok(None);
         }
         if offset >= self.buf_start && end <= self.buf_start + self.buf_len as u64 {
             let start = (offset - self.buf_start) as usize;
-            return Some(&self.buf[start..start + need_bytes]);
+            return Ok(Some(&self.buf[start..start + need_bytes]));
         }
 
         let avail_bytes = ((self.file_len - offset) / SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
         if avail_bytes < need_bytes as u64 {
-            return None;
+            return Ok(None);
         }
         let to_read = (self.buf.len() as u64).min(avail_bytes) as usize;
         self.buf_len = 0;
         self.count_read();
-        if self.file.read_aligned_at(offset, &mut self.buf[..to_read]).is_err() {
-            if to_read > need_bytes {
+        if let Err(e) = self.file.read_aligned_at(offset, &mut self.buf[..to_read]) {
+            if to_read > need_bytes && e.kind() == io::ErrorKind::UnexpectedEof {
                 self.count_read();
-                if self.file.read_aligned_at(offset, &mut self.buf[..need_bytes]).is_err() {
-                    return None;
-                }
+                self.file.read_aligned_at(offset, &mut self.buf[..need_bytes])?;
                 self.buf_start = offset;
                 self.buf_len = need_bytes;
-                return Some(&self.buf[..need_bytes]);
+                return Ok(Some(&self.buf[..need_bytes]));
             }
-            return None;
+            return Err(e);
         }
         self.buf_start = offset;
         self.buf_len = to_read;
-        Some(&self.buf[..need_bytes])
+        Ok(Some(&self.buf[..need_bytes]))
     }
 }
 
@@ -649,34 +650,34 @@ fn verify_needle_integrity<F: VolFile>(
     window: &mut AlignedScanWindow<'_, F>,
     offset: u64,
     hdr: &NeedleHeader,
-) -> bool {
+) -> Result<bool, VolumeError> {
     let key_end = 64usize + hdr.key_len as usize;
     let attrs_len = hdr.attrs_len as usize;
     let p_start = key_end + attrs_len;
     let Some(p_end) = (p_start as u64).checked_add(hdr.payload_size) else {
-        return false;
+        return Ok(false);
     };
     let total_len = p_end.div_ceil(SECTOR_SIZE as u64).saturating_mul(SECTOR_SIZE as u64);
     if total_len != hdr.total_len() || p_end > total_len {
-        return false;
+        return Ok(false);
     }
     let meta_sectors = p_start.div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
     let mut crc = 0u32;
     let mut pos = 0u64;
     while pos < total_len {
         let remain = ((total_len - pos) as usize).min(SCAN_BATCH_BYTES);
-        let Some(chunk) = window.read_at(offset + pos, remain) else {
-            return false;
+        let Some(chunk) = window.read_at(offset + pos, remain)? else {
+            return Ok(false);
         };
         if pos == 0 {
             if remain < meta_sectors {
-                return false;
+                return Ok(false);
             }
             if xxh3_64(&chunk[64..key_end]) != hdr.key_hash {
-                return false;
+                return Ok(false);
             }
             if attrs_len > 0 && crate::attrs::Attrs::decode(&chunk[key_end..p_start]).is_err() {
-                return false;
+                return Ok(false);
             }
         }
         let lo = (p_start as u64).max(pos);
@@ -686,7 +687,7 @@ fn verify_needle_integrity<F: VolFile>(
         }
         pos += remain as u64;
     }
-    crc == hdr.payload_crc32c
+    Ok(crc == hdr.payload_crc32c)
 }
 /// One write counted in `VolumeManager::writers_in_flight` (#167).
 struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
@@ -867,20 +868,25 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             // Scan valid needles
             let mut last_valid_end = SECTOR_SIZE as u64;
             let mut window = AlignedScanWindow::new(&*aligned_file, file_len, None);
-            while let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE) {
+            while let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE)? {
                 let mut header_bytes = [0u8; 64];
                 header_bytes.copy_from_slice(&sector[0..64]);
 
                 let magic = u32::from_le_bytes(header_bytes[0..4].try_into().unwrap());
-                let Some(hdr) = (magic == NEEDLE_MAGIC)
+                let valid_hdr = match (magic == NEEDLE_MAGIC)
                     .then(|| NeedleHeader::decode(&header_bytes).ok())
                     .flatten()
-                    .filter(|hdr| {
-                        let total_len = hdr.total_len();
-                        scan_offset.checked_add(total_len).is_some_and(|end| end <= file_len)
-                            && verify_needle_integrity(&mut window, scan_offset, hdr)
-                    })
-                else {
+                {
+                    Some(hdr) if scan_offset.checked_add(hdr.total_len()).is_some_and(|end| end <= file_len) => {
+                        if verify_needle_integrity(&mut window, scan_offset, &hdr)? {
+                            Some(hdr)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                let Some(hdr) = valid_hdr else {
                     // Unwritten or torn needle: step over it when the journal knows a later needle.
                     match jump_in_journal(scan_offset, &mut open_gaps)? {
                         Some(next) => {
@@ -1717,7 +1723,7 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         let mut scan_offset = SECTOR_SIZE as u64;
         let mut window = AlignedScanWindow::new(&*self.file, file_len, Some(&self.work));
 
-        while let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE) {
+        while let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE)? {
             if let Some(len) = self
                 .gaps
                 .lock()
@@ -1761,7 +1767,7 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 String::from_utf8_lossy(&sector[64..key_end]).to_string()
             } else {
                 let need_bytes = key_end.div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
-                let slice = match window.read_at(scan_offset, need_bytes) {
+                let slice = match window.read_at(scan_offset, need_bytes)? {
                     Some(s) => s,
                     None => break,
                 };
@@ -1866,7 +1872,7 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 }
             }
 
-            let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE) else {
+            let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE)? else {
                 break;
             };
             spent = spent.saturating_add(SECTOR_SIZE as u64);
@@ -1947,9 +1953,16 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             let mut err: Option<String> = None;
             while pos < total_len && !stop.load(Ordering::Relaxed) {
                 let remain = ((total_len - pos) as usize).min(SCAN_BATCH_BYTES);
-                let Some(chunk) = window.read_at(scan_offset + pos, remain) else {
-                    err = Some(format!("read failed at offset {}", scan_offset + pos));
-                    break;
+                let chunk = match window.read_at(scan_offset + pos, remain) {
+                    Ok(Some(c)) => c,
+                    Ok(None) => {
+                        err = Some(format!("short read at offset {}", scan_offset + pos));
+                        break;
+                    }
+                    Err(e) => {
+                        err = Some(format!("read error at offset {}: {}", scan_offset + pos, e));
+                        break;
+                    }
                 };
                 if pos > 0 || remain > SECTOR_SIZE {
                     let newly_read = if pos == 0 {
