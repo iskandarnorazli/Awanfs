@@ -718,6 +718,213 @@ pub struct S3ServiceState {
     pub body_idle_timeout_ms: Arc<AtomicU64>,
     /// Configured S3 region (default `"us-east-1"`, `--region`) (#140).
     pub region: String,
+    /// Side map for `0x200` attribute-update needles (`Decision 56`, `#203`).
+    pub attr_updates: Arc<AttrUpdateStore>,
+    /// `0x200` attribute-update needles ignored during recovery because their target was
+    /// absent, deleted, or a delete marker.
+    pub attr_updates_ignored: Arc<AtomicU64>,
+}
+
+#[inline]
+fn key_hash_of(key: &str) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(key.as_bytes())
+}
+
+#[derive(Default)]
+struct AttrUpdateMapState {
+    map: HashMap<(u32, u64, u64), Vec<crate::fsm::KeyAttrUpdate>>,
+    total_updates: usize,
+}
+
+/// Side map from `(bucket_id, key_hash, target_version_id)` to the latest live `0x200`
+/// attribute-update needle location per `AttrGroup`. Only updated objects hold entries.
+#[derive(Default)]
+pub struct AttrUpdateStore {
+    inner: RwLock<AttrUpdateMapState>,
+    entry_count: AtomicU64,
+    estimated: std::sync::atomic::AtomicUsize,
+}
+
+impl AttrUpdateStore {
+    /// Approximate heap bytes per updated object entry with one group update.
+    pub const fn side_map_entry_bytes() -> usize {
+        std::mem::size_of::<(u32, u64, u64)>()
+            + std::mem::size_of::<Vec<crate::fsm::KeyAttrUpdate>>()
+            + 8
+            + std::mem::size_of::<crate::fsm::KeyAttrUpdate>()
+    }
+
+    fn recompute_locked(state: &AttrUpdateMapState) -> usize {
+        if state.map.is_empty() {
+            return 0;
+        }
+        let slot_bytes = std::mem::size_of::<(u32, u64, u64)>()
+            + std::mem::size_of::<Vec<crate::fsm::KeyAttrUpdate>>()
+            + 8;
+        state.map.capacity() * slot_bytes
+            + state.total_updates * std::mem::size_of::<crate::fsm::KeyAttrUpdate>()
+    }
+
+    fn finish_write(&self, state: &AttrUpdateMapState, cache: Option<&PayloadCache>) {
+        let len = state.map.len() as u64;
+        let bytes = Self::recompute_locked(state);
+        self.entry_count.store(len, Ordering::Release);
+        self.estimated.store(bytes, Ordering::Release);
+        if let Some(c) = cache {
+            c.set_reserved_bytes(bytes);
+        }
+    }
+
+    pub fn has_updates(&self) -> bool {
+        self.entry_count.load(Ordering::Acquire) > 0
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.entry_count.load(Ordering::Acquire) as usize
+    }
+
+    pub fn estimated_bytes(&self) -> usize {
+        self.estimated.load(Ordering::Acquire)
+    }
+
+    pub fn get(&self, b_id: u32, key: &str, target_version_id: u64) -> Vec<crate::fsm::KeyAttrUpdate> {
+        if !self.has_updates() {
+            return Vec::new();
+        }
+        let h = key_hash_of(key);
+        self.inner
+            .read()
+            .map
+            .get(&(b_id, h, target_version_id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn max_ts(&self, b_id: u32, key: &str, target_version_id: u64) -> Option<u64> {
+        if !self.has_updates() {
+            return None;
+        }
+        let h = key_hash_of(key);
+        self.inner
+            .read()
+            .map
+            .get(&(b_id, h, target_version_id))
+            .and_then(|v| v.iter().map(|u| u.created_at_ns).max())
+    }
+
+    pub fn set_for_target(
+        &self,
+        b_id: u32,
+        key: &str,
+        target_version_id: u64,
+        updates: Vec<crate::fsm::KeyAttrUpdate>,
+        cache: Option<&PayloadCache>,
+    ) {
+        let h = key_hash_of(key);
+        let mut guard = self.inner.write();
+        if let Some(old) = guard.map.remove(&(b_id, h, target_version_id)) {
+            guard.total_updates = guard.total_updates.saturating_sub(old.len());
+        }
+        if !updates.is_empty() {
+            guard.total_updates += updates.len();
+            guard.map.insert((b_id, h, target_version_id), updates);
+        }
+        self.finish_write(&guard, cache);
+    }
+
+    pub fn remove_target(
+        &self,
+        b_id: u32,
+        key: &str,
+        target_version_id: u64,
+        cache: Option<&PayloadCache>,
+    ) -> Vec<crate::fsm::KeyAttrUpdate> {
+        if !self.has_updates() {
+            return Vec::new();
+        }
+        let h = key_hash_of(key);
+        let mut guard = self.inner.write();
+        let removed = guard.map.remove(&(b_id, h, target_version_id)).unwrap_or_default();
+        if !removed.is_empty() {
+            guard.total_updates = guard.total_updates.saturating_sub(removed.len());
+            self.finish_write(&guard, cache);
+        }
+        removed
+    }
+
+    pub fn live_groups_at(
+        &self,
+        b_id: u32,
+        key: &str,
+        target_version_id: u64,
+        vol_offset: u64,
+    ) -> Vec<crate::attrs::AttrGroup> {
+        if !self.has_updates() {
+            return Vec::new();
+        }
+        let h = key_hash_of(key);
+        self.inner
+            .read()
+            .map
+            .get(&(b_id, h, target_version_id))
+            .map(|list| {
+                list.iter()
+                    .filter(|u| u.vol_offset == vol_offset)
+                    .map(|u| u.group)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn move_offset(
+        &self,
+        b_id: u32,
+        key: &str,
+        target_version_id: u64,
+        g_old: u64,
+        g_new: u64,
+        new_total_len: u64,
+    ) -> usize {
+        if !self.has_updates() {
+            return 0;
+        }
+        let h = key_hash_of(key);
+        let mut guard = self.inner.write();
+        let Some(list) = guard.map.get_mut(&(b_id, h, target_version_id)) else {
+            return 0;
+        };
+        let mut moved = 0usize;
+        for u in list.iter_mut() {
+            if u.vol_offset == g_old {
+                u.vol_offset = g_new;
+                u.total_len = new_total_len;
+                moved += 1;
+            }
+        }
+        moved
+    }
+}
+
+/// Errors from `S3ServiceState::set_attribute_group`.
+#[derive(Debug)]
+pub enum SetAttrError {
+    Refused {
+        refusal: crate::fsm::Refusal,
+        delete_marker: Option<(String, bool)>,
+    },
+    TooLarge,
+    Internal {
+        detail: String,
+        after_record: bool,
+    },
+}
+
+/// Result of writing a `0x200` attribute-update needle via `set_attribute_group`.
+#[derive(Debug, Clone)]
+pub struct SetAttrOutcome {
+    pub version_id: Option<String>,
+    pub vol_offset: u64,
+    pub created_at_ns: u64,
 }
 
 /// What `S3ServiceState::try_with_data_dir_limits` keeps in memory.
@@ -816,6 +1023,8 @@ impl S3ServiceState {
                 crate::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT.as_millis() as u64,
             )),
             region: "us-east-1".to_string(),
+            attr_updates: Arc::new(AttrUpdateStore::default()),
+            attr_updates_ignored: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -903,6 +1112,10 @@ impl S3ServiceState {
         // 2. Replay the needle volumes, oldest first: writes only move to a newer volume, so
         // volume order is log order. Versions are ordered by their ids instead (versions.rs).
         let mut mp_extents: HashMap<(u32, u64), Vec<PartExtent>> = HashMap::new();
+        let mut pending_updates: HashMap<(u32, u64, u64), Vec<crate::fsm::KeyAttrUpdate>> = HashMap::new();
+        let mut updated_keys: HashMap<(u32, u64), String> = HashMap::new();
+        let mut unver_base_ns: HashMap<(u32, u64), u64> = HashMap::new();
+        let mut ignored_attr_updates: u64 = 0;
         for vm in volumes.values() {
             initial_vol_offset = vm.offset().max(4096);
             let _records_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::NeedleRecords);
@@ -910,12 +1123,66 @@ impl S3ServiceState {
             // buffering a volume's records in memory (#323, Decision 7A).
             let res = vm.try_scan_needles(|n| -> Result<(), String> {
                 let created_at_ms = n.created_at_ns / 1_000_000;
-                let (b_id, key, local, size, etag_hi, etag_lo, flags, crc32c) = (n.bucket_id, n.key, n.offset, n.payload_size, n.etag_hi, n.etag_lo, n.flags, n.payload_crc32c);
+                let (b_id, key, local, size, total_len, etag_hi, etag_lo, flags, crc32c) = (
+                    n.bucket_id,
+                    n.key,
+                    n.offset,
+                    n.payload_size,
+                    n.total_len,
+                    n.etag_hi,
+                    n.etag_lo,
+                    n.flags,
+                    n.payload_crc32c,
+                );
                 let offset = global_offset(vm.id(), local);
-                // Keys with a version history replay through the version store (#31).
-                if flags & (crate::meta_index::FLAG_VERSIONED | crate::meta_index::FLAG_VERSION_DELETE) != 0 || version_store.has(b_id as u32, &key) {
+                let b = b_id as u32;
+                let kh = key_hash_of(&key);
+
+                // Collect 0x200 attribute-update needles without disturbing base object replay
+                // and without keeping records for un-updated keys (#203, Decision 56).
+                if flags & crate::meta_index::FLAG_ATTR_UPDATE != 0 {
                     let _other_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::Other);
-                    let b = b_id as u32;
+                    let payload_res = match n.attr_update_payload {
+                        Some(p) => Ok(Bytes::from(p)),
+                        None => vm.read_needle_bytes(vm.id(), local, crc32c),
+                    };
+                    match payload_res
+                        .ok()
+                        .and_then(|bytes| crate::attrs::decode_attr_update(&bytes).ok())
+                    {
+                        Some((target_vid, upd_attrs)) => {
+                            let mut seen_groups = Vec::new();
+                            for (tag, _) in upd_attrs.iter() {
+                                let g = crate::attrs::AttrGroup::from_tag(tag);
+                                if !seen_groups.contains(&g) {
+                                    seen_groups.push(g);
+                                }
+                            }
+                            if seen_groups.is_empty() {
+                                ignored_attr_updates += 1;
+                            } else {
+                                updated_keys.entry((b, kh)).or_insert_with(|| key.clone());
+                                let slot = pending_updates.entry((b, kh, target_vid)).or_default();
+                                for group in seen_groups {
+                                    slot.push(crate::fsm::KeyAttrUpdate {
+                                        group,
+                                        created_at_ns: n.created_at_ns,
+                                        vol_offset: offset,
+                                        total_len,
+                                    });
+                                }
+                            }
+                        }
+                        None => {
+                            ignored_attr_updates += 1;
+                        }
+                    }
+                    return Ok(());
+                }
+
+                // Keys with a version history replay through the version store (#31).
+                if flags & (crate::meta_index::FLAG_VERSIONED | crate::meta_index::FLAG_VERSION_DELETE) != 0 || version_store.has(b, &key) {
+                    let _other_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::Other);
                     if !version_store.has(b, &key) {
                         let before = engine.get_object(b, key.as_bytes()).ok().map(|m| null_version_of(&m));
                         if let Some(nv) = before.filter(|v| v.flags & AWAN_FLAG_MULTIPART != 0) {
@@ -938,15 +1205,38 @@ impl S3ServiceState {
                     // pre-history record, as `null_version_of` gives it live (#238).
                     let modified = if before_history { created_at_ms.saturating_mul(1_000_000) } else { n.created_at_ns };
                     let ev = if before_history && flags & AWAN_FLAG_TOMBSTONE != 0 {
+                        if let Some(removed) = pending_updates.remove(&(b, kh, 0)) {
+                            ignored_attr_updates += removed.len() as u64;
+                        }
                         crate::versions::Event::Remove(0)
                     } else if flags & crate::meta_index::FLAG_VERSION_DELETE != 0 {
                         match vm.read_needle_bytes(vm.id(), local, crc32c) {
-                            Ok(p) if p.len() == 8 => crate::versions::Event::Remove(u64::from_le_bytes(p[..8].try_into().unwrap())),
+                            Ok(p) if p.len() == 8 => {
+                                let del_id = u64::from_le_bytes(p[..8].try_into().unwrap());
+                                if let Some(removed) = pending_updates.remove(&(b, kh, del_id)) {
+                                    ignored_attr_updates += removed.len() as u64;
+                                }
+                                crate::versions::Event::Remove(del_id)
+                            }
                             _ => return Ok(()),
                         }
                     } else if flags & AWAN_FLAG_TOMBSTONE != 0 {
+                        if null {
+                            if let Some(list) = pending_updates.get_mut(&(b, kh, 0)) {
+                                let before_len = list.len();
+                                list.retain(|u| u.created_at_ns > n.created_at_ns);
+                                ignored_attr_updates += (before_len - list.len()) as u64;
+                            }
+                        }
                         crate::versions::Event::Put(crate::versions::Version { ts, modified, null, marker: true, vol_offset: offset, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags })
                     } else {
+                        if before_history || null {
+                            if let Some(list) = pending_updates.get_mut(&(b, kh, 0)) {
+                                let before_len = list.len();
+                                list.retain(|u| u.created_at_ns > n.created_at_ns);
+                                ignored_attr_updates += (before_len - list.len()) as u64;
+                            }
+                        }
                         let (size, part_count) = if flags & AWAN_FLAG_MULTIPART != 0 {
                             match vm.read_needle_bytes(vm.id(), local, crc32c).ok().map(|b| decode_extents_manifest(&multipart.staging_dir, &b)) {
                                 Some(Ok((total, extents))) => {
@@ -990,7 +1280,25 @@ impl S3ServiceState {
                     return Ok(());
                 }
                 if flags & AWAN_FLAG_TOMBSTONE != 0 {
-                    let _ = engine.delete_object(b_id as u32, key.as_bytes());
+                    if let Some(removed) = pending_updates.remove(&(b, kh, 0)) {
+                        ignored_attr_updates += removed.len() as u64;
+                    }
+                    let _ = unver_base_ns.remove(&(b, kh));
+                    let next_state = match crate::fsm::key_step(
+                        crate::fsm::KeyState::Absent,
+                        crate::fsm::KeyRecord::Tombstone {
+                            versioned: false,
+                            is_null: false,
+                            created_at_ns: n.created_at_ns,
+                            vol_offset: offset,
+                        },
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => crate::fsm::KeyState::Absent,
+                    };
+                    if matches!(next_state, crate::fsm::KeyState::Absent) {
+                        let _ = engine.delete_object(b, key.as_bytes());
+                    }
                 } else if flags & AWAN_FLAG_MULTIPART != 0 {
                     let manifest = match vm.read_needle_bytes(vm.id(), local, crc32c) {
                         Ok(b) => match decode_extents_manifest(&multipart.staging_dir, &b) {
@@ -1007,7 +1315,7 @@ impl S3ServiceState {
                     };
                     if let Some((total, extents)) = manifest {
                         let _ = engine.put_object_at(
-                            b_id as u32,
+                            b,
                             key.as_bytes(),
                             offset,
                             total,
@@ -1017,7 +1325,15 @@ impl S3ServiceState {
                             flags,
                             created_at_ms,
                         );
-                        multipart.restore_completed(b_id as u32, &key, extents);
+                        multipart.restore_completed(b, &key, extents);
+                        if updated_keys.contains_key(&(b, kh)) {
+                            unver_base_ns.insert((b, kh), n.created_at_ns);
+                        }
+                        if let Some(list) = pending_updates.get_mut(&(b, kh, 0)) {
+                            let before_len = list.len();
+                            list.retain(|u| u.created_at_ns > n.created_at_ns);
+                            ignored_attr_updates += (before_len - list.len()) as u64;
+                        }
                     }
                 } else {
                     // A compressed needle's index row holds the object's size, not the stored one (#51).
@@ -1030,7 +1346,7 @@ impl S3ServiceState {
                         size
                     };
                     let _ = engine.put_object_at(
-                        b_id as u32,
+                        b,
                         key.as_bytes(),
                         offset,
                         size,
@@ -1040,6 +1356,14 @@ impl S3ServiceState {
                         flags,
                         created_at_ms,
                     );
+                    if updated_keys.contains_key(&(b, kh)) {
+                        unver_base_ns.insert((b, kh), n.created_at_ns);
+                    }
+                    if let Some(list) = pending_updates.get_mut(&(b, kh, 0)) {
+                        let before_len = list.len();
+                        list.retain(|u| u.created_at_ns > n.created_at_ns);
+                        ignored_attr_updates += (before_len - list.len()) as u64;
+                    }
                 }
                 Ok(())
             });
@@ -1047,6 +1371,111 @@ impl S3ServiceState {
                 return Err(e);
             }
         }
+
+        // Fold surviving 0x200 attribute updates in created_at_ns order through fsm::key_step (#203).
+        let attr_updates = Arc::new(AttrUpdateStore::default());
+        if !pending_updates.is_empty() {
+            let _other_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::Other);
+            for ((b_id, kh, target_vid), mut updates) in pending_updates {
+                let Some(key) = updated_keys.get(&(b_id, kh)) else {
+                    ignored_attr_updates += updates.len() as u64;
+                    continue;
+                };
+                updates.sort_by(|a, b| (a.created_at_ns, a.vol_offset).cmp(&(b.created_at_ns, b.vol_offset)));
+                let mut key_state = if version_store.has(b_id, key) {
+                    let entries = version_store
+                        .versions(b_id, key)
+                        .map(|list| {
+                            list.iter()
+                                .map(|v| {
+                                    if v.marker {
+                                        crate::fsm::KeyVersionEntry::DeleteMarker {
+                                            version_id: v.id(),
+                                            vol_offset: v.vol_offset,
+                                        }
+                                    } else {
+                                        crate::fsm::KeyVersionEntry::Object(crate::fsm::KeyObject {
+                                            version_id: v.id(),
+                                            created_at_ns: v.ts,
+                                            vol_offset: v.vol_offset,
+                                            flags: v.flags,
+                                            updates: Vec::new(),
+                                        })
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    crate::fsm::KeyState::Versioned { versions: entries }
+                } else {
+                    match engine.get_object(b_id, key.as_bytes()) {
+                        Ok(meta) => {
+                            let base_ns = unver_base_ns
+                                .get(&(b_id, kh))
+                                .copied()
+                                .unwrap_or_else(|| meta.created_at.saturating_mul(1_000_000));
+                            crate::fsm::KeyState::Unversioned(crate::fsm::KeyObject {
+                                version_id: 0,
+                                created_at_ns: base_ns,
+                                vol_offset: meta.vol_offset,
+                                flags: unpack_flags(meta.bucket_flags),
+                                updates: Vec::new(),
+                            })
+                        }
+                        Err(_) => crate::fsm::KeyState::Absent,
+                    }
+                };
+                for u in updates {
+                    let prev_ts = match &key_state {
+                        crate::fsm::KeyState::Unversioned(obj) => Some(obj.created_at_ns),
+                        crate::fsm::KeyState::Versioned { versions } => versions.iter().find_map(|e| match e {
+                            crate::fsm::KeyVersionEntry::Object(o) if o.version_id == target_vid => {
+                                Some(o.created_at_ns)
+                            }
+                            _ => None,
+                        }),
+                        crate::fsm::KeyState::Absent => None,
+                    };
+                    match crate::fsm::key_step(
+                        key_state.clone(),
+                        crate::fsm::KeyRecord::AttrUpdate {
+                            target_version_id: target_vid,
+                            group: u.group,
+                            created_at_ns: u.created_at_ns,
+                            vol_offset: u.vol_offset,
+                            total_len: u.total_len,
+                        },
+                    ) {
+                        Ok(next) => {
+                            if prev_ts.is_some_and(|t| u.created_at_ns <= t) {
+                                ignored_attr_updates += 1;
+                            }
+                            key_state = next;
+                        }
+                        Err(_) => {
+                            ignored_attr_updates += 1;
+                        }
+                    }
+                }
+                let final_updates = match key_state {
+                    crate::fsm::KeyState::Unversioned(obj) if target_vid == 0 => obj.updates,
+                    crate::fsm::KeyState::Versioned { versions } => versions
+                        .into_iter()
+                        .find_map(|e| match e {
+                            crate::fsm::KeyVersionEntry::Object(o) if o.version_id == target_vid => Some(o.updates),
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                if !final_updates.is_empty() {
+                    attr_updates.set_for_target(b_id, key, target_vid, final_updates, None);
+                }
+            }
+        }
+
+        let payload_cache = Arc::new(PayloadCache::new(crate::memory::split_cache(crate::memory::effective().cache).1.min(usize::MAX as u64) as usize));
+        payload_cache.set_reserved_bytes(attr_updates.estimated_bytes());
 
         let initial_bytes = volumes.values().map(|vm| vm.offset()).sum();
         let active_id = vol_mgr.as_ref().map(|vm| vm.id()).unwrap_or(1);
@@ -1066,7 +1495,7 @@ impl S3ServiceState {
             volumes: Arc::new(RwLock::new(volumes)),
             roll_lock: Arc::new(parking_lot::Mutex::new(())),
             volume_manager: Arc::new(RwLock::new(vol_mgr)),
-            payload_cache: Arc::new(PayloadCache::new(crate::memory::split_cache(crate::memory::effective().cache).1.min(usize::MAX as u64) as usize)),
+            payload_cache,
             body_budget: Arc::new(crate::memory::BodyBudget::new(crate::memory::effective().bodies)),
             next_vol_offset: Arc::new(RwLock::new(initial_vol_offset)),
             work,
@@ -1093,13 +1522,11 @@ impl S3ServiceState {
             bucket_configs: Arc::new(parking_lot::Mutex::new(bucket_store)),
             bucket_config_reader,
             bucket_config_metrics,
-            header_idle_timeout_ms: Arc::new(AtomicU64::new(
-                crate::body_timeout::DEFAULT_HEADER_IDLE_TIMEOUT.as_millis() as u64,
-            )),
-            body_idle_timeout_ms: Arc::new(AtomicU64::new(
-                crate::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT.as_millis() as u64,
-            )),
+            header_idle_timeout_ms: Arc::new(AtomicU64::new(crate::body_timeout::DEFAULT_HEADER_IDLE_TIMEOUT.as_millis() as u64)),
+            body_idle_timeout_ms: Arc::new(AtomicU64::new(crate::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT.as_millis() as u64)),
             region: "us-east-1".to_string(),
+            attr_updates,
+            attr_updates_ignored: Arc::new(AtomicU64::new(ignored_attr_updates)),
         })
     }
 
@@ -1244,31 +1671,62 @@ impl S3ServiceState {
         // an error and the object stays (verification/tla, DeleteLogsFirst).
         // A tombstone whole in the volume is replayed by recovery: the row is removed here
         // too, and the request still answers an error (#184, owner decision 4B).
-        let late = match self.write_to_active(b_id, key, &[], AWAN_FLAG_TOMBSTONE, 0, 0) {
-            Ok((vm, loc, _)) => {
+        let tomb_ts = self.unversioned_write_ts(b_id, key);
+        let (tomb_g, late) = match self.write_to_active_at(b_id, key, &[], AWAN_FLAG_TOMBSTONE, 0, 0, Some(tomb_ts)) {
+            Ok((vm, loc, g)) => {
                 self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                 self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                self.make_durable(&vm, loc.seq).await.err().map(|e| format!("could not sync the delete: {:?}", e))
+                let l = self.make_durable(&vm, loc.seq).await.err().map(|e| format!("could not sync the delete: {:?}", e));
+                (g, l)
             }
             Err(VolumeError::AfterRecord { loc, cause, .. }) => {
                 self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                 self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                Some(format!("could not record the delete: {}", cause))
+                (global_offset(loc.volume_id, loc.offset), Some(format!("could not record the delete: {}", cause)))
             }
             Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
         };
         self.mvcc.tombstone(b_id, key);
         let old_info = {
             let mut engine = self.engine.write();
-            let info = engine.get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size));
-            let _ = engine.delete_object(b_id, key.as_bytes());
+            let info = engine
+                .get_object(b_id, key.as_bytes())
+                .ok()
+                .map(|m| (m.vol_offset, m.size, unpack_flags(m.bucket_flags), m.created_at));
+            let prev_state = match info {
+                Some((off, _, old_flags, created_ms)) => crate::fsm::KeyState::Unversioned(crate::fsm::KeyObject {
+                    version_id: 0,
+                    created_at_ns: created_ms.saturating_mul(1_000_000),
+                    vol_offset: off,
+                    flags: old_flags,
+                    updates: Vec::new(),
+                }),
+                None => crate::fsm::KeyState::Absent,
+            };
+            match crate::fsm::key_step(
+                prev_state,
+                crate::fsm::KeyRecord::Tombstone {
+                    versioned: false,
+                    is_null: false,
+                    created_at_ns: tomb_ts,
+                    vol_offset: tomb_g,
+                },
+            ) {
+                Ok(crate::fsm::KeyState::Absent) | Err(_) => {
+                    let _ = engine.delete_object(b_id, key.as_bytes());
+                }
+                Ok(_) => {
+                    let _ = engine.delete_object(b_id, key.as_bytes());
+                }
+            }
             info
         };
-        if let Some((off, sz)) = old_info {
+        let retired_updates = self.attr_updates.remove_target(b_id, key, 0, Some(&self.payload_cache));
+        self.add_dead_attr_update_bytes(&retired_updates);
+        if let Some((off, sz, old_flags, _)) = old_info {
             if off > 0 {
                 self.payload_cache.remove(b_id, off);
-                let raw_len = 64 + key.len() + sz as usize;
-                let dead_bytes = raw_len.div_ceil(4096) as u64 * 4096;
+                let dead_bytes = self.needle_total_len(off, old_flags, key.len(), sz);
                 self.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
             }
         }
@@ -1386,7 +1844,18 @@ impl S3ServiceState {
             crate::versions::Versioning::Suspended => crate::meta_index::FLAG_VERSIONED | crate::meta_index::FLAG_NULL_ID,
         };
         let now = self.clock.now_ns();
-        Some((extra, self.versions.read().next_ts(b_id, key, now)))
+        let max_u = if extra & crate::meta_index::FLAG_NULL_ID != 0 {
+            self.attr_updates.max_ts(b_id, key, 0).unwrap_or(0)
+        } else {
+            0
+        };
+        Some((
+            extra,
+            self.versions
+                .read()
+                .next_ts(b_id, key, now)
+                .max(max_u.saturating_add(1)),
+        ))
     }
 
     /// Records a durable version event: updates the history, drops the needles it made
@@ -1473,11 +1942,17 @@ impl S3ServiceState {
             }
         }
         for v in dead {
+            let retired = self.attr_updates.remove_target(b_id, key, v.id(), Some(&self.payload_cache));
+            self.add_dead_attr_update_bytes(&retired);
             if v.vol_offset > 0 {
                 self.payload_cache.remove(b_id, v.vol_offset);
-                let dead_bytes = (64 + key.len() as u64 + v.size).div_ceil(4096) * 4096;
+                let dead_bytes = self.needle_total_len(v.vol_offset, v.flags, key.len(), v.size);
                 self.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
             }
+        }
+        if let crate::versions::Event::Remove(id) = ev {
+            let retired = self.attr_updates.remove_target(b_id, key, id, Some(&self.payload_cache));
+            self.add_dead_attr_update_bytes(&retired);
         }
         Ok(())
     }
@@ -1529,18 +2004,40 @@ impl S3ServiceState {
         self.compact_oldest_volume().await
     }
 
-    /// (dead bytes, used bytes) of a volume: a needle is live when an index row points at it.
+    /// (dead bytes, used bytes) of a volume: a needle is live when an index row or live
+    /// `0x200` attribute update points at it.
     /// Reads every needle header of the volume, so it costs about one read per needle.
     pub fn volume_usage(&self, vol_id: u32) -> Result<(u64, u64), VolumeError> {
         let vm = self.volumes.read().get(&vol_id).cloned().ok_or(VolumeError::CorruptIndex)?;
         let mut needles = Vec::new();
-        vm.recover_needles(|b_id, key, offset, size, _, _, _, _| needles.push((b_id as u32, key, offset, size)))?;
+        vm.scan_needles(|n| {
+            needles.push((
+                n.bucket_id as u32,
+                n.key,
+                n.offset,
+                n.total_len,
+                n.flags,
+                n.payload_crc32c,
+            ))
+        })?;
         let engine = self.engine.read();
+        let versions = self.versions.read();
         let mut dead = 0;
-        for (b_id, key, offset, size) in needles {
-            let total = (64 + key.len() as u64 + size).div_ceil(crate::direct_io::SECTOR_SIZE as u64) * crate::direct_io::SECTOR_SIZE as u64;
+        for (b_id, key, offset, total, flags, crc) in needles {
             let g = global_offset(vol_id, offset);
-            let live = engine.get_object(b_id, key.as_bytes()).map(|m| m.vol_offset == g).unwrap_or(false) || self.versions.read().holds_offset(b_id, &key, g);
+            let live = if flags & crate::meta_index::FLAG_ATTR_UPDATE != 0 {
+                match vm
+                    .read_needle_bytes(vol_id, offset, crc)
+                    .ok()
+                    .and_then(|b| crate::attrs::decode_attr_update(&b).ok())
+                {
+                    Some((target_vid, _)) => !self.attr_updates.live_groups_at(b_id, &key, target_vid, g).is_empty(),
+                    None => false,
+                }
+            } else {
+                engine.get_object(b_id, key.as_bytes()).map(|m| m.vol_offset == g).unwrap_or(false)
+                    || versions.holds_offset(b_id, &key, g)
+            };
             if !live {
                 dead += total;
             }
@@ -1637,13 +2134,83 @@ impl S3ServiceState {
             return Ok(CompactionReport { busy: true, ..CompactionReport::default() });
         }
         let mut needles = Vec::new();
-        old.scan_needles(|n| needles.push((n.bucket_id as u32, n.key, n.offset, n.payload_size, n.etag_hi, n.etag_lo, n.flags, n.payload_crc32c, n.created_at_ns)))?;
+        old.scan_needles(|n| {
+            needles.push((
+                n.bucket_id as u32,
+                n.key,
+                n.offset,
+                n.payload_size,
+                n.etag_hi,
+                n.etag_lo,
+                n.flags,
+                n.payload_crc32c,
+                n.created_at_ns,
+            ))
+        })?;
 
         let mut report = CompactionReport::default();
         let mut written: BTreeMap<u32, Arc<VolumeManager>> = BTreeMap::new();
         let mut throttle = crate::throttle::Throttle::new(self.compaction_rate.load(Ordering::Relaxed));
         for (b_id, key, local, size, etag_hi, etag_lo, flags, crc, created_at) in needles {
             let g_old = global_offset(old_id, local);
+            // Compacts live 0x200 attribute-update needles, keeping only the latest live group
+            // entries whose target version still exists and dropping superseded/deleted ones (#203).
+            if flags & crate::meta_index::FLAG_ATTR_UPDATE != 0 {
+                let raw_bytes = old.read_needle_bytes(old_id, local, crc)?;
+                let Ok((target_vid, upd_attrs)) = crate::attrs::decode_attr_update(&raw_bytes) else {
+                    report.dead_needles_reclaimed += 1;
+                    continue;
+                };
+                let _guard = self.lock_key(b_id, &key).await;
+                let target_alive = {
+                    let vs = self.versions.read();
+                    if vs.has(b_id, &key) {
+                        vs.find(b_id, &key, target_vid).is_some_and(|v| !v.marker)
+                    } else {
+                        target_vid == 0 && self.engine.read().get_object(b_id, key.as_bytes()).is_ok()
+                    }
+                };
+                let live_groups = if target_alive {
+                    self.attr_updates.live_groups_at(b_id, &key, target_vid, g_old)
+                } else {
+                    Vec::new()
+                };
+                if live_groups.is_empty() {
+                    if !target_alive {
+                        let _ = self.attr_updates.remove_target(b_id, &key, target_vid, Some(&self.payload_cache));
+                    }
+                    report.dead_needles_reclaimed += 1;
+                    continue;
+                }
+                let mut filtered = crate::attrs::Attrs::new();
+                for (tag, val) in upd_attrs.iter() {
+                    if live_groups.contains(&crate::attrs::AttrGroup::from_tag(tag)) {
+                        filtered.set(tag, val);
+                    }
+                }
+                let copy_payload = crate::attrs::encode_attr_update(target_vid, &filtered)
+                    .map_err(|_| VolumeError::CorruptIndex)?;
+                let copied = copy_payload.len() as u64;
+                let (vm, loc, g_new) = self.write_to_active_with(
+                    b_id,
+                    &key,
+                    &[],
+                    &copy_payload,
+                    flags,
+                    0,
+                    0,
+                    Some(created_at),
+                )?;
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                written.insert(vm.id(), Arc::clone(&vm));
+                self.attr_updates.move_offset(b_id, &key, target_vid, g_old, g_new, loc.total_len);
+                report.live_needles_copied += 1;
+                report.new_locations.insert(key, loc);
+                drop(_guard);
+                tokio::task::yield_now().await;
+                throttle.spend(copied).await;
+                continue;
+            }
             // An unversioned tombstone only matters until the needles it covers are gone, and
             // those are older, so already compacted. A delete marker is a version (#31): whether
             // a history holds it is decided under the key lock below, like any needle, because
@@ -1670,6 +2237,7 @@ impl S3ServiceState {
                 Vec::new()
             };
             let (vm, loc, g_new) = self.write_to_active_with(b_id, &key, &attrs, &bytes, flags, etag_hi, etag_lo, Some(created_at))?;
+            self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
             written.insert(vm.id(), Arc::clone(&vm));
             self.versions.write().move_offset(b_id, &key, g_old, g_new);
             if current {
@@ -2084,9 +2652,382 @@ impl S3ServiceState {
         vm.read_attrs(local)
     }
 
-    /// The `ObjectView` of an object, from its index row's offset and flags.
+    /// The `ObjectView` of an object, from its index row's offset and flags (base attributes only).
     pub fn object_view(&self, vol_offset: u64, flags: u16) -> Result<ObjectView, VolumeError> {
         Ok(ObjectView { attrs: self.object_attrs(vol_offset, flags)? })
+    }
+
+    /// Complete `ObjectView` for `(b_id, key, target_version_id)` merging base `0x400` attrs (if
+    /// `FLAG_ATTRS`) with any surviving `0x200` attribute-update needles from the side map (#203).
+    /// Objects with neither `FLAG_ATTRS` nor side-map entries do zero disk reads and zero locks.
+    pub fn object_view_for(
+        &self,
+        b_id: u32,
+        key: &str,
+        target_version_id: u64,
+        vol_offset: u64,
+        flags: u16,
+    ) -> Result<ObjectView, VolumeError> {
+        if flags & crate::meta_index::FLAG_ATTRS == 0 && !self.attr_updates.has_updates() {
+            return Ok(ObjectView {
+                attrs: crate::attrs::Attrs::new(),
+            });
+        }
+        let mut attrs = self.object_attrs(vol_offset, flags)?;
+        let mut updates = self.attr_updates.get(b_id, key, target_version_id);
+        if !updates.is_empty() {
+            updates.sort_by(|a, b| (a.created_at_ns, a.vol_offset).cmp(&(b.created_at_ns, b.vol_offset)));
+            let mut last_off = u64::MAX;
+            for u in updates {
+                if u.vol_offset == last_off {
+                    continue;
+                }
+                last_off = u.vol_offset;
+                let (vm, local) = self.volume_for(u.vol_offset)?;
+                let payload = vm.read_needle_bytes_verified(b_id, local)?;
+                let (upd_vid, upd_attrs) =
+                    crate::attrs::decode_attr_update(&payload).map_err(|_| VolumeError::CorruptIndex)?;
+                if upd_vid != target_version_id {
+                    return Err(VolumeError::CorruptIndex);
+                }
+                attrs.merge_from(&upd_attrs);
+            }
+        }
+        Ok(ObjectView { attrs })
+    }
+
+    /// Creation timestamp for an unversioned write or tombstone under per-key lock: guarantees a
+    /// monotonically higher timestamp than any prior `0x200` update on that key (`Decision 56`).
+    pub fn unversioned_write_ts(&self, b_id: u32, key: &str) -> u64 {
+        let now = self.clock.now_ns();
+        let max_u = self.attr_updates.max_ts(b_id, key, 0).unwrap_or(0);
+        now.max(max_u.saturating_add(1))
+    }
+
+    /// Returns exact sector-rounded needle length, reading the needle header only when `FLAG_ATTRS`
+    /// or `FLAG_COMPRESSED` is present so dead-byte accounting stays zero-read otherwise.
+    pub fn needle_total_len(&self, vol_offset: u64, flags: u16, key_len: usize, logical_size: u64) -> u64 {
+        if flags & (crate::meta_index::FLAG_ATTRS | crate::meta_index::FLAG_COMPRESSED) != 0 && vol_offset > 0 {
+            if let Ok((vm, local)) = self.volume_for(vol_offset) {
+                if let Ok(hdr) = vm.read_header(local) {
+                    return hdr.total_len();
+                }
+            }
+        }
+        (64 + key_len as u64 + logical_size).div_ceil(crate::direct_io::SECTOR_SIZE as u64)
+            * crate::direct_io::SECTOR_SIZE as u64
+    }
+
+    fn add_dead_attr_update_bytes(&self, updates: &[crate::fsm::KeyAttrUpdate]) {
+        if updates.is_empty() {
+            return;
+        }
+        let mut seen = Vec::with_capacity(updates.len());
+        let mut bytes = 0u64;
+        for u in updates {
+            if !seen.contains(&u.vol_offset) {
+                seen.push(u.vol_offset);
+                bytes += u.total_len;
+            }
+        }
+        if bytes > 0 {
+            self.tombstone_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Drives an unversioned overwrite through `fsm::key_step`, retiring any `0x200` updates
+    /// and accounting dead needle + update bytes in `tombstone_bytes`. Call under `lock_key`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retire_unversioned_overwrite(
+        &self,
+        b_id: u32,
+        key: &str,
+        old_info: Option<(u64, u64, u16)>,
+        new_offset: u64,
+        created_ns: u64,
+        flags: u16,
+    ) {
+        let prev_state = match old_info {
+            Some((off, _, old_flags)) => crate::fsm::KeyState::Unversioned(crate::fsm::KeyObject {
+                version_id: 0,
+                created_at_ns: 0,
+                vol_offset: off,
+                flags: old_flags,
+                updates: self.attr_updates.get(b_id, key, 0),
+            }),
+            None => crate::fsm::KeyState::Absent,
+        };
+        let next_state = match crate::fsm::key_step(
+            prev_state,
+            crate::fsm::KeyRecord::Object {
+                versioned: false,
+                is_null: false,
+                created_at_ns: created_ns,
+                vol_offset: new_offset,
+                flags,
+            },
+        ) {
+            Ok(s) => s,
+            Err(_) => crate::fsm::KeyState::Absent,
+        };
+        if let crate::fsm::KeyState::Unversioned(obj) = next_state {
+            let retired = self.attr_updates.remove_target(b_id, key, obj.version_id, Some(&self.payload_cache));
+            self.add_dead_attr_update_bytes(&retired);
+        }
+        if let Some((prev_off, prev_sz, old_flags)) = old_info {
+            if prev_off > 0 && prev_off != new_offset {
+                self.payload_cache.remove(b_id, prev_off);
+                let dead_bytes = self.needle_total_len(prev_off, old_flags, key.len(), prev_sz);
+                self.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Writes a `0x200` attribute-update delta needle for `(b_id, key, vid)` without rewriting
+    /// the object payload (`Decision 56`, `#203`). Acquires the per-key lock, checks existence and
+    /// delete-marker refusal through `fsm::key_step`, stamps monotonic `created_at_ns`, appends
+    /// the delta needle, and updates the side map and memory-budget cache accounting.
+    pub async fn set_attribute_group(
+        &self,
+        b_id: u32,
+        key: &str,
+        vid: Option<&str>,
+        update_attrs: crate::attrs::Attrs,
+    ) -> Result<SetAttrOutcome, SetAttrError> {
+        let mut groups = Vec::new();
+        for (tag, _) in update_attrs.iter() {
+            let g = crate::attrs::AttrGroup::from_tag(tag);
+            if !groups.contains(&g) {
+                groups.push(g);
+            }
+        }
+        if groups.is_empty() {
+            return Err(SetAttrError::Refused {
+                refusal: crate::fsm::INVALID_ARGUMENT,
+                delete_marker: None,
+            });
+        }
+        let _key_guard = self.lock_key(b_id, key).await;
+
+        let (mut key_state, target_vid, resp_vid, base_upper_ns, dm_info) = {
+            if vid.is_some() || self.versions.read().has(b_id, key) {
+                let parsed_vid = match vid {
+                    Some(s) => match crate::versions::parse_id(s) {
+                        Some(id) => Some(id),
+                        None => {
+                            return Err(SetAttrError::Refused {
+                                refusal: crate::fsm::NO_SUCH_VERSION,
+                                delete_marker: None,
+                            });
+                        }
+                    },
+                    None => None,
+                };
+                let vs = self.versions.read();
+                if !vs.has(b_id, key) {
+                    let meta_opt = self.engine.read().get_object(b_id, key.as_bytes()).ok();
+                    match (parsed_vid, meta_opt) {
+                        (Some(0), Some(m)) | (None, Some(m)) => {
+                            let updates = self.attr_updates.get(b_id, key, 0);
+                            let upper = (m.created_at + 1).saturating_mul(1_000_000);
+                            let ks = crate::fsm::KeyState::Unversioned(crate::fsm::KeyObject {
+                                version_id: 0,
+                                created_at_ns: m.created_at.saturating_mul(1_000_000),
+                                vol_offset: m.vol_offset,
+                                flags: unpack_flags(m.bucket_flags),
+                                updates,
+                            });
+                            (ks, 0u64, Some("null".to_string()), upper, None)
+                        }
+                        (Some(_), _) => (crate::fsm::KeyState::Absent, parsed_vid.unwrap(), None, 0, None),
+                        (None, None) => (crate::fsm::KeyState::Absent, 0, None, 0, None),
+                    }
+                } else {
+                    let list = vs.versions(b_id, key).unwrap_or(&[]);
+                    let entries: Vec<crate::fsm::KeyVersionEntry> = list
+                        .iter()
+                        .map(|v| {
+                            if v.marker {
+                                crate::fsm::KeyVersionEntry::DeleteMarker {
+                                    version_id: v.id(),
+                                    vol_offset: v.vol_offset,
+                                }
+                            } else {
+                                crate::fsm::KeyVersionEntry::Object(crate::fsm::KeyObject {
+                                    version_id: v.id(),
+                                    created_at_ns: v.ts,
+                                    vol_offset: v.vol_offset,
+                                    flags: v.flags,
+                                    updates: self.attr_updates.get(b_id, key, v.id()),
+                                })
+                            }
+                        })
+                        .collect();
+                    let ks = crate::fsm::KeyState::Versioned { versions: entries };
+                    let target_v = match parsed_vid {
+                        Some(id) => vs.find(b_id, key, id),
+                        None => vs.current(b_id, key),
+                    };
+                    match target_v {
+                        None => {
+                            let tid = parsed_vid.unwrap_or(0);
+                            (
+                                if parsed_vid.is_some() { ks } else { crate::fsm::KeyState::Absent },
+                                tid,
+                                None,
+                                0,
+                                None,
+                            )
+                        }
+                        Some(v) if v.marker => (
+                            ks,
+                            v.id(),
+                            Some(v.id_string()),
+                            0,
+                            Some((v.id_string(), parsed_vid.is_some())),
+                        ),
+                        Some(v) => {
+                            let upper = if v.ts == 0 {
+                                ((v.modified / 1_000_000) + 1).saturating_mul(1_000_000)
+                            } else {
+                                v.ts
+                            };
+                            (ks, v.id(), Some(v.id_string()), upper, None)
+                        }
+                    }
+                }
+            } else {
+                match self.engine.read().get_object(b_id, key.as_bytes()) {
+                    Ok(m) => {
+                        let updates = self.attr_updates.get(b_id, key, 0);
+                        let upper = (m.created_at + 1).saturating_mul(1_000_000);
+                        let ks = crate::fsm::KeyState::Unversioned(crate::fsm::KeyObject {
+                            version_id: 0,
+                            created_at_ns: m.created_at.saturating_mul(1_000_000),
+                            vol_offset: m.vol_offset,
+                            flags: unpack_flags(m.bucket_flags),
+                            updates,
+                        });
+                        (ks, 0u64, None, upper, None)
+                    }
+                    Err(_) => (crate::fsm::KeyState::Absent, 0u64, None, 0, None),
+                }
+            }
+        };
+
+        let existing_updates = self.attr_updates.get(b_id, key, target_vid);
+        let max_u = existing_updates.iter().map(|u| u.created_at_ns).max().unwrap_or(0);
+        let created_ns = self
+            .clock
+            .now_ns()
+            .max(base_upper_ns.saturating_add(1))
+            .max(max_u.saturating_add(1));
+
+        // Refuse invalid targets before writing any record to disk.
+        if let Err(refusal) = crate::fsm::key_step(
+            key_state.clone(),
+            crate::fsm::KeyRecord::AttrUpdate {
+                target_version_id: target_vid,
+                group: groups[0],
+                created_at_ns: created_ns,
+                vol_offset: 1,
+                total_len: 1,
+            },
+        ) {
+            return Err(SetAttrError::Refused {
+                refusal,
+                delete_marker: dm_info,
+            });
+        }
+
+        let payload = crate::attrs::encode_attr_update(target_vid, &update_attrs)
+            .map_err(|_| SetAttrError::TooLarge)?;
+        let flags = AWAN_FLAG_ACTIVE | crate::meta_index::FLAG_ATTR_UPDATE;
+        let (loc, g, late) = match self.write_to_active_with(
+            b_id,
+            key,
+            &[],
+            &payload,
+            flags,
+            0,
+            0,
+            Some(created_ns),
+        ) {
+            Ok((vm, loc, g)) => {
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                let l = self
+                    .make_durable(&vm, loc.seq)
+                    .await
+                    .err()
+                    .map(|e| format!("could not sync attribute update: {:?}", e));
+                (loc, g, l)
+            }
+            Err(VolumeError::AfterRecord { loc, cause, .. }) => {
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                (
+                    loc,
+                    global_offset(loc.volume_id, loc.offset),
+                    Some(format!("could not store attribute update: {}", cause)),
+                )
+            }
+            Err(e) => {
+                return Err(SetAttrError::Internal {
+                    detail: format!("could not store attribute update: {:?}", e),
+                    after_record: false,
+                });
+            }
+        };
+
+        for group in groups {
+            match crate::fsm::key_step(
+                key_state.clone(),
+                crate::fsm::KeyRecord::AttrUpdate {
+                    target_version_id: target_vid,
+                    group,
+                    created_at_ns: created_ns,
+                    vol_offset: g,
+                    total_len: loc.total_len,
+                },
+            ) {
+                Ok(next) => key_state = next,
+                Err(refusal) => {
+                    return Err(SetAttrError::Refused {
+                        refusal,
+                        delete_marker: dm_info,
+                    });
+                }
+            }
+        }
+        let new_updates = match key_state {
+            crate::fsm::KeyState::Unversioned(obj) => obj.updates,
+            crate::fsm::KeyState::Versioned { versions } => versions
+                .into_iter()
+                .find_map(|e| match e {
+                    crate::fsm::KeyVersionEntry::Object(o) if o.version_id == target_vid => Some(o.updates),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+            crate::fsm::KeyState::Absent => Vec::new(),
+        };
+        let superseded: Vec<_> = existing_updates
+            .into_iter()
+            .filter(|old| !new_updates.iter().any(|cur| cur.vol_offset == old.vol_offset))
+            .collect();
+        self.add_dead_attr_update_bytes(&superseded);
+        self.attr_updates
+            .set_for_target(b_id, key, target_vid, new_updates, Some(&self.payload_cache));
+
+        if let Some(detail) = late {
+            return Err(SetAttrError::Internal {
+                detail,
+                after_record: true,
+            });
+        }
+        Ok(SetAttrOutcome {
+            version_id: resp_vid,
+            vol_offset: g,
+            created_at_ns: created_ns,
+        })
     }
 
     /// The volume holding a global offset, and the offset inside it.
@@ -2250,7 +3191,9 @@ pub(crate) const FORMAT_2_FLAGS: u16 = crate::meta_index::FLAG_COMPRESSED | crat
 
 /// The oldest volume format that can hold a needle with these flags and attributes.
 fn needed_format(flags: u16, attrs: &[u8]) -> u32 {
-    if !attrs.is_empty() || flags & crate::meta_index::FLAG_ATTRS != 0 {
+    if !attrs.is_empty()
+        || flags & (crate::meta_index::FLAG_ATTRS | crate::meta_index::FLAG_ATTR_UPDATE) != 0
+    {
         3
     } else if flags & FORMAT_2_FLAGS != 0 {
         2
@@ -2364,7 +3307,7 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
     let (hits, misses) = state.payload_cache.hit_counts();
     let w = state.work.snapshot();
     let budget = crate::memory::effective();
-    let gauges: [(&str, &str, &str, u64); 25] = [
+    let gauges: [(&str, &str, &str, u64); 27] = [
         ("awanfs_volume_used_bytes", "gauge", "Bytes written into all open volumes, including dead needles.", used),
         ("awanfs_volume_free_span_bytes", "gauge", "Span left in the active volume before it rolls over.", free),
         ("awanfs_volumes_open", "gauge", "Open volumes.", state.volumes.read().len() as u64),
@@ -2404,6 +3347,18 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
             "counter",
             "Request-log lines dropped because the log writer could not keep up.",
             state.log_lines_dropped.load(Ordering::Relaxed),
+        ),
+        (
+            "awanfs_attr_updates_bytes",
+            "gauge",
+            "Estimated bytes held by the 0x200 attribute-update side map.",
+            state.attr_updates.estimated_bytes() as u64,
+        ),
+        (
+            "awanfs_attr_updates_ignored_total",
+            "counter",
+            "0x200 attribute-update needles ignored during recovery because their target was absent, deleted, or a delete marker.",
+            state.attr_updates_ignored.load(Ordering::Relaxed),
         ),
     ];
     for (name, kind, help, v) in gauges {

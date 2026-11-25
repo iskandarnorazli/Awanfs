@@ -870,8 +870,14 @@ pub async fn complete_multipart_upload(
                 Err(code) => return Ok(engine_error_response(code, key)),
             };
             let manifest = Bytes::from(encode_extents_manifest(&state.multipart.staging_dir, total_size, &extents));
+            let old_info = state
+                .engine
+                .read()
+                .get_object(b_id, key.as_bytes())
+                .ok()
+                .map(|m| (m.vol_offset, m.size, unpack_flags(m.bucket_flags)));
             let stamp = state.version_stamp(b_id, key);
-            let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
+            let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.unversioned_write_ts(b_id, key));
             let mp_flags = AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART | attrs_flag | stamp.map_or(0, |s| s.0);
             // A manifest whole in the volume is replayed by recovery as the object, and it
             // points at the parts: the upload is committed and indexed as on success, then the
@@ -921,6 +927,14 @@ pub async fn complete_multipart_upload(
                 ) {
                     return Ok(engine_error_response(code, key));
                 }
+                state.retire_unversioned_overwrite(
+                    b_id,
+                    key,
+                    old_info,
+                    manifest_offset,
+                    created_ns,
+                    mp_flags,
+                );
             }
 
             let location = format!("http://127.0.0.1:9000/{}/{}", bucket, key);

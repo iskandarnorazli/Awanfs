@@ -9,6 +9,7 @@ use std::num::NonZeroUsize;
 
 pub struct PayloadCache {
     max_bytes: usize,
+    reserved_bytes: std::sync::atomic::AtomicUsize,
     inner: Mutex<CacheState>,
     hits: std::sync::atomic::AtomicU64,
     misses: std::sync::atomic::AtomicU64,
@@ -31,6 +32,7 @@ impl PayloadCache {
         let cap = NonZeroUsize::new(entry_cap.max(1)).unwrap();
         Self {
             max_bytes,
+            reserved_bytes: std::sync::atomic::AtomicUsize::new(0),
             inner: Mutex::new(CacheState {
                 lru: LruCache::new(cap),
                 current_bytes: 0,
@@ -61,9 +63,32 @@ impl PayloadCache {
         (self.hits.load(std::sync::atomic::Ordering::Relaxed), self.misses.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// Reserves `bytes` out of the cache's byte budget for companion metadata (e.g. the
+    /// attribute-update side map), evicting payload entries as needed so combined cache memory
+    /// stays within `--memory-budget`'s cache allocation.
+    pub fn set_reserved_bytes(&self, bytes: usize) {
+        self.reserved_bytes
+            .store(bytes, std::sync::atomic::Ordering::Release);
+        let limit = self.effective_max_bytes();
+        let mut guard = self.inner.lock();
+        while guard.current_bytes > limit {
+            if let Some((_, (_, popped_sz))) = guard.lru.pop_lru() {
+                guard.current_bytes = guard.current_bytes.saturating_sub(popped_sz);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn effective_max_bytes(&self) -> usize {
+        self.max_bytes
+            .saturating_sub(self.reserved_bytes.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     pub fn insert(&self, b_id: u32, offset: u64, payload: Bytes) {
         let size = payload.len();
-        if size == 0 || size > self.max_bytes {
+        let limit = self.effective_max_bytes();
+        if size == 0 || size > limit {
             return;
         }
 
@@ -79,7 +104,7 @@ impl PayloadCache {
         }
 
         // Evict oldest items until there is room for the new payload
-        while guard.current_bytes + size > self.max_bytes {
+        while guard.current_bytes + size > limit {
             if let Some((_, (_, popped_sz))) = guard.lru.pop_lru() {
                 guard.current_bytes = guard.current_bytes.saturating_sub(popped_sz);
             } else {

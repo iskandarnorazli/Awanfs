@@ -1537,6 +1537,7 @@ user_visible = false
 server_tests = [
   "server/tests/format_version_test.rs",
   "server/tests/attributes_test.rs",
+  "server/tests/attr_update_test.rs",
   "server/tests/needle_writer_state_test.rs",
   "server/tests/work_count_test.rs",
   "server/tests/commit_cost_probe.rs",

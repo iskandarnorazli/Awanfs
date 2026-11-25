@@ -34,14 +34,14 @@ fn finish_put(
     state: &S3ServiceState,
     b_id: u32,
     key: &str,
-    old_info: Option<(u64, u64)>,
+    old_info: Option<(u64, u64, u16)>,
     vol_offset: u64,
     payload_len: u64,
     etag_hi: u64,
     etag_lo: u64,
     flags: u16,
     etag_hex: &str,
-    created_at_ms: u64,
+    created_ns: u64,
     checksum: Option<(crate::checksum::ChecksumAlgorithm, &str)>,
     reservation: CapacityReservation,
 ) -> Response<ResponseBody> {
@@ -55,18 +55,11 @@ fn finish_put(
         etag_lo,
         0,
         flags,
-        created_at_ms,
+        created_ns / 1_000_000,
     ) {
         return engine_error_response(code, key);
     }
-    if let Some((prev_off, prev_sz)) = old_info {
-        if prev_off > 0 && prev_off != vol_offset {
-            state.payload_cache.remove(b_id, prev_off);
-            let raw_len = 64 + key.len() + prev_sz as usize;
-            let dead_bytes = raw_len.div_ceil(4096) as u64 * 4096;
-            state.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
-        }
-    }
+    state.retire_unversioned_overwrite(b_id, key, old_info, vol_offset, created_ns, flags);
     let mut b = Response::builder()
         .status(StatusCode::OK)
         .header(ETAG, format!("\"{}\"", etag_hex))
@@ -628,7 +621,7 @@ fn version_get_response(
         PreconditionOutcome::Proceed => {}
         outcome => return precondition_failure_response(outcome, Some(&facts), key, head),
     }
-    let view = match state.object_view(v.vol_offset, v.flags) {
+    let view = match state.object_view_for(b_id, key, v.id(), v.vol_offset, v.flags) {
         Ok(view) => view,
         Err(e) => return internal_error_response(key, &format!("could not read the version's attributes: {:?}", e)),
     };
@@ -838,7 +831,9 @@ pub async fn copy_object(
             if precondition(headers, Some(&src_facts), true) != PreconditionOutcome::Proceed {
                 return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
             }
-            src_view = state.object_attrs(v.vol_offset, v.flags);
+            src_view = state
+                .object_view_for(src_b_id, src_key, v.id(), v.vol_offset, v.flags)
+                .map(|view| view.attrs);
             state
                 .read_version_bytes(src_b_id, src_key, &v)
                 .map(|b| (b, v.size, v.etag_hi, v.etag_lo, Some(v.id_string())))
@@ -853,7 +848,9 @@ pub async fn copy_object(
             if precondition(headers, Some(&src_facts), true) != PreconditionOutcome::Proceed {
                 return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
             }
-            src_view = state.object_attrs(m.vol_offset, flags);
+            src_view = state
+                .object_view_for(src_b_id, src_key, 0, m.vol_offset, flags)
+                .map(|view| view.attrs);
             state
                 .read_object_bytes(src_b_id, src_key, m.vol_offset, m.size, flags)
                 .map(|b| (b, m.size, m.etag_hi, m.etag_lo, None))
@@ -931,10 +928,15 @@ pub async fn copy_object(
         Ok(r) => r,
         Err(code) => return Ok(engine_error_response(code, key)),
     };
-    let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset);
+    let old_info = state
+        .engine
+        .read()
+        .get_object(b_id, key.as_bytes())
+        .ok()
+        .map(|m| (m.vol_offset, m.size, unpack_flags(m.bucket_flags)));
     let stamp = state.version_stamp(b_id, key);
     let flags = flags | stamp.map_or(0, |s| s.0);
-    let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
+    let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.unversioned_write_ts(b_id, key));
     let (vol_offset, flags, mut late) = match state
         .store_object(b_id, bucket, key, &copy_attrs, &bytes, flags, src_etag_hi, src_etag_lo, Some(created_ns))
         .await
@@ -982,11 +984,7 @@ pub async fn copy_object(
     ) {
         return Ok(engine_error_response(code, key));
     }
-    if let Some(prev_off) = old_info {
-        if prev_off > 0 && prev_off != vol_offset {
-            state.payload_cache.remove(b_id, prev_off);
-        }
-    }
+    state.retire_unversioned_overwrite(b_id, key, old_info, vol_offset, created_ns, flags);
     if let Some(e) = late {
         return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e)));
     }
@@ -1500,7 +1498,12 @@ pub async fn put_object(
         if let Err(code) = reservation.ensure_room(&state.engine, b_id, key.as_bytes()) {
             return Ok(engine_error_response(code, key));
         }
-        let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size));
+        let old_info = state
+            .engine
+            .read()
+            .get_object(b_id, key.as_bytes())
+            .ok()
+            .map(|m| (m.vol_offset, m.size, unpack_flags(m.bucket_flags)));
         let stamp = state.version_stamp(b_id, key);
         let attrs_flag = if put_attrs.is_empty() { 0 } else { crate::meta_index::FLAG_ATTRS };
         let flags = base_flags | attrs_flag | stamp.map_or(0, |s| s.0);
@@ -1511,7 +1514,7 @@ pub async fn put_object(
             ));
         }
         writer.set_flags(flags);
-        let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
+        let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.unversioned_write_ts(b_id, key));
         writer.set_created_at(created_ns);
         let first_vm = Arc::clone(writer.volume());
         let first_offset = global_offset(first_vm.id(), writer.offset());
@@ -1566,7 +1569,7 @@ pub async fn put_object(
                 Err(r) => r,
             }
         } else {
-            finish_put(&state, b_id, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns / 1_000_000, stream_cksum_ref, reservation)
+            finish_put(&state, b_id, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns, stream_cksum_ref, reservation)
         };
         return Ok(after_late_failure(key, late, answer));
     }
@@ -1667,7 +1670,10 @@ pub async fn put_object(
     };
     let old_info = {
         let engine = state.engine.read();
-        engine.get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size))
+        engine
+            .get_object(b_id, key.as_bytes())
+            .ok()
+            .map(|m| (m.vol_offset, m.size, unpack_flags(m.bucket_flags)))
     };
 
     let buf_cksum_out = if let Some((alg, expected_opt)) = req_checksum {
@@ -1695,7 +1701,7 @@ pub async fn put_object(
     };
     let stamp = state.version_stamp(b_id, key);
     let flags = flags | stamp.map_or(0, |s| s.0);
-    let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
+    let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.unversioned_write_ts(b_id, key));
     let (vol_offset, flags, late) = match state
         .store_object(b_id, bucket, key, &buf_attrs, &decoded_bytes, flags, etag_hi, etag_lo, Some(created_ns))
         .await
@@ -1717,7 +1723,7 @@ pub async fn put_object(
             Err(r) => r,
         }
     } else {
-        finish_put(&state, b_id, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns / 1_000_000, buf_cksum_ref, reservation)
+        finish_put(&state, b_id, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns, buf_cksum_ref, reservation)
     };
     Ok(after_late_failure(key, late, answer))
 }
@@ -1796,7 +1802,7 @@ pub async fn get_or_head_object(
         let flags = unpack_flags(m.bucket_flags);
         (m, flags & AWAN_FLAG_MULTIPART != 0)
     };
-    let view = match state.object_view(meta.vol_offset, unpack_flags(meta.bucket_flags)) {
+    let view = match state.object_view_for(b_id, key, 0, meta.vol_offset, unpack_flags(meta.bucket_flags)) {
         Ok(v) => v,
         Err(e) => return Ok(internal_error_response(key, &format!("could not read the object's attributes: {:?}", e))),
     };
@@ -2227,7 +2233,7 @@ pub async fn get_object_attributes(
     };
 
     let vid = query_map.get("versionId").map(|s| s.as_str());
-    let (vol_offset, flags, size, etag_hi, etag_lo, part_count, last_mod_http, version_id_str) = if vid.is_some() || state.versions.read().has(b_id, key) {
+    let (target_vid, vol_offset, flags, size, etag_hi, etag_lo, part_count, last_mod_http, version_id_str) = if vid.is_some() || state.versions.read().has(b_id, key) {
         let id = match vid {
             Some(s) => match crate::versions::parse_id(s) {
                 Some(i) => Some(i),
@@ -2261,7 +2267,7 @@ pub async fn get_object_attributes(
                 .body(full_body(Bytes::from(xml)))
                 .unwrap());
         }
-        (v.vol_offset, v.flags, v.size, v.etag_hi, v.etag_lo, v.part_count, crate::clock::format_http_date(v.modified), Some(v.id_string()))
+        (v.id(), v.vol_offset, v.flags, v.size, v.etag_hi, v.etag_lo, v.part_count, crate::clock::format_http_date(v.modified), Some(v.id_string()))
     } else {
         let meta = {
             let engine = state.engine.read();
@@ -2277,11 +2283,11 @@ pub async fn get_object_attributes(
                 }
             }
         };
-        (meta.vol_offset, unpack_flags(meta.bucket_flags), meta.size, meta.etag_hi, meta.etag_lo, unpack_part_count(meta.bucket_flags), crate::clock::format_http_date_ms(meta.created_at), None)
+        (0u64, meta.vol_offset, unpack_flags(meta.bucket_flags), meta.size, meta.etag_hi, meta.etag_lo, unpack_part_count(meta.bucket_flags), crate::clock::format_http_date_ms(meta.created_at), None)
     };
 
     let is_multipart = flags & AWAN_FLAG_MULTIPART != 0;
-    let view = match state.object_view(vol_offset, flags) {
+    let view = match state.object_view_for(b_id, key, target_vid, vol_offset, flags) {
         Ok(v) => v,
         Err(e) => return Ok(internal_error_response(key, &format!("could not read the object's attributes: {:?}", e))),
     };
@@ -2350,7 +2356,8 @@ pub async fn get_object_attributes(
         xml.push_str("  </ObjectParts>\n");
     }
     if want_storage_class {
-        xml.push_str("  <StorageClass>STANDARD</StorageClass>\n");
+        let sc = view.attrs.storage_class().unwrap_or("STANDARD");
+        xml.push_str(&format!("  <StorageClass>{}</StorageClass>\n", crate::xml::xml_escape(sc)));
     }
     if want_size {
         xml.push_str(&format!("  <ObjectSize>{}</ObjectSize>\n", size));
