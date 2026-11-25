@@ -4,12 +4,13 @@ use s3_server::attrs::{Attrs, TAG_CONTENT_TYPE};
 use s3_server::clock::{Clock, SystemClock};
 use s3_server::direct_io::SECTOR_SIZE;
 use s3_server::meta_index::{AWAN_FLAG_ACTIVE, AWAN_FLAG_TOMBSTONE};
-use s3_server::sim::{CrashMode, SimFs, SimRng};
+use s3_server::sim::{CrashMode, SimFault, SimFile, SimFs, SimOp, SimRng};
 use s3_server::vfile::{FileKind, VolFile, VolFs};
-use s3_server::volume::{NeedleHeader, ScannedNeedle, VolumeManager, NEEDLE_MAGIC};
+use s3_server::volume::{NeedleHeader, ScannedNeedle, VolumeError, VolumeManager, NEEDLE_MAGIC};
 use std::collections::HashMap;
-use std::io::{Seek, Write};
+use std::io::{self, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use xxhash_rust::xxh3::xxh3_64;
@@ -24,13 +25,13 @@ fn pattern(len: usize, seed: usize) -> Vec<u8> {
     (0..len).map(|i| ((i * 131 + seed * 7 + 13) % 251) as u8).collect()
 }
 
-fn scan_all(vm: &VolumeManager<SimFs>) -> Vec<ScannedNeedle> {
+fn scan_all<Fs: VolFs>(vm: &VolumeManager<Fs>) -> Vec<ScannedNeedle> {
     let mut out = Vec::new();
     vm.scan_needles(|n| out.push(n)).unwrap();
     out
 }
 
-fn read_via_copy_payload(vm: &VolumeManager<SimFs>, n: &ScannedNeedle) -> Vec<u8> {
+fn read_via_copy_payload<Fs: VolFs>(vm: &VolumeManager<Fs>, n: &ScannedNeedle) -> Vec<u8> {
     let mut got = Vec::with_capacity(n.payload_size as usize);
     let len = vm
         .copy_payload(n.offset, n.payload_crc32c, |chunk| {
@@ -570,4 +571,281 @@ fn torn_mid_volume_sector_zero_key_or_payload_survives_two_reopens() {
         assert_eq!(read_via_copy_payload(&vm2, &n2[0]), p3);
         assert_eq!(read_via_copy_payload(&vm2, &n2[1]), p4);
     }
+}
+
+struct FaultReadAfterFile {
+    inner: Arc<SimFile>,
+    kind: FileKind,
+    fail_from_offset: Arc<AtomicU64>,
+}
+
+impl VolFile for FaultReadAfterFile {
+    fn write_aligned_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        self.inner.write_aligned_at(offset, buf)
+    }
+    fn read_aligned_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        if self.kind == FileKind::Data && offset >= self.fail_from_offset.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::Other, "simulated Data::Read EIO"));
+        }
+        self.inner.read_aligned_at(offset, buf)
+    }
+    fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        self.inner.write_at(offset, buf)
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        self.inner.sync_all()
+    }
+    fn make_sparse(&self) -> io::Result<()> {
+        self.inner.make_sparse()
+    }
+    fn map(&self) -> io::Result<Option<memmap2::Mmap>> {
+        self.inner.map()
+    }
+}
+
+struct FaultReadAfterFs {
+    inner: SimFs,
+    fail_from_offset: Arc<AtomicU64>,
+}
+
+impl FaultReadAfterFs {
+    fn new() -> Self {
+        Self {
+            inner: SimFs::new(),
+            fail_from_offset: Arc::new(AtomicU64::new(u64::MAX)),
+        }
+    }
+}
+
+impl VolFs for FaultReadAfterFs {
+    type File = FaultReadAfterFile;
+
+    fn open(&self, path: &Path, kind: FileKind, create: bool) -> io::Result<Arc<Self::File>> {
+        let f = self.inner.open(path, kind, create)?;
+        Ok(Arc::new(FaultReadAfterFile {
+            inner: f,
+            kind,
+            fail_from_offset: Arc::clone(&self.fail_from_offset),
+        }))
+    }
+    fn exists(&self, path: &Path) -> bool {
+        self.inner.exists(path)
+    }
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+    fn list(&self, dir: &Path) -> io::Result<Vec<PathBuf>> {
+        self.inner.list(dir)
+    }
+}
+
+#[test]
+fn scan_needles_propagates_single_and_double_read_faults_instead_of_eof() {
+    // 1. Single-sector volume: to_read == need_bytes, single fault must return Err(VolumeError::Io)
+    {
+        let dir = Path::new("sim/seed209_scan_single_sector");
+        let dat_path = dir.join("volume_0001.dat");
+        let fs = SimFs::new();
+        let vm = VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap();
+        vm.write_needle(1, "tiny", b"abc", AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+        vm.sync_now().unwrap();
+
+        let dat = fs.file(&dat_path).unwrap();
+        dat.arm(SimOp::Read, SimFault::NoSpace);
+        let mut seen = Vec::new();
+        let res = vm.scan_needles(|n| seen.push(n.key));
+        assert!(
+            matches!(res, Err(VolumeError::Io(_))),
+            "single-sector scan_needles must propagate NoSpace read fault, got {:?} (seen={:?})",
+            res,
+            seen
+        );
+    }
+
+    // 2. Multi-needle volume: both single and double Data::Read faults (Eio and NoSpace) must propagate Err
+    let dir = Path::new("sim/seed209_scan_multi");
+    let dat_path = dir.join("volume_0001.dat");
+    let fs = SimFs::new();
+    let vm = VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap();
+    let p1 = pattern(5000, 209);
+    let p2 = pattern(9000, 210);
+    vm.write_needle(1, "k1", &p1, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+    vm.write_needle(1, "k2", &p2, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+    vm.sync_now().unwrap();
+
+    let dat = fs.file(&dat_path).unwrap();
+
+    // Single Eio fault
+    dat.arm(SimOp::Read, SimFault::Eio);
+    let mut seen = Vec::new();
+    let res = vm.scan_needles(|n| seen.push(n.key));
+    assert!(
+        matches!(res, Err(VolumeError::Io(_))),
+        "scan_needles must propagate single Eio read fault without retrying as EOF, got {:?} (seen={:?})",
+        res,
+        seen
+    );
+
+    // Single NoSpace fault
+    dat.arm(SimOp::Read, SimFault::NoSpace);
+    let mut seen = Vec::new();
+    let res = vm.scan_needles(|n| seen.push(n.key));
+    assert!(
+        matches!(res, Err(VolumeError::Io(_))),
+        "scan_needles must propagate single NoSpace read fault without retrying as EOF, got {:?} (seen={:?})",
+        res,
+        seen
+    );
+
+    // Double Eio fault: each call fails on its own fault without retrying non-EOF errors
+    dat.arm(SimOp::Read, SimFault::Eio);
+    dat.arm(SimOp::Read, SimFault::Eio);
+    let mut seen = Vec::new();
+    let res1 = vm.scan_needles(|n| seen.push(n.key));
+    assert!(
+        matches!(res1, Err(VolumeError::Io(_))),
+        "scan_needles must propagate first of double Eio read fault instead of returning Ok(()) with 0 needles, got {:?} (seen={:?})",
+        res1,
+        seen
+    );
+    let mut seen2 = Vec::new();
+    let res2 = vm.scan_needles(|n| seen2.push(n.key));
+    assert!(
+        matches!(res2, Err(VolumeError::Io(_))),
+        "scan_needles must propagate second of double Eio read fault, got {:?} (seen={:?})",
+        res2,
+        seen2
+    );
+
+    // Double NoSpace fault: each call fails on its own fault without retrying non-EOF errors
+    dat.arm(SimOp::Read, SimFault::NoSpace);
+    dat.arm(SimOp::Read, SimFault::NoSpace);
+    let mut seen = Vec::new();
+    let res1 = vm.scan_needles(|n| seen.push(n.key));
+    assert!(
+        matches!(res1, Err(VolumeError::Io(_))),
+        "scan_needles must propagate first of double NoSpace read fault instead of returning Ok(()) with 0 needles, got {:?} (seen={:?})",
+        res1,
+        seen
+    );
+    let mut seen2 = Vec::new();
+    let res2 = vm.scan_needles(|n| seen2.push(n.key));
+    assert!(
+        matches!(res2, Err(VolumeError::Io(_))),
+        "scan_needles must propagate second of double NoSpace read fault, got {:?} (seen={:?})",
+        res2,
+        seen2
+    );
+
+    // Clean scan after transient faults still sees both needles intact
+    let needles = scan_all(&vm);
+    assert_eq!(needles.iter().map(|n| n.key.as_str()).collect::<Vec<_>>(), vec!["k1", "k2"]);
+    assert_eq!(read_via_copy_payload(&vm, &needles[0]), p1);
+    assert_eq!(read_via_copy_payload(&vm, &needles[1]), p2);
+}
+
+#[test]
+fn open_with_propagates_read_fault_during_header_scan_and_never_truncates() {
+    let dir = Path::new("sim/seed209_open_header");
+    let dat_path = dir.join("volume_0001.dat");
+    let fs = FaultReadAfterFs::new();
+
+    let p1 = pattern(5000, 1);
+    let p2 = pattern(7000, 2);
+    let p3 = pattern(9000, 3);
+    let expected_offset = {
+        let vm = VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap();
+        vm.write_needle(1, "k1", &p1, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+        vm.write_needle(1, "k2", &p2, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+        vm.write_needle(1, "k3", &p3, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+        vm.sync_now().unwrap();
+        vm.offset()
+    };
+    let raw_len = fs.inner.file(&dat_path).unwrap().len().unwrap();
+    assert_eq!(raw_len, expected_offset);
+
+    // Fail Data::Read during header scan at offset 4096 while superblock at 0 succeeds.
+    fs.fail_from_offset.store(SECTOR_SIZE as u64, Ordering::SeqCst);
+    let err = match VolumeManager::open_with(&fs, dir, 1, false, clock()) {
+        Ok(vm) => panic!("open_with must fail on Data::Read fault during header scan, succeeded with offset {}", vm.offset()),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, VolumeError::Io(_)),
+        "expected VolumeError::Io from open_with header scan fault, got {:?}",
+        err
+    );
+    assert_eq!(
+        fs.inner.file(&dat_path).unwrap().len().unwrap(),
+        raw_len,
+        "open_with must NEVER truncate volume data file when header scan hits a read I/O error"
+    );
+
+    // Clear fault and reopen cleanly: all intact needles must remain recoverable.
+    fs.fail_from_offset.store(u64::MAX, Ordering::SeqCst);
+    let reopened = VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap();
+    assert_eq!(reopened.offset(), expected_offset);
+    let needles = scan_all(&reopened);
+    assert_eq!(needles.iter().map(|n| n.key.as_str()).collect::<Vec<_>>(), vec!["k1", "k2", "k3"]);
+    assert_eq!(read_via_copy_payload(&reopened, &needles[0]), p1);
+    assert_eq!(read_via_copy_payload(&reopened, &needles[1]), p2);
+    assert_eq!(read_via_copy_payload(&reopened, &needles[2]), p3);
+}
+
+#[test]
+fn open_with_propagates_read_fault_during_verify_needle_integrity_and_never_truncates() {
+    let dir = Path::new("sim/seed209_open_verify");
+    let dat_path = dir.join("volume_0001.dat");
+    let fs = FaultReadAfterFs::new();
+
+    // Needle > 1 MiB (SCAN_BATCH_BYTES) forces verify_needle_integrity to issue a second read_at past 4096 + 1 MiB.
+    let big_payload = pattern(1_200_000, 9);
+    let tail_payload = pattern(5000, 10);
+    let expected_offset = {
+        let vm = VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap();
+        vm.write_needle(1, "big", &big_payload, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+        vm.write_needle(1, "tail", &tail_payload, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+        vm.sync_now().unwrap();
+        vm.offset()
+    };
+    let raw_len = fs.inner.file(&dat_path).unwrap().len().unwrap();
+    assert_eq!(raw_len, expected_offset);
+
+    // Allow superblock (0) and first 1 MiB scan batch [4096..4096+1MiB], then fail the second batch read inside verify_needle_integrity.
+    fs.fail_from_offset.store(SECTOR_SIZE as u64 + (1 << 20), Ordering::SeqCst);
+    let err = match VolumeManager::open_with(&fs, dir, 1, false, clock()) {
+        Ok(vm) => panic!("open_with must fail on Data::Read fault during verify_needle_integrity, succeeded with offset {}", vm.offset()),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, VolumeError::Io(_)),
+        "expected VolumeError::Io from open_with verify_needle_integrity fault, got {:?}",
+        err
+    );
+    assert_eq!(
+        fs.inner.file(&dat_path).unwrap().len().unwrap(),
+        raw_len,
+        "open_with must NEVER truncate volume data file when verify_needle_integrity hits a read I/O error"
+    );
+
+    // Clear fault and reopen cleanly: both needles must still be intact.
+    fs.fail_from_offset.store(u64::MAX, Ordering::SeqCst);
+    let reopened = VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap();
+    assert_eq!(reopened.offset(), expected_offset);
+    let needles = scan_all(&reopened);
+    assert_eq!(needles.iter().map(|n| n.key.as_str()).collect::<Vec<_>>(), vec!["big", "tail"]);
+    assert_eq!(read_via_copy_payload(&reopened, &needles[0]), big_payload);
+    assert_eq!(read_via_copy_payload(&reopened, &needles[1]), tail_payload);
 }
