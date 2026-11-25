@@ -1367,8 +1367,10 @@ impl S3ServiceState {
                 }
                 Ok(())
             });
-            if let Ok(Err(e)) = res {
-                return Err(e);
+            match res {
+                Err(e) => return Err(format!("scan volume {}: {:?}", vm.id(), e)),
+                Ok(Err(e)) => return Err(e),
+                Ok(Ok(())) => {}
             }
         }
 
