@@ -35,6 +35,10 @@ pub const TAG_CHECKSUM: u16 = 0x0020;
 /// Multipart part sizes (little-endian `u64` per part), #117. Write-time.
 pub const TAG_PART_SIZES: u16 = 0x0021;
 
+/// Canonical owner ID / account UTF-8 (#151, Decision 3A). Write-time, stored only when it differs
+/// from the bucket owner.
+pub const TAG_OWNER: u16 = 0x0030;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttrsError {
     /// The block would not fit in a needle: 400 `MetadataTooLarge` for the request.
@@ -156,6 +160,18 @@ impl Attrs {
 
     pub fn website_redirect(&self) -> Option<&str> {
         self.get_str(TAG_WEBSITE_REDIRECT)
+    }
+
+    pub fn owner(&self) -> Option<&str> {
+        self.get_str(TAG_OWNER)
+    }
+
+    pub fn set_owner(&mut self, owner: &str) {
+        self.set(TAG_OWNER, owner.as_bytes());
+    }
+
+    pub fn clear_owner(&mut self) {
+        self.remove(TAG_OWNER);
     }
 
     /// Encodes `x-amz-meta-*` entries (already lower-cased names) into `TAG_USER_META`.

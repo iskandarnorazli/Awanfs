@@ -53,7 +53,18 @@ struct UserEntry {
     access_key: String,
     secret_key: String,
     policy: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    account: Option<String>,
 }
+
+/// Account identifier for the root key and legacy unowned resources.
+pub const ROOT_ACCOUNT: &str = "root";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Effect {
@@ -71,6 +82,10 @@ struct Statement {
 #[derive(Debug, Clone)]
 pub struct User {
     pub name: String,
+    pub id: String,
+    pub display_name: String,
+    pub email: Option<String>,
+    pub account: String,
     pub secret: String,
     statements: Vec<Statement>,
 }
@@ -78,12 +93,34 @@ pub struct User {
 /// Who signed a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {
-    /// Unsigned, accepted because of `--allow-anonymous`.
+    /// Unsigned, accepted because of `--allow-anonymous` (or CORS preflight).
     Anonymous,
-    /// The `AWANFS_ACCESS_KEY` pair: full access.
+    /// The `AWANFS_ACCESS_KEY` pair: root account.
     Root,
-    /// A user from the config file (by access key), limited by its policy.
-    User(String),
+    /// A user from the config file, belonging to `account` and limited by its policy.
+    User {
+        account: String,
+        name: String,
+        id: String,
+    },
+}
+
+impl Principal {
+    pub fn account(&self) -> Option<&str> {
+        match self {
+            Principal::Root => Some(ROOT_ACCOUNT),
+            Principal::User { account, .. } => Some(account.as_str()),
+            Principal::Anonymous => None,
+        }
+    }
+
+    pub fn canonical_id(&self) -> Option<&str> {
+        match self {
+            Principal::Root => Some(ROOT_ACCOUNT),
+            Principal::User { id, .. } => Some(id.as_str()),
+            Principal::Anonymous => None,
+        }
+    }
 }
 
 /// `*` matches any run of characters, `?` one character; everything else is literal.
@@ -160,7 +197,15 @@ fn parse_policy(text: &str) -> Result<Vec<Statement>, String> {
 #[derive(Debug, Default)]
 pub struct Iam {
     users: HashMap<String, User>,
+    by_name: HashMap<String, String>,
     compressed: std::collections::HashSet<String>,
+}
+
+fn validate_ident_field(user: &str, field: &str, val: &str) -> Result<(), String> {
+    if val.contains([':', '\n', '\r']) {
+        return Err(format!("user {}: {} contains forbidden character", user, field));
+    }
+    Ok(())
 }
 
 impl Iam {
@@ -172,12 +217,48 @@ impl Iam {
     pub fn parse(text: &str) -> Result<Self, String> {
         let file: ConfigFile = toml::from_str(text).map_err(|e| format!("config: {}", e))?;
         let mut users = HashMap::new();
+        let mut by_name = HashMap::new();
         for u in file.users {
+            if u.name.is_empty() {
+                return Err("user with empty name".to_string());
+            }
+            validate_ident_field(&u.name, "name", &u.name)?;
             if u.access_key.is_empty() || u.secret_key.is_empty() {
                 return Err(format!("user {}: empty access_key or secret_key", u.name));
             }
+            let id = match u.id {
+                Some(s) if s.is_empty() => return Err(format!("user {}: empty id", u.name)),
+                Some(s) => s,
+                None => crate::auth::sha256_hex(u.name.as_bytes()),
+            };
+            validate_ident_field(&u.name, "id", &id)?;
+            let account = match u.account {
+                Some(s) if s.is_empty() => return Err(format!("user {}: empty account", u.name)),
+                Some(s) => s,
+                None => u.name.clone(),
+            };
+            validate_ident_field(&u.name, "account", &account)?;
+            let display_name = u.display_name.filter(|s| !s.is_empty()).unwrap_or_else(|| u.name.clone());
+            let email = u.email.filter(|s| !s.is_empty());
             let statements = parse_policy(&u.policy).map_err(|e| format!("user {}: {}", u.name, e))?;
-            if users.insert(u.access_key.clone(), User { name: u.name.clone(), secret: u.secret_key, statements }).is_some() {
+            if by_name.insert(u.name.clone(), u.access_key.clone()).is_some() {
+                return Err(format!("user name {} is used twice", u.name));
+            }
+            if users
+                .insert(
+                    u.access_key.clone(),
+                    User {
+                        name: u.name.clone(),
+                        id,
+                        display_name,
+                        email,
+                        account,
+                        secret: u.secret_key,
+                        statements,
+                    },
+                )
+                .is_some()
+            {
                 return Err(format!("access key of user {} is used twice", u.name));
             }
         }
@@ -191,7 +272,7 @@ impl Iam {
                 Some(other) => return Err(format!("bucket {}: compression must be \"zstd\" or \"none\", not {:?}", b.name, other)),
             }
         }
-        Ok(Iam { users, compressed })
+        Ok(Iam { users, by_name, compressed })
     }
 
     /// Reads a config file; on Unix it must not be readable or writable by group or others.
@@ -212,12 +293,75 @@ impl Iam {
         self.users.get(access_key)
     }
 
+    pub fn user_by_name(&self, name: &str) -> Option<&User> {
+        self.by_name.get(name).and_then(|ak| self.users.get(ak))
+    }
+
     pub fn len(&self) -> usize {
         self.users.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.users.is_empty()
+    }
+
+    /// Evaluates the identity policy for user `name` on `(action, resource)`.
+    pub fn evaluate_user(&self, name: &str, action: &str, resource: &str) -> crate::authz::PolicyMatch {
+        let Some(u) = self.user_by_name(name) else {
+            return crate::authz::PolicyMatch::NoOpinion;
+        };
+        let hits = |e: Effect| {
+            u.statements.iter().any(|s| {
+                s.effect == e
+                    && s.actions.iter().any(|a| glob_match(a, action))
+                    && s.resources.iter().any(|r| glob_match(r, resource))
+            })
+        };
+        if hits(Effect::Deny) {
+            crate::authz::PolicyMatch::ExplicitDeny
+        } else if hits(Effect::Allow) {
+            crate::authz::PolicyMatch::Allow
+        } else {
+            crate::authz::PolicyMatch::NoOpinion
+        }
+    }
+
+    /// Pre-check for `DeleteObjects` (`POST /bucket?delete`): Allow if any statement permits
+    /// `s3:DeleteObject` inside `bucket`, ExplicitDeny if a blanket statement denies all keys.
+    pub fn may_delete_in_bucket(&self, name: &str, bucket: &str) -> crate::authz::PolicyMatch {
+        let Some(u) = self.user_by_name(name) else {
+            return crate::authz::PolicyMatch::NoOpinion;
+        };
+        let bucket_arn = format!("arn:aws:s3:::{}", bucket);
+        let key_prefix = format!("arn:aws:s3:::{}/", bucket);
+        let probe_key = format!("{}__awanfs_probe__", key_prefix);
+        let blanket_deny = u.statements.iter().any(|s| {
+            s.effect == Effect::Deny
+                && s.actions.iter().any(|a| glob_match(a, "s3:DeleteObject"))
+                && s.resources.iter().any(|r| {
+                    r == "*"
+                        || r == "arn:aws:s3:::*"
+                        || r == &format!("{}*", key_prefix)
+                        || glob_match(r, &bucket_arn)
+                })
+        });
+        if blanket_deny {
+            return crate::authz::PolicyMatch::ExplicitDeny;
+        }
+        let any_allow = u.statements.iter().any(|s| {
+            s.effect == Effect::Allow
+                && s.actions.iter().any(|a| glob_match(a, "s3:DeleteObject"))
+                && s.resources.iter().any(|r| {
+                    glob_match(r, &probe_key)
+                        || glob_match(r, &bucket_arn)
+                        || r.starts_with(&key_prefix)
+                })
+        });
+        if any_allow {
+            crate::authz::PolicyMatch::Allow
+        } else {
+            crate::authz::PolicyMatch::NoOpinion
+        }
     }
 
     /// May the user with `access_key` do `action` on `resource`? Deny wins, then Allow, else no.

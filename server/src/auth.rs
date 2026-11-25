@@ -210,7 +210,16 @@ fn secret_for<'a>(cfg: &'a AuthConfig, iam: Option<&'a Iam>, access_key: &str) -
             return Some((Principal::Root, s.as_str()));
         }
     }
-    iam.and_then(|i| i.user(access_key)).map(|u| (Principal::User(access_key.to_string()), u.secret.as_str()))
+    iam.and_then(|i| i.user(access_key)).map(|u| {
+        (
+            Principal::User {
+                account: u.account.clone(),
+                name: u.name.clone(),
+                id: u.id.clone(),
+            },
+            u.secret.as_str(),
+        )
+    })
 }
 
 /// `authenticate` with the config file's users too (#53); returns who signed the request.

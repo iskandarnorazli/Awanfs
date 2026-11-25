@@ -50,18 +50,24 @@ fn signed(c: &reqwest::Client, ak: &str, sk: &str, method: Method, host: &str, p
 const CONFIG: &str = r#"
 [[users]]
 name = "admin"
+account = "team"
+id = "team-admin-id"
+display_name = "Team Admin"
+email = "admin@team.example"
 access_key = "AKADMIN"
 secret_key = "admin-secret"
 policy = '{"Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}}'
 
 [[users]]
 name = "reader"
+account = "team"
 access_key = "AKREADER"
 secret_key = "reader-secret"
 policy = '''{"Statement": [{"Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket", "s3:ListAllMyBuckets"], "Resource": "*"}]}'''
 
 [[users]]
 name = "scoped"
+account = "team"
 access_key = "AKSCOPED"
 secret_key = "scoped-secret"
 policy = '''{"Statement": [
@@ -253,4 +259,204 @@ fn chunked(c: &reqwest::Client, ak: &str, sk: &str, host: &str, path: &str, chun
         .header("content-encoding", "aws-chunked")
         .header("authorization", format!("AWS4-HMAC-SHA256 Credential={}/{},SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,Signature={}", ak, scope, seed))
         .body(body)
+}
+
+#[test]
+fn users_file_fields_defaults_and_validation() {
+    let cfg = r#"
+[[users]]
+name = "alice"
+access_key = "AKALICE"
+secret_key = "alice-secret"
+policy = '{"Statement": []}'
+
+[[users]]
+name = "bob"
+account = "shared-acct"
+id = "bob-canonical-id"
+display_name = "Bob Builder"
+email = "bob@example.com"
+access_key = "AKBOB"
+secret_key = "bob-secret"
+policy = '{"Statement": []}'
+"#;
+    let iam = Iam::parse(cfg).unwrap();
+    let alice = iam.user("AKALICE").unwrap();
+    assert_eq!(alice.name, "alice");
+    assert_eq!(alice.account, "alice");
+    assert_eq!(alice.display_name, "alice");
+    assert_eq!(alice.email, None);
+    assert!(!alice.id.is_empty());
+    // Default id is a stable hash of the user name.
+    let iam2 = Iam::parse(cfg).unwrap();
+    assert_eq!(alice.id, iam2.user("AKALICE").unwrap().id);
+    assert_ne!(alice.id, "alice");
+
+    let bob = iam.user("AKBOB").unwrap();
+    assert_eq!(bob.name, "bob");
+    assert_eq!(bob.account, "shared-acct");
+    assert_eq!(bob.id, "bob-canonical-id");
+    assert_eq!(bob.display_name, "Bob Builder");
+    assert_eq!(bob.email.as_deref(), Some("bob@example.com"));
+
+    // Duplicate user names are rejected.
+    let dup_name = r#"
+[[users]]
+name = "dup"
+access_key = "AK1"
+secret_key = "s1"
+policy = '{"Statement": []}'
+[[users]]
+name = "dup"
+access_key = "AK2"
+secret_key = "s2"
+policy = '{"Statement": []}'
+"#;
+    assert!(Iam::parse(dup_name).is_err());
+
+    // Empty name, id, or account is rejected.
+    for bad_field in [r#"name = """#, r#"name = "x"
+id = """#, r#"name = "x"
+account = """#] {
+        let bad = format!("[[users]]\n{}\naccess_key = \"AK\"\nsecret_key = \"s\"\npolicy = '{{\"Statement\":[]}}'\n", bad_field);
+        assert!(Iam::parse(&bad).is_err(), "accepted: {}", bad_field);
+    }
+
+    // Colons and line breaks in name, account, or id are rejected (buckets.manifest safety).
+    for bad_char in [":", "\n", "\r"] {
+        for field in ["name", "account", "id"] {
+            let mut toml_fields = format!("name = \"safe\"\n");
+            if field == "name" {
+                toml_fields = format!("name = {:?}\n", format!("a{}b", bad_char));
+            } else {
+                toml_fields.push_str(&format!("{} = {:?}\n", field, format!("a{}b", bad_char)));
+            }
+            let bad = format!("[[users]]\n{}access_key = \"AK\"\nsecret_key = \"s\"\npolicy = '{{\"Statement\":[]}}'\n", toml_fields);
+            assert!(Iam::parse(&bad).is_err(), "accepted forbidden {:?} in {}", bad_char, field);
+        }
+    }
+}
+
+#[tokio::test]
+async fn same_account_users_share_ownership_and_removing_user_preserves_ownership() {
+    let dir = temp_dir("shared_acct");
+    let cfg_v1 = r#"
+[[users]]
+name = "alice"
+account = "team-shared"
+access_key = "AKALICE"
+secret_key = "alice-secret"
+policy = '{"Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}}'
+
+[[users]]
+name = "bob"
+account = "team-shared"
+access_key = "AKBOB"
+secret_key = "bob-secret"
+policy = '{"Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}}'
+"#;
+    let iam = ReloadingIam::open(&write_config(&dir, cfg_v1)).unwrap();
+    let mut st = S3ServiceState::new();
+    st.auth = AuthConfig { credentials: None, allow_anonymous: false };
+    *st.iam.write() = Some(Arc::clone(&iam));
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let handle = start_s3_reactor(addr, Arc::new(st)).await.unwrap();
+    let host = handle.local_addr.to_string();
+    let c = reqwest::Client::new();
+
+    assert_eq!(signed(&c, "AKALICE", "alice-secret", Method::PUT, &host, "/shared-bkt", b"").send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(signed(&c, "AKALICE", "alice-secret", Method::PUT, &host, "/shared-bkt/doc", b"team-bytes").send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(signed(&c, "AKBOB", "bob-secret", Method::GET, &host, "/shared-bkt/doc", b"").send().await.unwrap().text().await.unwrap(), "team-bytes");
+    assert_eq!(signed(&c, "AKBOB", "bob-secret", Method::PUT, &host, "/shared-bkt/doc2", b"bob-bytes").send().await.unwrap().status(), StatusCode::OK);
+
+    // Remove alice from config and reload; bob still owns and can read/delete team-shared's bucket and objects.
+    let cfg_v2 = r#"
+[[users]]
+name = "bob"
+account = "team-shared"
+access_key = "AKBOB"
+secret_key = "bob-secret"
+policy = '{"Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}}'
+"#;
+    write_config(&dir, cfg_v2);
+    iam.reload().unwrap();
+    assert_eq!(signed(&c, "AKALICE", "alice-secret", Method::GET, &host, "/shared-bkt/doc", b"").send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(signed(&c, "AKBOB", "bob-secret", Method::GET, &host, "/shared-bkt/doc", b"").send().await.unwrap().text().await.unwrap(), "team-bytes");
+    assert_eq!(signed(&c, "AKBOB", "bob-secret", Method::DELETE, &host, "/shared-bkt/doc", b"").send().await.unwrap().status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn cross_account_isolation_blocks_other_account_even_with_wildcard_policy() {
+    let dir = temp_dir("cross_acct");
+    let cfg = r#"
+[[users]]
+name = "alice"
+id = "alice-id"
+display_name = "Alice"
+email = "alice@example.com"
+access_key = "AKALICE"
+secret_key = "alice-secret"
+policy = '{"Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}}'
+
+[[users]]
+name = "bob"
+id = "bob-id"
+display_name = "Bob"
+email = "bob@example.com"
+access_key = "AKBOB"
+secret_key = "bob-secret"
+policy = '{"Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}}'
+"#;
+    let iam = ReloadingIam::open(&write_config(&dir, cfg)).unwrap();
+    let mut st = S3ServiceState::new();
+    st.auth = AuthConfig { credentials: Some(("AKROOT".into(), "root-secret".into())), allow_anonymous: false };
+    *st.iam.write() = Some(iam);
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let handle = start_s3_reactor(addr, Arc::new(st)).await.unwrap();
+    let host = handle.local_addr.to_string();
+    let c = reqwest::Client::new();
+    let alice = |m: Method, p: &str, b: &[u8]| signed(&c, "AKALICE", "alice-secret", m, &host, p, b);
+    let bob = |m: Method, p: &str, b: &[u8]| signed(&c, "AKBOB", "bob-secret", m, &host, p, b);
+    let root = |m: Method, p: &str, b: &[u8]| signed(&c, "AKROOT", "root-secret", m, &host, p, b);
+
+    assert_eq!(alice(Method::PUT, "/alice-bkt", b"").send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(alice(Method::PUT, "/alice-bkt/secret", b"top-secret").send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(bob(Method::PUT, "/bob-bkt", b"").send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(root(Method::PUT, "/root-bkt", b"").send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(root(Method::PUT, "/root-bkt/item", b"root-data").send().await.unwrap().status(), StatusCode::OK);
+
+    // Bob cannot access Alice's or Root's buckets/objects despite s3:* on * in his identity policy.
+    for (m, p) in [
+        (Method::GET, "/alice-bkt/secret"),
+        (Method::HEAD, "/alice-bkt/secret"),
+        (Method::PUT, "/alice-bkt/hijack"),
+        (Method::DELETE, "/alice-bkt/secret"),
+        (Method::GET, "/alice-bkt"),
+        (Method::GET, "/alice-bkt?list-type=2"),
+        (Method::HEAD, "/alice-bkt"),
+        (Method::DELETE, "/alice-bkt"),
+        (Method::GET, "/root-bkt/item"),
+        (Method::PUT, "/root-bkt/hijack"),
+        (Method::DELETE, "/root-bkt/item"),
+    ] {
+        let res = bob(m.clone(), p, b"x").send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "bob {} {}", m, p);
+    }
+    // Root cannot access Alice's bucket without a bucket policy or ACL either.
+    assert_eq!(root(Method::GET, "/alice-bkt/secret", b"").send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    // Batch delete on Alice's bucket is denied for Bob.
+    let del_xml = b"<Delete><Object><Key>secret</Key></Object></Delete>";
+    assert_eq!(bob(Method::POST, "/alice-bkt?delete", del_xml).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    // CopyObject from Alice's bucket into Bob's bucket is denied for Bob.
+    let copy_res = bob(Method::PUT, "/bob-bkt/stolen", b"").header("x-amz-copy-source", "/alice-bkt/secret").send().await.unwrap();
+    assert_eq!(copy_res.status(), StatusCode::FORBIDDEN);
+    // CreateBucket on an already-existing bucket owned by another account returns 409 BucketAlreadyExists.
+    let conflict = bob(Method::PUT, "/alice-bkt", b"").send().await.unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert!(conflict.text().await.unwrap().contains("BucketAlreadyExists"));
+    // ListBuckets only returns the caller's own buckets.
+    let bob_list = bob(Method::GET, "/", b"").send().await.unwrap().text().await.unwrap();
+    assert!(bob_list.contains("bob-bkt") && !bob_list.contains("alice-bkt") && !bob_list.contains("root-bkt"), "{}", bob_list);
+    let alice_list = alice(Method::GET, "/", b"").send().await.unwrap().text().await.unwrap();
+    assert!(alice_list.contains("alice-bkt") && !alice_list.contains("bob-bkt") && !alice_list.contains("root-bkt"), "{}", alice_list);
 }

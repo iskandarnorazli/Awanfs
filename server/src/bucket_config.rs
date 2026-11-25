@@ -305,6 +305,35 @@ impl BucketConfig {
     pub fn get(&self, kind: ConfigKind) -> Option<&ParsedConfig> {
         self.configs[kind as usize].as_ref()
     }
+
+    /// Account that owns this bucket (`owner` config record if set, else `+` record owner, else root).
+    pub fn effective_owner(&self) -> &str {
+        if let Some(cfg) = self.get(ConfigKind::Owner) {
+            if let Ok(s) = std::str::from_utf8(&cfg.raw) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return trimmed;
+                }
+            }
+        }
+        if self.owner.is_empty() {
+            crate::iam::ROOT_ACCOUNT
+        } else {
+            &self.owner
+        }
+    }
+
+    pub fn ownership(&self) -> crate::authz::BucketOwnership {
+        crate::authz::DEFAULT_BUCKET_OWNERSHIP
+    }
+
+    pub fn public_access_block(&self) -> crate::authz::PublicAccessBlock {
+        crate::authz::PublicAccessBlock::default()
+    }
+
+    pub fn policy_decision(&self) -> crate::authz::BucketPolicyDecision {
+        crate::authz::BucketPolicyDecision::none()
+    }
 }
 
 pub type BucketConfigMap = HashMap<u32, Arc<BucketConfig>>;
