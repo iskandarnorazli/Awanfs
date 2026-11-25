@@ -239,7 +239,8 @@ byte-for-byte determinism (`xxh3_64` trace hashes), and fails if any `FaultPoint
 Not covered by the simulation: HTTP, real OS thread interleavings, and the mapped read path
 (`SimFile` returns `None` from `map()`, so simulated reads use positioned reads; the mapped read
 path keeps its own tests). Not chosen: a whole-server simulation, and `loom` or `shuttle` for
-interleavings (owner, 2026-11-16, option B).
+interleavings (owner, 2026-11-16, option B). See [`VERIFICATION.md`](VERIFICATION.md) for how the
+simulation fits alongside TLA+, FSM tables, parser fuzzing, conformance suites, and performance gates.
 
 **Decision 68 (Claude, 2026-11-19, #26 stage 5): the metadata segments are leveled.** Flushes
 write level-0 segments, which may overlap; each deeper level holds non-overlapping segments and is

@@ -1,0 +1,29 @@
+# Verification map
+
+This document maps the six verification layers in AwanFS, what each layer proves, what it leaves uncovered, and the explicit boundaries for single-node deterministic simulation.
+
+## Verification layers
+
+| Layer | What it checks | What it does not check | CI gate or command |
+|---|---|---|---|
+| TLA+ state-space models | Design-level concurrency, recovery, manifest switching, and leveled compaction across `ObjectVersions.tla`, `Manifest.tla`, and `Levels.tla` (31 `.cfg` configs, including negative-control configs that fail on missing guards) | Rust implementation bugs, disk I/O parsing, and network framing | `bash verification/run_tlc.sh` |
+| Pure finite state machines | Exhaustive `(state, event)` transition tables for 11 explicit or wired machines in [`server/src/fsm.rs`](server/src/fsm.rs) (`STATE_MACHINES.md`) | Lock ordering, disk faults, and the 3 remaining implicit machines (write durability, volume lifecycle, object lifecycle) | `python3 scripts/test_check_state_machines.py && python3 scripts/check_state_machines.py` and `python3 scripts/check_fsm_driven.py` |
+| Storage-core deterministic simulation | Seeded `VolumeManager<SimFs>` crash recovery, torn writes, `EIO` and `ENOSPC` injection, 32 named `FaultPoint` events, delta-debugging shrinking, trace-hash determinism (`#213`, `server/src/sim.rs`, `sim_gen.rs`, `sim_model.rs`, `server/tests/sim_storage_test.rs`), plus `SimFs` unit tests in `manifest.rs`, `segment.rs`, and `segment_set.rs` | HTTP/S3 protocol parsing, `mmap` reads, OS thread interleavings, and joint `VolumeManager<SimFs>` plus `MetaStore<SimFs>` runs | `cargo test --locked --no-fail-fast --manifest-path server/Cargo.toml --test sim_storage_test` (2,000 CI seeds; 20,000 nightly seeds in [`.github/workflows/sim-nightly.yml`](.github/workflows/sim-nightly.yml)) |
+| Coverage-guided parser fuzzing | 20 stateless `libFuzzer` targets for S3 HTTP targets, SigV4, `aws-chunked`, range headers, attribute blocks, and XML payloads (`server/fuzz/`) | Stateful storage execution and crash recovery | [`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml) |
+| Protocol conformance and live-server tests | S3 wire compatibility, error codes, multi-restart metadata indexing, and CLI end-to-end journeys (`tests/s3tests/`, `tests/mint/`, `scripts/verify_drive.sh`, `tests/differential_minio_fuzz.py`, `server/tests/tiered_meta_test.rs`) | Seeded mid-write disk crashes and injected `EIO`/`ENOSPC` faults | `s3tests`, `mint`, and `bash scripts/verify_drive.sh` |
+| Performance and resource gates | Exact per-request disk writes, syncs, reads, and payload copies (`server/tests/work_count_test.rs`), plus real hardware latency, throughput, boot scan, and RSS benchmarks (`benchmarks/`) | Multi-node failover SLAs (Phase 4) and pricing or margin models | `cargo test --locked --manifest-path server/Cargo.toml --test work_count_test` and `benchmarks/` workflows (`bench-ratio.yml`, `bench-boot.yml`, `bench-metaindex.yml`, `bench-compaction-cost.yml`, `bench-scaling.yml`) |
+
+The `#213` storage simulation already proved its value against real implementation bugs while all TLA+ checks were green. It uncovered `#392` (torn `.idx` tail truncation and torn multi-sector needles), `#396` (Seed 45 incomplete needle verification and mid-volume gap skipping), `#399` (Seed 209 swallowed read errors in `AlignedScanWindow`), and `#403` (Seed 3624 spurious `note_append` on pre-header write failures).
+
+## Boundaries and non-goals for single-node DST
+
+- **Not protocol-aware.** Storage DST drives `VolumeManager<SimFs>` directly. HTTP framing, SigV4, XML parsing, S3 preconditions, bucket versioning, `0x200` attribute updates, and ACL or IAM rules stay covered by conformance suites, parser fuzzers, and TLA+.
+- **No `mmap` or OS thread-scheduler simulation.** `SimFile::map()` returns `Ok(None)` so simulated reads use positioned reads. `loom` and `shuttle` were weighed and declined in Decision 67 ([`ARCHITECTURE.md`](ARCHITECTURE.md)).
+- **No synthetic single-node disk latency or bandwidth model.** `SimFile` models durability boundaries and I/O errors in memory rather than NVMe queues, OS page cache behavior, Windows vs Linux `fdatasync` differences, or `mmap` page faults. Single-node latency, bandwidth, and SLAs come from real hardware benchmarks (`benchmarks/`), while algorithmic I/O work is gated by `WorkCounters` and `SimFile::calls`.
+- **No pricing or business margin formulas inside the Rust simulator.** Unit-economics models (such as cost per million PUTs or cost per TB-month across workloads) belong in offline analysis fed by measured hardware benchmarks and deterministic amplification counts.
+
+## Planned extensions
+
+- **Coverage-guided fuzzing over the storage harness ([#407](https://github.com/iskandarnorazli/Awanfs/issues/407)).** Add a `cargo-fuzz` target that decodes libFuzzer bytes into bounded `StorageOp` sequences and runs `VolumeManager<SimFs>` against `SimModel`.
+- **Joint volume and metadata simulation with I/O amplification budgets ([#408](https://github.com/iskandarnorazli/Awanfs/issues/408)).** Drive `VolumeManager<SimFs>` and `MetaStore<SimFs>` under one seeded crash/fault schedule before `#322` checkpoint boot, while asserting deterministic upper bounds on `SimFile::calls` and `WorkCounters`.
+- **Phase 4 network-extended simulation ([`CLUSTERING.md`](CLUSTERING.md) section 8).** Extend `#213` with simulated network latency, jitter, slow followers, partitions, and clock skew to verify leader failover, lease safety, and the 99.999% monthly availability target.
