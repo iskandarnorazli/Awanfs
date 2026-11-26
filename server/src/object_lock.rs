@@ -179,8 +179,13 @@ fn epoch_to_iso8601_z(epoch: u64) -> String {
 /// Computes `RetainUntilDate` for a bucket's `DefaultRetention` rule relative to `now_ns`.
 pub fn compute_default_retention(default: DefaultRetention, now_ns: u64) -> Retention {
     let now_sec = now_ns / 1_000_000_000;
+    let max_epoch = days_from_civil(9999, 12, 31)
+        .saturating_mul(86_400)
+        .saturating_add(86_399);
     let epoch = match default.period {
-        RetentionPeriod::Days(d) => now_sec.saturating_add(u64::from(d).saturating_mul(86_400)),
+        RetentionPeriod::Days(d) => now_sec
+            .saturating_add(u64::from(d).saturating_mul(86_400))
+            .min(max_epoch),
         RetentionPeriod::Years(y) => {
             let days = now_sec / 86_400;
             let secs = now_sec % 86_400;
@@ -190,6 +195,7 @@ pub fn compute_default_retention(default: DefaultRetention, now_ns: u64) -> Rete
             days_from_civil(target_year, month, target_day)
                 .saturating_mul(86_400)
                 .saturating_add(secs)
+                .min(max_epoch)
         }
     };
     Retention {
@@ -842,6 +848,26 @@ mod tests {
             now_ns,
         );
         assert_eq!(y1.retain_until_date, "2025-02-28T12:00:00Z");
+
+        let max_days = compute_default_retention(
+            DefaultRetention {
+                mode: RetentionMode::Compliance,
+                period: RetentionPeriod::Days(u32::MAX),
+            },
+            now_ns,
+        );
+        assert_eq!(max_days.retain_until_date, "9999-12-31T23:59:59Z");
+        assert!(parse_iso8601_z(&max_days.retain_until_date).is_some());
+
+        let max_years = compute_default_retention(
+            DefaultRetention {
+                mode: RetentionMode::Governance,
+                period: RetentionPeriod::Years(u32::MAX),
+            },
+            now_ns,
+        );
+        assert_eq!(max_years.retain_until_date, "9999-02-28T12:00:00Z");
+        assert!(parse_iso8601_z(&max_years.retain_until_date).is_some());
     }
 
     #[test]

@@ -248,17 +248,6 @@ pub(super) fn apply_lock_headers_and_default(
     let now_ns = state.clock.now_ns();
     let now_sec = now_ns / 1_000_000_000;
     let final_retention = if let Some(ref ret) = requested.retention {
-        if let Err(r) = crate::fsm::lock_step(
-            crate::fsm::Lock::default(),
-            crate::fsm::LockEvent::PutRetention {
-                mode: ret.mode,
-                until: ret.retain_until_epoch,
-                bypass_governance: false,
-            },
-            now_sec,
-        ) {
-            return Err(bad_request(r.code, r.why, key));
-        }
         Some(ret.clone())
     } else if apply_default {
         bucket_lock
@@ -281,10 +270,30 @@ pub(super) fn apply_lock_headers_and_default(
         ));
     }
 
+    let mut fsm_state = crate::fsm::Lock::default();
     if let Some(ref ret) = final_retention {
+        fsm_state = match crate::fsm::lock_step(
+            fsm_state,
+            crate::fsm::LockEvent::PutRetention {
+                mode: ret.mode,
+                until: ret.retain_until_epoch,
+                bypass_governance: false,
+            },
+            now_sec,
+        ) {
+            Ok(next) => next,
+            Err(r) => return Err(bad_request(r.code, r.why, key)),
+        };
         attrs.set_retention(Some(ret));
     }
     if let Some(on) = requested.legal_hold {
+        if let Err(r) = crate::fsm::lock_step(
+            fsm_state,
+            crate::fsm::LockEvent::PutLegalHold { on },
+            now_sec,
+        ) {
+            return Err(bad_request(r.code, r.why, key));
+        }
         attrs.set_legal_hold(on);
     }
     Ok(())

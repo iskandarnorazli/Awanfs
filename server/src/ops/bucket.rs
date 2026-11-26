@@ -395,20 +395,18 @@ pub async fn put_bucket_versioning(
         Ok(r) => r,
         Err(refusal) => return Ok(refusal_response(refusal, bucket)),
     };
-    let current = state.versioning.read().get(&b_id).copied().unwrap_or_default();
-    let has_object_lock = state.bucket_object_lock(b_id).is_some();
-    let next = match crate::fsm::versioning_step(current, req.status, has_object_lock) {
-        Ok(s) => s,
-        Err(refusal) => return Ok(refusal_response(refusal, bucket)),
-    };
-    if let Err(e) = state.set_versioning(b_id, next) {
-        return Ok(internal_error_response(bucket, &format!("could not record the versioning status: {}", e)));
+    match state.try_set_versioning(b_id, bucket, req.status) {
+        Ok(_) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_LENGTH, "0")
+            .body(empty_body())
+            .unwrap()),
+        Err(Ok(refusal)) => Ok(refusal_response(refusal, bucket)),
+        Err(Err(e)) => Ok(internal_error_response(
+            bucket,
+            &format!("could not record the versioning status: {}", e),
+        )),
     }
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_LENGTH, "0")
-        .body(empty_body())
-        .unwrap())
 }
 
 pub async fn list_objects(

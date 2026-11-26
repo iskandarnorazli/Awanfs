@@ -870,7 +870,20 @@ pub async fn complete_multipart_upload(
             let mut attrs = upload_attrs.clone().unwrap_or_default();
             if matches!(attrs.retention(), Ok(None)) {
                 if let Some(dr) = state.bucket_object_lock(b_id).and_then(|c| c.default_retention) {
-                    let ret = crate::object_lock::compute_default_retention(dr, state.clock.now_ns());
+                    let now_ns = state.clock.now_ns();
+                    let now_sec = now_ns / 1_000_000_000;
+                    let ret = crate::object_lock::compute_default_retention(dr, now_ns);
+                    if let Err(r) = crate::fsm::lock_step(
+                        crate::fsm::Lock::default(),
+                        crate::fsm::LockEvent::PutRetention {
+                            mode: ret.mode,
+                            until: ret.retain_until_epoch,
+                            bypass_governance: false,
+                        },
+                        now_sec,
+                    ) {
+                        return Ok(bad_request(r.code, r.why, key));
+                    }
                     attrs.set_retention(Some(&ret));
                 }
             }

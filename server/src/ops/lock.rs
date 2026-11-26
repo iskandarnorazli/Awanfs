@@ -6,7 +6,6 @@ use hyper::{Response, StatusCode};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::bucket_config::ConfigKind;
 use crate::fsm::LockEvent;
 use crate::object_lock::{
     lock_configuration_xml, parse_legal_hold, parse_lock_configuration, parse_retention_or_clear,
@@ -16,7 +15,6 @@ use crate::s3_api::{
     bad_request, empty_body, full_body, internal_error_response, read_body_admitted,
     ResponseBody, S3ServiceState, SetAttrError, MAX_XML_BODY,
 };
-use crate::versions::Versioning;
 use crate::xml::s3_error_xml;
 
 use super::object::{find_version, no_such_version};
@@ -61,7 +59,14 @@ fn resolve_target_version(
         },
         None => None,
     };
-    let Some(v) = find_version(state, b_id, key, parsed_id) else {
+    let v_opt = find_version(state, b_id, key, parsed_id).or_else(|| {
+        if parsed_id.is_none() && !state.versions.read().has(b_id, key) {
+            find_version(state, b_id, key, Some(0))
+        } else {
+            None
+        }
+    });
+    let Some(v) = v_opt else {
         return Err(if parsed_id.is_some() {
             no_such_version(key, false)
         } else {
@@ -184,39 +189,14 @@ pub async fn put_object_lock_configuration(
         return Ok(refusal_response(refusal, bucket));
     }
 
-    let already_enabled = state.bucket_object_lock(b_id).is_some();
-    if !already_enabled {
-        let ver = state.versioning.read().get(&b_id).copied().unwrap_or_default();
-        if ver != Versioning::Enabled {
-            return Ok(xml_error(
-                StatusCode::CONFLICT,
-                "InvalidBucketState",
-                "Versioning must be 'Enabled' on the bucket to apply a Object Lock configuration",
-                bucket,
-            ));
-        }
-    }
-
-    let res = state
-        .bucket_configs
-        .lock()
-        .put_config(b_id, ConfigKind::ObjectLock, &body_bytes);
-    match res {
-        Ok(()) => {
-            state.emit_bucket_config_event(
-                b_id,
-                bucket,
-                ConfigKind::ObjectLock.as_str(),
-                crate::events::CommitKind::BucketConfig,
-                body_bytes.len() as u64,
-            );
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_LENGTH, "0")
-                .body(empty_body())
-                .unwrap())
-        }
-        Err(e) => Ok(xml_error(
+    match state.enable_object_lock_config(b_id, bucket, &body_bytes) {
+        Ok(()) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_LENGTH, "0")
+            .body(empty_body())
+            .unwrap()),
+        Err(Ok(refusal)) => Ok(refusal_response(refusal, bucket)),
+        Err(Err(e)) => Ok(xml_error(
             StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             e.code(),
             &e.to_string(),

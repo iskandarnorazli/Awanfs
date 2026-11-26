@@ -797,6 +797,65 @@ async fn randomized_sequence_never_deletes_version_while_may_delete_refuses() {
     }
 }
 
+#[tokio::test]
+async fn pre_versioning_null_object_supports_put_and_get_lock_without_version_id() {
+    let dir = temp_dir("null_lock");
+    let (base, _state, _clock, handle) = spawn_clocked(Some(&dir), 1_750_000_000, None, AuthConfig::open()).await;
+    let c = reqwest::Client::new();
+
+    // Put object before versioning or Object Lock is enabled (unversioned "null" object).
+    assert_eq!(c.put(format!("{base}/null-bkt")).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        c.put(format!("{base}/null-bkt/legacy.txt")).body("old").send().await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    // Enable Versioning, then Object Lock on the bucket.
+    assert_eq!(
+        c.put(format!("{base}/null-bkt?versioning"))
+            .body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        c.put(format!("{base}/null-bkt?object-lock"))
+            .body("<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    // PUT & GET retention and legal hold without ?versionId= must both resolve the legacy null object.
+    let ret_xml = "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate></Retention>";
+    assert_eq!(
+        c.put(format!("{base}/null-bkt/legacy.txt?retention")).body(ret_xml).send().await.unwrap().status(),
+        StatusCode::OK
+    );
+    let get_ret = c.get(format!("{base}/null-bkt/legacy.txt?retention")).send().await.unwrap();
+    assert_eq!(get_ret.status(), StatusCode::OK);
+    assert!(get_ret.text().await.unwrap().contains("2030-01-01T00:00:00Z"));
+
+    assert_eq!(
+        c.put(format!("{base}/null-bkt/legacy.txt?legal-hold"))
+            .body("<LegalHold><Status>ON</Status></LegalHold>")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let get_lh = c.get(format!("{base}/null-bkt/legacy.txt?legal-hold")).send().await.unwrap();
+    assert_eq!(get_lh.status(), StatusCode::OK);
+    assert!(get_lh.text().await.unwrap().contains("<Status>ON</Status>"));
+
+    drop(handle);
+}
+
 #[test]
 fn grep_guard_no_retention_comparisons_outside_fsm_rs() {
     let src_root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));

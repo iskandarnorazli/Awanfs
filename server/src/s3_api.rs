@@ -2319,6 +2319,71 @@ impl S3ServiceState {
         Ok(())
     }
 
+    /// Atomically checks Object Lock + current versioning, steps `fsm::versioning_step`, and persists (#120).
+    pub fn try_set_versioning(
+        &self,
+        b_id: u32,
+        bucket: &str,
+        requested: crate::versions::Versioning,
+    ) -> Result<crate::versions::Versioning, Result<crate::fsm::Refusal, std::io::Error>> {
+        let mut bc = self.bucket_configs.lock();
+        let has_object_lock = bc
+            .load_bucket(b_id)
+            .and_then(|c| c.object_lock())
+            .is_some();
+        let mut ver = self.versioning.write();
+        let current = ver.get(&b_id).copied().unwrap_or_default();
+        let next = crate::fsm::versioning_step(current, requested, has_object_lock).map_err(Ok)?;
+        bc.apply_versioning(b_id, next)
+            .map_err(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        ver.insert(b_id, next);
+        drop(ver);
+        drop(bc);
+        self.emit_bucket_config_event(
+            b_id,
+            bucket,
+            "versioning",
+            crate::events::CommitKind::BucketVersioning,
+            next.as_str().len() as u64,
+        );
+        Ok(next)
+    }
+
+    /// Atomically verifies `Versioning::Enabled` (if lock is not already enabled) and stores `ObjectLock` config (#120).
+    pub fn enable_object_lock_config(
+        &self,
+        b_id: u32,
+        bucket: &str,
+        body: &[u8],
+    ) -> Result<(), Result<crate::fsm::Refusal, crate::bucket_config::ConfigError>> {
+        let mut bc = self.bucket_configs.lock();
+        let already_enabled = bc
+            .load_bucket(b_id)
+            .and_then(|c| c.object_lock())
+            .is_some();
+        if !already_enabled {
+            let ver = self.versioning.read().get(&b_id).copied().unwrap_or_default();
+            if ver != crate::versions::Versioning::Enabled {
+                return Err(Ok(crate::fsm::Refusal {
+                    status: 409,
+                    code: "InvalidBucketState",
+                    why: "Versioning must be 'Enabled' on the bucket to apply a Object Lock configuration",
+                }));
+            }
+        }
+        bc.put_config(b_id, crate::bucket_config::ConfigKind::ObjectLock, body)
+            .map_err(Err)?;
+        drop(bc);
+        self.emit_bucket_config_event(
+            b_id,
+            bucket,
+            crate::bucket_config::ConfigKind::ObjectLock.as_str(),
+            crate::events::CommitKind::BucketConfig,
+            body.len() as u64,
+        );
+        Ok(())
+    }
+
     /// Compacts the oldest volume. With a single volume, seals it first (the next writes go
     /// to a new one). See `compact_oldest_volume`.
     pub async fn perform_online_compaction(&self) -> Result<CompactionReport, VolumeError> {
