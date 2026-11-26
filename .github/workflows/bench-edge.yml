@@ -1,0 +1,69 @@
+name: Edge footprint on ARM
+
+# #363: Measure AwanFS peak RSS and throughput at edge budgets (128 MiB and 256 MiB)
+# at 4 KiB and 1 MiB on GitHub's hosted ARM runner (ubuntu-24.04-arm).
+# Manual dispatch only so benchmarks never trigger on schedules or pull requests.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  edge-footprint:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install psutil
+        run: python -m pip install --disable-pip-version-check psutil==6.1.1
+      - name: Build s3-server
+        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Budget RSS self-tests
+        run: python benchmarks/test_budget_rss.py
+      - name: Run 128 MiB and 256 MiB edge measurements
+        run: |
+          set +e
+          status=0
+          for budget in 128 256; do
+            for size in 4KiB 1MiB; do
+              report="${{ runner.temp }}/edge-${budget}-${size}.md"
+              python -u benchmarks/budget_rss.py \
+                --server-bin server/target/release/s3-server \
+                --budget "${budget}MiB" \
+                --budget-mib "$budget" \
+                --size "$size" \
+                --concurrency 64 \
+                --duration 10 \
+                --overhead 512 \
+                --report "$report"
+              rc=$?
+              if [ "$rc" -ne 0 ]; then
+                status=$rc
+              fi
+            done
+          done
+          exit "$status"
+      - name: Publish reports to job summary
+        if: always()
+        run: |
+          for f in "${{ runner.temp }}"/edge-*.md; do
+            if [ -f "$f" ]; then
+              cat "$f" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+      - name: Upload edge reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-footprint-reports
+          path: ${{ runner.temp }}/edge-*.md
