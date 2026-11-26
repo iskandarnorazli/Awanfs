@@ -1532,6 +1532,29 @@ class FastAndThreadReportTests(unittest.TestCase):
         self.assertIn("| group | 4 | 3001 | tokio-runtime-worker | 0.500 | 1.400 | 1.900 |", md)
         self.assertIn("| fast | 4 | 4001 | tokio-runtime-worker | 1.100 | 0.700 | 1.800 |", md)
 
+    def test_matrix_report_renders_fast_rows_for_every_put_size(self):
+        patterns, sizes, cores, concs, results = _sample_matrix_results()
+        pt = cs.PointResult(ops_per_sec=900.0, mib_per_sec=900.0, p50_ms=9.0, p99_ms=20.0, cpu_pct=80.0)
+        fast = {sz: {4: {64: pt}} for sz in sizes}
+        md = cs.render_matrix_report(
+            cmd="python benchmarks/core_scaling.py --matrix --compare-fast",
+            patterns=patterns,
+            sizes=sizes,
+            cores=cores,
+            concurrencies=concs,
+            results=results,
+            total_cores=16,
+            runs=2,
+            duration_sec=2.0,
+            seed=42,
+            memory_budget="32MiB",
+            prefill_bytes=48 * 1024 * 1024,
+            chart_paths=[],
+            fast_by_size=fast,
+        )
+        self.assertIn("| AwanFS (--durability fast) | seq-write | 4 KiB | 4 | 64 |", md)
+        self.assertIn("| AwanFS (--durability fast) | seq-write | 1 MiB | 4 | 64 |", md)
+
     def test_live_stub_phase_captures_thread_cpu_when_enabled(self):
         import threading
 

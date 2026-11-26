@@ -3377,7 +3377,13 @@ def render_matrix_report(
     fast_results: Optional[Dict[int, Dict[int, PointResult]]] = None,
     durability: str = "group",
     client_procs: int = 1,
+    fast_by_size: Optional[Dict[int, Dict[int, Dict[int, PointResult]]]] = None,
 ) -> str:
+    # `fast_by_size` is {size: {cores: {concurrency: point}}}; `fast_results` alone is 4 KiB.
+    fast_sizes: Dict[int, Dict[int, Dict[int, PointResult]]] = dict(fast_by_size or {})
+    if fast_results is not None:
+        fast_sizes.setdefault(4 * KIB, fast_results)
+    fast_results = fast_sizes.get(4 * KIB)
     budget_bytes = parse_size(memory_budget)
     cache_bytes = stated_cache_bytes(budget_bytes)
     shared_ns = [n for n in cores if n >= total_cores]
@@ -3447,12 +3453,14 @@ def render_matrix_report(
                         pt = results.get(pat, {}).get(sz, {}).get(srv, {}).get(n, {}).get(c)
                         lines.append(_matrix_row(srv, pat, sz_lbl, n, c, pt))
                         cli_rows.append(_matrix_client_row(srv, pat, sz_lbl, n, c, pt))
-        if srv == "AwanFS" and fast_results is not None and (4 * KIB) in sizes:
-            for n in cores:
-                for c in sorted(fast_results.get(n, {})):
-                    pt = fast_results[n][c]
-                    lines.append(_matrix_row("AwanFS (--durability fast)", put_pat, "4 KiB", n, c, pt))
-                    cli_rows.append(_matrix_client_row("AwanFS (--durability fast)", put_pat, "4 KiB", n, c, pt))
+        if srv == "AwanFS":
+            for sz in [z for z in sizes if z in fast_sizes]:
+                sz_lbl = row_size_label(put_pat, sz)
+                for n in cores:
+                    for c in sorted(fast_sizes[sz].get(n, {})):
+                        pt = fast_sizes[sz][n][c]
+                        lines.append(_matrix_row("AwanFS (--durability fast)", put_pat, sz_lbl, n, c, pt))
+                        cli_rows.append(_matrix_client_row("AwanFS (--durability fast)", put_pat, sz_lbl, n, c, pt))
 
     lines.extend([
         "",
@@ -3991,14 +3999,16 @@ def _run_matrix_mode(
         for pat in patterns
     }
 
-    fast_raw: Optional[Dict[int, Dict[int, List[PointResult]]]] = None
+    # {size: {cores: {concurrency: runs}}}: the fast pass runs every PUT size (owner, 2026-11-26).
+    fast_raw: Optional[Dict[int, Dict[int, Dict[int, List[PointResult]]]]] = None
     fast_concs_by_core: Dict[int, List[int]] = {}
-    if compare_fast and put_pat is not None and (4 * KIB) in sizes:
-        fast_raw = {}
+    if compare_fast and put_pat is not None:
+        fast_raw = {sz: {} for sz in sizes}
         for n in cores:
             targets = sorted({_pick_target(concurrencies, 64), _pick_target(concurrencies, 16 * n)})
             fast_concs_by_core[n] = targets
-            fast_raw[n] = {c: [] for c in targets}
+            for sz in sizes:
+                fast_raw[sz][n] = {c: [] for c in targets}
 
     try:
         for n in cores:
@@ -4010,8 +4020,9 @@ def _run_matrix_mode(
                             for c in concurrencies:
                                 raw_runs[pat][sz][srv][n][c].append(PointResult(reason=reason))
                 if fast_raw is not None:
-                    for c in fast_concs_by_core[n]:
-                        fast_raw[n][c].append(PointResult(reason=reason))
+                    for sz in fast_raw:
+                        for c in fast_concs_by_core[n]:
+                            fast_raw[sz][n][c].append(PointResult(reason=reason))
                 continue
 
             cli_cores, shares = client_cores_for(n, total_cores)
@@ -4057,7 +4068,7 @@ def _run_matrix_mode(
 
             if fast_raw is not None and put_pat is not None:
                 targets = fast_concs_by_core[n]
-                fast_prof = [(put_pat, 4 * KIB, c) for c in targets] if n in profile_cores else None
+                fast_prof = [(put_pat, 4 * KIB, c) for c in targets] if (n in profile_cores and (4 * KIB) in sizes) else None
                 for run_idx in range(a.runs):
                     print(
                         f"[N={n}, run {run_idx + 1}/{a.runs}] Starting AwanFS (--durability fast) "
@@ -4073,7 +4084,7 @@ def _run_matrix_mode(
                         cli_cores=cli_cores,
                         shares_cores=shares,
                         patterns=[put_pat],
-                        sizes=[4 * KIB],
+                        sizes=list(sizes),
                         concurrencies=targets,
                         duration_sec=a.duration,
                         seed=a.seed,
@@ -4082,8 +4093,8 @@ def _run_matrix_mode(
                         client_procs=a.client_procs,
                         data_root=data_root,
                     )
-                    for (_pat, _sz, c), pt in fast_map.items():
-                        fast_raw[n][c].append(pt)
+                    for (_pat, sz, c), pt in fast_map.items():
+                        fast_raw[sz][n][c].append(pt)
     finally:
         if orig_affinity:
             pin_process(os.getpid(), orig_affinity)
@@ -4101,11 +4112,11 @@ def _run_matrix_mode(
         }
         for pat in patterns
     }
-    fast_results: Optional[Dict[int, Dict[int, PointResult]]] = None
+    fast_by_size: Optional[Dict[int, Dict[int, Dict[int, PointResult]]]] = None
     if fast_raw is not None:
-        fast_results = {
-            n: {c: aggregate_runs(fast_raw[n][c]) for c in fast_concs_by_core[n]}
-            for n in cores
+        fast_by_size = {
+            sz: {n: {c: aggregate_runs(fast_raw[sz][n][c]) for c in fast_concs_by_core[n]} for n in cores}
+            for sz in fast_raw
         }
 
     try:
@@ -4128,9 +4139,9 @@ def _run_matrix_mode(
         memory_budget=a.memory_budget,
         prefill_bytes=prefill_bytes,
         chart_paths=chart_paths,
-        fast_results=fast_results,
         durability=durability,
         client_procs=a.client_procs,
+        fast_by_size=fast_by_size,
     )
     out_abs = os.path.abspath(a.output)
     os.makedirs(os.path.dirname(out_abs), exist_ok=True)
