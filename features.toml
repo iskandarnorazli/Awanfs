@@ -260,7 +260,7 @@ mint = [
 [[feature]]
 id = "lifecycle"
 name = "Bucket lifecycle configuration and expiration sweep"
-status = "partial"
+status = "done"
 issue = "#118"
 area = "lifecycle"
 design_section = "8.3"
@@ -275,6 +275,12 @@ mint = [
   "minio-js::Set lifecycle config on a bucket:",
 ]
 server_tests = [
+  "server/tests/lifecycle_conformance_test.rs::lifecycle_validation_errors_roundtrip_and_restart_persistence",
+  "server/tests/lifecycle_conformance_test.rs::lifecycle_filters_date_disabled_header_and_tags",
+  "server/tests/lifecycle_conformance_test.rs::lifecycle_versioned_noncurrent_delete_marker_and_restart",
+  "server/tests/lifecycle_conformance_test.rs::lifecycle_property_never_deletes_locked_version_or_premature_object",
+  "server/tests/lifecycle_conformance_test.rs::lifecycle_aborts_incomplete_multipart_uploads",
+  "server/tests/lifecycle_conformance_test.rs::lifecycle_rereads_state_tags_and_rules_under_key_lock",
   "server/tests/lifecycle_test.rs::test_lifecycle_xml_roundtrip_and_deletion",
   "server/tests/lifecycle_test.rs::test_prefix_scoped_expiration_and_negative_control",
   "server/tests/lifecycle_test.rs::test_stale_multipart_abort_sweep",
@@ -287,6 +293,7 @@ server_tests = [
   "server/tests/parser_robustness_test.rs::a_rule_id_and_prefix_keep_their_whitespace_through_the_serialiser",
   "server/tests/parser_robustness_test.rs::lifecycle_xml_round_trips_through_its_serialiser",
 ]
+drive = ["lifecycle"]
 fuzz = ["lifecycle_xml", "lifecycle_config_xml"]
 
 [[feature]]

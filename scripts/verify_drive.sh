@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Drives a fresh s3-server the way a user does (aws CLI) and keeps the evidence.
-#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post (default: all)
+#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle (default: all)
 # Needs: a built server (cargo build --release --manifest-path server/Cargo.toml), the aws CLI, curl.
 # Evidence: verification/evidence/<UTC timestamp>/ (kept after cleanup). Exit 0 only if every journey passed.
 set -uo pipefail
@@ -354,6 +354,37 @@ j_post() { S3 create-bucket --bucket verify-post && head -c 6000000 /dev/urandom
   S3 get-object --bucket verify-post --key up/big.bin "$EVID/post-big.out" >/dev/null && same "$EVID/post-big.bin" "$EVID/post-big.out" &&
   postform verify-post up/late.txt "$EVID/post.bin" -60 >"$EVID/post-expired.txt" && head -1 "$EVID/post-expired.txt" | grep -qx 403 &&
   grep -q AccessDenied "$EVID/post-expired.txt" && ! S3 head-object --bucket verify-post --key up/late.txt 2>/dev/null; }
+j_lifecycle() { local lc_data lc_port lc_url lc_pid="";
+  S3 create-bucket --bucket verify-lc &&
+  S3 put-bucket-lifecycle-configuration --bucket verify-lc --lifecycle-configuration '{"Rules":[{"ID":"r1","Filter":{"Prefix":"exp/"},"Status":"Enabled","Expiration":{"Days":5}}]}' &&
+  S3 get-bucket-lifecycle-configuration --bucket verify-lc --query 'Rules[0].ID' --output text | grep -qx r1 &&
+  echo "lc-body" >"$EVID/lc.bin" &&
+  S3 put-object --bucket verify-lc --key exp/a --body "$EVID/lc.bin" >"$EVID/lc-put.json" && grep -q 'rule-id=\\"r1\\"' "$EVID/lc-put.json" &&
+  S3 head-object --bucket verify-lc --key exp/a >"$EVID/lc-head.json" && grep -q 'rule-id=\\"r1\\"' "$EVID/lc-head.json" &&
+  ! S3 put-bucket-lifecycle-configuration --bucket verify-lc --lifecycle-configuration '{"Rules":[{"ID":"bad","Filter":{"Prefix":""},"Status":"Enabled","Expiration":{"Days":0}}]}' 2>"$EVID/lc-bad.err" &&
+  grep -q InvalidArgument "$EVID/lc-bad.err" &&
+  S3 delete-bucket-lifecycle --bucket verify-lc &&
+  ! S3 get-bucket-lifecycle-configuration --bucket verify-lc 2>"$EVID/lc-gone.err" && grep -q NoSuchLifecycleConfiguration "$EVID/lc-gone.err" &&
+  lc_data="$(mktemp -d)" &&
+  lc_port=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])') &&
+  lc_url="http://127.0.0.1:$lc_port" &&
+  (
+    trap '[ -n "${lc_pid:-}" ] && kill "$lc_pid" 2>/dev/null; wait "${lc_pid:-}" 2>/dev/null; rm -rf "$lc_data"' EXIT
+    AWANFS_ACCESS_KEY="$AWS_ACCESS_KEY_ID" AWANFS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" "$BIN" --port "$lc_port" --data-dir "$lc_data" --lifecycle-day-seconds 1 >>"$EVID/lc-server.log" 2>&1 & lc_pid=$!
+    ok=0; for _ in $(seq 1 100); do if curl -sf "$lc_url/_awanfs/health/ready" >/dev/null; then ok=1; break; fi; sleep 0.1; done; [ "$ok" -eq 1 ]
+    aws --endpoint-url "$lc_url" s3api create-bucket --bucket verify-lc-exp >/dev/null
+    aws --endpoint-url "$lc_url" s3api put-bucket-versioning --bucket verify-lc-exp --versioning-configuration Status=Enabled >/dev/null
+    aws --endpoint-url "$lc_url" s3api put-object --bucket verify-lc-exp --key k --body "$EVID/lc.bin" >/dev/null
+    aws --endpoint-url "$lc_url" s3api put-object --bucket verify-lc-exp --key k --body "$EVID/lc.bin" >/dev/null
+    aws --endpoint-url "$lc_url" s3api delete-object --bucket verify-lc-exp --key k >/dev/null
+    aws --endpoint-url "$lc_url" s3api put-bucket-lifecycle-configuration --bucket verify-lc-exp --lifecycle-configuration '{"Rules":[{"ID":"nc-dm","Filter":{"Prefix":""},"Status":"Enabled","Expiration":{"Days":1},"NoncurrentVersionExpiration":{"NoncurrentDays":1}}]}' >/dev/null
+    expired=0; for _ in $(seq 1 40); do
+      aws --endpoint-url "$lc_url" s3api list-object-versions --bucket verify-lc-exp >"$EVID/lc-vers.json"
+      if ! grep -q '"Key": "k"' "$EVID/lc-vers.json"; then expired=1; break; fi
+      sleep 0.2
+    done
+    [ "$expired" -eq 1 ]
+  ); }
 
 # Refuse to run a journey whose && chain is split by a `local x;` (see the note above md5q).
 masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:]]+local [^;]*;|&& *local ' || true)
@@ -361,7 +392,7 @@ masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:
 
 start || exit 1
 check doctor doctor
-features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post)
+features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle)
 [[ " ${features[*]} " == *" buckets "* ]] || check buckets j_buckets
 for f in "${features[@]}"; do check "$f" "j_$f"; done
 ls -la "$DATA" >"$EVID/data-dir.txt" 2>&1

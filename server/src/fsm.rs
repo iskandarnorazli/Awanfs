@@ -1732,3 +1732,429 @@ mod form_tests {
         assert_eq!(form_step(FormState::Epilogue, FormInput::Malformed, true), Ok(FormState::Epilogue), "the epilogue is ignored");
     }
 }
+
+/// Target evaluated by the bucket lifecycle sweeper (#118). Times are seconds since epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleTarget {
+    UnversionedObject { created_sec: u64 },
+    CurrentVersion { created_sec: u64 },
+    CurrentDeleteMarker { created_sec: u64, sole_version: bool },
+    NoncurrentVersion {
+        noncurrent_since_sec: u64,
+        newer_noncurrent_count: u32,
+        is_marker: bool,
+    },
+    MultipartUpload { initiated_sec: u64 },
+}
+
+/// One action extracted from a matching enabled (or disabled) lifecycle rule (#118).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpiryRuleAction {
+    Disabled,
+    ExpireDays(u32),
+    ExpireDate(u64),
+    ExpiredObjectDeleteMarker(bool),
+    NoncurrentExpiration {
+        noncurrent_days: u32,
+        newer_noncurrent_versions: Option<u32>,
+    },
+    AbortMultipart(u32),
+}
+
+/// Inputs to [`expiry_step`]: target facts, version lock state, current clock, and day length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpiryFacts {
+    pub target: LifecycleTarget,
+    pub lock: Lock,
+    pub now_sec: u64,
+    pub day_seconds: u64,
+}
+
+/// Decision returned by [`expiry_step`]: the sweeper only executes this decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpiryAction {
+    Keep,
+    Expire,
+    AddDeleteMarker,
+    RemoveVersion,
+    RemoveMarker,
+    AbortUpload,
+}
+
+/// Pure lifecycle state transition for one object, version, delete marker, or upload (#118).
+pub fn expiry_step(facts: ExpiryFacts, actions: &[ExpiryRuleAction]) -> ExpiryAction {
+    let day = facts.day_seconds.max(1);
+    let age_reached = |since: u64, days: u32| -> bool {
+        facts.now_sec >= since.saturating_add(u64::from(days).saturating_mul(day))
+    };
+
+    match facts.target {
+        LifecycleTarget::UnversionedObject { created_sec } => {
+            if facts.lock.may_delete(facts.now_sec, false).is_err() {
+                return ExpiryAction::Keep;
+            }
+            for &act in actions {
+                match act {
+                    ExpiryRuleAction::ExpireDays(d) if age_reached(created_sec, d) => {
+                        return ExpiryAction::Expire;
+                    }
+                    ExpiryRuleAction::ExpireDate(dt) if facts.now_sec >= dt => {
+                        return ExpiryAction::Expire;
+                    }
+                    _ => {}
+                }
+            }
+            ExpiryAction::Keep
+        }
+        LifecycleTarget::CurrentVersion { created_sec } => {
+            for &act in actions {
+                match act {
+                    ExpiryRuleAction::ExpireDays(d) if age_reached(created_sec, d) => {
+                        return ExpiryAction::AddDeleteMarker;
+                    }
+                    ExpiryRuleAction::ExpireDate(dt) if facts.now_sec >= dt => {
+                        return ExpiryAction::AddDeleteMarker;
+                    }
+                    _ => {}
+                }
+            }
+            ExpiryAction::Keep
+        }
+        LifecycleTarget::CurrentDeleteMarker {
+            created_sec,
+            sole_version,
+        } => {
+            if !sole_version {
+                return ExpiryAction::Keep;
+            }
+            for &act in actions {
+                match act {
+                    ExpiryRuleAction::ExpiredObjectDeleteMarker(true) => {
+                        return ExpiryAction::RemoveMarker;
+                    }
+                    ExpiryRuleAction::ExpireDays(d) if age_reached(created_sec, d) => {
+                        return ExpiryAction::RemoveMarker;
+                    }
+                    ExpiryRuleAction::ExpireDate(dt) if facts.now_sec >= dt => {
+                        return ExpiryAction::RemoveMarker;
+                    }
+                    _ => {}
+                }
+            }
+            ExpiryAction::Keep
+        }
+        LifecycleTarget::NoncurrentVersion {
+            noncurrent_since_sec,
+            newer_noncurrent_count,
+            is_marker,
+        } => {
+            if !is_marker && facts.lock.may_delete(facts.now_sec, false).is_err() {
+                return ExpiryAction::Keep;
+            }
+            for &act in actions {
+                if let ExpiryRuleAction::NoncurrentExpiration {
+                    noncurrent_days,
+                    newer_noncurrent_versions,
+                } = act
+                {
+                    if !age_reached(noncurrent_since_sec, noncurrent_days) {
+                        continue;
+                    }
+                    if let Some(keep_newer) = newer_noncurrent_versions {
+                        if newer_noncurrent_count < keep_newer {
+                            continue;
+                        }
+                    }
+                    return if is_marker {
+                        ExpiryAction::RemoveMarker
+                    } else {
+                        ExpiryAction::RemoveVersion
+                    };
+                }
+            }
+            ExpiryAction::Keep
+        }
+        LifecycleTarget::MultipartUpload { initiated_sec } => {
+            for &act in actions {
+                if let ExpiryRuleAction::AbortMultipart(days) = act {
+                    if age_reached(initiated_sec, days) {
+                        return ExpiryAction::AbortUpload;
+                    }
+                }
+            }
+            ExpiryAction::Keep
+        }
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    #[test]
+    fn expiry_every_case_is_decided() {
+        use ExpiryAction::*;
+        use ExpiryRuleAction::*;
+        use LifecycleTarget::*;
+
+        let locks = [
+            Lock::default(),
+            Lock {
+                retention: Some((RetentionMode::Governance, 2_000)),
+                legal_hold: false,
+            },
+            Lock {
+                retention: Some((RetentionMode::Governance, 500)),
+                legal_hold: false,
+            },
+            Lock {
+                retention: Some((RetentionMode::Compliance, 2_000)),
+                legal_hold: false,
+            },
+            Lock {
+                retention: None,
+                legal_hold: true,
+            },
+        ];
+
+        let targets = [
+            UnversionedObject { created_sec: 100 },
+            CurrentVersion { created_sec: 100 },
+            CurrentDeleteMarker {
+                created_sec: 100,
+                sole_version: false,
+            },
+            CurrentDeleteMarker {
+                created_sec: 100,
+                sole_version: true,
+            },
+            NoncurrentVersion {
+                noncurrent_since_sec: 100,
+                newer_noncurrent_count: 1,
+                is_marker: false,
+            },
+            NoncurrentVersion {
+                noncurrent_since_sec: 100,
+                newer_noncurrent_count: 3,
+                is_marker: false,
+            },
+            NoncurrentVersion {
+                noncurrent_since_sec: 100,
+                newer_noncurrent_count: 1,
+                is_marker: true,
+            },
+            NoncurrentVersion {
+                noncurrent_since_sec: 100,
+                newer_noncurrent_count: 3,
+                is_marker: true,
+            },
+            MultipartUpload { initiated_sec: 100 },
+        ];
+        let rules = [
+            Disabled,
+            ExpireDays(1),
+            ExpireDate(1_000),
+            ExpireDate(2_000),
+            ExpiredObjectDeleteMarker(false),
+            ExpiredObjectDeleteMarker(true),
+            NoncurrentExpiration {
+                noncurrent_days: 1,
+                newer_noncurrent_versions: None,
+            },
+            NoncurrentExpiration {
+                noncurrent_days: 1,
+                newer_noncurrent_versions: Some(2),
+            },
+            AbortMultipart(1),
+        ];
+
+        let mut decided = 0;
+        for &now_sec in &[150u64, 1_000u64] {
+            for &lock in &locks {
+                for &target in &targets {
+                    for &rule in &rules {
+                        let facts = ExpiryFacts {
+                            target,
+                            lock,
+                            now_sec,
+                            day_seconds: 100,
+                        };
+                        let got = expiry_step(facts, &[rule]);
+                        let age_ok = now_sec >= 200;
+                        let want = match (target, rule) {
+                            (_, Disabled) => Keep,
+                            (UnversionedObject { .. }, ExpireDays(_)) if age_ok => {
+                                if lock.may_delete(now_sec, false).is_err() { Keep } else { Expire }
+                            }
+                            (UnversionedObject { .. }, ExpireDate(dt)) if now_sec >= dt => {
+                                if lock.may_delete(now_sec, false).is_err() { Keep } else { Expire }
+                            }
+                            (CurrentVersion { .. }, ExpireDays(_)) if age_ok => AddDeleteMarker,
+                            (CurrentVersion { .. }, ExpireDate(dt)) if now_sec >= dt => AddDeleteMarker,
+                            (CurrentDeleteMarker { sole_version: true, .. }, ExpiredObjectDeleteMarker(true)) => {
+                                RemoveMarker
+                            }
+                            (CurrentDeleteMarker { sole_version: true, .. }, ExpireDays(_)) if age_ok => {
+                                RemoveMarker
+                            }
+                            (CurrentDeleteMarker { sole_version: true, .. }, ExpireDate(dt)) if now_sec >= dt => {
+                                RemoveMarker
+                            }
+                            (
+                                NoncurrentVersion {
+                                    newer_noncurrent_count,
+                                    is_marker,
+                                    ..
+                                },
+                                NoncurrentExpiration {
+                                    newer_noncurrent_versions,
+                                    ..
+                                },
+                            ) if age_ok => {
+                                if !is_marker && lock.may_delete(now_sec, false).is_err() {
+                                    Keep
+                                } else if newer_noncurrent_versions
+                                    .is_some_and(|n| newer_noncurrent_count < n)
+                                {
+                                    Keep
+                                } else if is_marker {
+                                    RemoveMarker
+                                } else {
+                                    RemoveVersion
+                                }
+                            }
+                            (MultipartUpload { .. }, AbortMultipart(_)) if age_ok => AbortUpload,
+                            _ => Keep,
+                        };
+                        assert_eq!(got, want, "now={now_sec} {target:?} + {rule:?} (lock={lock:?})");
+                        decided += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(decided, 2 * locks.len() * targets.len() * rules.len());
+    }
+
+    #[test]
+    fn expiry_never_removes_locked_version() {
+        let rules = [
+            ExpiryRuleAction::ExpireDays(1),
+            ExpiryRuleAction::ExpireDate(100),
+            ExpiryRuleAction::NoncurrentExpiration {
+                noncurrent_days: 1,
+                newer_noncurrent_versions: None,
+            },
+        ];
+        for lock in [
+            Lock {
+                retention: Some((RetentionMode::Governance, 2_000)),
+                legal_hold: false,
+            },
+            Lock {
+                retention: Some((RetentionMode::Compliance, 2_000)),
+                legal_hold: false,
+            },
+            Lock {
+                retention: None,
+                legal_hold: true,
+            },
+        ] {
+            assert_eq!(
+                expiry_step(
+                    ExpiryFacts {
+                        target: LifecycleTarget::UnversionedObject { created_sec: 10 },
+                        lock,
+                        now_sec: 1_000,
+                        day_seconds: 10,
+                    },
+                    &rules,
+                ),
+                ExpiryAction::Keep
+            );
+            assert_eq!(
+                expiry_step(
+                    ExpiryFacts {
+                        target: LifecycleTarget::NoncurrentVersion {
+                            noncurrent_since_sec: 10,
+                            newer_noncurrent_count: 10,
+                            is_marker: false,
+                        },
+                        lock,
+                        now_sec: 1_000,
+                        day_seconds: 10,
+                    },
+                    &rules,
+                ),
+                ExpiryAction::Keep
+            );
+            // Deleting current object adds a delete marker rather than deleting the locked version.
+            assert_eq!(
+                expiry_step(
+                    ExpiryFacts {
+                        target: LifecycleTarget::CurrentVersion { created_sec: 10 },
+                        lock,
+                        now_sec: 1_000,
+                        day_seconds: 10,
+                    },
+                    &rules,
+                ),
+                ExpiryAction::AddDeleteMarker
+            );
+        }
+    }
+
+    #[test]
+    fn expiry_respects_newer_noncurrent_and_sole_delete_marker() {
+        let dm_rule = [
+            ExpiryRuleAction::ExpiredObjectDeleteMarker(true),
+            ExpiryRuleAction::ExpireDays(5),
+        ];
+        assert_eq!(
+            expiry_step(
+                ExpiryFacts {
+                    target: LifecycleTarget::CurrentDeleteMarker {
+                        created_sec: 100,
+                        sole_version: false,
+                    },
+                    lock: Lock::default(),
+                    now_sec: 1_000,
+                    day_seconds: 10,
+                },
+                &dm_rule,
+            ),
+            ExpiryAction::Keep,
+            "non-sole delete marker must stay"
+        );
+        assert_eq!(
+            expiry_step(
+                ExpiryFacts {
+                    target: LifecycleTarget::CurrentDeleteMarker {
+                        created_sec: 100,
+                        sole_version: true,
+                    },
+                    lock: Lock::default(),
+                    now_sec: 110,
+                    day_seconds: 10,
+                },
+                &[ExpiryRuleAction::ExpireDays(5)],
+            ),
+            ExpiryAction::Keep,
+            "sole marker waits for ExpireDays threshold"
+        );
+        assert_eq!(
+            expiry_step(
+                ExpiryFacts {
+                    target: LifecycleTarget::CurrentDeleteMarker {
+                        created_sec: 100,
+                        sole_version: true,
+                    },
+                    lock: Lock::default(),
+                    now_sec: 150,
+                    day_seconds: 10,
+                },
+                &[ExpiryRuleAction::ExpireDays(5)],
+            ),
+            ExpiryAction::RemoveMarker
+        );
+    }
+}
