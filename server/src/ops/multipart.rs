@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ffi_bridge::{AWAN_FLAG_ACTIVE, AWAN_FLAG_MULTIPART};
-use crate::iam::Iam;
 use crate::meta_index::{unpack_flags, unpack_part_count};
 use crate::multipart::{
     complete_multipart_upload_result_xml_with_checksum, copy_part_result_xml, encode_extents_manifest,
@@ -165,6 +164,8 @@ pub async fn create_multipart_upload(
     bucket: &str,
     key: &str,
     headers: &HeaderMap,
+    writer_account: &str,
+    bucket_owner: &str,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let req_cksum = match crate::checksum::requested_checksum(headers) {
         Ok(Some(c)) => Some(c),
@@ -188,10 +189,11 @@ pub async fn create_multipart_upload(
     } else {
         None
     };
-    let attrs = match super::object::request_attrs_map(headers, key, None) {
+    let mut attrs = match super::object::request_attrs_map(headers, key, None) {
         Ok(a) => a,
         Err(resp) => return Ok(resp),
     };
+    super::object::apply_owner_attr(&mut attrs, writer_account, bucket_owner);
     let tag_set = match crate::ops::tagging::parse_tagging_header_from(headers, key) {
         Ok(t) => t,
         Err(resp) => return Ok(resp),
@@ -221,13 +223,14 @@ pub async fn create_multipart_upload(
     Ok(resp.body(full_body(Bytes::from(xml))).unwrap())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_part(
     state: Arc<S3ServiceState>,
     key: &str,
     path: &str,
     query_map: &HashMap<String, String>,
     headers: &HeaderMap,
-    iam: Option<Arc<Iam>>,
+    mut chunk_verifier: Option<crate::auth::ChunkVerifier>,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let upload_id = &query_map["uploadId"];
@@ -322,7 +325,7 @@ pub async fn upload_part(
         let mut body = body;
         let cache = &state.sigv4_cache;
         let mut decoder = is_chunked.then(|| {
-            let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
+            let mut verifier = chunk_verifier.take();
             crate::aws_chunked::ChunkedDecoder::new(move |sha: &str, sig: Option<&str>| {
                 verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))
             })
@@ -609,7 +612,7 @@ pub async fn upload_part(
             .unwrap());
     }
     let decoded_bytes = if is_chunked {
-        let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
+        let mut verifier = chunk_verifier.take();
         let cache = &state.sigv4_cache;
         match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |sha, sig| {
             verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))
@@ -811,15 +814,44 @@ pub async fn complete_multipart_upload(
                     part_raws.push(raw);
                 }
                 let computed = if cksum_type == "FULL_OBJECT" {
-                    let mut full_hasher = crate::checksum::Checksum::new(alg);
-                    for ext in &extents {
-                        let bytes = match state.part_bytes(b_id, ext) {
-                            Ok(b) => b,
-                            Err(e) => return Ok(internal_error_response(key, &format!("could not read part for checksum: {:?}", e))),
-                        };
-                        full_hasher.update(&bytes);
+                    let state_c = Arc::clone(&state);
+                    let extents_c = extents.clone();
+                    let key_c = key.to_string();
+                    let res = tokio::task::spawn_blocking(move || -> Result<String, crate::volume::VolumeError> {
+                        let mut full_hasher = crate::checksum::Checksum::new(alg);
+                        let chunk_len = crate::stream_read::read_chunk();
+                        let mut buf = vec![0u8; chunk_len];
+                        for ext in &extents_c {
+                            if total_size <= crate::s3_api::VERIFY_WHILE_SENDING_MIN
+                                && ext.part_size <= crate::s3_api::VERIFY_WHILE_SENDING_MIN
+                            {
+                                let bytes = state_c.part_bytes(b_id, ext)?;
+                                full_hasher.update(&bytes);
+                                continue;
+                            }
+                            if let Some(ref path) = ext.staged_path {
+                                let file = std::fs::File::open(path)?;
+                                let mut pos = 0u64;
+                                while pos < ext.part_size {
+                                    let n = (chunk_len as u64).min(ext.part_size - pos) as usize;
+                                    state_c.work.disk_read();
+                                    crate::direct_io::read_exact_at(&file, pos, &mut buf[..n])?;
+                                    full_hasher.update(&buf[..n]);
+                                    pos += n as u64;
+                                }
+                            } else {
+                                let bytes = state_c.read_part_unmapped(b_id, &key_c, ext)?;
+                                full_hasher.update(&bytes);
+                            }
+                        }
+                        Ok(full_hasher.finish_base64())
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => return Ok(internal_error_response(key, &format!("could not read part for checksum: {:?}", e))),
+                        Err(e) => return Ok(internal_error_response(key, &format!("checksum task failed: {:?}", e))),
                     }
-                    full_hasher.finish_base64()
                 } else {
                     crate::checksum::composite(alg, &part_raws)
                 };
@@ -867,8 +899,14 @@ pub async fn complete_multipart_upload(
                 Err(code) => return Ok(engine_error_response(code, key)),
             };
             let manifest = Bytes::from(encode_extents_manifest(&state.multipart.staging_dir, total_size, &extents));
+            let old_info = state
+                .engine
+                .read()
+                .get_object(b_id, key.as_bytes())
+                .ok()
+                .map(|m| (m.vol_offset, m.size, unpack_flags(m.bucket_flags)));
             let stamp = state.version_stamp(b_id, key);
-            let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
+            let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.unversioned_write_ts(b_id, key));
             let mp_flags = AWAN_FLAG_ACTIVE | AWAN_FLAG_MULTIPART | attrs_flag | stamp.map_or(0, |s| s.0);
             // A manifest whole in the volume is replayed by recovery as the object, and it
             // points at the parts: the upload is committed and indexed as on success, then the
@@ -895,7 +933,22 @@ pub async fn complete_multipart_upload(
             }
             let mut version_id = None;
             if let Some((extra, ts)) = stamp {
-                match finish_version_put(&state, b_id, key, ts, mp_flags, manifest_offset, total_size, hi, lo, extents.len() as u16, reservation) {
+                match finish_version_put(
+                    &state,
+                    b_id,
+                    key,
+                    ts,
+                    mp_flags,
+                    manifest_offset,
+                    total_size,
+                    hi,
+                    lo,
+                    extents.len() as u16,
+                    reservation,
+                    crate::events::CommitKind::MultipartComplete,
+                    &composite_etag,
+                    late.is_none(),
+                ) {
                     Ok(v) => {
                         if extra & crate::meta_index::FLAG_NULL_ID == 0 {
                             version_id = Some(v);
@@ -904,17 +957,22 @@ pub async fn complete_multipart_upload(
                     Err(r) => return Ok(r),
                 }
             } else {
-                if let Err(code) = reservation.commit_put_at(
-                    &state.engine,
+                if let Err(code) = state.commit_unversioned_put(
                     b_id,
-                    key.as_bytes(),
+                    bucket,
+                    key,
                     manifest_offset,
                     total_size,
                     hi,
                     lo,
                     extents.len() as u16,
                     mp_flags,
-                    created_ns / 1_000_000,
+                    created_ns,
+                    old_info,
+                    crate::events::CommitKind::MultipartComplete,
+                    &composite_etag,
+                    late.is_none(),
+                    reservation,
                 ) {
                     return Ok(engine_error_response(code, key));
                 }
@@ -1145,23 +1203,39 @@ pub async fn upload_part_copy(
         }
     }
 
-    let bytes = match (version_opt, src_meta) {
-        (Some(v), _) => state.read_version_bytes(src_b_id, src_key, &v),
-        (None, Some(m)) => {
-            let flags = unpack_flags(m.bucket_flags);
-            state.read_object_bytes(src_b_id, src_key, m.vol_offset, m.size, flags)
+    let part_bytes = if src_size > crate::s3_api::VERIFY_WHILE_SENDING_MIN {
+        let (vol_offset, flags) = match (version_opt, src_meta) {
+            (Some(v), _) => (v.vol_offset, v.flags),
+            (None, Some(m)) => (m.vol_offset, unpack_flags(m.bucket_flags)),
+            _ => unreachable!(),
+        };
+        let (start, len) = match range_req {
+            Some((s, e)) => (s, e - s + 1),
+            None => (0, src_size),
+        };
+        match state.read_object_range_unmapped(src_b_id, src_key, vol_offset, src_size, flags, start, len) {
+            Ok(b) => b,
+            Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
         }
-        _ => unreachable!(),
+    } else {
+        let bytes = match (version_opt, src_meta) {
+            (Some(v), _) => state.read_version_bytes(src_b_id, src_key, &v),
+            (None, Some(m)) => {
+                let flags = unpack_flags(m.bucket_flags);
+                state.read_object_bytes(src_b_id, src_key, m.vol_offset, m.size, flags)
+            }
+            _ => unreachable!(),
+        };
+        let bytes = match bytes {
+            Ok(b) => b,
+            Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
+        };
+        match range_req {
+            Some((start, end)) => bytes.slice(start as usize..=(end as usize).min(bytes.len().saturating_sub(1))),
+            None => bytes,
+        }
     };
-    let bytes = match bytes {
-        Ok(b) => b,
-        Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
-    };
-
-    let part_slice: &[u8] = match range_req {
-        Some((start, end)) => &bytes[start as usize..=(end as usize).min(bytes.len().saturating_sub(1))],
-        None => &bytes[..],
-    };
+    let part_slice: &[u8] = &part_bytes[..];
 
     let (hi, lo, hex, raw_md5) = compute_md5(part_slice);
     let staged_path = match state.multipart.write_staged_part(upload_id, part_num, part_slice) {

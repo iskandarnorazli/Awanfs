@@ -119,7 +119,17 @@ GETs with 4 clients 1.21-1.38x (runs 43736773027 and 43722345701,
 `measurements/2026-11-16-large-objects-155-step2.md`). The win was reusing read buffers. Reads
 go through the page cache by default: direct reads were slower at every size measured, up to
 256 MiB, so `AWAN_DIRECT_READ_MIN` is off until a larger size shows it helps (owner decision
-1C keeps the setting). The scrub is still to build.
+1C keeps the setting). Step four (PR #401) adds the background scrub
+(`server/src/scrub.rs`, `--scrub-mib-per-sec`, `GET /_awanfs/scrub`, Prometheus metrics and
+alerts), moves versioned GETs, large `CopyObject`/`UploadPartCopy`, and multipart
+`FULL_OBJECT` checksums onto unmapped positioned reads, accounts streaming read buffers
+against `--memory-budget`, and adds `ChunkTransform` for #121. Measured on `bench-large.yml`
+run 45575537280 and `bench-ratio.yml` run 45575543162
+(`measurements/2026-11-25-large-objects-155-step4.md`): peak RSS 50.4 MiB (39.2 MiB heap,
+9.2 MiB file pages, vs MinIO 373.4 MiB), first GET 1.78-2.35x MinIO (0.2-0.5 ms to headers),
+repeat GET 4 clients 1.24-1.32x, multipart GET 1.27-1.62x, 1 MiB range P50 1.1-1.2 ms
+(1.54-2.40x MinIO), 4 KiB GET P99 during 4 large PUTs 0.1-0.3 ms, and 6/6 ratio rows in
+tolerance (103.7 MiB RSS).
 
 **Decision 47 (2026-11-14): the conformance target is S3 behaviour only.** It is `test_s3.py`
 and `test_headers.py` of the ceph suite, without the RGW-only tests and storage classes
@@ -203,21 +213,34 @@ object's Last-Modified; its ordering time stays 0, so which version is current d
 and no clock reading decides it (decision 63). Not chosen: giving the null version its real time
 as its ordering time and raising the next stamp above it, which reopens the clock-step risk.
 
-**Decision 67 (Claude, 2026-11-19, #213 and #26): a volume reaches its files only through a
-file seam, so a seeded simulation can crash and fail them.** `server/src/vfile.rs` defines
-`VolFile` (aligned and unaligned positioned writes and reads, length, resize, `sync_data`, sparse,
-and the read mapping where there is one) and `VolFs` (open a data file or a journal, exists,
-remove). Production uses `DiskFile` and `DiskFs`, which keep today's three handles per file: the
-write handle, a second open used only to sync (a Windows sync through the write handle stalls
-every writer), and a read-only handle for page-cache reads (#155). `server/src/sim.rs` implements both in memory: a `SimFile` keeps the
+**Decision 67 (Claude, 2026-11-19; completed 2026-11-25, #213 and #26): a volume reaches its files
+only through a file seam, so a seeded simulation can crash and fail them.** `server/src/vfile.rs`
+defines `VolFile` (aligned and unaligned positioned writes and reads, length, resize, `sync_data`,
+sparse, and the read mapping where there is one) and `VolFs` (open a data file, journal, or
+segment, exists, remove). Production uses `DiskFile` and `DiskFs`, which keep today's three
+handles per file: the write handle, a second open used only to sync (a Windows sync through the
+write handle stalls every writer), and a read-only handle for page-cache reads (#155).
+`server/src/sim.rs` implements both in memory (`SimFile` and `SimFs`): a `SimFile` keeps the
 bytes made durable by `sync_data` apart from the writes since, so a crash drops them, keeps a
-seeded prefix in write order, or tears the next one; faults (`EIO`, `ENOSPC`) are armed by name
-per operation. The volume code becomes generic over `VolFs` with `DiskFs` as the default (stage 1b),
-so production is monomorphised and pays nothing; #26's segment files and manifest use the same
-seam from their first commit. Not covered by the simulation: HTTP, real thread interleavings, and
-the mapped read path (`SimFile` has no mapping, so simulated reads use positioned reads; the mapped
+seeded prefix in write order, or tears the next 4 KiB block; faults (`EIO`, `ENOSPC`) are armed
+per file and operation, and `FaultTracker` counts the 32 named `FaultPoint` events. The volume
+code becomes generic over `VolFs` with `DiskFs` as the default (stage 1b), so the production
+`s3-server` binary is monomorphised over `DiskFs` and pays no runtime or dispatch cost on the
+write path; #26's segment files and manifest use the same seam from their first commit.
+`server/src/sim_gen.rs` generates deterministic operation schedules (`StorageOp`: buffered PUT,
+overwrite, DELETE, CopyObject, interleaved streamed PUTs with relocation/late-fail/abandonment,
+multipart extents, compaction, `Sync`, data/journal fault injection, `DropUnsynced` and
+`SeededPrefix` crashes) and shrinks failing traces. `server/src/sim_model.rs` provides the pure
+survival oracle (`SimModel`, `Survives::Yes`, `Maybe`, `No`) aligned with `ObjectVersions.tla`.
+`server/tests/sim_storage_test.rs` runs `VolumeManager<SimFs>` end-to-end across
+`AWAN_SIM_SEEDS` (default 2,000 seeds in CI under 5 minutes; 20,000 seeds nightly via
+`.github/workflows/sim-nightly.yml`, printing failing seeds and shrunk traces), verifies
+byte-for-byte determinism (`xxh3_64` trace hashes), and fails if any `FaultPoint` never fired.
+Not covered by the simulation: HTTP, real OS thread interleavings, and the mapped read path
+(`SimFile` returns `None` from `map()`, so simulated reads use positioned reads; the mapped read
 path keeps its own tests). Not chosen: a whole-server simulation, and `loom` or `shuttle` for
-interleavings (owner, 2026-11-16, option B).
+interleavings (owner, 2026-11-16, option B). See [`VERIFICATION.md`](VERIFICATION.md) for how the
+simulation fits alongside TLA+, FSM tables, parser fuzzing, conformance suites, and performance gates.
 
 **Decision 68 (Claude, 2026-11-19, #26 stage 5): the metadata segments are leveled.** Flushes
 write level-0 segments, which may overlap; each deeper level holds non-overlapping segments and is
@@ -247,6 +270,11 @@ finer locks on one store (option A: it keeps the single flush); shared-nothing t
 (option C, Seastar's model) unless per-partition locks or CPU are measured as the limit after B,
 since Linux-first runtimes conflict with the both-platforms rule. The owner's agreement:
 [#322](https://github.com/iskandarnorazli/Awanfs/issues/322#issuecomment-7033753496).
+
+**Decision 70 (2026-11-25, #159): commit events, bucket usage counters and bucket namespace hooks sit on the commit path now.**
+1. **Commit events (`server/src/events.rs`):** Every acknowledged write, copy, multipart complete, delete, delete marker, version delete, `0x200` attribute update, and bucket manifest/config change emits one `CommitEvent` from the commit lock (unversioned objects via `S3ServiceState::commit_unversioned_put`, versioned changes via `S3ServiceState::record_version_commit`, unversioned deletes and attribute updates under their commit locks) with per-bucket monotonic `seq`. Failed requests (including `AfterRecord` late failures that answer 500) emit no event. Subscribers use bounded `4096`-entry non-blocking queues (`sync_channel` + `try_send`, Decision 41 pattern) and count drops in `awanfs_commit_events_dropped_total{subscriber}`; when no subscriber exists, `has_subscribers()` costs one relaxed atomic branch.
+2. **Usage counters:** `BucketUsage { objects, bytes }` per bucket is updated atomically inside `StorageEngine` (`current_objects`, `current_bytes` across both in-memory rows and spill segments) under `engine.write()`, with `VersionStore` separately tracking noncurrent versions (`all_versions = current + noncurrent`), rebuilt exactly by volume replay at boot. Prometheus always exports aggregate `awanfs_objects_total` and `awanfs_bytes_total` gauges, exports `awanfs_bucket_objects{bucket}`, `awanfs_bucket_bytes{bucket}`, `awanfs_bucket_all_versions_objects{bucket}`, and `awanfs_bucket_all_versions_bytes{bucket}` automatically up to `1,000` buckets, and gates per-bucket emission above `1,000` behind `--per-bucket-metrics` / `AWANFS_PER_BUCKET_METRICS=1` to bound cardinality ([owner decision](https://github.com/iskandarnorazli/Awanfs/issues/159#issuecomment-7125803228)).
+3. **Namespace:** `StorageEngine::bucket_names` keys buckets by `(namespace, name)` alongside `buckets.manifest` `+<id>:<name>[:<created_ns>[:<owner>[:<namespace>]]]`; legacy manifests default `namespace` to `""`. Replaceable storage class (`TAG_STORAGE_CLASS = 0x0014`) was already registered in #203.
 
 **Decision 66 (owner, 2026-11-17): no GPU or APU code path for now.** Erasure coding (decision
 64) is built with CPU vector instructions first and measured against the network rate. A GPU path

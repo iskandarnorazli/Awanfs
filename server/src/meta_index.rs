@@ -43,7 +43,8 @@ pub const FLAG_VERSIONED: u16 = 0x0040;
 pub const FLAG_NULL_ID: u16 = 0x0080;
 /// A tombstone removing one version; its 8-byte payload is the id (0 for null).
 pub const FLAG_VERSION_DELETE: u16 = 0x0100;
-/// Reserved for attribute-update needles (decision 43, #150 stage 2).
+/// Attribute-update delta needle (decision 43 & 56, #150 stage 2, #203). Payload holds
+/// `target_version_id: u64 LE || encoded Attrs block`; `0` targets an unversioned object or null version.
 pub const FLAG_ATTR_UPDATE: u16 = 0x0200;
 /// The needle carries an attributes block (format 3, `crate::attrs`, #150): HEAD and GET read
 /// it; rows without the flag read nothing more than they did before.
@@ -178,11 +179,20 @@ impl ColumnarObjectTable {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BucketUsage {
+    pub objects: u64,
+    pub bytes: u64,
+}
+
 pub struct BucketEntry {
     pub id: u32,
+    pub namespace: String,
     pub name: String,
     /// Lexicographical map from UTF-8 key bytes -> SoA row index
     pub key_index: BTreeMap<Vec<u8>, usize>,
+    pub current_objects: u64,
+    pub current_bytes: u64,
 }
 
 pub struct StorageEngine {
@@ -190,7 +200,7 @@ pub struct StorageEngine {
     pub key_arena: Vec<u8>,
     pub table: ColumnarObjectTable,
     pub buckets: HashMap<u32, BucketEntry>,
-    pub bucket_names: HashMap<String, u32>,
+    pub bucket_names: HashMap<String, HashMap<String, u32>>,
     pub next_bucket_id: u32,
     /// Open addressing / hash table: (bucket_id, key_hash) -> Vec of SoA row indices
     pub hash_slots: HashMap<(u32, u64), Vec<usize>>,
@@ -373,51 +383,92 @@ impl StorageEngine {
     }
 
     pub fn create_bucket(&mut self, name: &str) -> Result<u32, i32> {
+        self.create_bucket_in("", name)
+    }
+
+    pub fn create_bucket_in(&mut self, namespace: &str, name: &str) -> Result<u32, i32> {
         if name.len() < 3 || name.len() > 63 {
             return Err(ERR_INVALID_ARG);
         }
-        if let Some(&id) = self.bucket_names.get(name) {
+        if let Some(&id) = self.bucket_names.get(namespace).and_then(|m| m.get(name)) {
             return Ok(id);
         }
         let id = self.next_bucket_id;
         self.next_bucket_id += 1;
-        self.bucket_names.insert(name.to_string(), id);
+        self.bucket_names
+            .entry(namespace.to_string())
+            .or_default()
+            .insert(name.to_string(), id);
         self.buckets.insert(
             id,
             BucketEntry {
                 id,
+                namespace: namespace.to_string(),
                 name: name.to_string(),
                 key_index: BTreeMap::new(),
+                current_objects: 0,
+                current_bytes: 0,
             },
         );
         Ok(id)
     }
 
     pub fn restore_bucket(&mut self, id: u32, name: &str) {
+        self.restore_bucket_in(id, "", name);
+    }
+
+    pub fn restore_bucket_in(&mut self, id: u32, namespace: &str, name: &str) {
         let _heap_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::HotTable);
         if id >= self.next_bucket_id {
             self.next_bucket_id = id + 1;
         }
-        self.bucket_names.insert(name.to_string(), id);
+        self.bucket_names
+            .entry(namespace.to_string())
+            .or_default()
+            .insert(name.to_string(), id);
         self.buckets.entry(id).or_insert_with(|| BucketEntry {
             id,
+            namespace: namespace.to_string(),
             name: name.to_string(),
             key_index: BTreeMap::new(),
+            current_objects: 0,
+            current_bytes: 0,
         });
     }
 
     pub fn lookup_bucket(&self, name: &str) -> Result<u32, i32> {
-        self.bucket_names.get(name).copied().ok_or(ERR_BUCKET_NOT_FOUND)
+        self.lookup_bucket_in("", name)
+    }
+
+    pub fn lookup_bucket_in(&self, namespace: &str, name: &str) -> Result<u32, i32> {
+        self.bucket_names
+            .get(namespace)
+            .and_then(|m| m.get(name))
+            .copied()
+            .ok_or(ERR_BUCKET_NOT_FOUND)
+    }
+
+    pub fn bucket_usage(&self, bucket_id: u32) -> Option<BucketUsage> {
+        self.buckets.get(&bucket_id).map(|b| BucketUsage {
+            objects: b.current_objects,
+            bytes: b.current_bytes,
+        })
     }
 
     pub fn delete_bucket(&mut self, bucket_id: u32) -> Result<(), i32> {
         let bucket = self.buckets.get(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
-        if !bucket.key_index.is_empty() {
+        if !bucket.key_index.is_empty() || bucket.current_objects > 0 {
             return Err(ERR_BUCKET_NOT_EMPTY);
         }
+        let ns = bucket.namespace.clone();
         let name = bucket.name.clone();
         self.buckets.remove(&bucket_id);
-        self.bucket_names.remove(&name);
+        if let Some(map) = self.bucket_names.get_mut(&ns) {
+            map.remove(&name);
+            if map.is_empty() {
+                self.bucket_names.remove(&ns);
+            }
+        }
         Ok(())
     }
 
@@ -586,7 +637,9 @@ impl StorageEngine {
         let bucket_flags = pack_bucket_flags(bucket_id, part_count, active_flags);
 
         if let Some(row_idx) = existing_row {
-            let old_key_slice = self.table.key_slices[row_idx];
+            let old_meta = self.table.get(row_idx);
+            let old_flags = unpack_flags(old_meta.bucket_flags);
+            let was_live = old_flags & FLAG_ACTIVE != 0 && old_flags & FLAG_TOMBSTONE == 0;
             let meta = ObjectMeta {
                 key_hash,
                 bucket_flags,
@@ -595,9 +648,16 @@ impl StorageEngine {
                 etag_hi,
                 etag_lo,
                 created_at: now_ms,
-                key_slice: old_key_slice,
+                key_slice: old_meta.key_slice,
             };
             self.table.update(row_idx, &meta);
+            let bucket = self.buckets.get_mut(&bucket_id).expect("bucket checked");
+            if was_live {
+                bucket.current_bytes = bucket.current_bytes.saturating_sub(old_meta.size) + size;
+            } else {
+                bucket.current_objects += 1;
+                bucket.current_bytes += size;
+            }
             return Ok(());
         }
 
@@ -618,7 +678,21 @@ impl StorageEngine {
                 };
                 // A failed spill write must not be acknowledged: the object would be on the
                 // volume but missing from the index until a restart.
-                spill.put(bucket_id, key, &meta).map_err(|_| ERR_SPILL)?;
+                let prev = spill.put_replacing(bucket_id, key, &meta).map_err(|_| ERR_SPILL)?;
+                let prev_live_size = prev.and_then(|p| {
+                    let f = unpack_flags(p.bucket_flags);
+                    (f & FLAG_ACTIVE != 0 && f & FLAG_TOMBSTONE == 0).then_some(p.size)
+                });
+                let bucket = self.buckets.get_mut(&bucket_id).expect("bucket checked");
+                match prev_live_size {
+                    Some(old_sz) => {
+                        bucket.current_bytes = bucket.current_bytes.saturating_sub(old_sz) + size;
+                    }
+                    None => {
+                        bucket.current_objects += 1;
+                        bucket.current_bytes += size;
+                    }
+                }
                 return Ok(());
             }
         }
@@ -653,7 +727,10 @@ impl StorageEngine {
         };
 
         let row_idx = self.table.push(&meta);
-        self.buckets.get_mut(&bucket_id).expect("bucket checked").key_index.insert(key.to_vec(), row_idx);
+        let bucket = self.buckets.get_mut(&bucket_id).expect("bucket checked");
+        bucket.key_index.insert(key.to_vec(), row_idx);
+        bucket.current_objects += 1;
+        bucket.current_bytes += size;
         self.hash_slots.entry((bucket_id, key_hash)).or_default().push(row_idx);
         Ok(())
     }
@@ -704,23 +781,38 @@ impl StorageEngine {
         let bucket = self.buckets.get_mut(&bucket_id).ok_or(ERR_BUCKET_NOT_FOUND)?;
         let row_idx_opt = bucket.key_index.remove(key);
 
-        let mut in_memory_deleted = false;
+        let mut in_memory_deleted_size: Option<u64> = None;
         if let Some(row_idx) = row_idx_opt {
             let mut meta = self.table.get(row_idx);
+            let old_flags = unpack_flags(meta.bucket_flags);
+            let old_sz = if old_flags & FLAG_ACTIVE != 0 && old_flags & FLAG_TOMBSTONE == 0 {
+                meta.size
+            } else {
+                0
+            };
             let part_count = unpack_part_count(meta.bucket_flags);
             meta.bucket_flags = pack_bucket_flags(bucket_id, part_count, FLAG_TOMBSTONE);
             self.table.update(row_idx, &meta);
-            in_memory_deleted = true;
+            in_memory_deleted_size = Some(old_sz);
         }
 
-        let mut spilled_deleted = false;
+        let mut spilled_deleted_size: Option<u64> = None;
         if let Some(ref spill) = self.spill_index {
-            if !in_memory_deleted {
-                spilled_deleted = spill.delete(bucket_id, key).map_err(|_| ERR_SPILL)?;
+            if in_memory_deleted_size.is_none() {
+                spilled_deleted_size = spill
+                    .delete_returning(bucket_id, key)
+                    .map_err(|_| ERR_SPILL)?
+                    .and_then(|p| {
+                        let f = unpack_flags(p.bucket_flags);
+                        (f & FLAG_ACTIVE != 0 && f & FLAG_TOMBSTONE == 0).then_some(p.size)
+                    });
             }
         }
 
-        if in_memory_deleted || spilled_deleted {
+        if let Some(old_sz) = in_memory_deleted_size.or(spilled_deleted_size) {
+            let bucket = self.buckets.get_mut(&bucket_id).expect("bucket checked");
+            bucket.current_objects = bucket.current_objects.saturating_sub(1);
+            bucket.current_bytes = bucket.current_bytes.saturating_sub(old_sz);
             Ok(())
         } else {
             Err(ERR_NOT_FOUND)

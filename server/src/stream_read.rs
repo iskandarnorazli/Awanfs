@@ -84,6 +84,18 @@ pub fn readers_in_flight() -> usize {
     READERS.load(Ordering::SeqCst)
 }
 
+/// Optional per-chunk transform applied to verified payload bytes before sending
+/// (e.g. per-chunk decryption for SSE in #121).
+pub trait ChunkTransform: Send + Sync {
+    /// Transforms `chunk` at logical offset `offset` within its segment/object.
+    fn transform(&self, offset: u64, chunk: Bytes) -> Result<Bytes, String>;
+}
+
+/// Positioned read source for fault injection tests and custom non-file readers (#155).
+pub trait PositionedRead: Send + Sync {
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()>;
+}
+
 /// What to send: `len` payload bytes from payload offset `start` of the needle at `local`.
 pub struct PayloadRange {
     pub vm: Arc<VolumeManager>,
@@ -105,6 +117,8 @@ pub enum Source {
     Volume { vm: Arc<VolumeManager>, direct: bool },
     /// A multipart object's staged part file, read through the page cache (#155 requirement 5).
     File(Arc<std::fs::File>),
+    /// Custom positioned reader (used for fault injection tests, #155).
+    Reader(Arc<dyn PositionedRead>),
 }
 
 /// `len` bytes at position `at` of a source. `verify` is the CRC these bytes must have, for a
@@ -114,6 +128,7 @@ pub struct Segment {
     pub at: u64,
     pub len: u64,
     pub verify: Option<u32>,
+    pub transform: Option<Arc<dyn ChunkTransform>>,
 }
 
 /// What one response sends: its segments, in order.
@@ -122,6 +137,8 @@ pub struct Job {
     pub what: String,
     pub failures: Arc<AtomicU64>,
     pub work: Arc<crate::work::WorkCounters>,
+    pub body_budget: Option<Arc<crate::memory::BodyBudget>>,
+    pub on_corrupt: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 pub struct PreadBody {
@@ -139,8 +156,16 @@ impl PreadBody {
             at: payload_at + range.start,
             len: range.len,
             verify: range.verify,
+            transform: None,
         };
-        Self::from_job(Job { segments: vec![segment], what: range.what, failures: range.failures, work })
+        Self::from_job(Job {
+            segments: vec![segment],
+            what: range.what,
+            failures: range.failures,
+            work,
+            body_budget: None,
+            on_corrupt: None,
+        })
     }
 
     /// A body that sends `job`'s segments one after the other, as one reader.
@@ -195,8 +220,8 @@ impl hyper::body::Body for PreadBody {
 }
 
 /// The buffer one read lands in, handed to the response as it is: no copy. Back to the pool
-/// when the response has sent it.
-struct Window(Option<AlignedBuffer>);
+/// when the response has sent it, and releases its `BodyBudget` guard immediately on drop.
+struct Window(Option<AlignedBuffer>, Option<crate::memory::AdmissionGuard>);
 
 impl AsRef<[u8]> for Window {
     fn as_ref(&self) -> &[u8] {
@@ -212,6 +237,7 @@ impl Drop for Window {
                 free.push(b);
             }
         }
+        drop(self.1.take());
     }
 }
 
@@ -229,6 +255,10 @@ fn read_one(source: &Source, work: &crate::work::WorkCounters, pos: u64, n: u64,
             work.disk_read();
             crate::direct_io::read_exact_at(file, pos, &mut window[..n as usize]).map(|()| 0).map_err(|e| format!("{:?}", e))
         }
+        Source::Reader(reader) => {
+            work.disk_read();
+            reader.read_exact_at(pos, &mut window[..n as usize]).map(|()| 0).map_err(|e| format!("{:?}", e))
+        }
     }
 }
 
@@ -241,17 +271,74 @@ fn read_into(job: Job, tx: tokio::sync::mpsc::Sender<std::io::Result<Bytes>>) {
     let mut held: Option<Bytes> = None;
     let step = |state: StreamState, event: StreamEvent| stream_step(state, event).unwrap_or(state);
     let chunk_len = read_chunk();
+    let buf_bytes = chunk_len + 2 * SECTOR_SIZE;
+    let slot_bytes = buf_bytes as u64;
+    let any_verify = job.segments.iter().any(|s| s.verify.is_some());
+    let min_slots = if any_verify { 2u64 } else { 1u64 };
+    let charge = job
+        .body_budget
+        .as_deref()
+        .map(|b| slot_bytes.min(b.limit()))
+        .unwrap_or(slot_bytes);
+    let mut reserve = match job.body_budget.as_deref() {
+        Some(budget) if !job.segments.is_empty() => {
+            let need = if budget.limit() >= min_slots * charge {
+                min_slots * charge
+            } else {
+                charge
+            };
+            match budget.acquire_blocking_until(need, || tx.is_closed()) {
+                Some(g) => Some(g),
+                None => {
+                    state = step(state, StreamEvent::ClientGone);
+                    debug_assert_eq!(state, StreamState::Aborted(StreamAbort::ClientGone));
+                    return;
+                }
+            }
+        }
+        _ => None,
+    };
+
     for seg in &job.segments {
         let mut crc = 0u32;
         let (mut pos, end) = (seg.at, seg.at + seg.len);
         while pos < end {
+            if tx.is_closed() {
+                drop(held.take());
+                drop(reserve.take());
+                state = step(state, StreamEvent::ClientGone);
+                debug_assert_eq!(state, StreamState::Aborted(StreamAbort::ClientGone));
+                return;
+            }
+            let chunk_guard = match job.body_budget.as_deref() {
+                Some(budget) => {
+                    if let Some(g) = reserve.as_mut().and_then(|r| r.split_off(charge)) {
+                        Some(g)
+                    } else {
+                        match budget.acquire_blocking_until(charge, || tx.is_closed()) {
+                            Some(g) => Some(g),
+                            None => {
+                                drop(held.take());
+                                drop(reserve.take());
+                                state = step(state, StreamEvent::ClientGone);
+                                debug_assert_eq!(state, StreamState::Aborted(StreamAbort::ClientGone));
+                                return;
+                            }
+                        }
+                    }
+                }
+                None => None,
+            };
             let n = (chunk_len as u64).min(end - pos);
             // One buffer size for every chunk, so pooled buffers fit any read.
-            let mut window = take_buffer(chunk_len + 2 * SECTOR_SIZE);
-            let read = read_one(&seg.source, &work, pos, n, &mut window[..]).map(|at| Bytes::from_owner(Window(Some(window))).slice(at..at + n as usize));
-            let chunk = match read {
+            let mut window = take_buffer(buf_bytes);
+            let read = read_one(&seg.source, &work, pos, n, &mut window[..])
+                .map(|at| Bytes::from_owner(Window(Some(window), chunk_guard)).slice(at..at + n as usize));
+            let raw_chunk = match read {
                 Ok(c) => c,
                 Err(e) => {
+                    drop(held.take());
+                    drop(reserve.take());
                     state = step(state, StreamEvent::ReadError);
                     let _ = tx.blocking_send(Err(std::io::Error::other(format!("could not read the object: {}", e))));
                     debug_assert_eq!(state, StreamState::Aborted(StreamAbort::ReadError));
@@ -259,12 +346,32 @@ fn read_into(job: Job, tx: tokio::sync::mpsc::Sender<std::io::Result<Bytes>>) {
                 }
             };
             if seg.verify.is_some() {
-                crc = crc32c::crc32c_append(crc, &chunk);
+                crc = crc32c::crc32c_append(crc, &raw_chunk);
                 work.payload_verify(n);
             }
+            let logical_offset = pos - seg.at;
+            let chunk = match &seg.transform {
+                Some(xform) => match xform.transform(logical_offset, raw_chunk) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        drop(held.take());
+                        drop(reserve.take());
+                        state = step(state, StreamEvent::ReadError);
+                        let _ = tx.blocking_send(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("chunk transform failed: {}", e),
+                        )));
+                        debug_assert_eq!(state, StreamState::Aborted(StreamAbort::ReadError));
+                        return;
+                    }
+                },
+                None => raw_chunk,
+            };
             pos += n;
             if let Some(prev) = held.replace(chunk) {
                 if tx.blocking_send(Ok(prev)).is_err() {
+                    drop(held.take());
+                    drop(reserve.take());
                     state = step(state, StreamEvent::ClientGone);
                     debug_assert_eq!(state, StreamState::Aborted(StreamAbort::ClientGone));
                     return;
@@ -274,14 +381,25 @@ fn read_into(job: Job, tx: tokio::sync::mpsc::Sender<std::io::Result<Bytes>>) {
         }
         let checksum_ok = seg.verify.is_none_or(|want| want == crc);
         if !checksum_ok {
+            drop(held.take());
+            drop(reserve.take());
             state = step(state, StreamEvent::End { checksum_ok });
             debug_assert_eq!(state, StreamState::Aborted(StreamAbort::ChecksumMismatch));
             job.failures.fetch_add(1, Ordering::SeqCst);
+            let err_msg = format!(
+                "payload checksum mismatch: expected {:#010x}, actual {:#010x}",
+                seg.verify.unwrap_or(0),
+                crc
+            );
             tracing::error!(object = %job.what, expected = seg.verify.unwrap_or(0), actual = crc, "payload checksum mismatch while sending; the transfer is cut");
+            if let Some(ref on_corrupt) = job.on_corrupt {
+                on_corrupt(&err_msg);
+            }
             let _ = tx.blocking_send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "the object's bytes failed their checksum")));
             return;
         }
     }
+    drop(reserve.take());
     if let Some(last) = held {
         if tx.blocking_send(Ok(last)).is_err() {
             state = step(state, StreamEvent::ClientGone);

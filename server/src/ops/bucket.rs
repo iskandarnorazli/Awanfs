@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::ffi_bridge::{AWAN_ERR_BUCKET_NOT_EMPTY, AWAN_ERR_INVALID_ARG};
-use crate::iam::{Iam, Principal};
 use crate::s3_api::{
     bad_request, empty_body, full_body, internal_error_response, md5_to_etag_hex, read_body_admitted,
     s3_url_encode, ResponseBody, S3ServiceState, MAX_XML_BODY,
@@ -154,7 +153,7 @@ pub async fn create_bucket(
     state: Arc<S3ServiceState>,
     bucket: &str,
     path: &str,
-    principal: &Principal,
+    caller_owner: &str,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     if let Err(refusal) = crate::names::validate_bucket_name(bucket) {
@@ -188,20 +187,15 @@ pub async fn create_bucket(
         }
     }
 
-    let caller_owner = match principal {
-        Principal::User(ak) => ak.as_str(),
-        Principal::Root => "root",
-        Principal::Anonymous => "",
-    };
-
     let mut engine = state.engine.write();
     if let Ok(existing_id) = engine.lookup_bucket(bucket) {
         let existing_owner = state
             .bucket_config_reader
             .load_bucket(existing_id)
-            .map(|c| c.owner.clone())
-            .unwrap_or_default();
-        let same_owner = existing_owner == caller_owner || (existing_owner.is_empty() && caller_owner == "root");
+            .map(|c| c.effective_owner().to_string())
+            .unwrap_or_else(|| "root".to_string());
+        let eff_caller = if caller_owner.is_empty() { "root" } else { caller_owner };
+        let same_owner = existing_owner == eff_caller;
         let step = crate::fsm::bucket_step(
             crate::fsm::BucketState {
                 status: crate::fsm::BucketStatus::Active,
@@ -240,6 +234,7 @@ pub async fn create_bucket(
             let created_ns = state.clock.now_ns();
             state.bucket_created_ns.write().insert(id, created_ns);
             let _ = state.bucket_configs.lock().apply_bucket_create(id, bucket, created_ns, caller_owner, "");
+            state.emit_bucket_config_event(id, bucket, "", crate::events::CommitKind::BucketCreate, 0);
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_LENGTH, "0")
@@ -289,9 +284,11 @@ pub async fn delete_bucket(
     }
     match engine.delete_bucket(b_id) {
         Ok(()) => {
+            state.versions.write().remove_bucket(b_id);
             state.versioning.write().remove(&b_id);
             state.bucket_created_ns.write().remove(&b_id);
             let _ = state.bucket_configs.lock().apply_bucket_delete(b_id, bucket, true);
+            state.emit_bucket_config_event(b_id, bucket, "", crate::events::CommitKind::BucketDelete, 0);
             Ok(Response::builder()
                 .status(StatusCode::NO_CONTENT)
                 .header(CONTENT_LENGTH, "0")
@@ -729,8 +726,7 @@ pub async fn delete_objects(
     b_id: u32,
     bucket: &str,
     path: &str,
-    principal: &Principal,
-    iam: Option<&Iam>,
+    may_delete: impl Fn(&str) -> bool,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, &state.work, body, MAX_XML_BODY, None, state.body_idle_timeout(), path).await? {
@@ -749,17 +745,12 @@ pub async fn delete_objects(
         Err(refusal) => return Ok(refusal_response(refusal, bucket)),
     };
 
-    let user_may = |action: &str, resource: &str| match principal {
-        Principal::User(ak) => iam.is_some_and(|i| i.allows(ak, action, resource)),
-        _ => true,
-    };
-
     let mut ok_keys: Vec<DeletedOutcome<'_>> = Vec::new();
     let mut failed: Vec<(String, &'static str, String)> = Vec::new();
     for obj in &req.objects {
         let k = &obj.key;
         let vid = obj.version_id.as_deref();
-        if !user_may("s3:DeleteObject", &format!("arn:aws:s3:::{}/{}", bucket, k)) {
+        if !may_delete(k) {
             failed.push((k.clone(), "AccessDenied", "Access Denied".to_string()));
             continue;
         }

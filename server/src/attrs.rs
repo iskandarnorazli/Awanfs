@@ -27,13 +27,63 @@ pub const TAG_WEBSITE_REDIRECT: u16 = 0x0007;
 /// User metadata (`x-amz-meta-*`) packed as `name_len (u16 LE) | name | val_len (u16 LE) | val` (#152).
 pub const TAG_USER_META: u16 = 0x0008;
 
-/// Object tags (`TagSet`, #115). Mutable: rewriting the needle updates this tag.
+/// Object tags (`TagSet`, #115). Mutable via `0x200` attribute-update needles (#203).
 pub const TAG_TAGGING: u16 = 0x0010;
+/// Object ACL (#116). Replaceable via `0x200` attribute-update needles (#203).
+pub const TAG_ACL: u16 = 0x0031;
+/// Object Lock retention (#120). Replaceable via `0x200` attribute-update needles (#203).
+pub const TAG_RETENTION: u16 = 0x0040;
+/// Object Lock legal hold (#120). Replaceable via `0x200` attribute-update needles (#203).
+pub const TAG_LEGAL_HOLD: u16 = 0x0041;
+/// Object storage class (#159). Replaceable via `0x200` attribute-update needles (#203).
+pub const TAG_STORAGE_CLASS: u16 = 0x0060;
 /// Object checksum (`<ALG>:<TYPE>:<base64>`), #117. Write-time.
 pub const TAG_CHECKSUM: u16 = 0x0020;
 
 /// Multipart part sizes (little-endian `u64` per part), #117. Write-time.
 pub const TAG_PART_SIZES: u16 = 0x0021;
+
+/// Canonical owner ID / account UTF-8 (#151, Decision 3A). Write-time, stored only when it differs
+/// from the bucket owner.
+pub const TAG_OWNER: u16 = 0x0030;
+
+/// Replaceable attribute group updated independently by a `0x200` attribute-update needle.
+/// Only the latest update per `(key, version, group)` survives compaction and merges into `ObjectView`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AttrGroup {
+    Tagging,
+    Acl,
+    Retention,
+    LegalHold,
+    StorageClass,
+    Other(u16),
+}
+
+impl AttrGroup {
+    /// Maps a serialized attribute tag to its replacement group.
+    pub fn from_tag(tag: u16) -> Self {
+        match tag {
+            TAG_TAGGING => Self::Tagging,
+            TAG_ACL => Self::Acl,
+            TAG_RETENTION => Self::Retention,
+            TAG_LEGAL_HOLD => Self::LegalHold,
+            TAG_STORAGE_CLASS => Self::StorageClass,
+            other => Self::Other(other),
+        }
+    }
+
+    /// Returns the serialized attribute tag for this group.
+    pub fn tag(self) -> u16 {
+        match self {
+            Self::Tagging => TAG_TAGGING,
+            Self::Acl => TAG_ACL,
+            Self::Retention => TAG_RETENTION,
+            Self::LegalHold => TAG_LEGAL_HOLD,
+            Self::StorageClass => TAG_STORAGE_CLASS,
+            Self::Other(t) => t,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttrsError {
@@ -156,6 +206,38 @@ impl Attrs {
 
     pub fn website_redirect(&self) -> Option<&str> {
         self.get_str(TAG_WEBSITE_REDIRECT)
+    }
+
+    pub fn owner(&self) -> Option<&str> {
+        self.get_str(TAG_OWNER)
+    }
+
+    pub fn set_owner(&mut self, owner: &str) {
+        self.set(TAG_OWNER, owner.as_bytes());
+    }
+
+    pub fn clear_owner(&mut self) {
+        self.remove(TAG_OWNER);
+    }
+
+    pub fn storage_class(&self) -> Option<&str> {
+        self.get_str(TAG_STORAGE_CLASS).filter(|s| !s.is_empty())
+    }
+
+    pub fn set_storage_class(&mut self, storage_class: &str) {
+        self.set(TAG_STORAGE_CLASS, storage_class.as_bytes());
+    }
+
+    /// Merges every `(tag, value)` pair from `update` on top of `self`, replacing matching tags.
+    pub fn merge_from(&mut self, update: &Attrs) {
+        for &(tag, ref val) in &update.entries {
+            self.set(tag, val);
+        }
+    }
+
+    /// Iterates `(tag, value)` pairs in ascending tag order.
+    pub fn iter(&self) -> impl Iterator<Item = (u16, &[u8])> + '_ {
+        self.entries.iter().map(|(tag, val)| (*tag, val.as_slice()))
     }
 
     /// Encodes `x-amz-meta-*` entries (already lower-cased names) into `TAG_USER_META`.
@@ -556,5 +638,71 @@ mod tests {
             a.set_checksum(alg, &cksum_type, &val);
             prop_assert_eq!(a.checksum(), Some((alg, cksum_type.as_str(), val.as_str())));
         }
+
+        #[test]
+        fn prop_attr_update_round_trip(
+            target_version_id in any::<u64>(),
+            sc in "[A-Z0-9_]{0,32}",
+            pairs in proptest::collection::vec(("\\PC{1,32}", "\\PC{0,32}"), 0..=10),
+        ) {
+            let mut a = Attrs::new();
+            a.set(TAG_STORAGE_CLASS, sc.as_bytes());
+            let tags = crate::tagging::TagSet::new(
+                pairs.into_iter().map(|(k, v)| crate::tagging::Tag::new(k, v)).collect(),
+            );
+            a.set(TAG_TAGGING, &encode_tags(&tags));
+            let encoded = encode_attr_update(target_version_id, &a).unwrap();
+            let (decoded_ver, decoded_attrs) = decode_attr_update(&encoded).unwrap();
+            prop_assert_eq!(decoded_ver, target_version_id);
+            prop_assert_eq!(decoded_attrs, a);
+        }
     }
+
+    #[test]
+    fn attr_update_rejects_short_or_corrupt_payload() {
+        assert!(matches!(decode_attr_update(&[0u8; 7]), Err(AttrsError::Corrupt(_))));
+        let mut a = Attrs::new();
+        a.set_storage_class("GLACIER");
+        let mut payload = encode_attr_update(42, &a).unwrap();
+        let last = payload.len() - 1;
+        payload[last] ^= 0xff;
+        assert!(matches!(decode_attr_update(&payload), Err(AttrsError::Corrupt(_))));
+    }
+
+    #[test]
+    fn merge_from_replaces_updated_tags_preserving_base() {
+        let mut base = Attrs::new();
+        base.set(TAG_CONTENT_TYPE, b"text/plain");
+        base.set(TAG_STORAGE_CLASS, b"STANDARD");
+        base.set(TAG_OWNER, b"alice");
+
+        let mut upd = Attrs::new();
+        upd.set(TAG_STORAGE_CLASS, b"STANDARD_IA");
+        base.merge_from(&upd);
+
+        assert_eq!(base.content_type(), Some("text/plain"));
+        assert_eq!(base.storage_class(), Some("STANDARD_IA"));
+        assert_eq!(base.owner(), Some("alice"));
+    }
+}
+
+/// Encodes the payload of a `FLAG_ATTR_UPDATE` (`0x200`) needle:
+/// `target_version_id: u64 LE || encoded Attrs block`.
+/// `target_version_id == 0` addresses an unversioned object or the `null` version.
+pub fn encode_attr_update(target_version_id: u64, attrs: &Attrs) -> Result<Vec<u8>, AttrsError> {
+    let block = attrs.encode()?;
+    let mut out = Vec::with_capacity(8 + block.len());
+    out.extend_from_slice(&target_version_id.to_le_bytes());
+    out.extend_from_slice(&block);
+    Ok(out)
+}
+
+/// Decodes the payload of a `FLAG_ATTR_UPDATE` (`0x200`) needle into `(target_version_id, Attrs)`.
+pub fn decode_attr_update(bytes: &[u8]) -> Result<(u64, Attrs), AttrsError> {
+    if bytes.len() < 8 {
+        return Err(AttrsError::Corrupt("attr update payload shorter than 8-byte version id"));
+    }
+    let target_version_id = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let attrs = Attrs::decode(&bytes[8..])?;
+    Ok((target_version_id, attrs))
 }

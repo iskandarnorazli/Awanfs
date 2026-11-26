@@ -46,6 +46,7 @@ Options:
       --http-port <PORT>           Plain HTTP listener port when TLS is enabled
       --compaction-rate <MB/S>     Max compaction copy rate in MB/s, 0 = unlimited (default: 50)
       --auto-compaction <on|off>   Background compaction (default: on, or AWANFS_AUTO_COMPACTION)
+      --scrub-mib-per-sec <MIB/S>  Background needle scrub rate in MiB/s, 0 = off (default: 10, or AWANFS_SCRUB_MIB_PER_SEC)
       --otlp-endpoint <URL>        OpenTelemetry OTLP/HTTP trace endpoint (or OTEL_EXPORTER_OTLP_ENDPOINT)
       --access-log <PATH|->        Write S3 access log to file or '-' for stdout (or AWANFS_ACCESS_LOG)
       --config <PATH>              TOML config for users/policies/buckets (or AWANFS_CONFIG)
@@ -54,7 +55,14 @@ Options:
       --body-idle-timeout <DUR>    Idle timeout between request body frames (default: 20s)
       --region <NAME>              Server region (default: us-east-1, or AWANFS_REGION)
       --allow-anonymous            Allow unsigned requests (or AWANFS_ALLOW_ANONYMOUS=1)
+      --profile <NAME>             default, or production: refuse to start with anonymous access, no TLS,
+                                   plain HTTP next to TLS, a published or short secret key, or
+                                   --durability fast (or AWANFS_PROFILE)
+      --verify-payloads-at-boot    Check every stored payload's CRC at startup, not only those the journal does
+                                   not record (or AWANFS_VERIFY_PAYLOADS_AT_BOOT=1); use it for the first start
+                                   after upgrading from a build before #412, and after disk trouble
       --allow-small-parts          Allow multipart non-final parts under 5 MiB (off by default; for benchmarks)
+      --per-bucket-metrics         Always emit awanfs_bucket_* Prometheus gauges even above 1000 buckets (or AWANFS_PER_BUCKET_METRICS=1)
   -h, --help                       Print this help message and exit"
     );
 }
@@ -74,12 +82,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut listen = std::env::var("AWANFS_LISTEN").unwrap_or_else(|_| "127.0.0.1".to_string());
     let mut allow_anonymous = std::env::var("AWANFS_ALLOW_ANONYMOUS").ok().as_deref() == Some("1");
+    let mut profile_name = std::env::var("AWANFS_PROFILE").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "default".to_string());
     let mut access_log: Option<String> = None;
     let mut config_path: Option<PathBuf> = None;
     let mut tls_cert: Option<PathBuf> = std::env::var("AWANFS_TLS_CERT").ok().filter(|s| !s.is_empty()).map(PathBuf::from);
     let mut tls_key: Option<PathBuf> = std::env::var("AWANFS_TLS_KEY").ok().filter(|s| !s.is_empty()).map(PathBuf::from);
     let mut http_port: Option<u16> = None;
     let mut compaction_mb: Option<u64> = std::env::var("AWANFS_COMPACTION_RATE_MB").ok().and_then(|v| v.parse().ok());
+    let mut scrub_mib_per_sec: u64 = std::env::var("AWANFS_SCRUB_MIB_PER_SEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(s3_server::scrub::DEFAULT_SCRUB_MIB_PER_SEC);
     let mut otlp: Option<String> = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().filter(|s| !s.is_empty());
     let mut auto_compaction = std::env::var("AWANFS_AUTO_COMPACTION").ok().as_deref() != Some("off");
     let mut durability = std::env::var("AWANFS_DURABILITY").unwrap_or_else(|_| "group".to_string());
@@ -88,6 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut body_idle_timeout = s3_server::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT;
     let mut region = std::env::var("AWANFS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let mut allow_small_parts = false;
+    let mut per_bucket_metrics = std::env::var("AWANFS_PER_BUCKET_METRICS").ok().as_deref() == Some("1");
+    let mut verify_payloads_at_boot = std::env::var("AWANFS_VERIFY_PAYLOADS_AT_BOOT").ok().as_deref() == Some("1");
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -116,6 +131,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             http_port = args.next().and_then(|p| p.parse().ok());
         } else if arg == "--compaction-rate" {
             compaction_mb = args.next().and_then(|v| v.parse::<u64>().ok());
+        } else if arg == "--scrub-mib-per-sec" {
+            let Some(v) = args.next() else {
+                eprintln!("--scrub-mib-per-sec requires a non-negative integer");
+                std::process::exit(2);
+            };
+            match v.parse::<u64>() {
+                Ok(n) => scrub_mib_per_sec = n,
+                Err(_) => {
+                    eprintln!("--scrub-mib-per-sec must be a non-negative integer, not {:?}", v);
+                    std::process::exit(2);
+                }
+            }
         } else if arg == "--otlp-endpoint" {
             otlp = args.next();
         } else if arg == "--auto-compaction" {
@@ -149,8 +176,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         } else if arg == "--allow-anonymous" {
             allow_anonymous = true;
+        } else if arg == "--profile" {
+            if let Some(p) = args.next() {
+                profile_name = p;
+            }
         } else if arg == "--allow-small-parts" {
             allow_small_parts = true;
+        } else if arg == "--per-bucket-metrics" {
+            per_bucket_metrics = true;
+        } else if arg == "--verify-payloads-at-boot" {
+            verify_payloads_at_boot = true;
         } else if arg == "--data-dir" || arg == "-d" {
             if let Some(d_str) = args.next() {
                 data_dir = Some(PathBuf::from(d_str));
@@ -223,6 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
     let addr: SocketAddr = format!("{}:{}", listen, port).parse()?;
+    s3_server::volume::set_verify_payloads_at_boot(verify_payloads_at_boot);
     let mut state = match data_dir {
         Some(ref dir) => match S3ServiceState::try_with_data_dir(dir) {
             Ok(s) => s,
@@ -245,6 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Compaction copies at most this many MB/s (#28, decision 24); 0 = no limit.
     state.compaction_rate.store(compaction_mb.unwrap_or(50) * 1_000_000, std::sync::atomic::Ordering::Relaxed);
     state.lifecycle_day_seconds.store(lifecycle_day_seconds, std::sync::atomic::Ordering::Relaxed);
+    state.set_per_bucket_metrics(per_bucket_metrics);
     if lifecycle_day_seconds != 86_400 {
         eprintln!("WARNING: --lifecycle-day-seconds {} is set (default 86400); for test use only", lifecycle_day_seconds);
     }
@@ -295,6 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         state.start_auto_compaction(std::time::Duration::from_secs(600), 0.20, 1 << 30);
     }
     state.start_multipart_cleanup(std::time::Duration::from_secs(600), 7 * lifecycle_day_seconds * 1000);
+    state.start_scrub(std::time::Duration::from_secs(600), scrub_mib_per_sec);
 
     // TLS (#30, owner decision 18): with --cert and --key the port serves HTTPS only; plain
     // HTTP needs --http-port.
@@ -316,12 +354,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
     let https = tls.is_some();
+    // #358: --profile production refuses an unsafe configuration, one line per reason.
+    let profile = match s3_server::profile::Profile::parse(&profile_name) {
+        Some(p) => p,
+        None => {
+            eprintln!("--profile must be default or production, not {:?}", profile_name);
+            std::process::exit(2);
+        }
+    };
+    if profile == s3_server::profile::Profile::Production {
+        let root_secret = state.auth.credentials.as_ref().map(|(_, s)| s.as_str());
+        let users = state.iam.read().as_ref().map(|r| r.current());
+        let user_secrets: Vec<(&str, &str)> = users
+            .as_ref()
+            .map(|u| u.users().map(|u| (u.name.as_str(), u.secret.as_str())).collect())
+            .unwrap_or_default();
+        let facts = s3_server::profile::StartupFacts {
+            anonymous: state.auth.allow_anonymous,
+            tls: https,
+            plain_http_port: https && http_port.is_some(),
+            listen: &listen,
+            root_secret,
+            user_secrets,
+            durability_fast: matches!(durability, Durability::Fast),
+        };
+        let problems = s3_server::profile::production_problems(&facts);
+        if !problems.is_empty() {
+            eprintln!("--profile production refuses to start:");
+            for p in &problems {
+                eprintln!("  - {}", p);
+            }
+            std::process::exit(2);
+        }
+    }
+    s3_server::profile::set_active(profile);
     let handle = start_s3_reactor_with(addr, Arc::clone(&state), tls).await?;
     let plain = match (https, http_port) {
         (true, Some(p)) => Some(start_s3_reactor_with(format!("{}:{}", listen, p).parse()?, Arc::clone(&state), None).await?),
         _ => None,
     };
-    println!("S3 Storage Server listening on {}://{}", if https { "https" } else { "http" }, addr);
+    println!("S3 Storage Server listening on {}://{} (profile {})", if https { "https" } else { "http" }, handle.local_addr, profile.as_str());
 
     wait_for_stop_signal().await;
     eprintln!("stop signal received: finishing requests in flight");

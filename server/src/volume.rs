@@ -112,7 +112,13 @@ struct AlignedScanWindow<'a, F: VolFile> {
     buf: AlignedBuffer,
     buf_start: u64,
     buf_len: usize,
+    /// When set, the next refill reads at most this many bytes (at least what is needed).
+    next_refill_cap: Option<usize>,
 }
+
+/// What the open reads after a large journaled needle whose payload it skips (#412): the next
+/// header and its key, not a whole scan batch of the next payload.
+const SKIP_REFILL_BYTES: usize = 64 * 1024;
 
 impl<'a, F: VolFile> AlignedScanWindow<'a, F> {
     fn new(file: &'a F, file_len: u64, work: Option<&'a WorkCounters>) -> Self {
@@ -123,7 +129,13 @@ impl<'a, F: VolFile> AlignedScanWindow<'a, F> {
             buf: AlignedBuffer::new(SCAN_BATCH_BYTES),
             buf_start: 0,
             buf_len: 0,
+            next_refill_cap: None,
         }
+    }
+
+    /// The next refill reads at most `cap` bytes, or what it needs if more.
+    fn cap_next_refill(&mut self, cap: usize) {
+        self.next_refill_cap = Some(cap);
     }
 
     fn count_read(&self) {
@@ -134,44 +146,46 @@ impl<'a, F: VolFile> AlignedScanWindow<'a, F> {
 
     /// Returns at least `need_bytes` sector-aligned bytes starting at `offset`, refilling up to
     /// `SCAN_BATCH_BYTES` clamped to whole sectors inside `file_len`.
-    fn read_at(&mut self, offset: u64, need_bytes: usize) -> Option<&[u8]> {
+    /// Returns `Ok(None)` only at EOF/overflow; propagates underlying read I/O errors.
+    fn read_at(&mut self, offset: u64, need_bytes: usize) -> Result<Option<&[u8]>, io::Error> {
         debug_assert_eq!(offset % SECTOR_SIZE as u64, 0);
         debug_assert!(need_bytes > 0 && need_bytes % SECTOR_SIZE == 0);
         if need_bytes > self.buf.len() {
             self.buf = AlignedBuffer::new(need_bytes);
             self.buf_len = 0;
         }
-        let end = offset.checked_add(need_bytes as u64)?;
+        let Some(end) = offset.checked_add(need_bytes as u64) else {
+            return Ok(None);
+        };
         if end > self.file_len {
-            return None;
+            return Ok(None);
         }
         if offset >= self.buf_start && end <= self.buf_start + self.buf_len as u64 {
             let start = (offset - self.buf_start) as usize;
-            return Some(&self.buf[start..start + need_bytes]);
+            return Ok(Some(&self.buf[start..start + need_bytes]));
         }
 
         let avail_bytes = ((self.file_len - offset) / SECTOR_SIZE as u64) * SECTOR_SIZE as u64;
         if avail_bytes < need_bytes as u64 {
-            return None;
+            return Ok(None);
         }
-        let to_read = (self.buf.len() as u64).min(avail_bytes) as usize;
+        let cap = self.next_refill_cap.take().map_or(self.buf.len(), |c| c.max(need_bytes));
+        let to_read = (self.buf.len().min(cap) as u64).min(avail_bytes) as usize;
         self.buf_len = 0;
         self.count_read();
-        if self.file.read_aligned_at(offset, &mut self.buf[..to_read]).is_err() {
-            if to_read > need_bytes {
+        if let Err(e) = self.file.read_aligned_at(offset, &mut self.buf[..to_read]) {
+            if to_read > need_bytes && e.kind() == io::ErrorKind::UnexpectedEof {
                 self.count_read();
-                if self.file.read_aligned_at(offset, &mut self.buf[..need_bytes]).is_err() {
-                    return None;
-                }
+                self.file.read_aligned_at(offset, &mut self.buf[..need_bytes])?;
                 self.buf_start = offset;
                 self.buf_len = need_bytes;
-                return Some(&self.buf[..need_bytes]);
+                return Ok(Some(&self.buf[..need_bytes]));
             }
-            return None;
+            return Err(e);
         }
         self.buf_start = offset;
         self.buf_len = to_read;
-        Some(&self.buf[..need_bytes])
+        Ok(Some(&self.buf[..need_bytes]))
     }
 }
 
@@ -416,11 +430,16 @@ pub struct ScannedNeedle {
     /// Local offset in the volume.
     pub offset: u64,
     pub payload_size: u64,
+    pub attrs_len: u16,
+    pub total_len: u64,
     pub etag_hi: u64,
     pub etag_lo: u64,
     pub flags: u16,
     pub payload_crc32c: u32,
     pub created_at_ns: u64,
+    /// Verified payload bytes for `FLAG_ATTR_UPDATE` needles, read directly from the
+    /// streaming scan window without faulting the volume memory map at boot (#203).
+    pub attr_update_payload: Option<Vec<u8>>,
 }
 
 /// 64-byte Header of a Needle on disk.
@@ -525,9 +544,41 @@ const IDX_RECORD: usize = 42;
 /// Streaming buffer size for `.idx` journal scans (~688 KiB, an exact multiple of `IDX_RECORD`).
 const IDX_SCAN_CHUNK: usize = IDX_RECORD * 16_384;
 
-/// Streams the `.idx` journal in `IDX_SCAN_CHUNK` pieces and returns the highest indexed needle
-/// offset (`>= SECTOR_SIZE`), or `None` when the journal has no valid offset.
-fn scan_journal_max_offset<F: VolFile>(journal: &F, journal_len: u64) -> Result<Option<u64>, VolumeError> {
+/// `--verify-payloads-at-boot` (#412): the open checks every payload's CRC, journaled or not.
+/// For the first start after upgrading from a build before #412, whose journals may record
+/// needles that were never synced, and after suspected disk trouble.
+static VERIFY_PAYLOADS_AT_BOOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Makes every later open check every payload's CRC (`--verify-payloads-at-boot`).
+pub fn set_verify_payloads_at_boot(on: bool) {
+    VERIFY_PAYLOADS_AT_BOOT.store(on, Ordering::SeqCst);
+}
+
+/// Offsets the `.idx` journal records, one bit per sector of the volume (#412): 1 MiB for a
+/// 32 GiB span. A recorded needle's bytes were synced before its record was written.
+struct Journaled(Vec<u64>);
+
+impl Journaled {
+    fn new(span: u64) -> Self {
+        Journaled(vec![0u64; (span / SECTOR_SIZE as u64).div_ceil(64) as usize])
+    }
+
+    fn set(&mut self, offset: u64) {
+        let s = offset / SECTOR_SIZE as u64;
+        if let Some(w) = self.0.get_mut((s / 64) as usize) {
+            *w |= 1 << (s % 64);
+        }
+    }
+
+    fn has(&self, offset: u64) -> bool {
+        let s = offset / SECTOR_SIZE as u64;
+        offset % SECTOR_SIZE as u64 == 0 && self.0.get((s / 64) as usize).is_some_and(|w| w & (1 << (s % 64)) != 0)
+    }
+}
+
+/// Streams the `.idx` journal in `IDX_SCAN_CHUNK` pieces, marks every recorded offset in
+/// `marks`, and returns the highest one (`>= SECTOR_SIZE`), or `None` when it has none.
+fn scan_journal<F: VolFile>(journal: &F, journal_len: u64, marks: &mut Journaled) -> Result<Option<u64>, VolumeError> {
     let valid_len = journal_len - (journal_len % IDX_RECORD as u64);
     if valid_len == 0 {
         return Ok(None);
@@ -542,11 +593,63 @@ fn scan_journal_max_offset<F: VolFile>(journal: &F, journal_len: u64) -> Result<
             let o = u64::from_le_bytes(r[12..20].try_into().unwrap());
             if o >= SECTOR_SIZE as u64 {
                 max_off = Some(max_off.map_or(o, |m| m.max(o)));
+                marks.set(o);
             }
         }
         pos += n as u64;
     }
     Ok(max_off)
+}
+
+/// Streams the `.idx` journal in `IDX_SCAN_CHUNK` pieces and returns the `total_len` of the
+/// record at `target_offset`, if present.
+fn scan_journal_total_len<F: VolFile>(journal: &F, journal_len: u64, target_offset: u64) -> Result<Option<u64>, VolumeError> {
+    let valid_len = journal_len - (journal_len % IDX_RECORD as u64);
+    if valid_len == 0 {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; IDX_SCAN_CHUNK.min(valid_len as usize)];
+    let mut pos = 0u64;
+    while pos < valid_len {
+        let n = buf.len().min((valid_len - pos) as usize);
+        journal.read_at(pos, &mut buf[..n])?;
+        for r in buf[..n].chunks_exact(IDX_RECORD) {
+            let o = u64::from_le_bytes(r[12..20].try_into().unwrap());
+            if o == target_offset {
+                return Ok(Some(u64::from_le_bytes(r[20..28].try_into().unwrap())));
+            }
+        }
+        pos += n as u64;
+    }
+    Ok(None)
+}
+
+/// Outcome of scrubbing one needle in a volume (#155).
+#[derive(Debug, Clone)]
+pub enum ScrubNeedleResult {
+    Good {
+        offset: u64,
+        key: String,
+        payload_size: u64,
+    },
+    Bad {
+        offset: u64,
+        key: String,
+        payload_size: u64,
+        error: String,
+    },
+}
+
+fn pace_scrub(spent: u64, started: std::time::Instant, rate_bytes_per_sec: u64, stop: &std::sync::atomic::AtomicBool) {
+    if rate_bytes_per_sec == 0 {
+        return;
+    }
+    let mut rem = crate::throttle::delay_for(spent, started.elapsed(), rate_bytes_per_sec);
+    while !rem.is_zero() && !stop.load(Ordering::Relaxed) {
+        let slice = rem.min(std::time::Duration::from_millis(50));
+        std::thread::sleep(slice);
+        rem = crate::throttle::delay_for(spent, started.elapsed(), rate_bytes_per_sec);
+    }
 }
 
 /// Streams the `.idx` journal in `IDX_SCAN_CHUNK` pieces and returns the smallest indexed needle
@@ -574,13 +677,16 @@ fn next_indexed_in_journal<F: VolFile>(journal: &F, journal_len: u64, after: u64
     Ok(best)
 }
 
-/// Appends the pending journal records in order. A write that fails is cut back off the file,
-/// so a partly written record never shifts the records after it, and it and the ones after
-/// it stay pending.
-fn write_pending<F: VolFile>(journal: &F, end: &mut u64, pending: &mut Vec<[u8; IDX_RECORD]>) -> Result<(), VolumeError> {
+/// Appends, in order, the pending journal records numbered below `limit`. A write that fails
+/// is cut back off the file, so a partly written record never shifts the records after it,
+/// and it and the ones after it stay pending.
+fn write_pending<F: VolFile>(journal: &F, end: &mut u64, pending: &mut Vec<(u64, [u8; IDX_RECORD])>, limit: u64) -> Result<(), VolumeError> {
     let mut written = 0;
     let mut result = Ok(());
-    for rec in pending.iter() {
+    for (n, rec) in pending.iter() {
+        if *n >= limit {
+            break;
+        }
         let start = *end;
         if let Err(e) = journal.write_at(start, rec) {
             let _ = journal.set_len(start);
@@ -594,48 +700,57 @@ fn write_pending<F: VolFile>(journal: &F, end: &mut u64, pending: &mut Vec<[u8; 
     result
 }
 
+/// Checks a needle found at open: its length, key hash and attributes, and, when `payload` is
+/// true, its payload CRC. Adds the payload bytes it hashed to `verified`.
 fn verify_needle_integrity<F: VolFile>(
     window: &mut AlignedScanWindow<'_, F>,
     offset: u64,
     hdr: &NeedleHeader,
-) -> bool {
+    payload: bool,
+    verified: &mut u64,
+) -> Result<bool, VolumeError> {
     let key_end = 64usize + hdr.key_len as usize;
     let attrs_len = hdr.attrs_len as usize;
     let p_start = key_end + attrs_len;
     let Some(p_end) = (p_start as u64).checked_add(hdr.payload_size) else {
-        return false;
+        return Ok(false);
     };
     let total_len = p_end.div_ceil(SECTOR_SIZE as u64).saturating_mul(SECTOR_SIZE as u64);
     if total_len != hdr.total_len() || p_end > total_len {
-        return false;
+        return Ok(false);
     }
     let meta_sectors = p_start.div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
+    // A journaled needle was synced before its record was written: only its metadata is read.
+    let read_to = if payload { total_len } else { (meta_sectors as u64).max(SECTOR_SIZE as u64).min(total_len) };
     let mut crc = 0u32;
     let mut pos = 0u64;
-    while pos < total_len {
-        let remain = ((total_len - pos) as usize).min(SCAN_BATCH_BYTES);
-        let Some(chunk) = window.read_at(offset + pos, remain) else {
-            return false;
+    while pos < read_to {
+        let remain = ((read_to - pos) as usize).min(SCAN_BATCH_BYTES);
+        let Some(chunk) = window.read_at(offset + pos, remain)? else {
+            return Ok(false);
         };
         if pos == 0 {
             if remain < meta_sectors {
-                return false;
+                return Ok(false);
             }
             if xxh3_64(&chunk[64..key_end]) != hdr.key_hash {
-                return false;
+                return Ok(false);
             }
             if attrs_len > 0 && crate::attrs::Attrs::decode(&chunk[key_end..p_start]).is_err() {
-                return false;
+                return Ok(false);
             }
         }
-        let lo = (p_start as u64).max(pos);
-        let hi = p_end.min(pos + remain as u64);
-        if lo < hi {
-            crc = crc32c::crc32c_append(crc, &chunk[(lo - pos) as usize..(hi - pos) as usize]);
+        if payload {
+            let lo = (p_start as u64).max(pos);
+            let hi = p_end.min(pos + remain as u64);
+            if lo < hi {
+                crc = crc32c::crc32c_append(crc, &chunk[(lo - pos) as usize..(hi - pos) as usize]);
+                *verified += hi - lo;
+            }
         }
         pos += remain as u64;
     }
-    crc == hdr.payload_crc32c
+    Ok(!payload || crc == hdr.payload_crc32c)
 }
 /// One write counted in `VolumeManager::writers_in_flight` (#167).
 struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
@@ -679,8 +794,14 @@ pub struct VolumeManager<Fs: VolFs = DiskFs> {
     /// Tests: the next journal append fails, after the needle is on disk (#184).
     fail_next_index: std::sync::atomic::AtomicBool,
     fail_next_sync: std::sync::atomic::AtomicBool,
-    /// Journal records whose append failed, written before the next one (#184).
-    pending_journal: Mutex<Vec<[u8; IDX_RECORD]>>,
+    /// Journal records not yet written, numbered in the order their needles were written. A
+    /// record is written only by a sync, after the volume sync that covers its needle (#412),
+    /// so every record on disk names a needle whose bytes are on disk.
+    pending_journal: Mutex<Vec<(u64, [u8; IDX_RECORD])>>,
+    /// Records numbered so far; changed only under `pending_journal`'s lock.
+    journal_pushed: AtomicU64,
+    /// Payload bytes whose CRC the open checked (#412).
+    payload_verified_at_open: u64,
     /// Writes that have reserved an offset here and not yet written their header (#167). A
     /// streamed PUT counts from `begin_needle` until its `NeedleWriter` is dropped.
     writers_in_flight: std::sync::atomic::AtomicUsize,
@@ -743,10 +864,12 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             journal.set_len(journal_len)?;
             journal.sync_all()?;
         }
-        let max_indexed = scan_journal_max_offset(&*journal, journal_len)?;
         let mut open_gaps: BTreeMap<u64, u64> = BTreeMap::new();
 
         let mut file_len = aligned_file.len()?;
+        let mut journaled = Journaled::new(file_len.max(MAX_VOLUME_SPAN));
+        let max_indexed = scan_journal(&*journal, journal_len, &mut journaled)?;
+        let mut payload_verified_at_open = 0u64;
         if file_len >= MAX_VOLUME_SPAN {
             sparse = true;
         }
@@ -815,15 +938,28 @@ impl<Fs: VolFs> VolumeManager<Fs> {
 
             // Scan valid needles
             let mut last_valid_end = SECTOR_SIZE as u64;
-            let mut last_unchecked: Option<(u64, u64, NeedleHeader)> = None;
             let mut window = AlignedScanWindow::new(&*aligned_file, file_len, None);
-            while let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE) {
+            while let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE)? {
                 let mut header_bytes = [0u8; 64];
                 header_bytes.copy_from_slice(&sector[0..64]);
 
                 let magic = u32::from_le_bytes(header_bytes[0..4].try_into().unwrap());
-                if magic != NEEDLE_MAGIC {
-                    // Unwritten sector: the end of the volume, or a gap the journal can step over.
+                let valid_hdr = match (magic == NEEDLE_MAGIC)
+                    .then(|| NeedleHeader::decode(&header_bytes).ok())
+                    .flatten()
+                {
+                    Some(hdr) if scan_offset.checked_add(hdr.total_len()).is_some_and(|end| end <= file_len) => {
+                        let payload = VERIFY_PAYLOADS_AT_BOOT.load(Ordering::SeqCst) || !journaled.has(scan_offset);
+                        if verify_needle_integrity(&mut window, scan_offset, &hdr, payload, &mut payload_verified_at_open)? {
+                            Some(hdr)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                let Some(hdr) = valid_hdr else {
+                    // Unwritten or torn needle: step over it when the journal knows a later needle.
                     match jump_in_journal(scan_offset, &mut open_gaps)? {
                         Some(next) => {
                             scan_offset = next;
@@ -831,49 +967,14 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                         }
                         None => break,
                     }
-                }
+                };
 
-                match NeedleHeader::decode(&header_bytes) {
-                    Ok(hdr) => {
-                        let total_len = hdr.total_len();
-                        if scan_offset.checked_add(total_len).is_none_or(|end| end > file_len) {
-                            // Incomplete needle written during crash
-                            match jump_in_journal(scan_offset, &mut open_gaps)? {
-                                Some(next) => {
-                                    scan_offset = next;
-                                    continue;
-                                }
-                                None => break,
-                            }
-                        }
-                        if max_indexed.is_none_or(|m| scan_offset >= m) {
-                            if !verify_needle_integrity(&mut window, scan_offset, &hdr) {
-                                break;
-                            }
-                            last_unchecked = None;
-                            last_valid_end = scan_offset + total_len;
-                        } else {
-                            last_unchecked = Some((last_valid_end, scan_offset, hdr));
-                            last_valid_end = scan_offset + total_len;
-                        }
-                        scan_offset += total_len;
-                    }
-                    Err(_) => {
-                        // Torn needle: step over it when the journal knows a later needle.
-                        match jump_in_journal(scan_offset, &mut open_gaps)? {
-                            Some(next) => {
-                                scan_offset = next;
-                                continue;
-                            }
-                            None => break,
-                        }
-                    }
+                let total_len = hdr.total_len();
+                if journaled.has(scan_offset) && !VERIFY_PAYLOADS_AT_BOOT.load(Ordering::SeqCst) && total_len > SCAN_BATCH_BYTES as u64 {
+                    window.cap_next_refill(SKIP_REFILL_BYTES);
                 }
-            }
-            if let Some((prev_valid_end, last_off, last_hdr)) = last_unchecked {
-                if !verify_needle_integrity(&mut window, last_off, &last_hdr) {
-                    last_valid_end = prev_valid_end;
-                }
+                last_valid_end = scan_offset + total_len;
+                scan_offset += total_len;
             }
             scan_offset = last_valid_end;
 
@@ -921,6 +1022,8 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             fail_next_index: std::sync::atomic::AtomicBool::new(false),
             fail_next_sync: std::sync::atomic::AtomicBool::new(false),
             pending_journal: Mutex::new(Vec::new()),
+            journal_pushed: AtomicU64::new(0),
+            payload_verified_at_open,
             writers_in_flight: std::sync::atomic::AtomicUsize::new(0),
             sealed: std::sync::atomic::AtomicBool::new(false),
             gaps: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
@@ -1041,10 +1144,14 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         if self.fail_next_sync.swap(false, Ordering::SeqCst) {
             return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected sync failure")));
         }
+        // A write's seq is taken after its record is queued, so every write up to `target` has
+        // its record numbered below `limit`, and its bytes were written before this sync.
         let target = self.written_seq.load(Ordering::SeqCst);
-        self.flush_pending_journal()?;
+        let limit = self.journal_pushed.load(Ordering::SeqCst);
         self.file.sync_data()?;
         self.work.disk_sync();
+        // Records only after the volume sync: a record on disk names a needle on disk (#412).
+        self.flush_pending_journal(limit)?;
         self.journal.sync_data()?;
         self.work.disk_sync();
         let mut st = self.sync_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1067,20 +1174,25 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         rec[28..36].copy_from_slice(&payload_size.to_le_bytes());
         rec[36..38].copy_from_slice(&flags.to_le_bytes());
         rec[38..42].copy_from_slice(&crc.to_le_bytes());
-        let mut end = self.journal_end.lock();
         let mut pending = self.pending_journal.lock();
-        pending.push(rec);
+        let n = self.journal_pushed.fetch_add(1, Ordering::SeqCst);
+        pending.push((n, rec));
         if self.fail_next_index.swap(false, Ordering::SeqCst) {
             return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected index failure")));
         }
-        write_pending(&*self.journal, &mut end, &mut pending)
+        Ok(())
     }
 
-    /// Writes journal records left pending by a failed append (#184).
-    fn flush_pending_journal(&self) -> Result<(), VolumeError> {
+    /// Writes the pending journal records numbered below `limit` (#184, #412).
+    fn flush_pending_journal(&self, limit: u64) -> Result<(), VolumeError> {
         let mut end = self.journal_end.lock();
         let mut pending = self.pending_journal.lock();
-        write_pending(&*self.journal, &mut end, &mut pending)
+        write_pending(&*self.journal, &mut end, &mut pending, limit)
+    }
+
+    /// Payload bytes whose CRC the open checked: the needles the journal does not record (#412).
+    pub fn payload_verified_at_open(&self) -> u64 {
+        self.payload_verified_at_open
     }
 
     /// Tests: journal records not yet written.
@@ -1216,6 +1328,9 @@ impl<Fs: VolFs> VolumeManager<Fs> {
     /// The flags of a needle with this block, or `VolumeFull` (move to a newer volume) when
     /// this volume is older than format 3, which an older AwanFS would misread.
     fn attrs_flags(&self, attrs: &[u8], flags: u16) -> Result<u16, VolumeError> {
+        if flags & crate::meta_index::FLAG_ATTR_UPDATE != 0 && self.format < 3 {
+            return Err(VolumeError::VolumeFull { offset: self.current_offset.load(Ordering::SeqCst), len: 0 });
+        }
         if attrs.is_empty() {
             return Ok(flags);
         }
@@ -1226,6 +1341,17 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             return Err(VolumeError::VolumeFull { offset: self.current_offset.load(Ordering::SeqCst), len: 0 });
         }
         Ok(flags | crate::meta_index::FLAG_ATTRS)
+    }
+
+    /// Reads and CRC-verifies the 64-byte needle header at `offset` from the mapping.
+    pub fn read_header(&self, offset: u64) -> Result<NeedleHeader, VolumeError> {
+        let mmap = self.get_or_remap(offset + SECTOR_SIZE as u64)?;
+        if offset as usize + 64 > mmap.len() {
+            return Err(VolumeError::TornNeedleAtOffset(offset));
+        }
+        let mut hdr_bytes = [0u8; 64];
+        hdr_bytes.copy_from_slice(&mmap[offset as usize..offset as usize + 64]);
+        NeedleHeader::decode(&hdr_bytes)
     }
 
     /// The attributes block of the needle at `offset` (empty for none), read from the
@@ -1473,12 +1599,37 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         Ok(payload)
     }
 
-    /// Reads a needle payload from the mapping and verifies it against the `payload_crc32c`
+    /// Reads a needle payload from the mapping and verifies `bucket_id` and `payload_crc32c`
     /// stored in its 64-byte CRC-protected header (#323, Decision 7A).
     pub fn read_needle_bytes_verified(&self, bucket_id: u32, offset: u64) -> Result<Bytes, VolumeError> {
+        self.read_needle_bytes_checked(bucket_id, None, offset)
+    }
+
+    /// Reads a needle payload from the mapping and verifies `bucket_id`, `key_hash`, and
+    /// `payload_crc32c` against its CRC-protected header (#203).
+    pub fn read_needle_bytes_for_key(
+        &self,
+        bucket_id: u32,
+        key_hash: u64,
+        offset: u64,
+    ) -> Result<Bytes, VolumeError> {
+        self.read_needle_bytes_checked(bucket_id, Some(key_hash), offset)
+    }
+
+    fn read_needle_bytes_checked(
+        &self,
+        bucket_id: u32,
+        expected_key_hash: Option<u64>,
+        offset: u64,
+    ) -> Result<Bytes, VolumeError> {
         let (header, payload) = self.needle_header_and_payload_unverified(offset)?;
         if header.bucket_id != bucket_id as u16 {
             return Err(VolumeError::CorruptIndex);
+        }
+        if let Some(kh) = expected_key_hash {
+            if header.key_hash != kh {
+                return Err(VolumeError::CorruptIndex);
+            }
         }
         let actual_crc = crc32c::crc32c(&payload);
         self.work.payload_verify(payload.len() as u64);
@@ -1697,7 +1848,19 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         let mut scan_offset = SECTOR_SIZE as u64;
         let mut window = AlignedScanWindow::new(&*self.file, file_len, Some(&self.work));
 
-        while let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE) {
+        while let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE)? {
+            if let Some(len) = self
+                .gaps
+                .lock()
+                .get(&scan_offset)
+                .copied()
+                .or_else(|| self.open_gaps.get(&scan_offset).copied())
+            {
+                if len > 0 {
+                    scan_offset += len;
+                    continue;
+                }
+            }
             let mut header_bytes = [0u8; 64];
             header_bytes.copy_from_slice(&sector[0..64]);
 
@@ -1729,11 +1892,29 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 String::from_utf8_lossy(&sector[64..key_end]).to_string()
             } else {
                 let need_bytes = key_end.div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
-                let slice = match window.read_at(scan_offset, need_bytes) {
+                let slice = match window.read_at(scan_offset, need_bytes)? {
                     Some(s) => s,
                     None => break,
                 };
                 String::from_utf8_lossy(&slice[64..key_end]).to_string()
+            };
+
+            let attr_update_payload = if hdr.flags & crate::meta_index::FLAG_ATTR_UPDATE != 0 {
+                let p_start = hdr.payload_start();
+                let p_end = p_start.saturating_add(hdr.payload_size as usize);
+                let need_bytes = p_end.div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
+                if need_bytes <= SCAN_BATCH_BYTES {
+                    window
+                        .read_at(scan_offset, need_bytes)?
+                        .and_then(|slice| {
+                            let bytes = &slice[p_start..p_end];
+                            (crc32c::crc32c(bytes) == hdr.payload_crc32c).then(|| bytes.to_vec())
+                        })
+                } else {
+                    None
+                }
+            } else {
+                None
             };
 
             if let Err(e) = visitor(ScannedNeedle {
@@ -1741,11 +1922,14 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 key: key_str,
                 offset: scan_offset,
                 payload_size: hdr.payload_size,
+                attrs_len: hdr.attrs_len,
+                total_len,
                 etag_hi: hdr.etag_hi,
                 etag_lo: hdr.etag_lo,
                 flags: hdr.flags,
                 payload_crc32c: hdr.payload_crc32c,
                 created_at_ns: hdr.created_at_ns,
+                attr_update_payload,
             }) {
                 return Ok(Err(e));
             }
@@ -1754,5 +1938,238 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         }
 
         Ok(Ok(()))
+    }
+
+    /// Reads and CRC32C-verifies a needle payload using positioned reads (no volume mmap, #155).
+    pub fn read_needle_unmapped_verified(&self, bucket_id: u32, offset: u64) -> Result<Bytes, VolumeError> {
+        let mut hdr_sector = AlignedBuffer::new(SECTOR_SIZE);
+        self.read_aligned(offset, &mut hdr_sector)?;
+        let mut hdr_bytes = [0u8; 64];
+        hdr_bytes.copy_from_slice(&hdr_sector[0..64]);
+        let header = NeedleHeader::decode(&hdr_bytes)?;
+        if header.bucket_id != bucket_id as u16 {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let p_start = header.payload_start() as u64;
+        let len = header.payload_size as usize;
+        let mut out = vec![0u8; len];
+        if len > 0 {
+            self.read_cached(offset + p_start, &mut out)?;
+        }
+        let actual = crc32c::crc32c(&out);
+        self.work.payload_verify(len as u64);
+        if actual != header.payload_crc32c {
+            return Err(VolumeError::CrcMismatch {
+                expected: header.payload_crc32c,
+                actual,
+            });
+        }
+        Ok(Bytes::from(out))
+    }
+
+    /// Reads `len` bytes starting at payload offset `start` of the needle at `offset` via
+    /// positioned reads (no volume mmap, #155).
+    pub fn read_needle_range_unmapped(
+        &self,
+        bucket_id: u32,
+        offset: u64,
+        start: u64,
+        len: u64,
+    ) -> Result<Bytes, VolumeError> {
+        let (payload_at, payload_size, _) = self.payload_extent_with_crc(bucket_id, offset)?;
+        if start.checked_add(len).is_none_or(|end| end > payload_size) {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let mut out = vec![0u8; len as usize];
+        if len > 0 {
+            self.read_cached(payload_at + start, &mut out)?;
+        }
+        Ok(Bytes::from(out))
+    }
+
+    /// Scrubs every committed needle in this volume at up to `rate_bytes_per_sec` (0 = unlimited)
+    /// using positioned 1 MiB reads outside the volume mapping (#155).
+    pub fn scrub_volume<F>(
+        &self,
+        rate_bytes_per_sec: u64,
+        stop: &std::sync::atomic::AtomicBool,
+        mut visitor: F,
+    ) -> Result<(), VolumeError>
+    where
+        F: FnMut(ScrubNeedleResult),
+    {
+        let file_len = self.file.len()?.min(self.current_offset.load(Ordering::SeqCst));
+        let mut scan_offset = SECTOR_SIZE as u64;
+        let mut window = AlignedScanWindow::new(&*self.file, file_len, Some(&self.work));
+        let started = std::time::Instant::now();
+        let mut spent: u64 = 0;
+
+        while scan_offset < file_len && !stop.load(Ordering::Relaxed) {
+            if let Some(len) = self
+                .gaps
+                .lock()
+                .get(&scan_offset)
+                .copied()
+                .or_else(|| self.open_gaps.get(&scan_offset).copied())
+            {
+                if len > 0 {
+                    scan_offset += len;
+                    continue;
+                }
+            }
+
+            let Some(sector) = window.read_at(scan_offset, SECTOR_SIZE)? else {
+                break;
+            };
+            spent = spent.saturating_add(SECTOR_SIZE as u64);
+            pace_scrub(spent, started, rate_bytes_per_sec, stop);
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let mut header_bytes = [0u8; 64];
+            header_bytes.copy_from_slice(&sector[0..64]);
+
+            let hdr = match NeedleHeader::decode(&header_bytes) {
+                Ok(h) => h,
+                Err(e) => {
+                    visitor(ScrubNeedleResult::Bad {
+                        offset: scan_offset,
+                        key: format!("<corrupt-header@{}>", scan_offset),
+                        payload_size: 0,
+                        error: format!("{:?}", e),
+                    });
+                    let j_end = *self.journal_end.lock();
+                    if let Ok(Some(tl)) = scan_journal_total_len(&*self.journal, j_end, scan_offset) {
+                        if tl > 0 && tl % SECTOR_SIZE as u64 == 0 {
+                            scan_offset += tl;
+                            continue;
+                        }
+                    }
+                    match self.jump_gap_after(scan_offset) {
+                        Some(next) => {
+                            scan_offset = next;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+            };
+
+            let total_len = hdr.total_len();
+            if scan_offset.checked_add(total_len).is_none_or(|end| end > file_len) {
+                visitor(ScrubNeedleResult::Bad {
+                    offset: scan_offset,
+                    key: format!("<truncated@{}>", scan_offset),
+                    payload_size: hdr.payload_size,
+                    error: "needle extends past volume end".to_string(),
+                });
+                match self.jump_gap_after(scan_offset) {
+                    Some(next) => {
+                        scan_offset = next;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+
+            let key_end = 64usize + hdr.key_len as usize;
+            let attrs_len = hdr.attrs_len as usize;
+            let p_start = key_end + attrs_len;
+            let Some(p_end) = (p_start as u64).checked_add(hdr.payload_size) else {
+                visitor(ScrubNeedleResult::Bad {
+                    offset: scan_offset,
+                    key: format!("<overflow@{}>", scan_offset),
+                    payload_size: hdr.payload_size,
+                    error: "needle payload size overflow".to_string(),
+                });
+                scan_offset += total_len;
+                continue;
+            };
+            let meta_sectors = p_start.div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
+
+            let mut key_str = if key_end <= SECTOR_SIZE {
+                String::from_utf8_lossy(&sector[64..key_end]).to_string()
+            } else {
+                format!("<offset@{}>", scan_offset)
+            };
+
+            let mut crc = 0u32;
+            let mut pos = 0u64;
+            let mut err: Option<String> = None;
+            while pos < total_len && !stop.load(Ordering::Relaxed) {
+                let remain = ((total_len - pos) as usize).min(SCAN_BATCH_BYTES);
+                let chunk = match window.read_at(scan_offset + pos, remain) {
+                    Ok(Some(c)) => c,
+                    Ok(None) => {
+                        err = Some(format!("short read at offset {}", scan_offset + pos));
+                        break;
+                    }
+                    Err(e) => {
+                        err = Some(format!("read error at offset {}: {}", scan_offset + pos, e));
+                        break;
+                    }
+                };
+                if pos > 0 || remain > SECTOR_SIZE {
+                    let newly_read = if pos == 0 {
+                        (remain - SECTOR_SIZE) as u64
+                    } else {
+                        remain as u64
+                    };
+                    spent = spent.saturating_add(newly_read);
+                    pace_scrub(spent, started, rate_bytes_per_sec, stop);
+                }
+                if pos == 0 {
+                    if remain < meta_sectors {
+                        err = Some("metadata exceeds read chunk".to_string());
+                        break;
+                    }
+                    key_str = String::from_utf8_lossy(&chunk[64..key_end]).to_string();
+                    if xxh3_64(&chunk[64..key_end]) != hdr.key_hash {
+                        err = Some("key hash mismatch".to_string());
+                        break;
+                    }
+                    if attrs_len > 0 && crate::attrs::Attrs::decode(&chunk[key_end..p_start]).is_err() {
+                        err = Some("attributes CRC mismatch".to_string());
+                        break;
+                    }
+                }
+                let lo = (p_start as u64).max(pos);
+                let hi = p_end.min(pos + remain as u64);
+                if lo < hi {
+                    crc = crc32c::crc32c_append(crc, &chunk[(lo - pos) as usize..(hi - pos) as usize]);
+                }
+                pos += remain as u64;
+            }
+
+            if stop.load(Ordering::Relaxed) && pos < total_len && err.is_none() {
+                break;
+            }
+
+            if err.is_none() && crc != hdr.payload_crc32c {
+                err = Some(format!(
+                    "payload CRC32C mismatch: expected {:#010x}, actual {:#010x}",
+                    hdr.payload_crc32c, crc
+                ));
+            }
+
+            match err {
+                None => visitor(ScrubNeedleResult::Good {
+                    offset: scan_offset,
+                    key: key_str,
+                    payload_size: hdr.payload_size,
+                }),
+                Some(error) => visitor(ScrubNeedleResult::Bad {
+                    offset: scan_offset,
+                    key: key_str,
+                    payload_size: hdr.payload_size,
+                    error,
+                }),
+            }
+
+            scan_offset += total_len;
+        }
+
+        Ok(())
     }
 }

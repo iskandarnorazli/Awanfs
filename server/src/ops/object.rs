@@ -15,7 +15,6 @@ use crate::ffi_bridge::{
     unpack_flags, unpack_part_count, CapacityReservation, AWAN_FLAG_ACTIVE, AWAN_FLAG_MULTIPART,
     AWAN_FLAG_ZERO_BYTE,
 };
-use crate::iam::Iam;
 use crate::precondition::{
     format_http_date, parse_delete_conditions, precondition, write_precondition, ObjectFacts,
     PreconditionOutcome, WritePreconditionOutcome, DEFAULT_LAST_MODIFIED_SECS,
@@ -34,39 +33,38 @@ use crate::xml::{copy_object_result_xml, s3_error_xml};
 fn finish_put(
     state: &S3ServiceState,
     b_id: u32,
+    bucket: &str,
     key: &str,
-    old_info: Option<(u64, u64)>,
+    old_info: Option<(u64, u64, u16)>,
     vol_offset: u64,
     payload_len: u64,
     etag_hi: u64,
     etag_lo: u64,
     flags: u16,
     etag_hex: &str,
-    created_at_ms: u64,
+    created_ns: u64,
     checksum: Option<(crate::checksum::ChecksumAlgorithm, &str)>,
     reservation: CapacityReservation,
+    acked: bool,
 ) -> Response<ResponseBody> {
-    if let Err(code) = reservation.commit_put_at(
-        &state.engine,
+    if let Err(code) = state.commit_unversioned_put(
         b_id,
-        key.as_bytes(),
+        bucket,
+        key,
         vol_offset,
         payload_len,
         etag_hi,
         etag_lo,
         0,
         flags,
-        created_at_ms,
+        created_ns,
+        old_info,
+        crate::events::CommitKind::Put,
+        etag_hex,
+        acked,
+        reservation,
     ) {
         return engine_error_response(code, key);
-    }
-    if let Some((prev_off, prev_sz)) = old_info {
-        if prev_off > 0 && prev_off != vol_offset {
-            state.payload_cache.remove(b_id, prev_off);
-            let raw_len = 64 + key.len() + prev_sz as usize;
-            let dead_bytes = raw_len.div_ceil(4096) as u64 * 4096;
-            state.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
-        }
     }
     let mut b = Response::builder()
         .status(StatusCode::OK)
@@ -211,12 +209,26 @@ pub(crate) fn request_attrs_map(
     Ok(attrs)
 }
 
+pub(super) fn apply_owner_attr(attrs: &mut crate::attrs::Attrs, writer_account: &str, bucket_owner: &str) {
+    let eff_bucket = if bucket_owner.is_empty() { crate::iam::ROOT_ACCOUNT } else { bucket_owner };
+    let eff_writer = if writer_account.is_empty() { crate::iam::ROOT_ACCOUNT } else { writer_account };
+    if eff_writer != eff_bucket {
+        attrs.set_owner(eff_writer);
+    } else {
+        attrs.clear_owner();
+    }
+}
+
 fn request_attrs_with_checksum(
     headers: &HeaderMap,
     key: &str,
     checksum: Option<(crate::checksum::ChecksumAlgorithm, &str, &str)>,
+    writer_account: &str,
+    bucket_owner: &str,
 ) -> Result<Vec<u8>, Response<ResponseBody>> {
-    request_attrs_map(headers, key, checksum)?
+    let mut attrs = request_attrs_map(headers, key, checksum)?;
+    apply_owner_attr(&mut attrs, writer_account, bucket_owner);
+    attrs
         .encode()
         .map_err(|_| bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key))
 }
@@ -230,7 +242,7 @@ fn with_tagging_count(b: hyper::http::response::Builder, count: usize) -> hyper:
 }
 
 fn request_attrs(headers: &HeaderMap, key: &str) -> Result<Vec<u8>, Response<ResponseBody>> {
-    request_attrs_with_checksum(headers, key, None)
+    request_attrs_with_checksum(headers, key, None, "", "")
 }
 
 pub(crate) fn checksum_mode_enabled(headers: &HeaderMap) -> bool {
@@ -404,6 +416,9 @@ pub(crate) fn finish_version_put(
     etag_lo: u64,
     part_count: u16,
     reservation: CapacityReservation,
+    kind: crate::events::CommitKind,
+    etag: &str,
+    acked: bool,
 ) -> Result<String, Response<ResponseBody>> {
     let v = crate::versions::Version {
         ts,
@@ -417,7 +432,15 @@ pub(crate) fn finish_version_put(
         part_count,
         flags,
     };
-    match state.record_version_with_reservation(b_id, key, crate::versions::Event::Put(v), Some(reservation)) {
+    let ev_spec = crate::s3_api::VersionCommitEventSpec {
+        time: ts,
+        version: Some(v.id_string()),
+        kind,
+        size,
+        etag: etag.to_string(),
+        acked,
+    };
+    match state.record_version_commit(b_id, key, crate::versions::Event::Put(v), Some(reservation), Some(ev_spec)) {
         Ok(()) => Ok(v.id_string()),
         Err(code) => Err(engine_error_response(code, key)),
     }
@@ -544,9 +567,11 @@ pub(super) fn precondition_failure_response(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn version_get_response(
     state: &S3ServiceState,
     b_id: u32,
+    bucket: &str,
     key: &str,
     vid: Option<&str>,
     head: bool,
@@ -615,13 +640,16 @@ fn version_get_response(
         PreconditionOutcome::Proceed => {}
         outcome => return precondition_failure_response(outcome, Some(&facts), key, head),
     }
-    let view = match state.object_view(v.vol_offset, v.flags) {
+    let view = match state.object_view_for(b_id, key, v.id(), v.vol_offset, v.flags) {
         Ok(view) => view,
         Err(e) => return internal_error_response(key, &format!("could not read the version's attributes: {:?}", e)),
     };
     if let Some(pn) = part_num {
         if v.flags & AWAN_FLAG_MULTIPART != 0 {
-            let extents = match state.multipart.get_completed_extents(b_id, key) {
+            let extents = match state
+                .manifest_extents(b_id, v.vol_offset)
+                .or_else(|| state.multipart.get_completed_extents(b_id, key))
+            {
                 Some(e) => e,
                 None => return internal_error_response(key, "the multipart object's part list is missing"),
             };
@@ -641,6 +669,18 @@ fn version_get_response(
             let ext = &extents[(pn - 1) as usize];
             let body = if head {
                 empty_body()
+            } else if v.size > VERIFY_WHILE_SENDING_MIN {
+                match state.multipart_body(
+                    b_id,
+                    format!("{}/{} part {}", bucket, key, pn),
+                    &extents,
+                    ext.cumulative_end - ext.part_size,
+                    ext.part_size,
+                    true,
+                ) {
+                    Ok(b) => b.boxed(),
+                    Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
+                }
             } else {
                 let b = match state.part_bytes(b_id, ext) {
                     Ok(b) => b,
@@ -676,6 +716,84 @@ fn version_get_response(
                 .unwrap();
         }
     }
+    let tag_count = view.attrs.tag_count();
+    let cksum_mode = checksum_mode_enabled(headers);
+    let is_compressed = v.flags & crate::meta_index::FLAG_COMPRESSED != 0;
+    let is_multipart = v.flags & AWAN_FLAG_MULTIPART != 0;
+    let builder = with_tagging_count(
+        Response::builder()
+            .with_object_metadata(&view, overrides)
+            .header(ETAG, etag_val)
+            .header(ACCEPT_RANGES, "bytes")
+            .header("x-amz-version-id", v.id_string())
+            .header(LAST_MODIFIED, crate::clock::format_http_date(v.modified)),
+        tag_count,
+    );
+    if !head && !is_compressed && v.size > VERIFY_WHILE_SENDING_MIN {
+        let what = format!("{}/{}", bucket, key);
+        if let Some(h) = range {
+            match parse_range_header(h, v.size) {
+                Ok(Some(r)) => {
+                    let len = r.end - r.start + 1;
+                    let body = if is_multipart {
+                        match state
+                            .manifest_extents(b_id, v.vol_offset)
+                            .or_else(|| state.multipart.get_completed_extents(b_id, key))
+                        {
+                            Some(extents) => state.multipart_body(b_id, what, &extents, r.start, len, false),
+                            None => return internal_error_response(key, "the multipart object's part list is missing"),
+                        }
+                    } else {
+                        state.large_payload_body(b_id, what, v.vol_offset, v.size, r.start, len, false)
+                    };
+                    let body = match body {
+                        Ok(b) => b,
+                        Err(e) => return internal_error_response(key, &format!("could not read the version: {:?}", e)),
+                    };
+                    return builder
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(CONTENT_RANGE, format!("bytes {}-{}/{}", r.start, r.end, v.size))
+                        .header(CONTENT_LENGTH, len.to_string())
+                        .body(body.boxed())
+                        .unwrap();
+                }
+                Err(()) => {
+                    return Response::builder()
+                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                        .header(CONTENT_TYPE, "application/xml")
+                        .header(CONTENT_RANGE, format!("bytes */{}", v.size))
+                        .body(full_body(Bytes::from(s3_error_xml(
+                            "InvalidRange",
+                            "The requested range cannot be satisfied.",
+                            key,
+                            "req-range-err",
+                        ))))
+                        .unwrap();
+                }
+                Ok(None) => {}
+            }
+        }
+        let body = if is_multipart {
+            match state
+                .manifest_extents(b_id, v.vol_offset)
+                .or_else(|| state.multipart.get_completed_extents(b_id, key))
+            {
+                Some(extents) => state.multipart_body(b_id, what, &extents, 0, v.size, true),
+                None => return internal_error_response(key, "the multipart object's part list is missing"),
+            }
+        } else {
+            state.large_payload_body(b_id, what, v.vol_offset, v.size, 0, v.size, true)
+        };
+        let body = match body {
+            Ok(b) => b,
+            Err(e) => return internal_error_response(key, &format!("could not read the version: {:?}", e)),
+        };
+        return with_checksum_headers(builder, &view.attrs, cksum_mode)
+            .status(StatusCode::OK)
+            .header(CONTENT_LENGTH, v.size.to_string())
+            .body(body.boxed())
+            .unwrap();
+    }
     let bytes = if head {
         Bytes::new()
     } else {
@@ -684,17 +802,6 @@ fn version_get_response(
             Err(e) => return internal_error_response(key, &format!("could not read the version: {:?}", e)),
         }
     };
-    let tag_count = view.attrs.tag_count();
-    let cksum_mode = checksum_mode_enabled(headers);
-    let builder = with_tagging_count(
-        Response::builder()
-            .with_object_metadata(&view, &overrides)
-            .header(ETAG, etag_val)
-            .header(ACCEPT_RANGES, "bytes")
-            .header("x-amz-version-id", v.id_string())
-            .header(LAST_MODIFIED, crate::clock::format_http_date(v.modified)),
-        tag_count,
-    );
     if let Some(h) = range {
         match parse_range_header(h, v.size) {
             Ok(Some(r)) => {
@@ -734,12 +841,15 @@ fn version_get_response(
         .unwrap()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn copy_object(
     state: Arc<S3ServiceState>,
     b_id: u32,
     bucket: &str,
     key: &str,
     headers: &HeaderMap,
+    writer_account: &str,
+    bucket_owner: &str,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let copy_source = headers.get("x-amz-copy-source").expect("CopyObject requires x-amz-copy-source");
     let copy_source_raw = copy_source.to_str().unwrap_or("");
@@ -794,7 +904,7 @@ pub async fn copy_object(
     };
 
     let src_view: Result<crate::attrs::Attrs, VolumeError>;
-    let read = match (&src_vid, &src_meta) {
+    let (src_vol_offset, src_flags, src_size, src_etag_hi, src_etag_lo, copied_vid, version_opt) = match (&src_vid, &src_meta) {
         (Some(vid), _) => {
             let Some(id) = crate::versions::parse_id(vid) else {
                 return Ok(no_such_version(src_key, false));
@@ -822,10 +932,11 @@ pub async fn copy_object(
             if precondition(headers, Some(&src_facts), true) != PreconditionOutcome::Proceed {
                 return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
             }
-            src_view = state.object_attrs(v.vol_offset, v.flags);
-            state
-                .read_version_bytes(src_b_id, src_key, &v)
-                .map(|b| (b, v.size, v.etag_hi, v.etag_lo, Some(v.id_string())))
+            src_view = state
+                .object_view_for(src_b_id, src_key, v.id(), v.vol_offset, v.flags)
+                .map(|view| view.attrs);
+            let vid_s = v.id_string();
+            (v.vol_offset, v.flags, v.size, v.etag_hi, v.etag_lo, Some(vid_s), Some(v))
         }
         (None, Some(m)) => {
             let flags = unpack_flags(m.bucket_flags);
@@ -837,16 +948,32 @@ pub async fn copy_object(
             if precondition(headers, Some(&src_facts), true) != PreconditionOutcome::Proceed {
                 return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
             }
-            src_view = state.object_attrs(m.vol_offset, flags);
-            state
-                .read_object_bytes(src_b_id, src_key, m.vol_offset, m.size, flags)
-                .map(|b| (b, m.size, m.etag_hi, m.etag_lo, None))
+            let target_vid = state
+                .versions
+                .read()
+                .current(src_b_id, src_key)
+                .map_or(0, |v| v.id());
+            src_view = state
+                .object_view_for(src_b_id, src_key, target_vid, m.vol_offset, flags)
+                .map(|view| view.attrs);
+            (m.vol_offset, flags, m.size, m.etag_hi, m.etag_lo, None, None)
         }
         (None, None) => unreachable!("src_meta is read whenever no version is named"),
     };
-    let (bytes, src_size, src_etag_hi, src_etag_lo, copied_vid) = match read {
-        Ok(r) => r,
-        Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
+    let stream_copy = src_size > STREAM_PUT_MIN
+        && (src_flags & crate::meta_index::FLAG_COMPRESSED == 0)
+        && !state.compresses(bucket);
+    let bytes = if stream_copy {
+        Bytes::new()
+    } else {
+        let read = match version_opt {
+            Some(v) => state.read_version_bytes(src_b_id, src_key, &v),
+            None => state.read_object_bytes(src_b_id, src_key, src_vol_offset, src_size, src_flags),
+        };
+        match read {
+            Ok(b) => b,
+            Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
+        }
     };
     let replace = match headers.get("x-amz-metadata-directive").and_then(|v| v.to_str().ok()) {
         None => false,
@@ -897,11 +1024,12 @@ pub async fn copy_object(
             None => copy_attrs_obj.remove(crate::attrs::TAG_TAGGING),
         }
     }
+    apply_owner_attr(&mut copy_attrs_obj, writer_account, bucket_owner);
     let copy_attrs = match copy_attrs_obj.encode() {
         Ok(a) => a,
         Err(_) => return Ok(bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key)),
     };
-    let flags = if bytes.is_empty() {
+    let flags = if src_size == 0 {
         AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE
     } else {
         AWAN_FLAG_ACTIVE
@@ -914,14 +1042,38 @@ pub async fn copy_object(
         Ok(r) => r,
         Err(code) => return Ok(engine_error_response(code, key)),
     };
-    let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| m.vol_offset);
+    let old_info = state
+        .engine
+        .read()
+        .get_object(b_id, key.as_bytes())
+        .ok()
+        .map(|m| (m.vol_offset, m.size, unpack_flags(m.bucket_flags)));
     let stamp = state.version_stamp(b_id, key);
     let flags = flags | stamp.map_or(0, |s| s.0);
-    let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
-    let (vol_offset, flags, mut late) = match state
-        .store_object(b_id, bucket, key, &copy_attrs, &bytes, flags, src_etag_hi, src_etag_lo, Some(created_ns))
-        .await
-    {
+    let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.unversioned_write_ts(b_id, key));
+    let store_res = if stream_copy {
+        state
+            .stream_copy_object(
+                b_id,
+                key,
+                &copy_attrs,
+                flags,
+                src_b_id,
+                src_key,
+                src_vol_offset,
+                src_size,
+                src_flags,
+                src_etag_hi,
+                src_etag_lo,
+                created_ns,
+            )
+            .await
+    } else {
+        state
+            .store_object(b_id, bucket, key, &copy_attrs, &bytes, flags, src_etag_hi, src_etag_lo, Some(created_ns))
+            .await
+    };
+    let (vol_offset, flags, mut late) = match store_res {
         Ok((o, f)) => (o, f, None),
         // Indexed as on success, then answered 500 (#184, owner decision 4B).
         Err(e) => match S3ServiceState::late_record(&e) {
@@ -929,15 +1081,30 @@ pub async fn copy_object(
             None => return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e))),
         },
     };
+    let etag_hex = md5_to_etag_hex(src_etag_hi, src_etag_lo);
     if let Some((_, ts)) = stamp {
-        let vid = match finish_version_put(&state, b_id, key, ts, flags, vol_offset, src_size, src_etag_hi, src_etag_lo, 0, reservation) {
+        let vid = match finish_version_put(
+            &state,
+            b_id,
+            key,
+            ts,
+            flags,
+            vol_offset,
+            src_size,
+            src_etag_hi,
+            src_etag_lo,
+            0,
+            reservation,
+            crate::events::CommitKind::Copy,
+            &etag_hex,
+            late.is_none(),
+        ) {
             Ok(v) => v,
             Err(r) => return Ok(r),
         };
         if let Some(e) = late.take() {
             return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e)));
         }
-        let etag_hex = md5_to_etag_hex(src_etag_hi, src_etag_lo);
         let resp = Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/xml")
@@ -951,30 +1118,28 @@ pub async fn copy_object(
             .body(full_body(Bytes::from(copy_object_result_xml(&etag_hex, &crate::versions::iso8601(ts)))))
             .unwrap());
     }
-    if let Err(code) = reservation.commit_put_at(
-        &state.engine,
+    if let Err(code) = state.commit_unversioned_put(
         b_id,
-        key.as_bytes(),
+        bucket,
+        key,
         vol_offset,
         src_size,
         src_etag_hi,
         src_etag_lo,
         0,
         flags,
-        created_ns / 1_000_000,
+        created_ns,
+        old_info,
+        crate::events::CommitKind::Copy,
+        &etag_hex,
+        late.is_none(),
+        reservation,
     ) {
         return Ok(engine_error_response(code, key));
-    }
-    if let Some(prev_off) = old_info {
-        if prev_off > 0 && prev_off != vol_offset {
-            state.payload_cache.remove(b_id, prev_off);
-        }
     }
     if let Some(e) = late {
         return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e)));
     }
-
-    let etag_hex = md5_to_etag_hex(src_etag_hi, src_etag_lo);
     let xml = copy_object_result_xml(&etag_hex, &crate::versions::iso8601(created_ns));
     let resp = Response::builder()
         .status(StatusCode::OK)
@@ -1109,6 +1274,7 @@ impl StreamPipeline {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn put_object(
     state: Arc<S3ServiceState>,
     b_id: u32,
@@ -1116,7 +1282,9 @@ pub async fn put_object(
     key: &str,
     path: &str,
     headers: &HeaderMap,
-    iam: Option<Arc<Iam>>,
+    writer_account: &str,
+    bucket_owner: &str,
+    mut chunk_verifier: Option<crate::auth::ChunkVerifier>,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let expected_len = headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok());
@@ -1169,6 +1337,8 @@ pub async fn put_object(
         &signed_headers,
         key,
         req_checksum.as_ref().and_then(|(alg, exp)| exp.as_deref().map(|v| (*alg, "FULL_OBJECT", v))),
+        writer_account,
+        bucket_owner,
     ) {
         Ok(a) => a,
         Err(resp) => return Ok(resp),
@@ -1206,9 +1376,9 @@ pub async fn put_object(
         let mut digest = Some(crate::digest::StreamingDigest::new_md5_only());
         let mut cksum_hasher = req_checksum.as_ref().map(|(alg, _)| crate::checksum::Checksum::new(*alg));
         let mut body = body;
-        let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
         let cache = &state.sigv4_cache;
         let mut decoder = is_chunked.then(|| {
+            let mut verifier = chunk_verifier.take();
             crate::aws_chunked::ChunkedDecoder::new(move |sha: &str, sig: Option<&str>| {
                 verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))
             })
@@ -1478,7 +1648,12 @@ pub async fn put_object(
         if let Err(code) = reservation.ensure_room(&state.engine, b_id, key.as_bytes()) {
             return Ok(engine_error_response(code, key));
         }
-        let old_info = state.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size));
+        let old_info = state
+            .engine
+            .read()
+            .get_object(b_id, key.as_bytes())
+            .ok()
+            .map(|m| (m.vol_offset, m.size, unpack_flags(m.bucket_flags)));
         let stamp = state.version_stamp(b_id, key);
         let attrs_flag = if put_attrs.is_empty() { 0 } else { crate::meta_index::FLAG_ATTRS };
         let flags = base_flags | attrs_flag | stamp.map_or(0, |s| s.0);
@@ -1489,7 +1664,7 @@ pub async fn put_object(
             ));
         }
         writer.set_flags(flags);
-        let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
+        let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.unversioned_write_ts(b_id, key));
         writer.set_created_at(created_ns);
         let first_vm = Arc::clone(writer.volume());
         let first_offset = global_offset(first_vm.id(), writer.offset());
@@ -1498,10 +1673,7 @@ pub async fn put_object(
         let (first_loc, mut late) = match writer.finish(etag_hi, etag_lo) {
             Ok(l) => (l, None),
             Err(VolumeError::AfterRecord { loc, flags, cause }) => (loc, Some(VolumeError::AfterRecord { loc, flags, cause })),
-            Err(e) => {
-                state.streams.note_append(b_id, key, u64::MAX);
-                return Ok(internal_error_response(key, &format!("could not store the object: {:?}", e)));
-            }
+            Err(e) => return Ok(internal_error_response(key, &format!("could not store the object: {:?}", e))),
         };
         state.streams.note_append(b_id, key, first_offset);
         let (vm, loc, vol_offset) = if stamp.is_none() && ticket.appended_after(first_offset) {
@@ -1511,7 +1683,10 @@ pub async fn put_object(
             }
             let moved = {
                 let (st, k, fvm) = (Arc::clone(&state), key.to_string(), Arc::clone(&first_vm));
-                tokio::task::spawn_blocking(move || st.relocate_needle(b_id, &k, &fvm, &first_loc, flags, etag_hi, etag_lo)).await
+                tokio::task::spawn_blocking(move || {
+                    st.relocate_needle(b_id, &k, &fvm, &first_loc, flags, etag_hi, etag_lo, Some(created_ns))
+                })
+                .await
             };
             match moved {
                 Ok(Ok(moved)) => moved,
@@ -1536,7 +1711,22 @@ pub async fn put_object(
         state.hook("put_stored", key);
         let stream_cksum_ref = stream_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
         let answer = if let Some((extra, ts)) = stamp {
-            match finish_version_put(&state, b_id, key, ts, flags, vol_offset, len, etag_hi, etag_lo, 0, reservation) {
+            match finish_version_put(
+                &state,
+                b_id,
+                key,
+                ts,
+                flags,
+                vol_offset,
+                len,
+                etag_hi,
+                etag_lo,
+                0,
+                reservation,
+                crate::events::CommitKind::Put,
+                &etag_hex,
+                late.is_none(),
+            ) {
                 Ok(vid) => {
                     let resp_vid = (extra & crate::meta_index::FLAG_NULL_ID == 0).then_some(vid.as_str());
                     put_ok_response(&etag_hex, resp_vid, stream_cksum_ref)
@@ -1544,7 +1734,7 @@ pub async fn put_object(
                 Err(r) => r,
             }
         } else {
-            finish_put(&state, b_id, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns / 1_000_000, stream_cksum_ref, reservation)
+            finish_put(&state, b_id, bucket, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns, stream_cksum_ref, reservation, late.is_none())
         };
         return Ok(after_late_failure(key, late, answer));
     }
@@ -1583,7 +1773,7 @@ pub async fn put_object(
     }
 
     let decoded_bytes = if is_chunked {
-        let mut verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &signed_headers);
+        let mut verifier = chunk_verifier.take();
         let cache = &state.sigv4_cache;
         match crate::aws_chunked::decode_aws_chunked_checked(&raw_bytes, |sha, sig| {
             verifier.as_mut().map_or(true, |v| v.check_digest(cache, sha, sig))
@@ -1645,7 +1835,10 @@ pub async fn put_object(
     };
     let old_info = {
         let engine = state.engine.read();
-        engine.get_object(b_id, key.as_bytes()).ok().map(|m| (m.vol_offset, m.size))
+        engine
+            .get_object(b_id, key.as_bytes())
+            .ok()
+            .map(|m| (m.vol_offset, m.size, unpack_flags(m.bucket_flags)))
     };
 
     let buf_cksum_out = if let Some((alg, expected_opt)) = req_checksum {
@@ -1665,13 +1858,15 @@ pub async fn put_object(
         &signed_headers,
         key,
         buf_cksum_out.as_ref().map(|(a, v)| (*a, "FULL_OBJECT", v.as_str())),
+        writer_account,
+        bucket_owner,
     ) {
         Ok(a) => a,
         Err(resp) => return Ok(resp),
     };
     let stamp = state.version_stamp(b_id, key);
     let flags = flags | stamp.map_or(0, |s| s.0);
-    let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.clock.now_ns());
+    let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.unversioned_write_ts(b_id, key));
     let (vol_offset, flags, late) = match state
         .store_object(b_id, bucket, key, &buf_attrs, &decoded_bytes, flags, etag_hi, etag_lo, Some(created_ns))
         .await
@@ -1685,7 +1880,22 @@ pub async fn put_object(
     state.hook("put_stored", key);
     let buf_cksum_ref = buf_cksum_out.as_ref().map(|(a, v)| (*a, v.as_str()));
     let answer = if let Some((extra, ts)) = stamp {
-        match finish_version_put(&state, b_id, key, ts, flags, vol_offset, payload_len, etag_hi, etag_lo, 0, reservation) {
+        match finish_version_put(
+            &state,
+            b_id,
+            key,
+            ts,
+            flags,
+            vol_offset,
+            payload_len,
+            etag_hi,
+            etag_lo,
+            0,
+            reservation,
+            crate::events::CommitKind::Put,
+            &final_etag_hex,
+            late.is_none(),
+        ) {
             Ok(vid) => {
                 let resp_vid = (extra & crate::meta_index::FLAG_NULL_ID == 0).then_some(vid.as_str());
                 put_ok_response(&final_etag_hex, resp_vid, buf_cksum_ref)
@@ -1693,7 +1903,7 @@ pub async fn put_object(
             Err(r) => r,
         }
     } else {
-        finish_put(&state, b_id, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns / 1_000_000, buf_cksum_ref, reservation)
+        finish_put(&state, b_id, bucket, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns, buf_cksum_ref, reservation, late.is_none())
     };
     Ok(after_late_failure(key, late, answer))
 }
@@ -1745,7 +1955,7 @@ pub async fn get_or_head_object(
     let vid = query_map.get("versionId").map(|s| s.as_str());
     if vid.is_some() || state.versions.read().has(b_id, key) {
         let range = headers.get("Range").and_then(|v| v.to_str().ok());
-        return Ok(version_get_response(&state, b_id, key, vid, is_head, range, part_num, headers, &overrides));
+        return Ok(version_get_response(&state, b_id, bucket, key, vid, is_head, range, part_num, headers, &overrides));
     }
     let (meta, is_multipart) = {
         let engine = state.engine.read();
@@ -1772,7 +1982,7 @@ pub async fn get_or_head_object(
         let flags = unpack_flags(m.bucket_flags);
         (m, flags & AWAN_FLAG_MULTIPART != 0)
     };
-    let view = match state.object_view(meta.vol_offset, unpack_flags(meta.bucket_flags)) {
+    let view = match state.object_view_for(b_id, key, 0, meta.vol_offset, unpack_flags(meta.bucket_flags)) {
         Ok(v) => v,
         Err(e) => return Ok(internal_error_response(key, &format!("could not read the object's attributes: {:?}", e))),
     };
@@ -1958,7 +2168,7 @@ pub async fn get_or_head_object(
                     let loaded = if meta.size > VERIFY_WHILE_SENDING_MIN {
                         state.load_payload_unverified(b_id, meta.vol_offset, meta.size as usize).map(|(b, _)| b)
                     } else {
-                        state.load_payload(b_id, meta.vol_offset, meta.size as usize)
+                        state.load_payload_for(b_id, &format!("{}/{}", bucket, key), meta.vol_offset, meta.size as usize)
                     };
                     let full = match loaded {
                         Ok(b) => b,
@@ -2079,7 +2289,9 @@ pub async fn get_or_head_object(
                 if is_compressed {
                     state_for_read.load_compressed(b_id, meta.vol_offset, meta.size).unwrap_or_default()
                 } else {
-                    state_for_read.load_payload(b_id, meta.vol_offset, meta.size as usize).unwrap_or_default()
+                    state_for_read
+                        .load_payload_for(b_id, &format!("{}/{}", bucket, key), meta.vol_offset, meta.size as usize)
+                        .unwrap_or_default()
                 }
             })
             .await
@@ -2203,7 +2415,7 @@ pub async fn get_object_attributes(
     };
 
     let vid = query_map.get("versionId").map(|s| s.as_str());
-    let (vol_offset, flags, size, etag_hi, etag_lo, part_count, last_mod_http, version_id_str) = if vid.is_some() || state.versions.read().has(b_id, key) {
+    let (target_vid, vol_offset, flags, size, etag_hi, etag_lo, part_count, last_mod_http, version_id_str) = if vid.is_some() || state.versions.read().has(b_id, key) {
         let id = match vid {
             Some(s) => match crate::versions::parse_id(s) {
                 Some(i) => Some(i),
@@ -2237,7 +2449,7 @@ pub async fn get_object_attributes(
                 .body(full_body(Bytes::from(xml)))
                 .unwrap());
         }
-        (v.vol_offset, v.flags, v.size, v.etag_hi, v.etag_lo, v.part_count, crate::clock::format_http_date(v.modified), Some(v.id_string()))
+        (v.id(), v.vol_offset, v.flags, v.size, v.etag_hi, v.etag_lo, v.part_count, crate::clock::format_http_date(v.modified), Some(v.id_string()))
     } else {
         let meta = {
             let engine = state.engine.read();
@@ -2253,11 +2465,11 @@ pub async fn get_object_attributes(
                 }
             }
         };
-        (meta.vol_offset, unpack_flags(meta.bucket_flags), meta.size, meta.etag_hi, meta.etag_lo, unpack_part_count(meta.bucket_flags), crate::clock::format_http_date_ms(meta.created_at), None)
+        (0u64, meta.vol_offset, unpack_flags(meta.bucket_flags), meta.size, meta.etag_hi, meta.etag_lo, unpack_part_count(meta.bucket_flags), crate::clock::format_http_date_ms(meta.created_at), None)
     };
 
     let is_multipart = flags & AWAN_FLAG_MULTIPART != 0;
-    let view = match state.object_view(vol_offset, flags) {
+    let view = match state.object_view_for(b_id, key, target_vid, vol_offset, flags) {
         Ok(v) => v,
         Err(e) => return Ok(internal_error_response(key, &format!("could not read the object's attributes: {:?}", e))),
     };
@@ -2326,7 +2538,8 @@ pub async fn get_object_attributes(
         xml.push_str("  </ObjectParts>\n");
     }
     if want_storage_class {
-        xml.push_str("  <StorageClass>STANDARD</StorageClass>\n");
+        let sc = view.attrs.storage_class().unwrap_or("STANDARD");
+        xml.push_str(&format!("  <StorageClass>{}</StorageClass>\n", crate::xml::xml_escape(sc)));
     }
     if want_size {
         xml.push_str(&format!("  <ObjectSize>{}</ObjectSize>\n", size));

@@ -31,6 +31,8 @@ fn needles_after_a_failed_write_survive_reopen() {
         vm.fail_next_write();
         assert!(vm.write_needle(1, "n2", &pattern(5000, 2), 1, 0, 0).is_err());
         vm.write_needle(1, "n3", &pattern(5000, 3), 1, 0, 0).unwrap();
+        // #412: journal records are written by a sync; the gap is stepped over through them.
+        vm.sync_now().unwrap();
     }
     let vm = VolumeManager::open(&dir, 1).unwrap();
     let found = recovered(&vm);
@@ -50,10 +52,12 @@ fn index_journal_is_appended_across_reopen() {
     {
         let vm = VolumeManager::open(&dir, 1).unwrap();
         vm.write_needle(1, "a", b"first", 1, 0, 0).unwrap();
+        vm.sync_now().unwrap(); // #412: records are written by a sync
     }
     {
         let vm = VolumeManager::open(&dir, 1).unwrap();
         vm.write_needle(1, "b", b"second", 1, 0, 0).unwrap();
+        vm.sync_now().unwrap(); // #412: records are written by a sync
     }
     let len = std::fs::metadata(dir.join("volume_0001.idx")).unwrap().len();
     assert_eq!(len, 2 * 42, "a reopen must append to the .idx journal, not overwrite it from the start");

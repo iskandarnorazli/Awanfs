@@ -191,7 +191,13 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
-async fn fill(dir: &std::path::Path, objects: u64, size: usize) -> Result<(), Box<dyn std::error::Error>> {
+async fn fill(
+    dir: &std::path::Path,
+    objects: u64,
+    size: usize,
+    with_attrs: bool,
+    attr_updates_pct: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let t = Instant::now();
     let state = Arc::new(S3ServiceState::try_with_data_dir(dir)?);
     let b_id = state.engine.write().create_bucket(BUCKET).map_err(|c| format!("create_bucket: {}", c))?;
@@ -201,20 +207,50 @@ async fn fill(dir: &std::path::Path, objects: u64, size: usize) -> Result<(), Bo
     for vm in state.volumes.read().values() {
         vm.set_durability(Durability::Fast);
     }
+    let mut base_attrs_bytes = Vec::new();
+    let mut base_flags = AWAN_FLAG_ACTIVE;
+    if with_attrs {
+        let mut a = s3_server::attrs::Attrs::new();
+        a.set(s3_server::attrs::TAG_CONTENT_TYPE, b"application/octet-stream");
+        a.set_storage_class("STANDARD");
+        base_attrs_bytes = a.encode().map_err(|e| format!("attrs encode: {:?}", e))?;
+        base_flags |= s3_server::FLAG_ATTRS;
+    }
+    let mut upd_attrs = s3_server::attrs::Attrs::new();
+    upd_attrs.set_storage_class("STANDARD_IA");
+    let upd_payload = s3_server::attrs::encode_attr_update(0, &upd_attrs)
+        .map_err(|e| format!("encode_attr_update: {:?}", e))?;
+
     for i in 0..objects {
         let data = payload(i, size);
         let (hi, lo, _, _) = compute_md5(&data);
         state
-            .store_object(b_id, BUCKET, &key(i), &[], &data, AWAN_FLAG_ACTIVE, hi, lo, Some(created_ns + i))
+            .store_object(b_id, BUCKET, &key(i), &base_attrs_bytes, &data, base_flags, hi, lo, Some(created_ns + i * 2))
             .await
             .map_err(|e| format!("store_object {}: {:?}", key(i), e))?;
+        if attr_updates_pct > 0 && (i as usize % 100) < attr_updates_pct {
+            state
+                .write_to_active_with(
+                    b_id,
+                    &key(i),
+                    &[],
+                    &upd_payload,
+                    AWAN_FLAG_ACTIVE | s3_server::FLAG_ATTR_UPDATE,
+                    0,
+                    0,
+                    Some(created_ns + i * 2 + 1),
+                )
+                .map_err(|e| format!("attr_update {}: {:?}", key(i), e))?;
+        }
     }
     state.sync_all_volumes().map_err(|e| format!("sync_all_volumes: {}", e))?;
     let secs = t.elapsed().as_secs_f64();
     println!(
-        "{{\"phase\":\"fill\",\"objects\":{},\"size\":{},\"secs\":{:.3},\"objects_per_s\":{:.0},\"volumes\":{},\"bytes_on_disk\":{}}}",
+        "{{\"phase\":\"fill\",\"objects\":{},\"size\":{},\"with_attrs\":{},\"attr_updates_pct\":{},\"secs\":{:.3},\"objects_per_s\":{:.0},\"volumes\":{},\"bytes_on_disk\":{}}}",
         objects,
         size,
+        with_attrs,
+        attr_updates_pct,
         secs,
         objects as f64 / secs,
         state.volumes.read().len(),
@@ -256,7 +292,7 @@ fn boot_with(dir: &std::path::Path, objects: u64, size: usize, out: &mut dyn std
     }
     writeln!(
         out,
-        "{{\"phase\":\"boot\",\"objects\":{},\"secs\":{:.3},\"objects_per_s\":{:.0},\"peak_rss_mib\":{},\"peak_heap_mib\":{:.3},\"heap_after_mib\":{:.3},\"heap_parts_mib\":{{\"needle_records\":{:.3},\"checksum_map\":{:.3},\"hot_table\":{:.3},\"spill_index\":{:.3},\"other\":{:.3}}},\"heap_parts_after_mib\":{{\"needle_records\":{:.3},\"checksum_map\":{:.3},\"hot_table\":{:.3},\"spill_index\":{:.3},\"other\":{:.3}}},\"checked\":{},\"wrong\":{}}}",
+        "{{\"phase\":\"boot\",\"objects\":{},\"secs\":{:.3},\"objects_per_s\":{:.0},\"peak_rss_mib\":{},\"peak_heap_mib\":{:.3},\"heap_after_mib\":{:.3},\"heap_parts_mib\":{{\"needle_records\":{:.3},\"checksum_map\":{:.3},\"hot_table\":{:.3},\"spill_index\":{:.3},\"other\":{:.3}}},\"heap_parts_after_mib\":{{\"needle_records\":{:.3},\"checksum_map\":{:.3},\"hot_table\":{:.3},\"spill_index\":{:.3},\"other\":{:.3}}},\"attr_updates_entries\":{},\"attr_updates_bytes\":{},\"attr_updates_entry_bytes\":{},\"checked\":{},\"wrong\":{}}}",
         objects,
         secs,
         objects as f64 / secs,
@@ -273,6 +309,9 @@ fn boot_with(dir: &std::path::Path, objects: u64, size: usize, out: &mut dyn std
         part_after_mib(BootHeapPart::HotTable),
         part_after_mib(BootHeapPart::SpillIndex),
         part_after_mib(BootHeapPart::Other),
+        state.attr_updates.entry_count(),
+        state.attr_updates.estimated_bytes(),
+        s3_server::AttrUpdateStore::side_map_entry_bytes(),
         checked,
         wrong
     )?;
@@ -310,6 +349,8 @@ fn scan(dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
         volumes.push(VolumeManager::open(dir, id).map_err(|e| format!("volume {}: {}", id, e))?);
     }
     let open_secs = t_open.elapsed().as_secs_f64();
+    // Payload bytes whose CRC the opens checked: the needles the journals do not record (#412).
+    let open_verified: u64 = volumes.iter().map(|vm| vm.payload_verified_at_open()).sum();
     let before_reads: Vec<u64> = volumes
         .iter()
         .map(|vm| vm.work_counters().snapshot().disk_reads)
@@ -331,13 +372,14 @@ fn scan(dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
         .sum();
     let needles_per_s = needles as f64 / secs.max(1e-9);
     Ok(format!(
-        "{{\"phase\":\"scan\",\"volumes\":{},\"open_secs\":{:.3},\"secs\":{:.3},\"needles\":{},\"needles_per_s\":{:.0},\"read_calls\":{}}}",
+        "{{\"phase\":\"scan\",\"volumes\":{},\"open_secs\":{:.3},\"secs\":{:.3},\"needles\":{},\"needles_per_s\":{:.0},\"read_calls\":{},\"open_payload_verified_bytes\":{}}}",
         volumes.len(),
         open_secs,
         secs,
         needles,
         needles_per_s,
-        read_calls
+        read_calls,
+        open_verified
     ))
 }
 
@@ -348,14 +390,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = PathBuf::from(arg("--dir", "boot_bench"));
     let objects: u64 = arg("--objects", "10000000").parse()?;
     let size: usize = arg("--size", "64").parse()?;
+    let with_attrs = args.iter().any(|a| a == "--attrs");
+    let attr_updates_pct: usize = arg("--attr-updates-pct", "0").parse()?;
     match args.get(1).map(String::as_str) {
-        Some("fill") => fill(&dir, objects, size).await,
+        Some("fill") => fill(&dir, objects, size, with_attrs, attr_updates_pct).await,
         Some("scan") => {
             println!("{}", scan(&dir)?);
             Ok(())
         }
         Some("boot") => boot(&dir, objects, size),
-        _ => Err("usage: boot_bench fill|scan|boot --dir DIR [--objects N] [--size BYTES]".into()),
+        _ => Err("usage: boot_bench fill|scan|boot --dir DIR [--objects N] [--size BYTES] [--attrs] [--attr-updates-pct N]".into()),
     }
 }
 
@@ -376,7 +420,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let objects = 5u64;
-        fill(&dir, objects, 64).await.unwrap();
+        fill(&dir, objects, 64, false, 0).await.unwrap();
 
         let res = scan(&dir);
         let _ = std::fs::remove_dir_all(&dir);
@@ -417,7 +461,7 @@ mod tests {
     fn boot_reports_peak_and_retained_heap() {
         let dir = TempDir::new("heap");
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(fill(&dir.0, 16, 64)).unwrap();
+        rt.block_on(fill(&dir.0, 16, 64, false, 0)).unwrap();
         drop(rt);
 
         let mut out = Vec::new();

@@ -2,31 +2,22 @@ use bytes::Bytes;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use hyper::{Response, StatusCode};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::attrs::{encode_tags, TAG_TAGGING};
+use crate::attrs::{encode_tags, Attrs, TAG_TAGGING};
 use crate::bucket_config::ConfigKind;
-use crate::ffi_bridge::{unpack_flags, unpack_part_count, AWAN_FLAG_MULTIPART};
-use crate::meta_index::FLAG_ATTRS;
+use crate::ffi_bridge::unpack_flags;
 use crate::ops::object::{find_version, no_such_version};
 use crate::s3_api::{
-    bad_request, empty_body, engine_error_response, full_body, internal_error_response,
-    read_body_admitted, ResponseBody, S3ServiceState, MAX_XML_BODY,
+    bad_request, empty_body, full_body, internal_error_response,
+    read_body_admitted, ResponseBody, S3ServiceState, SetAttrError, MAX_XML_BODY,
 };
 use crate::tagging::{parse_tagging_xml, tagging_xml, Scope, TagSet};
-use crate::volume::{split_offset, VolumeError};
 use crate::xml::s3_error_xml;
 
 struct TargetNeedle {
     vol_offset: u64,
-    size: u64,
-    etag_hi: u64,
-    etag_lo: u64,
-    part_count: u16,
     flags: u16,
-    created_ms: u64,
-    created_ns: Option<u64>,
     version: Option<crate::versions::Version>,
 }
 
@@ -89,13 +80,7 @@ fn resolve_target(
         }
         return Ok(TargetNeedle {
             vol_offset: v.vol_offset,
-            size: v.size,
-            etag_hi: v.etag_hi,
-            etag_lo: v.etag_lo,
-            part_count: v.part_count,
             flags: v.flags,
-            created_ms: v.ts / 1_000_000,
-            created_ns: (v.ts > 0).then_some(v.ts),
             version: Some(v),
         });
     }
@@ -110,42 +95,9 @@ fn resolve_target(
     })?;
     Ok(TargetNeedle {
         vol_offset: meta.vol_offset,
-        size: meta.size,
-        etag_hi: meta.etag_hi,
-        etag_lo: meta.etag_lo,
-        part_count: unpack_part_count(meta.bucket_flags),
         flags: unpack_flags(meta.bucket_flags),
-        created_ms: meta.created_at,
-        created_ns: (meta.created_at > 0).then_some(meta.created_at * 1_000_000),
         version: None,
     })
-}
-
-fn read_stored_needle_bytes(
-    state: &S3ServiceState,
-    b_id: u32,
-    target: &TargetNeedle,
-) -> Result<Bytes, VolumeError> {
-    if target.size == 0 && target.flags & AWAN_FLAG_MULTIPART == 0 {
-        return Ok(Bytes::new());
-    }
-    let (vol_id, local) = split_offset(target.vol_offset);
-    let vm = state
-        .volumes
-        .read()
-        .get(&vol_id)
-        .cloned()
-        .ok_or(VolumeError::CorruptIndex)?;
-    vm.read_needle_bytes_verified(b_id, local)
-}
-
-fn retire_old_needle(state: &S3ServiceState, b_id: u32, key: &str, old_offset: u64, new_offset: u64, size: u64) {
-    if old_offset > 0 && old_offset != new_offset {
-        state.payload_cache.remove(b_id, old_offset);
-        let raw_len = 64 + key.len() + size as usize;
-        let dead_bytes = raw_len.div_ceil(4096) as u64 * 4096;
-        state.tombstone_bytes.fetch_add(dead_bytes, Ordering::Relaxed);
-    }
 }
 
 pub async fn get_object_tagging(
@@ -159,11 +111,12 @@ pub async fn get_object_tagging(
         Ok(t) => t,
         Err(resp) => return Ok(resp),
     };
-    let attrs = match state.object_attrs(target.vol_offset, target.flags) {
-        Ok(a) => a,
+    let target_vid = target.version.as_ref().map_or(0, |v| v.id());
+    let view = match state.object_view_for(b_id, key, target_vid, target.vol_offset, target.flags) {
+        Ok(v) => v,
         Err(e) => return Ok(internal_error_response(key, &format!("could not read the object's attributes: {:?}", e))),
     };
-    let mut tag_set = match attrs.tag_set() {
+    let mut tag_set = match view.attrs.tag_set() {
         Ok(s) => s,
         Err(e) => return Ok(internal_error_response(key, &format!("could not decode the object's tags: {:?}", e))),
     };
@@ -236,10 +189,14 @@ pub async fn put_bucket_tagging(
             bucket,
         ));
     }
-    let res = state
-        .bucket_configs
-        .lock()
-        .put_config(b_id, ConfigKind::Tagging, &body_bytes);
+    let res = {
+        let mut bc = state.bucket_configs.lock();
+        let res = bc.put_config(b_id, ConfigKind::Tagging, &body_bytes);
+        if res.is_ok() {
+            state.emit_bucket_config_event(b_id, bucket, "tagging", crate::events::CommitKind::BucketConfig, body_bytes.len() as u64);
+        }
+        res
+    };
     match res {
         Ok(()) => Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -294,10 +251,14 @@ pub async fn delete_bucket_tagging(
     b_id: u32,
     bucket: &str,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
-    let res = state
-        .bucket_configs
-        .lock()
-        .delete_config(b_id, ConfigKind::Tagging);
+    let res = {
+        let mut bc = state.bucket_configs.lock();
+        let res = bc.delete_config(b_id, ConfigKind::Tagging);
+        if res.is_ok() {
+            state.emit_bucket_config_event(b_id, bucket, "tagging", crate::events::CommitKind::BucketConfig, 0);
+        }
+        res
+    };
     match res {
         Ok(()) => Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -311,6 +272,52 @@ pub async fn delete_bucket_tagging(
     }
 }
 
+fn map_set_attr_error(key: &str, err: SetAttrError) -> Response<ResponseBody> {
+    match err {
+        SetAttrError::TooLarge => bad_request(
+            "MetadataTooLarge",
+            "Your metadata headers exceed the maximum allowed metadata size.",
+            key,
+        ),
+        SetAttrError::Internal { detail, .. } => internal_error_response(key, &detail),
+        SetAttrError::Refused {
+            delete_marker: Some((vid_str, explicit_vid)),
+            ..
+        } => {
+            let (status, code, msg) = if explicit_vid {
+                (
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "MethodNotAllowed",
+                    "The specified method is not allowed against a delete marker.",
+                )
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    "NoSuchKey",
+                    "The specified key does not exist.",
+                )
+            };
+            let xml = s3_error_xml(code, msg, key, "req-tagging");
+            Response::builder()
+                .status(status)
+                .header(CONTENT_TYPE, "application/xml")
+                .header("x-amz-delete-marker", "true")
+                .header("x-amz-version-id", vid_str)
+                .body(full_body(Bytes::from(xml)))
+                .unwrap()
+        }
+        SetAttrError::Refused { refusal, .. } => {
+            let status = StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::NOT_FOUND);
+            let msg = match refusal.code {
+                "NoSuchVersion" => "The specified version does not exist.",
+                "NoSuchKey" => "The specified key does not exist.",
+                _ => refusal.why,
+            };
+            xml_error(status, refusal.code, msg, key)
+        }
+    }
+}
+
 async fn update_object_tags(
     state: &S3ServiceState,
     b_id: u32,
@@ -319,104 +326,51 @@ async fn update_object_tags(
     new_tags: Option<TagSet>,
     ok_status: StatusCode,
 ) -> Response<ResponseBody> {
-    let _key_guard = state.lock_key(b_id, key).await;
+    let clearing = new_tags.as_ref().is_none_or(|s| s.tags.is_empty());
+    let mut upd = Attrs::new();
+    if let Some(ref set) = new_tags {
+        if !set.tags.is_empty() {
+            upd.set(TAG_TAGGING, &encode_tags(set));
+            return match state.set_attribute_group(b_id, key, vid, upd).await {
+                Ok(out) => {
+                    let mut b = Response::builder().status(ok_status).header(CONTENT_LENGTH, "0");
+                    if let Some(vid_str) = out.version_id {
+                        b = b.header("x-amz-version-id", vid_str);
+                    }
+                    b.body(empty_body()).unwrap()
+                }
+                Err(e) => map_set_attr_error(key, e),
+            };
+        }
+    }
+    debug_assert!(clearing);
     let target = match resolve_target(state, b_id, key, vid) {
         Ok(t) => t,
         Err(resp) => return resp,
     };
-    let mut attrs = match state.object_attrs(target.vol_offset, target.flags) {
-        Ok(a) => a,
+    let target_vid = target.version.as_ref().map_or(0, |v| v.id());
+    let view = match state.object_view_for(b_id, key, target_vid, target.vol_offset, target.flags) {
+        Ok(v) => v,
         Err(e) => return internal_error_response(key, &format!("could not read the object's attributes: {:?}", e)),
     };
-
-    let clearing = new_tags.as_ref().is_none_or(|s| s.tags.is_empty());
-    if clearing && attrs.get(TAG_TAGGING).is_none() {
+    if view.attrs.tag_count() == 0 {
         let mut b = Response::builder().status(ok_status).header(CONTENT_LENGTH, "0");
         if let Some(ref v) = target.version {
             b = b.header("x-amz-version-id", v.id_string());
         }
         return b.body(empty_body()).unwrap();
     }
-
-    match new_tags {
-        Some(ref set) if !set.tags.is_empty() => attrs.set(TAG_TAGGING, &encode_tags(set)),
-        _ => attrs.remove(TAG_TAGGING),
-    }
-
-    let new_attrs_bytes = match attrs.encode() {
-        Ok(b) => b,
-        Err(_) => return bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key),
-    };
-    let new_flags = if new_attrs_bytes.is_empty() {
-        target.flags & !FLAG_ATTRS
-    } else {
-        target.flags | FLAG_ATTRS
-    };
-
-    let stored_bytes = match read_stored_needle_bytes(state, b_id, &target) {
-        Ok(b) => b,
-        Err(e) => return internal_error_response(key, &format!("could not read the object's payload: {:?}", e)),
-    };
-
-    let (new_offset, late) = match state
-        .store_payload_with(
-            b_id,
-            key,
-            &new_attrs_bytes,
-            &stored_bytes,
-            new_flags,
-            target.etag_hi,
-            target.etag_lo,
-            target.created_ns,
-        )
-        .await
-    {
-        Ok(off) => (off, None),
-        // Indexed as on success, then answered 500 (#184, owner decision 4B).
-        Err(e) => match S3ServiceState::late_record(&e) {
-            Some((off, _)) => (off, Some(e)),
-            None => return internal_error_response(key, &format!("could not store updated object tags: {:?}", e)),
-        },
-    };
-    if new_flags & AWAN_FLAG_MULTIPART != 0 {
-        state.payload_cache.remove(b_id, new_offset);
-    }
-
-    let version_id = if let Some(mut v) = target.version {
-        let vid_str = v.id_string();
-        v.vol_offset = new_offset;
-        v.flags = new_flags;
-        if let Err(code) = state.record_version(b_id, key, crate::versions::Event::Put(v)) {
-            return engine_error_response(code, key);
+    upd.set(TAG_TAGGING, &encode_tags(&TagSet::default()));
+    match state.set_attribute_group(b_id, key, vid, upd).await {
+        Ok(out) => {
+            let mut b = Response::builder().status(ok_status).header(CONTENT_LENGTH, "0");
+            if let Some(vid_str) = out.version_id {
+                b = b.header("x-amz-version-id", vid_str);
+            }
+            b.body(empty_body()).unwrap()
         }
-        retire_old_needle(state, b_id, key, target.vol_offset, new_offset, target.size);
-        Some(vid_str)
-    } else {
-        retire_old_needle(state, b_id, key, target.vol_offset, new_offset, target.size);
-        if let Err(code) = state.engine.write().put_object_at(
-            b_id,
-            key.as_bytes(),
-            new_offset,
-            target.size,
-            target.etag_hi,
-            target.etag_lo,
-            target.part_count,
-            new_flags,
-            target.created_ms,
-        ) {
-            return engine_error_response(code, key);
-        }
-        None
-    };
-    if let Some(e) = late {
-        return internal_error_response(key, &format!("could not store updated object tags: {:?}", e));
+        Err(e) => map_set_attr_error(key, e),
     }
-
-    let mut b = Response::builder().status(ok_status).header(CONTENT_LENGTH, "0");
-    if let Some(vid_str) = version_id {
-        b = b.header("x-amz-version-id", vid_str);
-    }
-    b.body(empty_body()).unwrap()
 }
 
 pub(crate) fn parse_tagging_header_from(

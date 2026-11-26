@@ -49,7 +49,9 @@ PATTERNS: Tuple[str, ...] = ("seq-write", "rand-write", "seq-read", "rand-read")
 DEFAULT_SIZES = "4KiB,1MiB"
 DEFAULT_CONCURRENCIES = "1,4,16,64,256"
 DEFAULT_SEED = 42
-DEFAULT_MEMORY_BUDGET = "32MiB"
+# AwanFS runs at its own default memory budget, like every other server (#423, owner 2026-11-26).
+# A budget given with --memory-budget is passed through, and then the prefill must exceed its cache.
+DEFAULT_MEMORY_BUDGET = ""
 DEFAULT_PREFILL_SIZE = "48MiB"
 DURABILITIES: Tuple[str, ...] = ("group", "fast", "strict")
 DEFAULT_PROFILE_THREAD_CORES: Tuple[int, ...] = (4, 8)
@@ -90,7 +92,15 @@ WORKLOADS: List[Tuple[str, str, str, int]] = [
     ("put_64k", "PUT 64 KiB", "put", 64 * KIB),
     ("get_4k", "GET 4 KiB", "get", 4 * KIB),
     ("get_64k", "GET 64 KiB", "get", 64 * KIB),
+    # Up to 1 MiB (owner, 2026-11-26). In the report tables; the charts keep the first four.
+    ("put_1m", "PUT 1 MiB", "put", 1024 * KIB),
+    ("get_1m", "GET 1 MiB", "get", 1024 * KIB),
 ]
+
+CHART_WORKLOADS: List[Tuple[str, str, str, int]] = WORKLOADS[:4]
+
+# AwanFS `--durability fast` runs every PUT workload (owner, 2026-11-26).
+PUT_WORKLOADS: List[Tuple[str, str, str, int]] = [w for w in WORKLOADS if w[2] == "put"]
 
 SERVER_STYLES: Dict[str, Dict[str, object]] = {
     "AwanFS": {"linestyle": "-", "marker": "o", "color": "#1f77b4", "hatch": ""},
@@ -122,6 +132,16 @@ class ThreadCpuSample:
         return self.user_s + self.system_s
 
 
+@dataclass(frozen=True)
+class PhaseWork:
+    """What AwanFS's own counters (`/_awanfs/metrics`) say one phase did (#431)."""
+    syncs_per_sec: float
+    puts_per_sync: Optional[float]
+    mib_per_sync: Optional[float]
+    disk_mib_per_sec: float
+    peak_inflight_mib: float
+
+
 @dataclass
 class PointResult:
     ops_per_sec: Optional[float] = None
@@ -138,6 +158,7 @@ class PointResult:
     client_cores_given: Optional[int] = None
     client_procs: Optional[int] = None
     concurrency: Optional[int] = None
+    work: Optional[PhaseWork] = None
 
     @property
     def measured(self) -> bool:
@@ -368,6 +389,119 @@ def parse_sizes(spec: str) -> List[int]:
     return vals
 
 
+def parse_servers(spec: str) -> List[str]:
+    """`--servers`: a subset of SERVERS by name, any case; empty means all of them (#431)."""
+    if not spec or not spec.strip():
+        return list(SERVERS)
+    by_lower = {s.lower(): s for s in SERVERS}
+    vals: List[str] = []
+    for part in spec.split(","):
+        name = part.strip()
+        if not name:
+            continue
+        srv = by_lower.get(name.lower())
+        if srv is None:
+            raise ValueError(f"unknown server {name!r}; expected one of {', '.join(SERVERS)}")
+        if srv not in vals:
+            vals.append(srv)
+    if not vals:
+        raise ValueError("servers list cannot be empty")
+    return vals
+
+
+WORK_COUNTERS: Tuple[str, ...] = (
+    "awanfs_disk_syncs_total",
+    "awanfs_disk_write_bytes_total",
+    "awanfs_disk_writes_total",
+    "awanfs_peak_inflight_bytes",
+)
+
+
+def parse_awanfs_metrics(text: str) -> Dict[str, float]:
+    """The WORK_COUNTERS values in Prometheus text from `/_awanfs/metrics`."""
+    out: Dict[str, float] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2 or parts[0] not in WORK_COUNTERS:
+            continue
+        try:
+            out[parts[0]] = float(parts[1])
+        except ValueError:
+            continue
+    return out
+
+
+def scrape_awanfs_metrics(host: str, port: int, timeout_sec: float = 5.0) -> Optional[Dict[str, float]]:
+    """GET `/_awanfs/metrics` (no authentication); None when the server does not answer."""
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout_sec)
+        try:
+            conn.request("GET", "/_awanfs/metrics")
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8", errors="replace")
+            if resp.status != 200:
+                return None
+            return parse_awanfs_metrics(body)
+        finally:
+            conn.close()
+    except (OSError, http.client.HTTPException):
+        return None
+
+
+def phase_work(
+    before: Dict[str, float],
+    after: Dict[str, float],
+    elapsed_sec: float,
+    ops_per_sec: Optional[float],
+) -> PhaseWork:
+    """Rates from the counters' change over one phase. `elapsed_sec` is the phase's wall time."""
+    elapsed = max(elapsed_sec, 1e-9)
+    syncs = max(0.0, after.get("awanfs_disk_syncs_total", 0.0) - before.get("awanfs_disk_syncs_total", 0.0))
+    wbytes = max(0.0, after.get("awanfs_disk_write_bytes_total", 0.0) - before.get("awanfs_disk_write_bytes_total", 0.0))
+    syncs_per_sec = syncs / elapsed
+    puts_per_sync = (ops_per_sec / syncs_per_sec) if (syncs > 0 and ops_per_sec is not None) else None
+    mib_per_sync = (wbytes / syncs / MIB) if syncs > 0 else None
+    return PhaseWork(
+        syncs_per_sec=syncs_per_sec,
+        puts_per_sync=puts_per_sync,
+        mib_per_sync=mib_per_sync,
+        disk_mib_per_sec=wbytes / elapsed / MIB,
+        peak_inflight_mib=after.get("awanfs_peak_inflight_bytes", 0.0) / MIB,
+    )
+
+
+def format_work_cells(w: PhaseWork) -> List[str]:
+    """syncs/s, PUTs per sync, MiB per sync, disk MiB/s, peak in-flight MiB."""
+    return [
+        f"{w.syncs_per_sec:.1f}",
+        "no syncs" if w.puts_per_sync is None else f"{w.puts_per_sync:.1f}",
+        "no syncs" if w.mib_per_sync is None else f"{w.mib_per_sync:.2f}",
+        f"{w.disk_mib_per_sec:.1f}",
+        f"{w.peak_inflight_mib:.1f}",
+    ]
+
+
+def _median_work(points: Sequence["PointResult"]) -> Optional[PhaseWork]:
+    works = [p.work for p in points if p.work is not None]
+    if not works:
+        return None
+
+    def med(vals: List[Optional[float]]) -> Optional[float]:
+        got = [v for v in vals if v is not None]
+        return statistics.median(got) if got else None
+
+    return PhaseWork(
+        syncs_per_sec=statistics.median(w.syncs_per_sec for w in works),
+        puts_per_sync=med([w.puts_per_sync for w in works]),
+        mib_per_sync=med([w.mib_per_sync for w in works]),
+        disk_mib_per_sec=statistics.median(w.disk_mib_per_sec for w in works),
+        peak_inflight_mib=statistics.median(w.peak_inflight_mib for w in works),
+    )
+
+
 def parse_patterns(spec: str) -> List[str]:
     if not spec or not spec.strip():
         return list(PATTERNS)
@@ -406,6 +540,16 @@ def parse_concurrencies(spec: str) -> List[int]:
 def stated_cache_bytes(memory_budget_bytes: int) -> int:
     """AwanFS splits `--memory-budget` in half between payload cache and in-flight bodies."""
     return memory_budget_bytes // 2
+
+
+def prefill_cache_check(memory_budget: str, prefill_size: str) -> Optional[int]:
+    """The stated cache of a budget given by name, checked against the prefill; `None` for the
+    server's default budget, whose cache is not known here (#423)."""
+    if not memory_budget:
+        return None
+    cache_bytes = stated_cache_bytes(parse_size(memory_budget))
+    validate_prefill_exceeds_cache(parse_size(prefill_size), cache_bytes)
+    return cache_bytes
 
 
 def validate_prefill_exceeds_cache(prefill_bytes: int, cache_bytes: int) -> None:
@@ -1055,6 +1199,7 @@ def aggregate_runs(run_points: Sequence[PointResult]) -> PointResult:
         client_cores_given=cli_cores_vals[0] if cli_cores_vals else None,
         client_procs=cli_procs_vals[0] if cli_procs_vals else None,
         concurrency=conc_vals[0] if conc_vals else None,
+        work=_median_work(measured),
     )
 
 
@@ -2451,7 +2596,7 @@ def write_charts(
         ax.grid(True, alpha=0.3)
 
     # Figures 1..4: one 4-panel figure per workload
-    for wkey, wlabel, mode, size in WORKLOADS:
+    for wkey, wlabel, mode, size in CHART_WORKLOADS:
         fig, axes = plt.subplots(1, 4, figsize=(16, 4.2))
         panels = [
             ("(a) Throughput", "K ops/s", "ops_per_sec", 1e-3),
@@ -2490,8 +2635,8 @@ def write_charts(
         plt.close(fig)
 
     # Figure 5: ops/s per busy core across workloads
-    fig5, axes5 = plt.subplots(1, len(WORKLOADS), figsize=(16, 4.2))
-    for ax, (wkey, wlabel, _mode, _size) in zip(axes5, WORKLOADS):
+    fig5, axes5 = plt.subplots(1, len(CHART_WORKLOADS), figsize=(16, 4.2))
+    for ax, (wkey, wlabel, _mode, _size) in zip(axes5, CHART_WORKLOADS):
         for srv in SERVERS:
             st = SERVER_STYLES[srv]
             ax.plot(
@@ -2619,10 +2764,13 @@ def render_report(
     duration_sec: float,
     max_put_ops: Optional[Dict[int, Optional[float]]] = None,
     chart_paths: Optional[Sequence[str]] = None,
-    fast_results: Optional[Dict[int, PointResult]] = None,
+    fast_results: Optional[Dict] = None,
     durability: str = "group",
     client_procs: int = 1,
 ) -> str:
+    # `fast_results` is {workload key: {cores: point}}; a bare {cores: point} is PUT 4 KiB.
+    if fast_results is not None and all(isinstance(k, int) for k in fast_results):
+        fast_results = {"put_4k": fast_results}
     max_n = max(cores)
     shared_ns = [n for n in cores if n >= total_cores]
     if shared_ns:
@@ -2685,8 +2833,8 @@ def render_report(
         for srv in SERVERS:
             pts = results.get(wkey, {}).get(srv, {})
             lines.append(_throughput_row(wlabel, size_label, srv, pts))
-            if wkey == "put_4k" and srv == "AwanFS" and fast_results is not None:
-                lines.append(_throughput_row(wlabel, size_label, "AwanFS (--durability fast)", fast_results))
+            if srv == "AwanFS" and fast_results is not None and wkey in fast_results:
+                lines.append(_throughput_row(wlabel, size_label, "AwanFS (--durability fast)", fast_results[wkey]))
 
     lines.extend([
         "",
@@ -2714,8 +2862,8 @@ def render_report(
         for srv in SERVERS:
             pts = results.get(wkey, {}).get(srv, {})
             lines.append(_cpu_row(wlabel, size_label, srv, pts))
-            if wkey == "put_4k" and srv == "AwanFS" and fast_results is not None:
-                lines.append(_cpu_row(wlabel, size_label, "AwanFS (--durability fast)", fast_results))
+            if srv == "AwanFS" and fast_results is not None and wkey in fast_results:
+                lines.append(_cpu_row(wlabel, size_label, "AwanFS (--durability fast)", fast_results[wkey]))
 
     cap_entries: List[Tuple[str, str]] = []
     cli_rows: List[str] = []
@@ -2745,8 +2893,8 @@ def render_report(
         for srv in SERVERS:
             pts = results.get(wkey, {}).get(srv, {})
             cli_rows.append(_client_cpu_row(wlabel, size_label, srv, pts))
-            if wkey == "put_4k" and srv == "AwanFS" and fast_results is not None:
-                cli_rows.append(_client_cpu_row(wlabel, size_label, "AwanFS (--durability fast)", fast_results))
+            if srv == "AwanFS" and fast_results is not None and wkey in fast_results:
+                cli_rows.append(_client_cpu_row(wlabel, size_label, "AwanFS (--durability fast)", fast_results[wkey]))
 
     lines.extend([
         "",
@@ -2767,7 +2915,7 @@ def render_report(
             thread_entries.append((durability, n, 16 * n, pt))
     if fast_results is not None:
         for n in cores:
-            pt = fast_results.get(n)
+            pt = fast_results.get("put_4k", {}).get(n)
             if pt and pt.measured and pt.thread_cpu:
                 thread_entries.append(("fast", n, 16 * n, pt))
     lines.extend(_render_thread_breakdown_lines(thread_entries))
@@ -3048,8 +3196,12 @@ def measure_server_matrix_for_cores(
     profile_threads_points: Optional[Sequence[Tuple[str, int, int]]] = None,
     client_procs: int = 1,
     data_root: Optional[str] = None,
+    scrape_work: bool = False,
 ) -> Dict[Tuple[str, int, int], PointResult]:
-    """Starts one server, prefills reads once, runs the `(pattern, size, concurrency)` sweep, cleans up."""
+    """Starts one server, prefills reads once, runs the `(pattern, size, concurrency)` sweep, cleans up.
+
+    With `scrape_work` (AwanFS only), reads `/_awanfs/metrics` before and after each phase (#431).
+    """
     all_keys = [(pat, sz, c) for pat in patterns for sz in sizes for c in concurrencies]
     n_cli_cores = len(cli_cores) if cli_cores else None
     try:
@@ -3090,6 +3242,8 @@ def measure_server_matrix_for_cores(
                 for c in concurrencies:
                     print(f"    {server_name} N={n_cores} {pat} {format_size(sz)} c={c} (procs={client_procs})...", flush=True)
                     sample_here = (pat, sz, c) in profile_set
+                    before = scrape_awanfs_metrics("127.0.0.1", port) if scrape_work else None
+                    t0 = time.monotonic()
                     pt = _run_pattern_phase_with_cpu(
                         "127.0.0.1",
                         port,
@@ -3108,6 +3262,11 @@ def measure_server_matrix_for_cores(
                         cli_cores=cli_cores,
                         data_root=data_root,
                     )
+                    if scrape_work:
+                        elapsed = time.monotonic() - t0
+                        after = scrape_awanfs_metrics("127.0.0.1", port)
+                        if before is not None and after is not None and pt.measured:
+                            pt.work = phase_work(before, after, elapsed, pt.ops_per_sec)
                     out[(pat, sz, c)] = pt
                     if sample_here and pt.thread_cpu:
                         _log_thread_samples(server_name, n_cores, c, pt.thread_cpu, pt.wall_sec)
@@ -3119,6 +3278,13 @@ def measure_server_matrix_for_cores(
         except OSError:
             pass
     return out
+
+
+def fast_concurrencies_for(n_cores: int, concurrencies: Sequence[int], every: bool = False) -> List[int]:
+    """Concurrencies the fast pass runs at N cores: all of them with `--fast-every-concurrency`."""
+    if every:
+        return list(concurrencies)
+    return sorted({_pick_target(concurrencies, 64), _pick_target(concurrencies, 16 * n_cores)})
 
 
 def _pick_target(values: Sequence[int], preferred: int) -> int:
@@ -3366,9 +3532,19 @@ def render_matrix_report(
     fast_results: Optional[Dict[int, Dict[int, PointResult]]] = None,
     durability: str = "group",
     client_procs: int = 1,
+    fast_by_size: Optional[Dict[int, Dict[int, Dict[int, PointResult]]]] = None,
+    servers: Sequence[str] = SERVERS,
 ) -> str:
-    budget_bytes = parse_size(memory_budget)
-    cache_bytes = stated_cache_bytes(budget_bytes)
+    # `fast_by_size` is {size: {cores: {concurrency: point}}}; `fast_results` alone is 4 KiB.
+    fast_sizes: Dict[int, Dict[int, Dict[int, PointResult]]] = dict(fast_by_size or {})
+    if fast_results is not None:
+        fast_sizes.setdefault(4 * KIB, fast_results)
+    fast_results = fast_sizes.get(4 * KIB)
+    if memory_budget:
+        budget_bytes = parse_size(memory_budget)
+        budget_note = f"AwanFS `--memory-budget {format_size(budget_bytes)}` (stated cache half = {format_size(stated_cache_bytes(budget_bytes))})"
+    else:
+        budget_note = "AwanFS at its default `--memory-budget` (a quarter of RAM, held between 128 MiB and 2 GiB; half of it is the cache)"
     shared_ns = [n for n in cores if n >= total_cores]
     if shared_ns:
         sharing_note = (
@@ -3388,7 +3564,7 @@ def render_matrix_report(
         "",
         f"- **Machine:** {platform.node()} ({platform.platform()}, {total_cores} logical cores, {rwb.host_ram_gb()} GB RAM, CPU: {rwb.cpu_model()})",
         f"- **Methodology:** `patterns = {', '.join(patterns)}`, `sizes = {', '.join(format_size(s) for s in sizes)}`, `cores = {', '.join(str(n) for n in cores)}`, `concurrencies = {', '.join(str(c) for c in concurrencies)}`, `client_procs = {client_procs}`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase, seed = `{seed}`.",
-        f"- **Cache & Prefill:** AwanFS `--memory-budget {format_size(budget_bytes)}` (stated cache half = {format_size(cache_bytes)}). Read prefill size = {format_size(prefill_bytes)} ({describe_prefill_sets(prefill_bytes, patterns, sizes)}), identical deterministic bytes for every server, written before timing.",
+        f"- **Cache & Prefill:** {budget_note}. Read prefill size = {format_size(prefill_bytes)} ({describe_prefill_sets(prefill_bytes, patterns, sizes)}), identical deterministic bytes for every server, written before timing.",
         f"- **Core pinning:** {sharing_note}",
         f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()} RustFS release defaults (durable, 3.09 syncs/PUT; measurements/2026-11-21-durability-probe.md, #334). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default.",
         "",
@@ -3427,7 +3603,7 @@ def render_matrix_report(
         reason = pt.reason if pt and pt.reason else "unknown"
         return f"| {srv_label} | {pat} | {sz_lbl} | {n} | {c} | {procs_shown} | {cores_cell} | not measured ({reason}) | - | - |"
 
-    for srv in SERVERS:
+    for srv in servers:
         for pat in patterns:
             for sz in sizes:
                 sz_lbl = row_size_label(pat, sz)
@@ -3436,12 +3612,14 @@ def render_matrix_report(
                         pt = results.get(pat, {}).get(sz, {}).get(srv, {}).get(n, {}).get(c)
                         lines.append(_matrix_row(srv, pat, sz_lbl, n, c, pt))
                         cli_rows.append(_matrix_client_row(srv, pat, sz_lbl, n, c, pt))
-        if srv == "AwanFS" and fast_results is not None and (4 * KIB) in sizes:
-            for n in cores:
-                for c in sorted(fast_results.get(n, {})):
-                    pt = fast_results[n][c]
-                    lines.append(_matrix_row("AwanFS (--durability fast)", put_pat, "4 KiB", n, c, pt))
-                    cli_rows.append(_matrix_client_row("AwanFS (--durability fast)", put_pat, "4 KiB", n, c, pt))
+        if srv == "AwanFS":
+            for sz in [z for z in sizes if z in fast_sizes]:
+                sz_lbl = row_size_label(put_pat, sz)
+                for n in cores:
+                    for c in sorted(fast_sizes[sz].get(n, {})):
+                        pt = fast_sizes[sz][n][c]
+                        lines.append(_matrix_row("AwanFS (--durability fast)", put_pat, sz_lbl, n, c, pt))
+                        cli_rows.append(_matrix_client_row("AwanFS (--durability fast)", put_pat, sz_lbl, n, c, pt))
 
     lines.extend([
         "",
@@ -3469,6 +3647,7 @@ def render_matrix_report(
                 if pt and pt.measured and pt.thread_cpu:
                     thread_entries.append(("fast", n, c, pt))
     lines.extend(_render_thread_breakdown_lines(thread_entries))
+    lines.extend(_render_work_lines(results, patterns, sizes, cores, concurrencies, durability, fast_sizes, put_pat))
 
     if chart_paths:
         lines.extend(["", "## Charts", ""])
@@ -3477,6 +3656,48 @@ def render_matrix_report(
 
     lines.append("")
     return "\n".join(lines)
+
+
+def _render_work_lines(
+    results: Dict[str, Dict[int, Dict[str, Dict[int, Dict[int, PointResult]]]]],
+    patterns: Sequence[str],
+    sizes: Sequence[int],
+    cores: Sequence[int],
+    concurrencies: Sequence[int],
+    durability: str,
+    fast_sizes: Dict[int, Dict[int, Dict[int, PointResult]]],
+    put_pat: str,
+) -> List[str]:
+    """One row per AwanFS phase with counters; nothing when no phase was scraped (#431)."""
+    rows: List[str] = []
+
+    def row(mode: str, pat: str, sz: int, n: int, c: int, pt: Optional[PointResult]) -> None:
+        if pt is None or not pt.measured or pt.work is None:
+            return
+        cells = format_work_cells(pt.work)
+        rows.append(f"| {mode} | {pat} | {row_size_label(pat, sz)} | {n} | {c} | {pt.ops_per_sec:,.0f} | " + " | ".join(cells) + " |")
+
+    for pat in patterns:
+        for sz in sizes:
+            for n in cores:
+                for c in concurrencies:
+                    row(durability, pat, sz, n, c, results.get(pat, {}).get(sz, {}).get("AwanFS", {}).get(n, {}).get(c))
+    for sz in [z for z in sizes if z in fast_sizes]:
+        for n in cores:
+            for c in sorted(fast_sizes[sz].get(n, {})):
+                row("fast", put_pat, sz, n, c, fast_sizes[sz][n][c])
+    if not rows:
+        return []
+    return [
+        "",
+        "## AwanFS work per phase (`/_awanfs/metrics`, before and after each phase)",
+        "",
+        "Syncs and disk bytes are the server's own counters; rates use the phase's wall time. PUTs per sync is ops/s over syncs/s.",
+        "",
+        "| Durability | Pattern | Size | Cores | Concurrency | ops/s | syncs/s | PUTs per sync | MiB per sync | disk MiB/s | peak in-flight MiB |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+        *rows,
+    ]
 
 
 _TRIVIAL_HTTP_RS = r"""use std::io::{Read, Write};
@@ -3914,7 +4135,7 @@ def _resolve_profile_config(
         profile_cores = set(DEFAULT_PROFILE_THREAD_CORES) if auto else set()
     cmp_flag = getattr(a, "compare_fast", None)
     # Benchmarks run every server at its defaults (owner, 2026-11-20): the fast pass runs only
-    # when asked for by name, never on its own.
+    # when asked for by name. bench-scaling.yml asks for it (owner, 2026-11-26).
     compare_fast = bool(cmp_flag) and (durability != "fast")
     return durability, profile_cores, compare_fast
 
@@ -3961,33 +4182,37 @@ def _run_matrix_mode(
     patterns = parse_patterns(a.pattern)
     sizes = parse_sizes(a.sizes)
     concurrencies = parse_concurrencies(a.concurrencies)
-    budget_bytes = parse_size(a.memory_budget)
-    cache_bytes = stated_cache_bytes(budget_bytes)
     prefill_bytes = parse_size(a.prefill_size)
-    validate_prefill_exceeds_cache(prefill_bytes, cache_bytes)
+    prefill_cache_check(a.memory_budget, a.prefill_size)
     durability, profile_cores, compare_fast = _resolve_profile_config(a, cores, total_cores)
     put_pat = "seq-write" if "seq-write" in patterns else ("rand-write" if "rand-write" in patterns else None)
+    servers = parse_servers(getattr(a, "servers", "") or "")
+    fast_every = bool(getattr(a, "fast_every_concurrency", False))
+    if "AwanFS" not in servers:
+        compare_fast = False
 
     orig_affinity = get_process_affinity(os.getpid())
     raw_runs: Dict[str, Dict[int, Dict[str, Dict[int, Dict[int, List[PointResult]]]]]] = {
         pat: {
             sz: {
                 srv: {n: {c: [] for c in concurrencies} for n in cores}
-                for srv in SERVERS
+                for srv in servers
             }
             for sz in sizes
         }
         for pat in patterns
     }
 
-    fast_raw: Optional[Dict[int, Dict[int, List[PointResult]]]] = None
+    # {size: {cores: {concurrency: runs}}}: the fast pass runs every PUT size (owner, 2026-11-26).
+    fast_raw: Optional[Dict[int, Dict[int, Dict[int, List[PointResult]]]]] = None
     fast_concs_by_core: Dict[int, List[int]] = {}
-    if compare_fast and put_pat is not None and (4 * KIB) in sizes:
-        fast_raw = {}
+    if compare_fast and put_pat is not None:
+        fast_raw = {sz: {} for sz in sizes}
         for n in cores:
-            targets = sorted({_pick_target(concurrencies, 64), _pick_target(concurrencies, 16 * n)})
+            targets = fast_concurrencies_for(n, concurrencies, every=fast_every)
             fast_concs_by_core[n] = targets
-            fast_raw[n] = {c: [] for c in targets}
+            for sz in sizes:
+                fast_raw[sz][n] = {c: [] for c in targets}
 
     try:
         for n in cores:
@@ -3995,12 +4220,13 @@ def _run_matrix_mode(
                 reason = f"requested {n} cores > {total_cores} available"
                 for pat in patterns:
                     for sz in sizes:
-                        for srv in SERVERS:
+                        for srv in servers:
                             for c in concurrencies:
                                 raw_runs[pat][sz][srv][n][c].append(PointResult(reason=reason))
                 if fast_raw is not None:
-                    for c in fast_concs_by_core[n]:
-                        fast_raw[n][c].append(PointResult(reason=reason))
+                    for sz in fast_raw:
+                        for c in fast_concs_by_core[n]:
+                            fast_raw[sz][n][c].append(PointResult(reason=reason))
                 continue
 
             cli_cores, shares = client_cores_for(n, total_cores)
@@ -4012,7 +4238,7 @@ def _run_matrix_mode(
                 ]
 
             for run_idx in range(a.runs):
-                order = server_order_for_run(run_idx, SERVERS)
+                order = server_order_for_run(run_idx, servers)
                 for srv in order:
                     print(
                         f"[N={n}, run {run_idx + 1}/{a.runs}] Starting {srv} "
@@ -4040,13 +4266,14 @@ def _run_matrix_mode(
                         profile_threads_points=srv_prof,
                         client_procs=a.client_procs,
                         data_root=data_root,
+                        scrape_work=(srv == "AwanFS"),
                     )
                     for (pat, sz, c), pt in phase_map.items():
                         raw_runs[pat][sz][srv][n][c].append(pt)
 
             if fast_raw is not None and put_pat is not None:
                 targets = fast_concs_by_core[n]
-                fast_prof = [(put_pat, 4 * KIB, c) for c in targets] if n in profile_cores else None
+                fast_prof = [(put_pat, 4 * KIB, c) for c in targets] if (n in profile_cores and (4 * KIB) in sizes) else None
                 for run_idx in range(a.runs):
                     print(
                         f"[N={n}, run {run_idx + 1}/{a.runs}] Starting AwanFS (--durability fast) "
@@ -4062,7 +4289,7 @@ def _run_matrix_mode(
                         cli_cores=cli_cores,
                         shares_cores=shares,
                         patterns=[put_pat],
-                        sizes=[4 * KIB],
+                        sizes=list(sizes),
                         concurrencies=targets,
                         duration_sec=a.duration,
                         seed=a.seed,
@@ -4070,9 +4297,10 @@ def _run_matrix_mode(
                         profile_threads_points=fast_prof,
                         client_procs=a.client_procs,
                         data_root=data_root,
+                        scrape_work=True,
                     )
-                    for (_pat, _sz, c), pt in fast_map.items():
-                        fast_raw[n][c].append(pt)
+                    for (_pat, sz, c), pt in fast_map.items():
+                        fast_raw[sz][n][c].append(pt)
     finally:
         if orig_affinity:
             pin_process(os.getpid(), orig_affinity)
@@ -4084,17 +4312,17 @@ def _run_matrix_mode(
                     n: {c: aggregate_runs(raw_runs[pat][sz][srv][n][c]) for c in concurrencies}
                     for n in cores
                 }
-                for srv in SERVERS
+                for srv in servers
             }
             for sz in sizes
         }
         for pat in patterns
     }
-    fast_results: Optional[Dict[int, Dict[int, PointResult]]] = None
+    fast_by_size: Optional[Dict[int, Dict[int, Dict[int, PointResult]]]] = None
     if fast_raw is not None:
-        fast_results = {
-            n: {c: aggregate_runs(fast_raw[n][c]) for c in fast_concs_by_core[n]}
-            for n in cores
+        fast_by_size = {
+            sz: {n: {c: aggregate_runs(fast_raw[sz][n][c]) for c in fast_concs_by_core[n]} for n in cores}
+            for sz in fast_raw
         }
 
     try:
@@ -4117,9 +4345,10 @@ def _run_matrix_mode(
         memory_budget=a.memory_budget,
         prefill_bytes=prefill_bytes,
         chart_paths=chart_paths,
-        fast_results=fast_results,
         durability=durability,
         client_procs=a.client_procs,
+        fast_by_size=fast_by_size,
+        servers=servers,
     )
     out_abs = os.path.abspath(a.output)
     os.makedirs(os.path.dirname(out_abs), exist_ok=True)
@@ -4145,8 +4374,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--pattern", default="", help="Comma-separated patterns: seq-write,rand-write,seq-read,rand-read")
     ap.add_argument("--sizes", default="", help="Comma-separated object sizes (e.g. 4KiB,1MiB or 4096,1048576)")
     ap.add_argument("--concurrencies", default="", help="Comma-separated concurrencies (e.g. 1,4,16,64,256)")
+    ap.add_argument("--servers", default="", help=f"Matrix only: comma-separated subset of {', '.join(SERVERS)} (default: all)")
+    ap.add_argument("--fast-every-concurrency", action="store_true",
+                    help="Matrix only: run AwanFS --durability fast at every listed concurrency, not two per core count")
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED, help=f"RNG seed for random patterns and prefill (default: {DEFAULT_SEED})")
-    ap.add_argument("--memory-budget", default=DEFAULT_MEMORY_BUDGET, help=f"AwanFS --memory-budget (default: {DEFAULT_MEMORY_BUDGET})")
+    ap.add_argument("--memory-budget", default=DEFAULT_MEMORY_BUDGET, help="AwanFS --memory-budget (default: none passed, the server's own)")
     ap.add_argument("--prefill-size", default=DEFAULT_PREFILL_SIZE, help=f"Total prefill size per read set, > cache (default: {DEFAULT_PREFILL_SIZE})")
     ap.add_argument("--durability", default="group", choices=DURABILITIES, help="AwanFS --durability mode (default: group)")
     ap.add_argument("--compare-fast", dest="compare_fast", action="store_true", default=None,
@@ -4252,7 +4484,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         wkey: {srv: {n: [] for n in cores} for srv in SERVERS}
         for wkey, *_ in WORKLOADS
     }
-    raw_fast_runs: Optional[Dict[int, List[PointResult]]] = {n: [] for n in cores} if compare_fast else None
+    raw_fast_runs: Optional[Dict[str, Dict[int, List[PointResult]]]] = (
+        {wk: {n: [] for n in cores} for wk, *_ in PUT_WORKLOADS} if compare_fast else None
+    )
 
     try:
         for n in cores:
@@ -4262,7 +4496,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     for srv in SERVERS:
                         raw_runs[wkey][srv][n].append(PointResult(reason=reason))
                 if raw_fast_runs is not None:
-                    raw_fast_runs[n].append(PointResult(reason=reason))
+                    for wk in raw_fast_runs:
+                        raw_fast_runs[wk][n].append(PointResult(reason=reason))
                 continue
 
             cli_cores, shares = client_cores_for(n, total_cores)
@@ -4295,12 +4530,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         cli_cores,
                         shares,
                         a.duration,
-                        workloads=[WORKLOADS[0]],
+                        workloads=PUT_WORKLOADS,
                         profile_threads=(n in profile_cores),
                         client_procs=a.client_procs,
                         data_root=data_root,
                     )
-                    raw_fast_runs[n].append(fast_map["put_4k"])
+                    for wk in raw_fast_runs:
+                        raw_fast_runs[wk][n].append(fast_map[wk])
     finally:
         if orig_affinity:
             pin_process(os.getpid(), orig_affinity)
@@ -4312,8 +4548,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         }
         for wkey, *_ in WORKLOADS
     }
-    fast_results: Optional[Dict[int, PointResult]] = (
-        {n: aggregate_runs(raw_fast_runs[n]) for n in cores} if raw_fast_runs is not None else None
+    fast_results: Optional[Dict[str, Dict[int, PointResult]]] = (
+        {wk: {n: aggregate_runs(runs) for n, runs in by_n.items()} for wk, by_n in raw_fast_runs.items()}
+        if raw_fast_runs is not None else None
     )
 
     try:

@@ -78,55 +78,90 @@ Switches, so the same model checks the current code and the fixes:
                     the fix for #112: conditional writers evaluate ~Visible(engine).present under
                     the key lock at commit (Acquire, after any streamed body). Without it they
                     check before acquiring the lock, so two racing creators can both pass.
+  Updaters          attribute-update processes (0x200 needles, #203). Each updater acquires the
+                    key lock, refuses if the target is absent or a delete marker, otherwise writes
+                    an "attr" needle with its own created_at_ns timestamp (Decision 56).
+  ReplayAppliesAttrUpdates
+                    recovery applies 0x200 attribute-update needles. Without it, acked attribute
+                    updates vanish on restart.
+  AttrReplayByTime  recovery replays base records first and then folds 0x200 updates in
+                    timestamp order (Decision 56). Without it (applying updates in log order),
+                    compaction moving a base needle past an update makes recovery ignore the
+                    update or overwrite it with the base attributes.
 *)
-EXTENDS Naturals, FiniteSets
+EXTENDS Naturals, FiniteSets, Sequences
 
-CONSTANTS Writers, Deleters, UseKeyLock, WriteCanFail, RecoverSkipsGaps, DeleteLogsFirst,
+CONSTANTS Writers, Deleters, Updaters, UseKeyLock, WriteCanFail, RecoverSkipsGaps, DeleteLogsFirst,
           Streamers, Relocate, Compactor, CompactWaitsForWriters,
           FailLeavesRecord, IndexAfterLateFail, Versioning, ClockStepsBack, NullReplay,
-          CondWriters, CheckCondUnderLock
+          CondWriters, CheckCondUnderLock, ReplayAppliesAttrUpdates, AttrReplayByTime,
+          EmitOnCommit
 
 ASSUME Streamers \subseteq Writers
 ASSUME CondWriters \subseteq Writers
+ASSUME Updaters \cap (Writers \cup Deleters) = {}
 ASSUME CheckCondUnderLock \in BOOLEAN
+ASSUME ReplayAppliesAttrUpdates \in BOOLEAN
+ASSUME AttrReplayByTime \in BOOLEAN
+ASSUME EmitOnCommit \in BOOLEAN
 
-Procs == Writers \cup Deleters
-Gone == [present |-> FALSE, val |-> "none"]
+Procs == Writers \cup Deleters \cup Updaters
+Gone == [present |-> FALSE, val |-> "none", attr |-> "none"]
 Ts == 1..2
 Max(S) == CHOOSE m \in S : \A x \in S : x <= m
 
 \* A key's state, live or rebuilt: its unversioned row, whether it has a version history, and
 \* the history (a set of versions; at most one is the null version).
-NoRow == [present |-> FALSE, val |-> "none", ts |-> 0]
+NoRow == [present |-> FALSE, val |-> "none", ts |-> 0, attr |-> "none", uts |-> 0]
 Empty == [row |-> NoRow, hist |-> FALSE, store |-> {}]
-RowOf(r) == IF r.kind = "put" THEN [present |-> TRUE, val |-> r.val, ts |-> r.ts] ELSE NoRow
-NullOf(row) == IF row.present THEN {[val |-> row.val, ts |-> 0, null |-> TRUE, marker |-> FALSE]} ELSE {}
-VersionOf(r) == [val |-> r.val, ts |-> r.ts, null |-> FALSE, marker |-> r.kind = "tomb"]
+RowOf(r) == IF r.kind = "put" THEN [present |-> TRUE, val |-> r.val, ts |-> r.ts, attr |-> "none", uts |-> 0] ELSE NoRow
+NullOf(row) == IF row.present THEN {[val |-> row.val, ts |-> 0, null |-> TRUE, marker |-> FALSE, attr |-> row.attr, uts |-> row.uts]} ELSE {}
+VersionOf(r) == [val |-> r.val, ts |-> r.ts, null |-> FALSE, marker |-> r.kind = "tomb", attr |-> "none", uts |-> 0]
 NonNull(s) == {v \in s : ~v.null}
 StartHist(k) == IF k.hist THEN k.store ELSE NullOf(k.row)
 
 \* What a GET shows: the row, or the history's version with the largest time.
 Visible(k) ==
-    IF ~k.hist THEN [present |-> k.row.present, val |-> k.row.val]
+    IF ~k.hist THEN [present |-> k.row.present, val |-> k.row.val, attr |-> k.row.attr]
     ELSE IF k.store = {} THEN Gone
     ELSE LET top == CHOOSE v \in k.store : \A w \in k.store : w.ts <= v.ts IN
-         IF top.marker THEN Gone ELSE [present |-> TRUE, val |-> top.val]
+         IF top.marker THEN Gone ELSE [present |-> TRUE, val |-> top.val, attr |-> top.attr]
+
+\* Applies a single 0x200 attribute-update needle if its target version is present and not a delete marker.
+\* If `tombs` is non-empty (time-ordered replay), an unversioned tombstone at a later offset kills earlier
+\* unversioned updates even if a subsequent PUT happened at the same clock tick.
+ApplyAttr(k, u, tombs) ==
+    IF u.target = 0 THEN
+        IF \E t \in tombs : t.o > u.o THEN k
+        ELSE IF ~k.hist THEN
+            IF k.row.present /\ u.ts > k.row.ts /\ u.ts > k.row.uts
+            THEN [k EXCEPT !.row = [k.row EXCEPT !.attr = u.val, !.uts = u.ts]]
+            ELSE k
+        ELSE IF \E v \in k.store : v.null /\ ~v.marker /\ u.ts > v.ts /\ u.ts > v.uts
+        THEN LET nv == CHOOSE v \in k.store : v.null IN
+             [k EXCEPT !.store = (k.store \ {nv}) \cup {[nv EXCEPT !.attr = u.val, !.uts = u.ts]}]
+        ELSE k
+    ELSE IF k.hist /\ \E v \in k.store : ~v.null /\ v.ts = u.target /\ ~v.marker /\ u.ts > v.uts
+    THEN LET tv == CHOOSE v \in k.store : ~v.null /\ v.ts = u.target IN
+         [k EXCEPT !.store = (k.store \ {tv}) \cup {[tv EXCEPT !.attr = u.val, !.uts = u.ts]}]
+    ELSE k
 
 \* The live index applies a committed record. An unversioned record never meets a history live:
 \* it was stamped while the bucket was unversioned, and a history needs a versioned write.
 LiveApply(k, r) ==
-    IF r.ver THEN [row |-> k.row, hist |-> TRUE, store |-> StartHist(k) \cup {VersionOf(r)}]
+    IF r.kind = "attr" THEN ApplyAttr(k, r, {})
+    ELSE IF r.ver THEN [row |-> k.row, hist |-> TRUE, store |-> StartHist(k) \cup {VersionOf(r)}]
     ELSE [k EXCEPT !.row = RowOf(r)]
 
-\* Recovery applies the next record in log order.
+\* Recovery applies the next base record in log order.
 ReplayApply(k, r) ==
     IF r.ver THEN [row |-> k.row, hist |-> TRUE, store |-> StartHist(k) \cup {VersionOf(r)}]
     ELSE IF ~k.hist THEN [k EXCEPT !.row = RowOf(r)]
     ELSE IF NullReplay
     THEN [k EXCEPT !.store = NonNull(k.store) \cup
-                   (IF r.kind = "put" THEN {[val |-> r.val, ts |-> 0, null |-> TRUE, marker |-> FALSE]} ELSE {})]
+                   (IF r.kind = "put" THEN {[val |-> r.val, ts |-> 0, null |-> TRUE, marker |-> FALSE, attr |-> "none", uts |-> 0]} ELSE {})]
     ELSE [k EXCEPT !.store = NonNull(k.store) \cup
-                   {[val |-> r.val, ts |-> r.ts, null |-> TRUE, marker |-> r.kind = "tomb"]}]
+                   {[val |-> r.val, ts |-> r.ts, null |-> TRUE, marker |-> r.kind = "tomb", attr |-> "none", uts |-> 0]}]
 
 \* The order of a request's steps after it takes the lock.
 Steps(p) == IF p \in Deleters /\ ~DeleteLogsFirst
@@ -135,11 +170,11 @@ Steps(p) == IF p \in Deleters /\ ~DeleteLogsFirst
             THEN <<"write", "relocate", "index">>
             ELSE <<"reserve", "write", "index">>
 
-VARIABLES pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning, condWon
+VARIABLES pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning, condWon, utarget, seq, events, commits
 
-vars == <<pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning, condWon>>
-procVars == <<pc, step, off, nextOff, log, engine, lock, condWon>>
-cVars == <<cpc, cut, snap, clock, versioning>>
+vars == <<pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning, condWon, utarget, seq, events, commits>>
+procVars == <<pc, step, off, nextOff, log, engine, lock, condWon, utarget>>
+cVars == <<cpc, cut, snap, clock, versioning, seq, events, commits>>
 Dropped == cpc = "done"
 
 \* Moves p to its next step, or to release after the last one.
@@ -147,20 +182,69 @@ Advance(p) ==
     /\ step' = [step EXCEPT ![p] = step[p] + 1]
     /\ pc' = [pc EXCEPT ![p] = IF step[p] < 3 THEN Steps(p)[step[p] + 1] ELSE "release"]
 
-RECURSIVE Replay(_, _, _)
-Replay(o, limit, acc) ==
+RECURSIVE ScanEnd(_, _)
+ScanEnd(o, limit) ==
+    IF o >= limit THEN limit
+    ELSE IF RecoverSkipsGaps THEN limit
+    ELSE IF {r \in log : r.o = o} = {} THEN o
+    ELSE ScanEnd(o + 1, limit)
+
+RECURSIVE ReplayBase(_, _, _)
+ReplayBase(o, limit, acc) ==
+    IF o >= limit THEN acc
+    ELSE LET recs == {r \in log : r.o = o /\ r.kind \in {"put", "tomb"}} IN
+         IF recs = {} THEN ReplayBase(o + 1, limit, acc)
+         ELSE LET r == CHOOSE x \in recs : TRUE IN
+              ReplayBase(o + 1, limit, ReplayApply(acc, r))
+
+RECURSIVE ReplayOffsetOrder(_, _, _)
+ReplayOffsetOrder(o, limit, acc) ==
     IF o >= limit THEN acc
     ELSE LET recs == {r \in log : r.o = o} IN
-         IF recs = {}
-         THEN IF RecoverSkipsGaps THEN Replay(o + 1, limit, acc) ELSE acc
+         IF recs = {} THEN ReplayOffsetOrder(o + 1, limit, acc)
          ELSE LET r == CHOOSE x \in recs : TRUE IN
-              Replay(o + 1, limit, ReplayApply(acc, r))
+              ReplayOffsetOrder(o + 1, limit,
+                  IF r.kind = "attr" THEN
+                      IF ReplayAppliesAttrUpdates THEN ApplyAttr(acc, r, {}) ELSE acc
+                  ELSE ReplayApply(acc, r))
+
+BeforeAttr(a, b) == a.ts < b.ts \/ (a.ts = b.ts /\ a.o <= b.o)
+
+RECURSIVE FoldAttrs(_, _, _)
+FoldAttrs(rem, acc, tombs) ==
+    IF rem = {} THEN acc
+    ELSE LET u == CHOOSE x \in rem : \A y \in rem : BeforeAttr(x, y) IN
+         FoldAttrs(rem \ {u}, ApplyAttr(acc, u, tombs), tombs)
+
+StartOff == IF Dropped THEN cut ELSE 1
+EndOff == ScanEnd(StartOff, nextOff)
+ScanRecs == {r \in log : r.o >= StartOff /\ r.o < EndOff}
+
+\* Base state rebuilt from objects/tombstones alone; used by UpdateNeverResurrects and AttrReplayByTime.
+BaseRecovered == ReplayBase(StartOff, EndOff, Empty)
 
 \* A removed volume is not read: replay starts at the first offset that still exists.
-Recovered == Replay(IF Dropped THEN cut ELSE 1, nextOff, Empty)
+Recovered ==
+    IF ~AttrReplayByTime THEN ReplayOffsetOrder(StartOff, EndOff, Empty)
+    ELSE IF ~ReplayAppliesAttrUpdates THEN BaseRecovered
+    ELSE FoldAttrs({r \in ScanRecs : r.kind = "attr"}, BaseRecovered,
+                   {r \in ScanRecs : r.kind = "tomb" /\ ~r.ver})
 
 \* A versioned write's time (versions.rs next_ts), taken under the key lock.
 Stamp == Max({clock} \cup {v.ts + 1 : v \in engine.store})
+UnverWriteTs == IF Updaters = {} THEN clock ELSE Max({clock, engine.row.ts, engine.row.uts + 1})
+ValidAttrTargets ==
+    IF ~engine.hist THEN IF engine.row.present THEN {0} ELSE {}
+    ELSE {IF v.null THEN 0 ELSE v.ts : v \in {x \in engine.store : ~x.marker}}
+AttrStamp(t) ==
+    IF t = 0 THEN
+        IF ~engine.hist THEN Max({clock, engine.row.ts + 1, engine.row.uts + 1})
+        ELSE IF \E v \in engine.store : v.null THEN
+            LET nv == CHOOSE v \in engine.store : v.null IN Max({clock, nv.ts + 1, nv.uts + 1})
+        ELSE clock
+    ELSE IF \E v \in engine.store : ~v.null /\ v.ts = t THEN
+        LET tv == CHOOSE v \in engine.store : ~v.null /\ v.ts = t IN Max({clock, tv.ts + 1, tv.uts + 1})
+    ELSE clock
 
 \* The record a request wrote, if it is in the log.
 Own(p) == {r \in log : r.o = off[p]}
@@ -168,7 +252,8 @@ OwnVersioned(p) == \E r \in Own(p) : r.ver
 \* The record the index applies: the request's own, or (DELETE before #39, or a write into a
 \* removed volume) the record it would have written.
 RecOf(p) == IF Own(p) # {} THEN CHOOSE r \in Own(p) : TRUE
-            ELSE [o |-> 0, kind |-> IF p \in Writers THEN "put" ELSE "tomb", val |-> p, ver |-> versioning, ts |-> clock]
+            ELSE IF p \in Updaters THEN [o |-> 0, kind |-> "attr", val |-> p, ver |-> engine.hist, target |-> utarget[p], ts |-> AttrStamp(utarget[p])]
+            ELSE [o |-> 0, kind |-> IF p \in Writers THEN "put" ELSE "tomb", val |-> p, ver |-> versioning, target |-> 0, ts |-> IF versioning THEN Stamp ELSE UnverWriteTs]
 
 Init ==
     /\ pc = [p \in Procs |-> "start"]
@@ -184,6 +269,10 @@ Init ==
     /\ clock = 1
     /\ versioning = FALSE
     /\ condWon = [p \in CondWriters |-> FALSE]
+    /\ utarget = [p \in Updaters |-> 0]
+    /\ seq = 0
+    /\ events = <<>>
+    /\ commits = <<>>
 
 \* Broken variant (#112): condition checked BEFORE taking the key lock.
 PreCheck(p) ==
@@ -191,7 +280,7 @@ PreCheck(p) ==
     /\ ~CheckCondUnderLock
     /\ pc[p] = "start"
     /\ pc' = [pc EXCEPT ![p] = IF Visible(engine).present THEN "done" ELSE "checked"]
-    /\ UNCHANGED <<step, off, nextOff, log, engine, lock, condWon>>
+    /\ UNCHANGED <<step, off, nextOff, log, engine, lock, condWon, utarget>>
     /\ UNCHANGED cVars
 
 \* A streamer reserves before it has the lock: the body arrives next, for as long as the
@@ -202,7 +291,7 @@ StreamReserve(p) ==
     /\ off' = [off EXCEPT ![p] = nextOff]
     /\ nextOff' = nextOff + 1
     /\ pc' = [pc EXCEPT ![p] = "body"]
-    /\ UNCHANGED <<step, log, engine, lock, condWon>>
+    /\ UNCHANGED <<step, log, engine, lock, condWon, utarget>>
     /\ UNCHANGED cVars
 
 Acquire(p) ==
@@ -212,9 +301,18 @@ Acquire(p) ==
     /\ IF UseKeyLock THEN lock = "free" /\ lock' = p ELSE UNCHANGED lock
     /\ IF p \in CondWriters /\ CheckCondUnderLock /\ Visible(engine).present
        THEN /\ pc' = [pc EXCEPT ![p] = "release"]
-            /\ UNCHANGED step
+            /\ UNCHANGED <<step, utarget>>
+       ELSE IF p \in Updaters THEN
+            IF ValidAttrTargets = {} THEN
+                /\ pc' = [pc EXCEPT ![p] = "release"]
+                /\ UNCHANGED <<step, utarget>>
+            ELSE \E t \in ValidAttrTargets :
+                /\ utarget' = [utarget EXCEPT ![p] = t]
+                /\ step' = [step EXCEPT ![p] = 1]
+                /\ pc' = [pc EXCEPT ![p] = Steps(p)[1]]
        ELSE /\ step' = [step EXCEPT ![p] = 1]
             /\ pc' = [pc EXCEPT ![p] = Steps(p)[1]]
+            /\ UNCHANGED utarget
     /\ UNCHANGED <<off, nextOff, log, engine, condWon>>
     /\ UNCHANGED cVars
 
@@ -223,24 +321,27 @@ Reserve(p) ==
     /\ off' = [off EXCEPT ![p] = nextOff]
     /\ nextOff' = nextOff + 1
     /\ Advance(p)
-    /\ UNCHANGED <<log, engine, lock, condWon>>
+    /\ UNCHANGED <<log, engine, lock, condWon, utarget>>
     /\ UNCHANGED cVars
 
 Write(p) ==
     /\ pc[p] = "write"
     \* Into a removed volume file, the bytes go nowhere (the handle outlives the file).
     /\ log' = IF Dropped /\ off[p] < cut THEN log
+              ELSE IF p \in Updaters THEN
+                  log \cup {[o |-> off[p], kind |-> "attr", val |-> p,
+                             ver |-> engine.hist, target |-> utarget[p], ts |-> AttrStamp(utarget[p])]}
               ELSE log \cup {[o |-> off[p], kind |-> IF p \in Writers THEN "put" ELSE "tomb", val |-> p,
-                               ver |-> versioning, ts |-> IF versioning THEN Stamp ELSE clock]}
+                              ver |-> versioning, target |-> 0, ts |-> IF versioning THEN Stamp ELSE UnverWriteTs]}
     /\ Advance(p)
-    /\ UNCHANGED <<off, nextOff, engine, lock, condWon>>
+    /\ UNCHANGED <<off, nextOff, engine, lock, condWon, utarget>>
     /\ UNCHANGED cVars
 
 Fail(p) ==
     /\ WriteCanFail
     /\ pc[p] = "write"
     /\ pc' = [pc EXCEPT ![p] = "release"]
-    /\ UNCHANGED <<step, off, nextOff, log, engine, lock, condWon>>
+    /\ UNCHANGED <<step, off, nextOff, log, engine, lock, condWon, utarget>>
     /\ UNCHANGED cVars
 
 \* Under the lock, after the streamer's own record is in the log: a record of this key at a
@@ -248,7 +349,7 @@ Fail(p) ==
 \* again at the end of the log. The copy can fail like any write.
 \* Only an unversioned write relocates: versions are ordered by time, not offset.
 LaterRecord(p) == (\E r \in log : r.o > off[p]) /\ ~OwnVersioned(p)
-CopyOf(p) == [o |-> nextOff, kind |-> "put", val |-> p, ver |-> FALSE, ts |-> clock]
+CopyOf(p) == [o |-> nextOff, kind |-> "put", val |-> p, ver |-> FALSE, target |-> 0, ts |-> UnverWriteTs]
 
 RelocateStep(p) ==
     /\ pc[p] = "relocate"
@@ -258,7 +359,7 @@ RelocateStep(p) ==
             /\ log' = log \cup {CopyOf(p)}
        ELSE UNCHANGED <<off, nextOff, log>>
     /\ Advance(p)
-    /\ UNCHANGED <<engine, lock, condWon>>
+    /\ UNCHANGED <<engine, lock, condWon, utarget>>
     /\ UNCHANGED cVars
 
 RelocateFail(p) ==
@@ -266,7 +367,7 @@ RelocateFail(p) ==
     /\ pc[p] = "relocate"
     /\ Relocate /\ LaterRecord(p)
     /\ pc' = [pc EXCEPT ![p] = "release"]
-    /\ UNCHANGED <<step, off, nextOff, log, engine, lock, condWon>>
+    /\ UNCHANGED <<step, off, nextOff, log, engine, lock, condWon, utarget>>
     /\ UNCHANGED cVars
 
 
@@ -278,7 +379,7 @@ LateFail(p) ==
     /\ \E r \in log : r.o = off[p]
     /\ engine' = IF IndexAfterLateFail THEN LiveApply(engine, RecOf(p)) ELSE engine
     /\ pc' = [pc EXCEPT ![p] = "release"]
-    /\ UNCHANGED <<step, off, nextOff, log, lock, condWon>>
+    /\ UNCHANGED <<step, off, nextOff, log, lock, condWon, utarget>>
     /\ UNCHANGED cVars
 
 \* A streamer's copy reaches the log, then the same failure: the copy is the newest record.
@@ -291,66 +392,81 @@ RelocateLateFail(p) ==
     /\ log' = log \cup {CopyOf(p)}
     /\ engine' = IF IndexAfterLateFail THEN LiveApply(engine, CopyOf(p)) ELSE engine
     /\ pc' = [pc EXCEPT ![p] = "release"]
-    /\ UNCHANGED <<step, lock, condWon>>
+    /\ UNCHANGED <<step, lock, condWon, utarget>>
     /\ UNCHANGED cVars
 
 Index(p) ==
     /\ pc[p] = "index"
-    /\ engine' = LiveApply(engine, RecOf(p))
+    /\ LET nextEng == LiveApply(engine, RecOf(p))
+           nextSeq == seq + 1
+           ev == [seq |-> nextSeq, op |-> p, state |-> nextEng]
+       IN /\ engine' = nextEng
+          /\ seq' = nextSeq
+          /\ commits' = Append(commits, ev)
+          /\ events' = IF EmitOnCommit THEN Append(events, ev) ELSE events
     /\ condWon' = IF p \in CondWriters THEN [condWon EXCEPT ![p] = TRUE] ELSE condWon
     /\ Advance(p)
-    /\ UNCHANGED <<off, nextOff, log, lock>>
-    /\ UNCHANGED cVars
+    /\ UNCHANGED <<off, nextOff, log, lock, utarget, cpc, cut, snap, clock, versioning>>
 
 Release(p) ==
     /\ pc[p] = "release"
     /\ IF UseKeyLock THEN lock' = "free" ELSE UNCHANGED lock
     /\ pc' = [pc EXCEPT ![p] = "done"]
-    /\ UNCHANGED <<step, off, nextOff, log, engine, condWon>>
+    /\ UNCHANGED <<step, off, nextOff, log, engine, condWon, utarget>>
     /\ UNCHANGED cVars
 
 \* The compaction pass (#167).
 InFlightBelowCut == \E p \in Procs : off[p] > 0 /\ off[p] < cut /\ pc[p] \in {"body", "write"}
 \* The record the index points at: the newest record of the value the engine holds.
 Points(r) == Visible(engine).present /\ r.kind = "put" /\ r.val = Visible(engine).val
-             /\ ~\E r2 \in log : r2.val = r.val /\ r2.o > r.o
+             /\ ~\E r2 \in log : r2.kind = "put" /\ r2.val = r.val /\ r2.o > r.o
+\* A 0x200 attribute update record is live only if it still provides the latest update for a live non-marker version.
+LiveAttr(u) ==
+    /\ u.kind = "attr"
+    /\ IF ~engine.hist
+       THEN u.target = 0 /\ engine.row.present /\ engine.row.uts = u.ts
+       ELSE \E v \in engine.store : ~v.marker /\ (IF v.null THEN 0 ELSE v.ts) = u.target /\ v.uts = u.ts
+    /\ ~\E u2 \in log : u2.kind = "attr" /\ u2.target = u.target /\ u2.ts = u.ts /\ u2.o > u.o
 CSeal ==
     /\ Compactor /\ cpc = "idle"
     /\ cut' = nextOff
     /\ cpc' = "sealed"
-    /\ UNCHANGED <<snap, clock, versioning>> /\ UNCHANGED procVars
+    /\ UNCHANGED <<snap, clock, versioning, seq, events, commits>> /\ UNCHANGED procVars
 CScan ==
     /\ cpc = "sealed"
     /\ CompactWaitsForWriters => ~InFlightBelowCut
     /\ snap' = {r \in log : r.o < cut}
     /\ cpc' = "scanned"
-    /\ UNCHANGED <<cut, clock, versioning>> /\ UNCHANGED procVars
+    /\ UNCHANGED <<cut, clock, versioning, seq, events, commits>> /\ UNCHANGED procVars
 CCopy ==
     /\ cpc = "scanned"
     /\ UseKeyLock => lock = "free"
-    /\ IF \E r \in snap : Points(r)
-       THEN /\ log' = log \cup {[(CHOOSE r \in snap : Points(r)) EXCEPT !.o = nextOff]}
-            /\ nextOff' = nextOff + 1
-       ELSE UNCHANGED <<log, nextOff>>
+    /\ LET bases == IF \E r \in snap : Points(r) THEN {[CHOOSE r \in snap : Points(r) EXCEPT !.o = nextOff]} ELSE {}
+           offBase == nextOff + Cardinality(bases)
+           liveAttrs == {u \in snap : LiveAttr(u)}
+           copiedAttrs == IF liveAttrs = {} THEN {}
+                          ELSE {[u EXCEPT !.o = offBase + Cardinality({v \in liveAttrs : BeforeAttr(v, u)}) - 1] : u \in liveAttrs}
+       IN /\ log' = log \cup bases \cup copiedAttrs
+          /\ nextOff' = offBase + Cardinality(liveAttrs)
     /\ cpc' = "copied"
-    /\ UNCHANGED <<cut, snap, pc, step, off, engine, lock, clock, versioning, condWon>>
+    /\ UNCHANGED <<cut, snap, pc, step, off, engine, lock, clock, versioning, condWon, utarget, seq, events, commits>>
 CDrop ==
     /\ cpc = "copied"
     /\ log' = {r \in log : r.o >= cut}
     /\ cpc' = "done"
-    /\ UNCHANGED <<cut, snap, pc, step, off, nextOff, engine, lock, clock, versioning, condWon>>
+    /\ UNCHANGED <<cut, snap, pc, step, off, nextOff, engine, lock, clock, versioning, condWon, utarget, seq, events, commits>>
 
 \* PutBucketVersioning: no key lock.
 VersionOn ==
     /\ Versioning /\ ~versioning
     /\ versioning' = TRUE
-    /\ UNCHANGED <<procVars, cpc, cut, snap, clock>>
+    /\ UNCHANGED <<procVars, cpc, cut, snap, clock, seq, events, commits>>
 
 \* The wall clock moves; it only matters to versioned writes.
 Tick ==
     /\ Versioning
     /\ clock' \in (IF ClockStepsBack THEN Ts \ {clock} ELSE {c \in Ts : c > clock})
-    /\ UNCHANGED <<procVars, cpc, cut, snap, versioning>>
+    /\ UNCHANGED <<procVars, cpc, cut, snap, versioning, seq, events, commits>>
 
 AllDone == (\A p \in Procs : pc[p] = "done") /\ cpc \in {"idle", "done"}
 
@@ -384,12 +500,23 @@ AtMostOneConditionalCreateWins ==
 \* ListObjectVersions shows the same history before and after a restart.
 HistorySurvivesRestart == AllDone => Recovered.hist = engine.hist /\ Recovered.store = engine.store
 
+\* Attribute updates never resurrect a deleted key or deleted version in recovery.
+UpdateNeverResurrects ==
+    /\ Visible(Recovered).present => Visible(BaseRecovered).present
+    /\ Recovered.hist = BaseRecovered.hist
+    /\ { [val |-> v.val, ts |-> v.ts, null |-> v.null, marker |-> v.marker] : v \in Recovered.store }
+       = { [val |-> v.val, ts |-> v.ts, null |-> v.null, marker |-> v.marker] : v \in BaseRecovered.store }
+
+EventsMatchCommits == events = commits
+
 TypeOK ==
     /\ pc \in [Procs -> {"start", "checked", "body", "reserve", "write", "relocate", "index", "release", "done"}]
     /\ step \in [Procs -> 0..4]
-    /\ nextOff \in 1..(Cardinality(Procs) + Cardinality(Streamers) + 2)
+    /\ nextOff \in 1..(Cardinality(Procs) + Cardinality(Streamers) + Cardinality(Updaters) + 3)
     /\ cpc \in {"idle", "sealed", "scanned", "copied", "done"}
     /\ clock \in Ts
     /\ versioning \in BOOLEAN
     /\ condWon \in [CondWriters -> BOOLEAN]
+    /\ utarget \in [Updaters -> Nat]
+    /\ seq \in Nat
 ====

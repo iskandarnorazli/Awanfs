@@ -31,3 +31,4 @@ reason and the decision that allowed it (`scripts/check_ratchet_log.py`).
 | test_s3::test_put_bucket_encryption_kms | dde3ca2 | fell through to another operation before #148; 501 now | owner, 2026-11-17, #148 option A; ARCHITECTURE.md decision 61 |
 | test_s3::test_put_bucket_encryption_s3 | dde3ca2 | fell through to another operation before #148; 501 now | owner, 2026-11-17, #148 option A; ARCHITECTURE.md decision 61 |
 | test_s3::test_put_tags_acl_public | dde3ca2 | fell through to another operation before #148; 501 now | owner, 2026-11-17, #148 option A; ARCHITECTURE.md decision 61 |
+| test_s3::test_object_copy_canned_acl | f3b672d | alt reads main's copied object expecting 200 via x-amz-acl, which is unimplemented (501) until #122; account isolation now denies cross-account read with 403 AccessDenied | owner, 2026-11-24, #151 option 3A (issuecomment-7136163072); ARCHITECTURE.md decision 61 |

@@ -3,6 +3,8 @@ name: Core scaling benchmark
 # Measures PUT and GET throughput, latency (P50, P99), server CPU %, and ops/s per busy core
 # across pinned core counts (N = 1, 2, 4, ...) for AwanFS, MinIO, RustFS, Garage, and SeaweedFS (Issue #250, #268).
 # Outputs go to $RUNNER_TEMP/core_scaling so no run ever overwrites measurements/.
+# Sizes reach 1 MiB, and AwanFS `--durability fast` runs every PUT size next to the default
+# (owner, 2026-11-26): an exception to AGENTS.md's defaults-only rule for this workflow.
 
 on:
   workflow_dispatch:
@@ -174,6 +176,7 @@ jobs:
             --client-procs "${{ inputs.client_procs || '4' }}" \
             --data-dir "$RUNNER_TEMP" \
             --output $RUNNER_TEMP/core_scaling/report.md \
+            --compare-fast \
             "${extra_args[@]}"
 
       - name: Run client ceiling probe (local HTTP)
@@ -250,6 +253,7 @@ jobs:
               "--client-procs", "${{ inputs.client_procs || '4' }}",
               "--data-dir", os.environ["RUNNER_TEMP"],
               "--output", os.path.join(out_dir, "report.md"),
+              "--compare-fast",
           ]
           cores = "${{ inputs.cores }}".strip()
           if cores:

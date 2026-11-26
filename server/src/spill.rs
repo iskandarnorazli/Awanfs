@@ -184,6 +184,16 @@ impl SpillIndex {
         self.insert(&mut st, sort_key(bucket_id, key), Entry::Row(*meta))
     }
 
+    /// Inserts `meta` under a single write lock and returns any prior live row (#159).
+    pub fn put_replacing(&self, bucket_id: u32, key: &[u8], meta: &ObjectMeta) -> Result<Option<ObjectMeta>, SpillError> {
+        let _heap_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::SpillIndex);
+        let k = sort_key(bucket_id, key);
+        let mut st = self.state.write();
+        let prev = Self::get_locked(&st, &k)?;
+        self.insert(&mut st, k, Entry::Row(*meta))?;
+        Ok(prev)
+    }
+
     /// Inserts like [`SpillIndex::put`] and returns the lock wait/hold breakdown and flush/compaction counts.
     pub fn put_measured(&self, bucket_id: u32, key: &[u8], meta: &ObjectMeta) -> Result<PutSample, SpillError> {
         let t0 = std::time::Instant::now();
@@ -220,14 +230,19 @@ impl SpillIndex {
 
     /// Deletes the key; returns whether it was there.
     pub fn delete(&self, bucket_id: u32, key: &[u8]) -> Result<bool, SpillError> {
+        Ok(self.delete_returning(bucket_id, key)?.is_some())
+    }
+
+    /// Deletes the key under a single write lock and returns the removed live row, if any (#159).
+    pub fn delete_returning(&self, bucket_id: u32, key: &[u8]) -> Result<Option<ObjectMeta>, SpillError> {
         let _heap_guard = crate::memory::BootHeapGuard::enter(crate::memory::BootHeapPart::SpillIndex);
         let k = sort_key(bucket_id, key);
         let mut st = self.state.write();
-        if Self::get_locked(&st, &k)?.is_none() {
-            return Ok(false);
-        }
+        let Some(prev) = Self::get_locked(&st, &k)? else {
+            return Ok(None);
+        };
         self.insert(&mut st, k, Entry::Tombstone)?;
-        Ok(true)
+        Ok(Some(prev))
     }
 
     /// Up to `limit` rows of the bucket whose keys start with `prefix`, after `start_after`

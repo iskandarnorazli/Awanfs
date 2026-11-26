@@ -1,6 +1,7 @@
 """Self-tests for core_scaling.py: pinning, scaling, CPU %, unmeasured gaps, charts, and report."""
 import math
 import os
+import re
 import sys
 import tempfile
 import types
@@ -520,7 +521,7 @@ class PatternAndSizeParsingTests(unittest.TestCase):
             cs.parse_concurrencies("0,4")
 
     def test_prefill_exceeds_stated_cache_size(self):
-        budget_bytes = cs.parse_size(cs.DEFAULT_MEMORY_BUDGET)
+        budget_bytes = cs.parse_size("32MiB")  # #423: a budget given by name; the default passes none
         cache_bytes = cs.stated_cache_bytes(budget_bytes)
         prefill_bytes = cs.parse_size(cs.DEFAULT_PREFILL_SIZE)
         self.assertGreater(prefill_bytes, cache_bytes)
@@ -529,6 +530,46 @@ class PatternAndSizeParsingTests(unittest.TestCase):
             cs.validate_prefill_exceeds_cache(cache_bytes, cache_bytes)
         with self.assertRaises(ValueError):
             cs.validate_prefill_exceeds_cache(cache_bytes - 1024, cache_bytes)
+
+
+class WorkflowFastFlagTests(unittest.TestCase):
+    def test_every_bench_scaling_job_passes_compare_fast(self):
+        # #419 (owner, 2026-11-26): AwanFS --durability fast runs on every bench-scaling run,
+        # the self-hosted job's included. Each step that runs core_scaling.py for a benchmark
+        # (not the client ceiling probe) passes --compare-fast.
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".github", "workflows", "bench-scaling.yml")
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        steps = re.split(r"\n\s*- name: ", text)
+        runs = [s for s in steps if "benchmarks/core_scaling.py" in s and "--ceiling-probe" not in s
+                and "test_core_scaling" not in s]
+        self.assertGreaterEqual(len(runs), 2, "the hosted and the self-hosted benchmark steps")
+        for step in runs:
+            self.assertIn("--compare-fast", step, step.splitlines()[0])
+
+
+class DefaultMemoryBudgetTests(unittest.TestCase):
+    """#423 (owner, 2026-11-26): AwanFS runs at its own default memory budget, like every other
+    server, on the same 48 MiB prefill."""
+
+    def test_the_default_passes_no_memory_budget_and_skips_the_cache_check(self):
+        self.assertEqual(cs.DEFAULT_MEMORY_BUDGET, "")
+        self.assertIsNone(cs.prefill_cache_check("", cs.DEFAULT_PREFILL_SIZE))
+        # A budget given by name still needs a prefill above its cache half.
+        self.assertEqual(cs.prefill_cache_check("32MiB", "48MiB"), 16 * 1024 * 1024)
+        with self.assertRaises(ValueError):
+            cs.prefill_cache_check("128MiB", "48MiB")
+
+    def test_the_matrix_report_names_the_default_budget(self):
+        patterns, sizes, cores, concs, results = _sample_matrix_results()
+        md = cs.render_matrix_report(
+            cmd="python benchmarks/core_scaling.py --matrix",
+            patterns=patterns, sizes=sizes, cores=cores, concurrencies=concs, results=results,
+            total_cores=16, runs=2, duration_sec=2.0, seed=42, memory_budget="",
+            prefill_bytes=48 * 1024 * 1024, chart_paths=[],
+        )
+        self.assertIn("AwanFS at its default `--memory-budget`", md)
+        self.assertNotIn("--memory-budget 0", md)
 
 
 class WorkloadSequenceTests(unittest.TestCase):
@@ -1469,6 +1510,31 @@ class FastAndThreadReportTests(unittest.TestCase):
         self.assertIn("| group | 4 | 1002 | (unnamed) | 0.050 | 0.020 | 0.070 |", md)
         self.assertIn("| fast | 4 | 2001 | tokio-runtime-worker | 1.200 | 0.600 | 1.800 |", md)
 
+    def test_workloads_reach_1_mib_and_fast_rows_render_for_every_put_size(self):
+        sizes = {(mode, sz) for _k, _l, mode, sz in cs.WORKLOADS}
+        self.assertIn(("put", 1024 * cs.KIB), sizes)
+        self.assertIn(("get", 1024 * cs.KIB), sizes)
+        self.assertEqual([w[0] for w in cs.PUT_WORKLOADS], ["put_4k", "put_64k", "put_1m"])
+        self.assertEqual(cs.WORKLOADS[0][0], "put_4k")
+        cores, results = _sample_results()
+        pt = cs.PointResult(ops_per_sec=900.0, p50_ms=9.0, p99_ms=20.0, cpu_pct=80.0, ops_per_busy_core=1125.0)
+        fast = {wk: {n: pt for n in cores} for wk, *_ in cs.PUT_WORKLOADS}
+        md = cs.render_report(
+            cmd="python benchmarks/core_scaling.py --cores 1,2,4 --compare-fast",
+            cores=cores,
+            results=results,
+            total_cores=16,
+            runs=2,
+            duration_sec=2.0,
+            chart_paths=[],
+            fast_results=fast,
+        )
+        for label in ["PUT 4 KiB", "PUT 64 KiB", "PUT 1 MiB"]:
+            self.assertIn(f"| {label} |", md)
+            self.assertIn("AwanFS (--durability fast)", md.split(f"| {label} |", 1)[1].split("\n", 1)[0] + md)
+        self.assertEqual(md.count("| AwanFS (--durability fast) |"), 3 * 3, "throughput, CPU and client rows per PUT size")
+        self.assertIn("| GET 1 MiB |", md)
+
     def test_matrix_report_renders_fast_row_and_per_thread_cpu_table(self):
         patterns, sizes, cores, concs, results = _sample_matrix_results()
         results["seq-write"][4096]["AwanFS"][4][64] = cs.PointResult(
@@ -1506,6 +1572,29 @@ class FastAndThreadReportTests(unittest.TestCase):
         self.assertIn("## Per-Thread CPU Breakdown", md)
         self.assertIn("| group | 4 | 3001 | tokio-runtime-worker | 0.500 | 1.400 | 1.900 |", md)
         self.assertIn("| fast | 4 | 4001 | tokio-runtime-worker | 1.100 | 0.700 | 1.800 |", md)
+
+    def test_matrix_report_renders_fast_rows_for_every_put_size(self):
+        patterns, sizes, cores, concs, results = _sample_matrix_results()
+        pt = cs.PointResult(ops_per_sec=900.0, mib_per_sec=900.0, p50_ms=9.0, p99_ms=20.0, cpu_pct=80.0)
+        fast = {sz: {4: {64: pt}} for sz in sizes}
+        md = cs.render_matrix_report(
+            cmd="python benchmarks/core_scaling.py --matrix --compare-fast",
+            patterns=patterns,
+            sizes=sizes,
+            cores=cores,
+            concurrencies=concs,
+            results=results,
+            total_cores=16,
+            runs=2,
+            duration_sec=2.0,
+            seed=42,
+            memory_budget="32MiB",
+            prefill_bytes=48 * 1024 * 1024,
+            chart_paths=[],
+            fast_by_size=fast,
+        )
+        self.assertIn("| AwanFS (--durability fast) | seq-write | 4 KiB | 4 | 64 |", md)
+        self.assertIn("| AwanFS (--durability fast) | seq-write | 1 MiB | 4 | 64 |", md)
 
     def test_live_stub_phase_captures_thread_cpu_when_enabled(self):
         import threading
@@ -1954,6 +2043,139 @@ class TrivialHttpAndCeilingProbeTests(unittest.TestCase):
             self.assertIn("PUT 4 KiB", md)
             self.assertIn("GET 4 KiB", md)
             self.assertIn("Client CPU", md)
+
+
+SAMPLE_METRICS = """# HELP awanfs_disk_syncs_total fsync / FlushFileBuffers calls.
+# TYPE awanfs_disk_syncs_total counter
+awanfs_disk_syncs_total 120
+# HELP awanfs_disk_write_bytes_total Bytes passed to disk write calls.
+# TYPE awanfs_disk_write_bytes_total counter
+awanfs_disk_write_bytes_total 268435456
+awanfs_disk_writes_total 4000
+awanfs_peak_inflight_bytes 67108864
+awanfs_requests_total{method="PUT",status="200"} 999
+"""
+
+
+class PostMortemMatrixTests(unittest.TestCase):
+    """#431: an AwanFS-only matrix with the server's sync counters per phase (#430)."""
+
+    def test_servers_flag_limits_the_matrix_and_rejects_unknown_names(self):
+        self.assertEqual(cs.parse_servers(""), list(cs.SERVERS))
+        self.assertEqual(cs.parse_servers("AwanFS"), ["AwanFS"])
+        self.assertEqual(cs.parse_servers("awanfs, seaweedfs"), ["AwanFS", "SeaweedFS"])
+        with self.assertRaises(ValueError):
+            cs.parse_servers("AwanFS,Ceph")
+
+    def test_metrics_text_parses_into_the_work_counters(self):
+        got = cs.parse_awanfs_metrics(SAMPLE_METRICS)
+        self.assertEqual(got["awanfs_disk_syncs_total"], 120.0)
+        self.assertEqual(got["awanfs_disk_write_bytes_total"], 268435456.0)
+        self.assertEqual(got["awanfs_peak_inflight_bytes"], 67108864.0)
+        self.assertNotIn("awanfs_requests_total", got)
+
+    def test_phase_work_derives_rates_from_before_and_after(self):
+        before = {"awanfs_disk_syncs_total": 100.0, "awanfs_disk_write_bytes_total": 0.0, "awanfs_peak_inflight_bytes": 0.0}
+        after = {"awanfs_disk_syncs_total": 150.0, "awanfs_disk_write_bytes_total": 100.0 * cs.MIB, "awanfs_peak_inflight_bytes": 8.0 * cs.MIB}
+        w = cs.phase_work(before, after, elapsed_sec=5.0, ops_per_sec=20.0)
+        self.assertAlmostEqual(w.syncs_per_sec, 10.0)
+        self.assertAlmostEqual(w.puts_per_sync, 2.0)
+        self.assertAlmostEqual(w.mib_per_sync, 2.0)
+        self.assertAlmostEqual(w.disk_mib_per_sec, 20.0)
+        self.assertAlmostEqual(w.peak_inflight_mib, 8.0)
+
+    def test_phase_with_no_syncs_reports_no_syncs(self):
+        same = {"awanfs_disk_syncs_total": 7.0, "awanfs_disk_write_bytes_total": 0.0, "awanfs_peak_inflight_bytes": 0.0}
+        w = cs.phase_work(same, dict(same), elapsed_sec=5.0, ops_per_sec=1000.0)
+        self.assertEqual(w.syncs_per_sec, 0.0)
+        self.assertIsNone(w.puts_per_sync)
+        self.assertIsNone(w.mib_per_sync)
+        self.assertEqual(cs.format_work_cells(w)[1:3], ["no syncs", "no syncs"])
+
+    def test_matrix_scrapes_awanfs_counters_around_every_phase(self):
+        scrapes = [
+            {"awanfs_disk_syncs_total": 0.0, "awanfs_disk_write_bytes_total": 0.0, "awanfs_peak_inflight_bytes": 0.0},
+            {"awanfs_disk_syncs_total": 40.0, "awanfs_disk_write_bytes_total": 40.0 * cs.MIB, "awanfs_peak_inflight_bytes": cs.MIB},
+            {"awanfs_disk_syncs_total": 40.0, "awanfs_disk_write_bytes_total": 40.0 * cs.MIB, "awanfs_peak_inflight_bytes": cs.MIB},
+            {"awanfs_disk_syncs_total": 60.0, "awanfs_disk_write_bytes_total": 80.0 * cs.MIB, "awanfs_peak_inflight_bytes": 2 * cs.MIB},
+        ]
+        proc = mock.Mock(pid=1234)
+        with mock.patch.object(cs, "_prefill_server", return_value=None), \
+                mock.patch.object(cs, "_stop_proc"), \
+                mock.patch.object(cs, "pin_process"), \
+                mock.patch.object(cs, "scrape_awanfs_metrics", side_effect=scrapes) as scrape, \
+                mock.patch.object(cs, "_run_pattern_phase_with_cpu",
+                                  side_effect=lambda *a, **k: cs.PointResult(ops_per_sec=100.0, p50_ms=1.0, p99_ms=2.0)):
+            res = cs.measure_server_matrix_for_cores(
+                server_name="AwanFS",
+                starter=lambda: (proc, 9000, tempfile.mkdtemp(), os.path.join(tempfile.gettempdir(), "nolog.log")),
+                n_cores=2,
+                cli_cores=[2, 3],
+                shares_cores=False,
+                patterns=["seq-write"],
+                sizes=[cs.MIB],
+                concurrencies=[16, 64],
+                duration_sec=1.0,
+                seed=42,
+                prefill_bytes=cs.MIB,
+                scrape_work=True,
+            )
+        self.assertEqual(scrape.call_count, 4, "one scrape before and one after each phase")
+        self.assertAlmostEqual(res[("seq-write", cs.MIB, 16)].work.mib_per_sync, 1.0)
+        self.assertAlmostEqual(res[("seq-write", cs.MIB, 64)].work.mib_per_sync, 2.0)
+
+    def test_other_servers_are_not_scraped(self):
+        proc = mock.Mock(pid=1234)
+        with mock.patch.object(cs, "_prefill_server", return_value=None), \
+                mock.patch.object(cs, "_stop_proc"), \
+                mock.patch.object(cs, "pin_process"), \
+                mock.patch.object(cs, "scrape_awanfs_metrics") as scrape, \
+                mock.patch.object(cs, "_run_pattern_phase_with_cpu", return_value=cs.PointResult(ops_per_sec=100.0, p50_ms=1.0, p99_ms=2.0)):
+            res = cs.measure_server_matrix_for_cores(
+                server_name="MinIO",
+                starter=lambda: (proc, 9000, tempfile.mkdtemp(), os.path.join(tempfile.gettempdir(), "nolog.log")),
+                n_cores=2, cli_cores=[2, 3], shares_cores=False, patterns=["seq-write"], sizes=[cs.MIB],
+                concurrencies=[16], duration_sec=1.0, seed=42, prefill_bytes=cs.MIB,
+            )
+        scrape.assert_not_called()
+        self.assertIsNone(res[("seq-write", cs.MIB, 16)].work)
+
+    def test_aggregate_runs_keeps_the_median_work(self):
+        w = lambda s: cs.PhaseWork(syncs_per_sec=s, puts_per_sync=100.0 / s, mib_per_sync=1.0, disk_mib_per_sec=s, peak_inflight_mib=1.0)
+        agg = cs.aggregate_runs([
+            cs.PointResult(ops_per_sec=100.0, p50_ms=1.0, p99_ms=2.0, work=w(10.0)),
+            cs.PointResult(ops_per_sec=100.0, p50_ms=1.0, p99_ms=2.0, work=w(20.0)),
+            cs.PointResult(ops_per_sec=100.0, p50_ms=1.0, p99_ms=2.0, work=w(30.0)),
+        ])
+        self.assertAlmostEqual(agg.work.syncs_per_sec, 20.0)
+
+    def test_fast_every_concurrency_runs_fast_at_every_listed_concurrency(self):
+        self.assertEqual(cs.fast_concurrencies_for(8, [16, 64, 128, 256], every=True), [16, 64, 128, 256])
+        self.assertEqual(cs.fast_concurrencies_for(8, [16, 64, 128, 256], every=False), [64, 128])
+
+    def _work_report(self, servers):
+        pt = lambda: cs.PointResult(ops_per_sec=300.0, mib_per_sec=300.0, p50_ms=1.0, p99_ms=2.0, cpu_pct=100.0,
+                                    work=cs.PhaseWork(syncs_per_sec=30.0, puts_per_sync=10.0, mib_per_sync=10.0,
+                                                      disk_mib_per_sec=300.0, peak_inflight_mib=64.0))
+        results = {"seq-write": {cs.MIB: {srv: {8: {64: pt()}} for srv in servers}}}
+        return cs.render_matrix_report(
+            cmd="x", patterns=["seq-write"], sizes=[cs.MIB], cores=[8], concurrencies=[64], results=results,
+            total_cores=16, runs=1, duration_sec=1.0, seed=42, memory_budget="", prefill_bytes=cs.MIB,
+            chart_paths=[], fast_by_size={cs.MIB: {8: {64: pt()}}}, servers=servers,
+        )
+
+    def test_matrix_report_has_a_work_table_row_per_awanfs_phase_for_group_and_fast(self):
+        md = self._work_report(["AwanFS"])
+        self.assertIn("## AwanFS work per phase", md)
+        self.assertIn("| Durability | Pattern | Size | Cores | Concurrency | ops/s | syncs/s | PUTs per sync | MiB per sync | disk MiB/s | peak in-flight MiB |", md)
+        self.assertIn("| group | seq-write | 1 MiB | 8 | 64 | 300 | 30.0 | 10.0 | 10.00 | 300.0 | 64.0 |", md)
+        self.assertIn("| fast | seq-write | 1 MiB | 8 | 64 | 300 | 30.0 | 10.0 | 10.00 | 300.0 | 64.0 |", md)
+
+    def test_matrix_report_lists_only_the_servers_that_ran(self):
+        md = self._work_report(["AwanFS"])
+        self.assertIn("| AwanFS | seq-write |", md)
+        self.assertNotIn("| MinIO | seq-write |", md)
+        self.assertNotIn("| RustFS | seq-write |", md)
 
 
 if __name__ == "__main__":

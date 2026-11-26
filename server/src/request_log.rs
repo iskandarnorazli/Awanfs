@@ -13,6 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 tokio::task_local! {
     static REQUEST_ID: String;
     static ERROR_CODE: std::cell::RefCell<Option<String>>;
+    static AUTHZ_REASON: std::cell::RefCell<Option<&'static str>>;
+    static PRINCIPAL: std::cell::RefCell<Option<String>>;
 }
 
 /// Receives one finished JSON log line, without the newline.
@@ -57,13 +59,23 @@ pub fn current_request_id() -> Option<String> {
     REQUEST_ID.try_with(|id| id.clone()).ok()
 }
 
-/// Runs `fut` with `id` as the current request ID. Returns its output and the S3 error code
-/// of the last error body written while it ran.
-pub async fn with_request_id<F: std::future::Future>(id: String, fut: F) -> (F::Output, Option<String>) {
-    ERROR_CODE
+/// Runs `fut` with `id` as the current request ID. Returns its output, the S3 error code
+/// of the last error body written while it ran, and the authorization audit reason if recorded.
+pub async fn with_request_id<F: std::future::Future>(id: String, fut: F) -> (F::Output, Option<String>, Option<&'static str>) {
+    PRINCIPAL
         .scope(std::cell::RefCell::new(None), async move {
-            let out = REQUEST_ID.scope(id, fut).await;
-            (out, ERROR_CODE.with(|c| c.borrow().clone()))
+            AUTHZ_REASON
+                .scope(std::cell::RefCell::new(None), async move {
+                    ERROR_CODE
+                        .scope(std::cell::RefCell::new(None), async move {
+                            let out = REQUEST_ID.scope(id, fut).await;
+                            let err = ERROR_CODE.with(|c| c.borrow().clone());
+                            let reason = AUTHZ_REASON.with(|r| *r.borrow());
+                            (out, err, reason)
+                        })
+                        .await
+                })
+                .await
         })
         .await
 }
@@ -71,6 +83,22 @@ pub async fn with_request_id<F: std::future::Future>(id: String, fut: F) -> (F::
 /// Called by `s3_error_xml`: remembers the error code for the access log.
 pub fn note_error_code(code: &str) {
     let _ = ERROR_CODE.try_with(|c| *c.borrow_mut() = Some(code.to_string()));
+}
+
+/// Called by `ops::authorize`: remembers the authorization audit reason for the request log.
+pub fn note_authz_reason(reason: &'static str) {
+    let _ = AUTHZ_REASON.try_with(|r| *r.borrow_mut() = Some(reason));
+}
+
+/// Records the authenticated caller principal on the current request task (#159).
+pub fn note_principal(principal: impl Into<String>) {
+    let p = principal.into();
+    let _ = PRINCIPAL.try_with(|slot| *slot.borrow_mut() = Some(p));
+}
+
+/// Returns the caller principal recorded for the current request task, if any (#159).
+pub fn current_principal() -> Option<String> {
+    PRINCIPAL.try_with(|slot| slot.borrow().clone()).ok().flatten()
 }
 
 /// The access key a request claims: `Credential=<key>/...` in the Authorization header or
@@ -182,13 +210,18 @@ pub struct RequestRecord<'a> {
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub duration_us: u64,
+    pub authz_reason: Option<&'a str>,
 }
 
 impl RequestRecord<'_> {
     pub fn to_json(&self) -> String {
         let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let reason_field = match self.authz_reason {
+            Some(r) => format!(",\"authz_reason\":\"{}\"", json_escape(r)),
+            None => String::new(),
+        };
         format!(
-            "{{\"ts_ms\":{},\"level\":\"info\",\"request_id\":\"{}\",\"method\":\"{}\",\"operation\":\"{}\",\"bucket\":\"{}\",\"key\":\"{}\",\"status\":{},\"bytes_in\":{},\"bytes_out\":{},\"duration_us\":{}}}",
+            "{{\"ts_ms\":{},\"level\":\"info\",\"request_id\":\"{}\",\"method\":\"{}\",\"operation\":\"{}\",\"bucket\":\"{}\",\"key\":\"{}\",\"status\":{},\"bytes_in\":{},\"bytes_out\":{},\"duration_us\":{}{}}}",
             ts_ms,
             json_escape(self.request_id),
             json_escape(self.method),
@@ -198,7 +231,8 @@ impl RequestRecord<'_> {
             self.status,
             self.bytes_in,
             self.bytes_out,
-            self.duration_us
+            self.duration_us,
+            reason_field
         )
     }
 }
