@@ -54,6 +54,8 @@ pub struct PostForm {
     done: bool,
     file_offset: u64,
     pub(crate) policy: Option<Policy>,
+    /// The budget charge for the fields, held until the file is handed to PUT.
+    fields_guard: Option<crate::memory::AdmissionGuard>,
 }
 
 pub(crate) fn refusal_response(r: Refusal, resource: &str) -> Response<ResponseBody> {
@@ -74,12 +76,40 @@ pub fn is_form_upload(headers: &HeaderMap) -> bool {
         .is_some_and(|t| t.trim().eq_ignore_ascii_case("multipart/form-data"))
 }
 
-/// Reads the form up to the start of the file and sets the request's key from it. The
-/// fields are bounded by the parser's limits (100 fields of at most 20 KiB).
+/// The most a form may hold before its file: 100 fields of 20 KiB, each with 8 KiB of part
+/// headers. Reading them is charged to the body budget, up to this.
+const FIELDS_CAP: u64 = (crate::form_upload::DEFAULT_MAX_FIELDS * (crate::form_upload::DEFAULT_MAX_FIELD_BYTES + crate::form_upload::DEFAULT_MAX_HEADER_BYTES)) as u64;
+
+/// The largest form: the largest object plus room for its fields.
+const MAX_FORM_BODY: u64 = crate::s3_api::MAX_OBJECT_BODY + crate::s3_api::MAX_XML_BODY;
+
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// Reads the form up to the start of the file and sets the request's key from it. This runs
+/// before authentication, so it is bounded three ways: the parser's limits on fields, a charge
+/// to the body budget for what it holds, and a total deadline of three idle timeouts for the
+/// whole field phase (a client trickling bytes cannot hold the connection forever).
 pub async fn read_form(state: &S3ServiceState, mut c: Classified) -> Result<Classified, Response<ResponseBody>> {
     let path = c.parts.uri.path().to_string();
+    let Some(declared) = content_length(&c.parts.headers) else {
+        return Err(refusal_response(MISSING_LENGTH, &path));
+    };
+    if declared > MAX_FORM_BODY {
+        return Err(crate::s3_api::entity_too_large(&path, MAX_FORM_BODY));
+    }
     let ct = c.parts.headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
     let boundary = extract_boundary(ct).map_err(|r| refusal_response(r, &path))?;
+    let fields_guard = match state.body_budget.acquire_async(declared.min(FIELDS_CAP)).await {
+        Ok(g) => g,
+        Err(_) => {
+            return Err(crate::s3_api::slow_down_response(
+                &path,
+                "Please reduce your request rate; in-flight body memory budget exhausted.",
+            ))
+        }
+    };
     let mut parser = FormParser::new(&boundary, FormLimits::default());
     let mut fields = FormFields::default();
     let mut filename = None;
@@ -87,8 +117,13 @@ pub async fn read_form(state: &S3ServiceState, mut c: Classified) -> Result<Clas
     let mut done = false;
     let mut started = false;
     let idle = state.body_idle_timeout();
+    let deadline = tokio::time::Instant::now() + idle * 3;
     while !started {
-        let frame = match crate::body_timeout::next_frame_with_idle(&mut c.body, idle).await {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Err(request_timeout_response(&path));
+        }
+        let frame = match crate::body_timeout::next_frame_with_idle(&mut c.body, idle.min(left)).await {
             Err(_) => return Err(request_timeout_response(&path)),
             Ok(None) => {
                 let r = parser.finish().err().unwrap_or(MALFORMED);
@@ -115,7 +150,16 @@ pub async fn read_form(state: &S3ServiceState, mut c: Classified) -> Result<Clas
     let key = po::object_key(&fields, filename.as_deref()).map_err(|r| refusal_response(r, &path))?;
     let file_offset = parser.file_data_offset().unwrap_or(0);
     c.key = Some(key);
-    c.form = Some(Box::new(PostForm { fields, filename, parser, pending, done, file_offset, policy: None }));
+    c.form = Some(Box::new(PostForm {
+        fields,
+        filename,
+        parser,
+        pending,
+        done,
+        file_offset,
+        policy: None,
+        fields_guard: Some(fields_guard),
+    }));
     Ok(c)
 }
 
@@ -314,20 +358,26 @@ pub async fn execute(
     mut body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let mut form = form.expect("read_form ran for PostObject");
-    let Some(content_length) = req_headers
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
-    else {
+    let Some(content_length) = content_length(req_headers) else {
         return Ok(refusal_response(MISSING_LENGTH, path));
     };
+    // The file ends at the closing delimiter, so its size is known before it is read. A
+    // body that does not end there is refused, on every path.
     let Some(predicted) = content_length.checked_sub(form.file_offset + form.parser.closing_len()) else {
         return Ok(refusal_response(MALFORMED, path));
     };
+    if predicted > crate::s3_api::MAX_OBJECT_BODY {
+        return Ok(crate::s3_api::entity_too_large(path, crate::s3_api::MAX_OBJECT_BODY));
+    }
     let failed = Arc::new(Mutex::new(None));
-    let (size, file_body, _guard) = if form.done || predicted <= STREAM_PUT_MIN {
-        let cap = predicted.max(STREAM_PUT_MIN);
-        let guard = match state.body_budget.acquire_async(cap.min(predicted.saturating_add(1024))).await {
+    let (size, file_body) = if form.done || predicted <= STREAM_PUT_MIN {
+        // Charged for the bytes this holds: the pending ones when the whole form came in one
+        // frame, else the predicted size (at most 4 MiB here).
+        let held: u64 = if form.done { form.pending.iter().map(|b| b.len() as u64).sum() } else { predicted };
+        if form.done && held != predicted {
+            return Ok(refusal_response(MALFORMED, path));
+        }
+        let guard = match state.body_budget.acquire_async(held).await {
             Ok(g) => g,
             Err(_) => {
                 return Ok(crate::s3_api::slow_down_response(
@@ -336,11 +386,16 @@ pub async fn execute(
                 ))
             }
         };
-        let data = match read_small_file(&state, &mut form, &mut body, cap, path).await {
+        let data = match read_small_file(&state, &mut form, &mut body, predicted, path).await {
             Ok(d) => d,
             Err(resp) => return Ok(resp),
         };
-        (data.len() as u64, FormFileBody::Buffered(Some(data)), Some(guard))
+        if data.len() as u64 != predicted {
+            return Ok(refusal_response(MALFORMED, path));
+        }
+        // PUT charges these bytes itself when it reads them: charge them once.
+        drop(guard);
+        (predicted, FormFileBody::Buffered(Some(data)))
     } else {
         let parser = std::mem::replace(&mut form.parser, FormParser::new("-", FormLimits::default()));
         let mut s = StreamingFile {
@@ -356,8 +411,9 @@ pub async fn execute(
         for b in std::mem::take(&mut form.pending) {
             s.take(b);
         }
-        (predicted, FormFileBody::Streaming(Box::new(s)), None)
+        (predicted, FormFileBody::Streaming(Box::new(s)))
     };
+    form.fields_guard = None;
     if let Err(r) = po::check_size(form.policy.as_ref(), size) {
         return Ok(refusal_response(r, path));
     }

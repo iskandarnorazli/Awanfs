@@ -1182,10 +1182,10 @@ pub fn validate(a: Authorized) -> Result<Validated, Response<ResponseBody>> {
     } else {
         body_limit_for(&c.parts.method, &target)
     };
-    let declared = c
-        .parts
-        .headers
-        .get("x-amz-decoded-content-length")
+    // A form's size is its Content-Length; `x-amz-decoded-content-length` is for aws-chunked
+    // PUT bodies and must not let a form past the limit.
+    let decoded = if c.op == Operation::PostObject { None } else { c.parts.headers.get("x-amz-decoded-content-length") };
+    let declared = decoded
         .or_else(|| c.parts.headers.get(CONTENT_LENGTH))
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok());

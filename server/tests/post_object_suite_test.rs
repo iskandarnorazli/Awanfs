@@ -799,3 +799,92 @@ async fn a_post_to_a_bucket_without_a_form_is_method_not_allowed() {
     let r = c.post(format!("http://{}/post-notform", srv.host)).body("x").send().await.unwrap();
     assert_eq!(r.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
+
+// ---- Bounds found by the review on #119 (issuecomment after 7194136864) --------------------
+
+/// Sends a form's head and `body` with a declared Content-Length, and returns the status the
+/// server answers with, without sending the rest of what was declared.
+async fn raw_post(host: &str, bucket: &str, declared: u64, extra: &str, body: &[u8], trickle: Option<&[u8]>) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(host).await.unwrap();
+    let head = format!(
+        "POST /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: multipart/form-data; boundary={}\r\nContent-Length: {}\r\n{}\r\n",
+        bucket, host, BOUNDARY, declared, extra
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(body).await.unwrap();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut extra_bytes = trickle.unwrap_or(&[]).iter();
+    loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let text = String::from_utf8_lossy(&buf[..pos]).to_string();
+            return text.split_whitespace().nth(1).unwrap().parse().unwrap();
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no answer within 20 s");
+        if let Some(b) = extra_bytes.next() {
+            let _ = s.write_all(&[*b]).await;
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(100), s.read(&mut chunk)).await {
+            Ok(Ok(0)) => panic!("connection closed without an answer"),
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+            Ok(Err(e)) => panic!("read failed: {}", e),
+            Err(_) => {}
+        }
+    }
+}
+
+/// A whole form in fewer bytes than its Content-Length declares is refused, nothing is
+/// stored, and the next form goes through. Before the fix the form was stored, and with a
+/// large declared size its budget charge was the declared size, not the bytes held.
+#[tokio::test]
+async fn a_form_shorter_than_its_content_length_is_refused_without_holding_the_budget() {
+    let srv = anonymous_server().await;
+    let c = reqwest::Client::new();
+    make_bucket(&c, &srv, "post-short").await;
+    let body = form_body(&[field("key", "foo.txt")], None, b"bar");
+    let status = raw_post(&srv.host, "post-short", body.len() as u64 + (1 << 20), "", &body, None).await;
+    assert_eq!(status, 400);
+    assert_eq!(get_body(&c, &srv, "post-short", "foo.txt").await.0, StatusCode::NOT_FOUND);
+    let ok = post(&c, &srv.host, "post-short", form_body(&[field("key", "next.txt")], None, b"bar")).await;
+    assert_eq!(ok.status(), StatusCode::NO_CONTENT);
+}
+
+/// A form whose file would be larger than 5 GiB is refused before the file is read, whether
+/// or not it also sends `x-amz-decoded-content-length` (which validation used to trust).
+#[tokio::test]
+async fn a_form_with_a_file_above_5_gib_is_refused_before_reading_it() {
+    let srv = anonymous_server().await;
+    let c = reqwest::Client::new();
+    make_bucket(&c, &srv, "post-huge").await;
+    let mut head = Vec::new();
+    head.extend_from_slice(format!("--{b}\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nfoo.txt\r\n", b = BOUNDARY).as_bytes());
+    head.extend_from_slice(format!("--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"f\"\r\n\r\nxxxx", b = BOUNDARY).as_bytes());
+    let gib5 = 5u64 << 30;
+    assert_eq!(raw_post(&srv.host, "post-huge", gib5 + (8 << 20), "", &head, None).await, 400, "file above 5 GiB");
+    assert_eq!(
+        raw_post(&srv.host, "post-huge", 6 << 30, "x-amz-decoded-content-length: 1\r\n", &head, None).await,
+        400,
+        "a decoded length does not get a form past the limit"
+    );
+    assert_eq!(get_body(&c, &srv, "post-huge", "foo.txt").await.0, StatusCode::NOT_FOUND);
+}
+
+/// The fields are read before authentication, so their whole read has a deadline (three idle
+/// timeouts): a client that sends a byte just often enough to stay under the idle timeout gets
+/// 408 instead of holding the connection.
+#[tokio::test]
+async fn a_form_that_trickles_its_fields_gets_408() {
+    let mut state = S3ServiceState::new();
+    state.auth = AuthConfig::open();
+    state.set_body_idle_timeout(std::time::Duration::from_millis(300));
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let h = start_s3_reactor(addr, Arc::new(state)).await.unwrap();
+    let srv = Srv { host: h.local_addr.to_string(), _h: h };
+    let c = reqwest::Client::new();
+    make_bucket(&c, &srv, "post-slow").await;
+    let start = format!("--{b}\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\n", b = BOUNDARY);
+    let slow = vec![b'k'; 200];
+    assert_eq!(raw_post(&srv.host, "post-slow", 1 << 20, "", start.as_bytes(), Some(&slow)).await, 408);
+}
