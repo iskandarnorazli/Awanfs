@@ -46,7 +46,8 @@ fn a_late_record_after_a_gap_survives_a_restart_once_a_later_write_is_journaled(
         let vm = VolumeManager::open(&dir, 1).unwrap();
         gap_then_late_record(&vm);
         vm.write_needle(1, "n4", &pattern(5000, 4), 1, 0, 0).unwrap();
-        assert_eq!(vm.pending_journal_len(), 0, "n4's append wrote n3's record first");
+        // #412: records are written by the sync, after the volume sync, in order: n3's first.
+        assert_eq!(vm.pending_journal_len(), 2, "n3's and n4's records wait for the sync");
         vm.sync_now().unwrap();
     }
     let vm = VolumeManager::open(&dir, 1).unwrap();

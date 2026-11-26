@@ -1,17 +1,16 @@
-//! #412: can a needle at or before the `.idx` journal's last recorded offset be torn?
-//!
-//! A needle's journal record is written right after its header, with no sync between them,
-//! and the volume and the journal reach the disk independently. So a crash can keep the
-//! record and tear the needle's sector 0 after its 64-byte header: the header decodes, the
-//! payload is wrong, and the journal names the needle. Only the payload check at open
-//! (`verify_needle_integrity`) rejects it. Skipping that check for journaled needles would
-//! return the torn bytes as an object.
+//! #412 (owner decision: option B, issuecomment-7183429119): a needle's `.idx` record is written
+//! only after the volume sync that covers the needle. So every record on disk names a needle
+//! whose bytes are on disk, and the open checks payload CRCs only for needles the journal does
+//! not record. Before this, a record was written right after its needle's header with no sync
+//! between them, a crash could keep the record and tear the needle, and the open had to read
+//! every payload (`measurements/2026-11-26-boot-large-objects.md`).
 
 use s3_server::clock::{Clock, SystemClock};
 use s3_server::meta_index::AWAN_FLAG_ACTIVE;
 use s3_server::sim::{CrashMode, SimFs, SimRng};
 use s3_server::vfile::VolFs;
 use s3_server::volume::{NeedleHeader, ScannedNeedle, VolumeManager};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -35,62 +34,100 @@ fn journal_offsets(idx: &[u8]) -> Vec<u64> {
     idx.chunks_exact(IDX_RECORD).map(|r| u64::from_le_bytes(r[12..20].try_into().unwrap())).collect()
 }
 
-/// The needle at `offset` has a header that decodes and a payload whose CRC does not match.
-fn torn_after_header(dat: &[u8], offset: usize, key: &[u8], payload: &[u8]) -> bool {
-    let p_start = offset + 64 + key.len();
-    let p_end = p_start + payload.len();
-    dat.len() >= p_end
-        && NeedleHeader::decode(dat[offset..offset + 64].try_into().unwrap()).is_ok()
-        && &dat[offset + 64..p_start] == key
-        && crc32c::crc32c(&dat[p_start..p_end]) != crc32c::crc32c(payload)
+#[test]
+fn opening_a_volume_whose_needles_are_all_journaled_verifies_no_payload() {
+    let dir = Path::new("sim/boot_all_journaled");
+    let fs = SimFs::new();
+    {
+        let vm = VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap();
+        for i in 0..5 {
+            vm.write_needle(1, &format!("k{}", i), &pattern(3000 + i * 5000, i), AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+        }
+        vm.sync_now().unwrap();
+        assert_eq!(vm.pending_journal_len(), 0, "the sync wrote every record");
+    }
+    let vm = VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap();
+    assert_eq!(vm.payload_verified_at_open(), 0, "every needle is journaled: no payload is read");
+    assert_eq!(scan_all(&vm).len(), 5);
 }
 
 #[test]
-fn a_crash_can_tear_a_needle_the_journal_records_and_open_still_rejects_it() {
-    let dir = Path::new("sim/boot_verify_journal");
+fn opening_a_volume_verifies_exactly_the_needles_the_journal_does_not_record() {
+    let dir = Path::new("sim/boot_tail_unjournaled");
+    let fs = SimFs::new();
+    let (c, d) = (pattern(7000, 3), pattern(20_000, 4));
+    {
+        let vm = VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap();
+        vm.write_needle(1, "a", &pattern(5000, 1), AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+        vm.write_needle(1, "b", &pattern(9000, 2), AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+        vm.sync_now().unwrap();
+        // Written, not synced: their records are still pending, so the journal lacks them.
+        vm.write_needle(1, "c", &c, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+        vm.write_needle(1, "d", &d, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+        assert_eq!(vm.pending_journal_len(), 2, "unsynced needles have no record on disk yet");
+    }
+    let vm = VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap();
+    assert_eq!(vm.payload_verified_at_open(), (c.len() + d.len()) as u64, "only c's and d's payloads are checked");
+    let keys: Vec<String> = scan_all(&vm).into_iter().map(|n| n.key).collect();
+    assert_eq!(keys, ["a", "b", "c", "d"]);
+}
+
+/// Streamed needles finish out of offset order: k2 starts first and finishes last, so a
+/// journal could record k3 above k2. The open trusts a needle by its own record, not by
+/// being below the journal's last offset.
+#[test]
+fn every_record_a_crash_leaves_names_a_whole_needle_and_no_torn_needle_comes_back() {
+    let dir = Path::new("sim/boot_crash_records");
     let dat_path = dir.join("volume_0001.dat");
     let idx_path = dir.join("volume_0001.idx");
     let fs = SimFs::new();
-    let vm = VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap();
+    let vm = Arc::new(VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap());
 
+    let mut want: HashMap<String, Vec<u8>> = HashMap::new();
     let p0 = pattern(4000, 1);
     vm.write_needle(1, "a", &p0, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+    want.insert("a".into(), p0);
     vm.sync_now().unwrap();
-    // Two unsynced needles of two sectors each: tail sector, then sector 0 with the header.
-    let p1 = pattern(6000, 2);
-    let p2 = pattern(6000, 3);
-    let b = vm.write_needle(1, "b", &p1, AWAN_FLAG_ACTIVE, 0, 0).unwrap().offset as usize;
-    let c = vm.write_needle(1, "c", &p2, AWAN_FLAG_ACTIVE, 0, 0).unwrap().offset as usize;
 
-    let mut torn_before_last = 0;
-    let mut torn_at_last = 0;
+    let p2 = pattern(54_650, 2);
+    let mut w = vm.begin_needle(1, "k2", p2.len() as u64, AWAN_FLAG_ACTIVE).unwrap();
+    w.write(&p2).unwrap();
+    let p3 = pattern(17_285, 3);
+    vm.write_needle(1, "k3", &p3, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+    vm.sync_now().unwrap();
+    w.finish(0, 0).unwrap();
+    let p4 = pattern(6000, 4);
+    vm.write_needle(1, "k4", &p4, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+    want.insert("k2".into(), p2);
+    want.insert("k3".into(), p3);
+    want.insert("k4".into(), p4);
+
+    let mut records_seen = 0;
     for seed in 0..2000u64 {
         let after = fs.crashed(CrashMode::SeededPrefix, &mut SimRng::new(seed));
         let dat = after.file(&dat_path).unwrap().contents();
         let idx = after.file(&idx_path).unwrap().contents();
-        let journaled = journal_offsets(&idx);
-        let last = journaled.iter().copied().max().unwrap_or(0) as usize;
-
-        let b_torn = torn_after_header(&dat, b, b"b", &p1) && journaled.contains(&(b as u64));
-        let c_torn = torn_after_header(&dat, c, b"c", &p2) && journaled.contains(&(c as u64));
-        if b_torn && b < last {
-            torn_before_last += 1;
-        }
-        if (b_torn && b == last) || (c_torn && c == last) {
-            torn_at_last += 1;
+        for off in journal_offsets(&idx) {
+            records_seen += 1;
+            let o = off as usize;
+            let hdr = NeedleHeader::decode(dat[o..o + 64].try_into().unwrap())
+                .unwrap_or_else(|e| panic!("seed {}: the journal records {} but its header is gone: {:?}", seed, off, e));
+            let p = o + 64 + hdr.key_len as usize + hdr.attrs_len as usize;
+            let payload = &dat[p..p + hdr.payload_size as usize];
+            assert_eq!(crc32c::crc32c(payload), hdr.payload_crc32c, "seed {}: the journal records a torn needle at {}", seed, off);
         }
 
         let reopened = VolumeManager::open_with(&after, dir, 1, false, clock()).unwrap();
         for n in scan_all(&reopened) {
-            match n.key.as_str() {
-                "a" => {}
-                "b" => assert!(!b_torn, "seed {}: torn b, recorded in the journal, came back", seed),
-                "c" => assert!(!c_torn, "seed {}: torn c, recorded in the journal, came back", seed),
-                other => panic!("seed {}: unexpected key {:?}", seed, other),
-            }
+            let mut got = Vec::new();
+            reopened
+                .copy_payload(n.offset, n.payload_crc32c, |chunk| {
+                    got.extend_from_slice(chunk);
+                    Ok(())
+                })
+                .unwrap_or_else(|e| panic!("seed {}: {} came back unreadable: {:?}", seed, n.key, e));
+            assert!(got == want[&n.key], "seed {}: {} came back with torn bytes", seed, n.key);
         }
     }
-    eprintln!("torn and journaled: {} before the last journal offset, {} at it", torn_before_last, torn_at_last);
-    assert!(torn_before_last > 0, "some seed tears b while the journal records b and c");
-    assert!(torn_at_last > 0, "some seed tears the needle at the journal's last offset");
+    assert!(records_seen > 0, "some seed keeps journal records");
 }

@@ -349,6 +349,8 @@ fn scan(dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
         volumes.push(VolumeManager::open(dir, id).map_err(|e| format!("volume {}: {}", id, e))?);
     }
     let open_secs = t_open.elapsed().as_secs_f64();
+    // Payload bytes whose CRC the opens checked: the needles the journals do not record (#412).
+    let open_verified: u64 = volumes.iter().map(|vm| vm.payload_verified_at_open()).sum();
     let before_reads: Vec<u64> = volumes
         .iter()
         .map(|vm| vm.work_counters().snapshot().disk_reads)
@@ -370,13 +372,14 @@ fn scan(dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
         .sum();
     let needles_per_s = needles as f64 / secs.max(1e-9);
     Ok(format!(
-        "{{\"phase\":\"scan\",\"volumes\":{},\"open_secs\":{:.3},\"secs\":{:.3},\"needles\":{},\"needles_per_s\":{:.0},\"read_calls\":{}}}",
+        "{{\"phase\":\"scan\",\"volumes\":{},\"open_secs\":{:.3},\"secs\":{:.3},\"needles\":{},\"needles_per_s\":{:.0},\"read_calls\":{},\"open_payload_verified_bytes\":{}}}",
         volumes.len(),
         open_secs,
         secs,
         needles,
         needles_per_s,
-        read_calls
+        read_calls,
+        open_verified
     ))
 }
 
