@@ -233,6 +233,7 @@ struct RuleDraft {
     id: Option<String>,
     status: Option<String>,
     legacy_prefix: Option<String>,
+    cur_prefix: Option<String>,
     has_filter: bool,
     filter: FilterSpec,
     in_tag: Option<TagDraft>,
@@ -304,7 +305,7 @@ impl RuleDraft {
                 self.has_filter = true;
             }
             ["Filter", "Prefix"] | ["Filter", "And", "Prefix"] => {
-                self.filter.prefix.get_or_insert_with(String::new);
+                self.cur_prefix = Some(String::new());
             }
             ["Filter", "Tag"] | ["Filter", "And", "Tag"] => {
                 self.in_tag = Some(TagDraft::default());
@@ -359,8 +360,7 @@ impl RuleDraft {
                 .get_or_insert_with(String::new)
                 .push_str(text),
             ["Filter", "Prefix"] | ["Filter", "And", "Prefix"] => {
-                self.filter
-                    .prefix
+                self.cur_prefix
                     .get_or_insert_with(String::new)
                     .push_str(text);
             }
@@ -471,6 +471,20 @@ impl RuleDraft {
 
     fn on_end(&mut self, path: &[String]) -> Result<(), Refusal> {
         let rel: Vec<&str> = path.iter().skip(2).map(|s| s.as_str()).collect();
+        if matches!(rel.as_slice(), ["Filter", "Prefix"] | ["Filter", "And", "Prefix"]) {
+            if let Some(p) = self.cur_prefix.take() {
+                match &mut self.filter.prefix {
+                    None => self.filter.prefix = Some(p),
+                    Some(prev) => {
+                        if p.starts_with(prev.as_str()) {
+                            *prev = p;
+                        } else if !prev.starts_with(p.as_str()) {
+                            return Err(malformed("conflicting Prefix predicates"));
+                        }
+                    }
+                }
+            }
+        }
         if matches!(rel.as_slice(), ["Filter", "Tag"] | ["Filter", "And", "Tag"]) {
             if let Some(tag) = self.in_tag.take() {
                 let key = tag
@@ -700,6 +714,23 @@ fn parse_midnight_utc(raw: &str) -> Result<String, Refusal> {
     }
 
     Ok(format!("{year:04}-{month:02}-{day:02}T00:00:00Z"))
+}
+
+/// Converts a normalized `"YYYY-MM-DDT00:00:00Z"` timestamp to Unix epoch seconds.
+pub fn parse_midnight_utc_epoch(normalized: &str) -> Option<u64> {
+    if normalized.len() < 10 {
+        return None;
+    }
+    let y: i64 = normalized.get(0..4)?.parse().ok()?;
+    let m: i64 = normalized.get(5..7)?.parse().ok()?;
+    let d: i64 = normalized.get(8..10)?.parse().ok()?;
+    let yy = if m <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days).ok()?.checked_mul(86_400)
 }
 
 pub fn lifecycle_config_xml(config: &LifecycleConfig) -> String {
@@ -1431,5 +1462,23 @@ mod tests {
             let parsed = parse_lifecycle_config_xml(&xml).expect("serialized config must parse");
             prop_assert_eq!(cfg, parsed);
         }
+    }
+
+    #[test]
+    fn dual_prefix_and_midnight_epoch() {
+        let xml = wrap_rules(
+            "<Rule><ID>r</ID><Status>Enabled</Status>\
+             <Filter><Prefix>days1/</Prefix><Tag><Key>tom</Key><Value>sawyer</Value></Tag>\
+             <And><Prefix>days1</Prefix><Tag><Key>huck</Key><Value>finn</Value></Tag></And></Filter>\
+             <Expiration><Days>1</Days></Expiration></Rule>",
+        );
+        let cfg = parse_lifecycle_config_xml(&xml).expect("dual compatible prefix must parse");
+        assert!(applies(&cfg.rules[0], "days1/huck", 4, &[("tom", "sawyer"), ("huck", "finn")]));
+        assert!(!applies(&cfg.rules[0], "days1/tom", 4, &[("tom", "sawyer")]));
+        let reparsed = parse_lifecycle_config_xml(&lifecycle_config_xml(&cfg)).unwrap();
+        assert_eq!(cfg, reparsed);
+
+        let ep = parse_midnight_utc_epoch("2020-01-01T00:00:00Z").unwrap();
+        assert_eq!(ep, 1_577_836_800);
     }
 }

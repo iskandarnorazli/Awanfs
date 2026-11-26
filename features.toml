@@ -229,7 +229,7 @@ mint = [
 [[feature]]
 id = "lifecycle"
 name = "Bucket lifecycle configuration and expiration sweep"
-status = "partial"
+status = "done"
 issue = "#118"
 area = "lifecycle"
 design_section = "8.3"
@@ -243,7 +243,8 @@ mint = [
   "minio-js::Set lifecycle config of a bucket",
   "minio-js::Set lifecycle config on a bucket:",
 ]
-server_tests = ["server/tests/lifecycle_test.rs", "server/tests/scheduler_test.rs", "server/tests/clock_and_dates_test.rs"]
+server_tests = ["server/tests/lifecycle_conformance_test.rs", "server/tests/lifecycle_test.rs", "server/tests/scheduler_test.rs", "server/tests/clock_and_dates_test.rs"]
+drive = ["lifecycle"]
 fuzz = ["lifecycle_xml", "lifecycle_config_xml"]
 
 [[feature]]

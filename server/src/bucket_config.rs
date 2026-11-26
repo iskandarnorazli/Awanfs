@@ -256,6 +256,27 @@ impl ValidatorRegistry {
             }),
         );
         reg.register(
+            ConfigKind::Lifecycle,
+            Arc::new(|bytes: &[u8]| {
+                let xml_str = std::str::from_utf8(bytes).map_err(|_| ConfigError::Rejected {
+                    status: 400,
+                    code: "MalformedXML",
+                    message: "Lifecycle configuration is not valid UTF-8".to_string(),
+                })?;
+                let lc = crate::lifecycle_config::parse_lifecycle_config_xml(xml_str).map_err(|r| {
+                    ConfigError::Rejected {
+                        status: r.status,
+                        code: r.code,
+                        message: r.why.to_string(),
+                    }
+                })?;
+                Ok(ParsedConfig::with_parsed(
+                    Bytes::copy_from_slice(bytes),
+                    Arc::new(lc),
+                ))
+            }),
+        );
+        reg.register(
             ConfigKind::ObjectLock,
             Arc::new(|bytes: &[u8]| {
                 let xml_str = std::str::from_utf8(bytes).map_err(|_| ConfigError::Rejected {
@@ -354,6 +375,12 @@ impl BucketConfig {
 
     pub fn policy_decision(&self) -> crate::authz::BucketPolicyDecision {
         crate::authz::BucketPolicyDecision::none()
+    }
+
+    pub fn lifecycle(&self) -> Option<Arc<crate::lifecycle_config::LifecycleConfig>> {
+        self.get(ConfigKind::Lifecycle)
+            .and_then(|p| p.parsed.as_ref())
+            .and_then(|a| Arc::clone(a).downcast::<crate::lifecycle_config::LifecycleConfig>().ok())
     }
 
     pub fn object_lock(&self) -> Option<crate::object_lock::LockConfiguration> {

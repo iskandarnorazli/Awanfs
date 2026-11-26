@@ -24,6 +24,7 @@
 | Conditional writes and deletes | `conditional` | [conditional.md](conditional.md) |
 | Object lock, retention & legal hold | `lock` | [object-lock.md](object-lock.md) |
 | POST object (browser form uploads, SigV4) | `post` | [post-object.md](post-object.md) |
+| Bucket lifecycle rules & expiration | `lifecycle` | [lifecycle.md](lifecycle.md) |
 
 Signatures are checked on every journey: `doctor` proves an unsigned request gets 403 and a signed one 200, and every journey runs signed with the keys the script gives the server.
 
@@ -31,7 +32,6 @@ Signatures are checked on every journey: `doctor` proves an unsigned request get
 
 Each has a source path, and none has a journey. The reason is in brackets.
 
-- Lifecycle rules, `?lifecycle` (`lifecycle.rs`): stored and returned, but nothing expires objects (#118).
 - Presigned URLs (`auth.rs`, `X-Amz-Expires`): the aws CLI can make one (`aws s3 presign`), not yet driven.
 - IAM users and policies, `--config` (`iam.rs`): needs a config file and a second key pair; covered by `iam_test.rs` (#53, #130).
 - Per-bucket compression, `[[buckets]] compression = "zstd"` (`compress.rs`): needs `--config`; covered by `compression_test.rs` (#51).
