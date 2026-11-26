@@ -544,6 +544,16 @@ const IDX_RECORD: usize = 42;
 /// Streaming buffer size for `.idx` journal scans (~688 KiB, an exact multiple of `IDX_RECORD`).
 const IDX_SCAN_CHUNK: usize = IDX_RECORD * 16_384;
 
+/// `--verify-payloads-at-boot` (#412): the open checks every payload's CRC, journaled or not.
+/// For the first start after upgrading from a build before #412, whose journals may record
+/// needles that were never synced, and after suspected disk trouble.
+static VERIFY_PAYLOADS_AT_BOOT: AtomicBool = AtomicBool::new(false);
+
+/// Makes every later open check every payload's CRC (`--verify-payloads-at-boot`).
+pub fn set_verify_payloads_at_boot(on: bool) {
+    VERIFY_PAYLOADS_AT_BOOT.store(on, Ordering::SeqCst);
+}
+
 /// Offsets the `.idx` journal records, one bit per sector of the volume (#412): 1 MiB for a
 /// 32 GiB span. A recorded needle's bytes were synced before its record was written.
 struct Journaled(Vec<u64>);
@@ -939,7 +949,7 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                     .flatten()
                 {
                     Some(hdr) if scan_offset.checked_add(hdr.total_len()).is_some_and(|end| end <= file_len) => {
-                        let payload = !journaled.has(scan_offset);
+                        let payload = VERIFY_PAYLOADS_AT_BOOT.load(Ordering::SeqCst) || !journaled.has(scan_offset);
                         if verify_needle_integrity(&mut window, scan_offset, &hdr, payload, &mut payload_verified_at_open)? {
                             Some(hdr)
                         } else {
@@ -960,7 +970,7 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 };
 
                 let total_len = hdr.total_len();
-                if journaled.has(scan_offset) && total_len > SCAN_BATCH_BYTES as u64 {
+                if journaled.has(scan_offset) && !VERIFY_PAYLOADS_AT_BOOT.load(Ordering::SeqCst) && total_len > SCAN_BATCH_BYTES as u64 {
                     window.cap_next_refill(SKIP_REFILL_BYTES);
                 }
                 last_valid_end = scan_offset + total_len;

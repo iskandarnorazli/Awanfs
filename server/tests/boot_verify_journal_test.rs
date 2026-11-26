@@ -72,6 +72,36 @@ fn opening_a_volume_verifies_exactly_the_needles_the_journal_does_not_record() {
     assert_eq!(keys, ["a", "b", "c", "d"]);
 }
 
+/// Option B's one change to what survives (owner decision, issuecomment-7184789974): recovery
+/// steps over a gap only through the journal, and a record reaches the journal only through a
+/// sync. So a needle after a gap survives a restart once synced, and not before.
+#[test]
+fn a_needle_after_a_gap_survives_a_restart_once_synced_and_not_before() {
+    for synced in [false, true] {
+        let dir = Path::new(if synced { "sim/gap_synced" } else { "sim/gap_unsynced" });
+        let fs = SimFs::new();
+        let p3 = pattern(5000, 3);
+        {
+            let vm = VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap();
+            vm.write_needle(1, "n1", &pattern(5000, 1), AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+            vm.sync_now().unwrap();
+            vm.fail_next_write();
+            assert!(vm.write_needle(1, "n2", &pattern(5000, 2), AWAN_FLAG_ACTIVE, 0, 0).is_err(), "n2 leaves a gap");
+            vm.write_needle(1, "n3", &p3, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+            if synced {
+                vm.sync_now().unwrap();
+            }
+        }
+        let vm = VolumeManager::open_with(&fs, dir, 1, false, clock()).unwrap();
+        let keys: Vec<String> = scan_all(&vm).into_iter().map(|n| n.key).collect();
+        if synced {
+            assert_eq!(keys, ["n1", "n3"], "synced: the journal steps the gap to n3");
+        } else {
+            assert_eq!(keys, ["n1"], "not synced: n3 has no record, so the scan stops at the gap");
+        }
+    }
+}
+
 /// Streamed needles finish out of offset order: k2 starts first and finishes last, so a
 /// journal could record k3 above k2. The open trusts a needle by its own record, not by
 /// being below the journal's last offset.

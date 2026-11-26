@@ -58,6 +58,9 @@ Options:
       --profile <NAME>             default, or production: refuse to start with anonymous access, no TLS,
                                    plain HTTP next to TLS, a published or short secret key, or
                                    --durability fast (or AWANFS_PROFILE)
+      --verify-payloads-at-boot    Check every stored payload's CRC at startup, not only those the journal does
+                                   not record (or AWANFS_VERIFY_PAYLOADS_AT_BOOT=1); use it for the first start
+                                   after upgrading from a build before #412, and after disk trouble
       --allow-small-parts          Allow multipart non-final parts under 5 MiB (off by default; for benchmarks)
       --per-bucket-metrics         Always emit awanfs_bucket_* Prometheus gauges even above 1000 buckets (or AWANFS_PER_BUCKET_METRICS=1)
   -h, --help                       Print this help message and exit"
@@ -99,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut region = std::env::var("AWANFS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let mut allow_small_parts = false;
     let mut per_bucket_metrics = std::env::var("AWANFS_PER_BUCKET_METRICS").ok().as_deref() == Some("1");
+    let mut verify_payloads_at_boot = std::env::var("AWANFS_VERIFY_PAYLOADS_AT_BOOT").ok().as_deref() == Some("1");
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -180,6 +184,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             allow_small_parts = true;
         } else if arg == "--per-bucket-metrics" {
             per_bucket_metrics = true;
+        } else if arg == "--verify-payloads-at-boot" {
+            verify_payloads_at_boot = true;
         } else if arg == "--data-dir" || arg == "-d" {
             if let Some(d_str) = args.next() {
                 data_dir = Some(PathBuf::from(d_str));
@@ -252,6 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
     let addr: SocketAddr = format!("{}:{}", listen, port).parse()?;
+    s3_server::volume::set_verify_payloads_at_boot(verify_payloads_at_boot);
     let mut state = match data_dir {
         Some(ref dir) => match S3ServiceState::try_with_data_dir(dir) {
             Ok(s) => s,
