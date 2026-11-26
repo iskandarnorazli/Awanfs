@@ -3860,6 +3860,12 @@ pub struct RemoteAddr(pub std::net::SocketAddr);
 /// nothing here can shadow a bucket (#44).
 pub const ADMIN_PREFIX: &str = "/_awanfs/";
 
+/// The health answers say which profile is active (#358).
+fn with_profile(mut r: Response<ResponseBody>) -> Response<ResponseBody> {
+    r.headers_mut().insert("x-awanfs-profile", hyper::header::HeaderValue::from_static(crate::profile::active().as_str()));
+    r
+}
+
 fn plain(status: StatusCode, text: &str) -> Response<ResponseBody> {
     Response::builder()
         .status(status)
@@ -3911,11 +3917,11 @@ fn admin_response(state: &S3ServiceState, method: &Method, path: &str) -> Respon
         return plain(StatusCode::METHOD_NOT_ALLOWED, "GET or HEAD");
     }
     match path {
-        "/_awanfs/health/live" => plain(StatusCode::OK, "live"),
-        "/_awanfs/health/ready" => match state.readiness() {
+        "/_awanfs/health/live" => with_profile(plain(StatusCode::OK, "live")),
+        "/_awanfs/health/ready" => with_profile(match state.readiness() {
             None => plain(StatusCode::OK, "ready"),
             Some(reason) => plain(StatusCode::SERVICE_UNAVAILABLE, &format!("not ready: {}", reason)),
-        },
+        }),
         "/_awanfs/metrics" => Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
@@ -3937,6 +3943,7 @@ fn admin_response(state: &S3ServiceState, method: &Method, path: &str) -> Respon
 pub fn render_metrics(state: &S3ServiceState) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(8192);
+    let _ = writeln!(out, "# HELP awanfs_profile The startup profile (#358).\n# TYPE awanfs_profile gauge\nawanfs_profile{{profile=\"{}\"}} 1", crate::profile::active().as_str());
     state.metrics.render(&mut out);
     state.bucket_config_metrics.render(&mut out);
     state.events.render_metrics(&mut out);

@@ -55,6 +55,9 @@ Options:
       --body-idle-timeout <DUR>    Idle timeout between request body frames (default: 20s)
       --region <NAME>              Server region (default: us-east-1, or AWANFS_REGION)
       --allow-anonymous            Allow unsigned requests (or AWANFS_ALLOW_ANONYMOUS=1)
+      --profile <NAME>             default, or production: refuse to start with anonymous access, no TLS,
+                                   plain HTTP next to TLS, a published or short secret key, or
+                                   --durability fast (or AWANFS_PROFILE)
       --allow-small-parts          Allow multipart non-final parts under 5 MiB (off by default; for benchmarks)
       --per-bucket-metrics         Always emit awanfs_bucket_* Prometheus gauges even above 1000 buckets (or AWANFS_PER_BUCKET_METRICS=1)
   -h, --help                       Print this help message and exit"
@@ -76,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut listen = std::env::var("AWANFS_LISTEN").unwrap_or_else(|_| "127.0.0.1".to_string());
     let mut allow_anonymous = std::env::var("AWANFS_ALLOW_ANONYMOUS").ok().as_deref() == Some("1");
+    let mut profile_name = std::env::var("AWANFS_PROFILE").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "default".to_string());
     let mut access_log: Option<String> = None;
     let mut config_path: Option<PathBuf> = None;
     let mut tls_cert: Option<PathBuf> = std::env::var("AWANFS_TLS_CERT").ok().filter(|s| !s.is_empty()).map(PathBuf::from);
@@ -168,6 +172,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         } else if arg == "--allow-anonymous" {
             allow_anonymous = true;
+        } else if arg == "--profile" {
+            if let Some(p) = args.next() {
+                profile_name = p;
+            }
         } else if arg == "--allow-small-parts" {
             allow_small_parts = true;
         } else if arg == "--per-bucket-metrics" {
@@ -339,12 +347,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
     let https = tls.is_some();
+    // #358: --profile production refuses an unsafe configuration, one line per reason.
+    let profile = match s3_server::profile::Profile::parse(&profile_name) {
+        Some(p) => p,
+        None => {
+            eprintln!("--profile must be default or production, not {:?}", profile_name);
+            std::process::exit(2);
+        }
+    };
+    if profile == s3_server::profile::Profile::Production {
+        let root_secret = state.auth.credentials.as_ref().map(|(_, s)| s.as_str());
+        let users = state.iam.read().as_ref().map(|r| r.current());
+        let user_secrets: Vec<(&str, &str)> = users
+            .as_ref()
+            .map(|u| u.users().map(|u| (u.name.as_str(), u.secret.as_str())).collect())
+            .unwrap_or_default();
+        let facts = s3_server::profile::StartupFacts {
+            anonymous: state.auth.allow_anonymous,
+            tls: https,
+            plain_http_port: https && http_port.is_some(),
+            listen: &listen,
+            root_secret,
+            user_secrets,
+            durability_fast: matches!(durability, Durability::Fast),
+        };
+        let problems = s3_server::profile::production_problems(&facts);
+        if !problems.is_empty() {
+            eprintln!("--profile production refuses to start:");
+            for p in &problems {
+                eprintln!("  - {}", p);
+            }
+            std::process::exit(2);
+        }
+    }
+    s3_server::profile::set_active(profile);
     let handle = start_s3_reactor_with(addr, Arc::clone(&state), tls).await?;
     let plain = match (https, http_port) {
         (true, Some(p)) => Some(start_s3_reactor_with(format!("{}:{}", listen, p).parse()?, Arc::clone(&state), None).await?),
         _ => None,
     };
-    println!("S3 Storage Server listening on {}://{}", if https { "https" } else { "http" }, addr);
+    println!("S3 Storage Server listening on {}://{} (profile {})", if https { "https" } else { "http" }, handle.local_addr, profile.as_str());
 
     wait_for_stop_signal().await;
     eprintln!("stop signal received: finishing requests in flight");
