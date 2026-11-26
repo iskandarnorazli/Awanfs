@@ -315,6 +315,7 @@ test_s3::test_object_write_file
 test_s3::test_object_write_read_update_read_delete
 test_s3::test_object_write_to_nonexist_bucket
 test_s3::test_object_write_with_chunked_transfer_encoding
+test_s3::test_post_object_no_key_specified
 test_s3::test_put_current_object_if_match
 test_s3::test_put_current_object_if_none_match
 test_s3::test_put_delete_tags

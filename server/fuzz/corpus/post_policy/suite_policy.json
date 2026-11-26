@@ -1,0 +1,1 @@
+{"expiration": "2099-01-01T00:00:00Z", "conditions": [{"bucket": "b"}, ["starts-with", "$key", "foo"], {"acl": "private"}, ["starts-with", "$Content-Type", "text/plain"], ["content-length-range", 0, 1024]]}

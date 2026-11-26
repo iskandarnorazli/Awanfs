@@ -113,13 +113,15 @@ pub(crate) fn entity_too_large(resource: &str, limit: u64) -> Response<ResponseB
 /// Reads a request body of at most `limit` bytes, timing out if no frame arrives within
 /// `idle_timeout`. `Ok(Err(response))` is the answer to send when the body is too large,
 /// times out, or is cut short.
-pub(crate) async fn read_body(
-    mut body: hyper::body::Incoming,
+pub(crate) async fn read_body<B>(
+    mut body: B,
     limit: u64,
     idle_timeout: std::time::Duration,
     resource: &str,
-) -> Result<Result<Bytes, Response<ResponseBody>>, hyper::Error> {
-    use hyper::body::Body as _;
+) -> Result<Result<Bytes, Response<ResponseBody>>, hyper::Error>
+where
+    B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Unpin,
+{
     if body.size_hint().lower() > limit {
         return Ok(Err(entity_too_large(resource, limit)));
     }
@@ -167,16 +169,18 @@ pub(crate) fn slow_down_response(resource: &str, msg: &str) -> Response<Response
 
 /// Acquires against `budget` before buffering `body`, returning the `AdmissionGuard` and
 /// `InflightGuard` alongside the collected bytes so the caller holds both until consumed or dropped.
-pub(crate) async fn read_body_admitted(
+pub(crate) async fn read_body_admitted<B>(
     budget: &crate::memory::BodyBudget,
     work: &Arc<WorkCounters>,
-    body: hyper::body::Incoming,
+    body: B,
     limit: u64,
     estimated_bytes: Option<u64>,
     idle_timeout: std::time::Duration,
     resource: &str,
-) -> Result<Result<(Bytes, (crate::memory::AdmissionGuard, crate::work::InflightGuard)), Response<ResponseBody>>, hyper::Error> {
-    use hyper::body::Body as _;
+) -> Result<Result<(Bytes, (crate::memory::AdmissionGuard, crate::work::InflightGuard)), Response<ResponseBody>>, hyper::Error>
+where
+    B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Unpin,
+{
     let hint = estimated_bytes
         .or_else(|| body.size_hint().exact())
         .unwrap_or(limit)
@@ -238,7 +242,10 @@ pub const VERIFY_WHILE_SENDING_MIN: u64 = 4 * 1024 * 1024;
 pub const STREAM_PUT_MIN: u64 = 4 * 1024 * 1024;
 
 /// Reads and drops what is left of a request body, at most `limit` bytes.
-pub(crate) async fn drain_body(body: &mut hyper::body::Incoming, limit: u64) {
+pub(crate) async fn drain_body<B>(body: &mut B, limit: u64)
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
     let mut seen = 0u64;
     while seen < limit {
         match crate::body_timeout::next_frame_with_idle(body, crate::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT).await {
@@ -4247,6 +4254,15 @@ async fn handle_s3_inner(
     let classified = match crate::ops::classify_request(req) {
         Ok(c) => c,
         Err(resp) => return Ok(resp),
+    };
+    // A form upload's key and credentials are in its body (#119): read the fields first.
+    let classified = if classified.op == crate::ops::Operation::PostObject {
+        match crate::ops::post_object::read_form(&state, classified).await {
+            Ok(c) => c,
+            Err(resp) => return Ok(resp),
+        }
+    } else {
+        classified
     };
     let authenticated = match crate::ops::authenticate(&state, classified) {
         Ok(a) => a,

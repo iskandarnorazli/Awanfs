@@ -1622,3 +1622,113 @@ mod scrub_tests {
         assert_eq!(table.len(), 3 * 3, "every state against every event");
     }
 }
+
+/// The `multipart/form-data` parser of POST object (#119): where it is in the body. The
+/// parser in `server/src/form_upload.rs` finds delimiters and part headers and tells this
+/// machine what it found; the machine decides the next state, or refuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormState {
+    /// Before the first delimiter.
+    Preamble,
+    /// Just after a delimiter: `\r\n` starts a part, `--` ends the body.
+    AfterBoundary,
+    PartHeaders,
+    FieldBody,
+    FileBody,
+    /// After the closing delimiter: the rest is ignored.
+    Epilogue,
+}
+
+/// What the parser found next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormInput {
+    /// A delimiter line.
+    Boundary,
+    /// `\r\n` after a delimiter: another part follows.
+    NextPart,
+    /// `--` after a delimiter: the closing delimiter.
+    Close,
+    /// Part headers naming a field.
+    FieldPart,
+    /// Part headers naming the file.
+    FilePart,
+    /// Anything else after a delimiter.
+    Malformed,
+}
+
+pub const FORM_MALFORMED: Refusal = refuse_because("MalformedPOSTRequest", 400, "malformed multipart/form-data POST request");
+pub const FORM_NO_FILE: Refusal = refuse_because("InvalidArgument", 400, "POST requires a file part");
+
+/// One step of the form parser. `file_seen`: the file part has started, so it must be the
+/// last part (S3 ignores fields after the file; AwanFS refuses them so nothing after the
+/// file can change what was stored).
+pub fn form_step(state: FormState, input: FormInput, file_seen: bool) -> Result<FormState, Refusal> {
+    use FormInput as I;
+    use FormState as S;
+    match (state, input) {
+        (S::Epilogue, _) => Ok(S::Epilogue),
+        (_, I::Malformed) => Err(FORM_MALFORMED),
+        (S::Preamble | S::FieldBody | S::FileBody, I::Boundary) => Ok(S::AfterBoundary),
+        (S::AfterBoundary, I::NextPart) if file_seen => Err(FORM_MALFORMED),
+        (S::AfterBoundary, I::NextPart) => Ok(S::PartHeaders),
+        (S::AfterBoundary, I::Close) if !file_seen => Err(FORM_NO_FILE),
+        (S::AfterBoundary, I::Close) => Ok(S::Epilogue),
+        (S::PartHeaders, I::FieldPart) => Ok(S::FieldBody),
+        (S::PartHeaders, I::FilePart) => Ok(S::FileBody),
+        _ => Err(FORM_MALFORMED),
+    }
+}
+
+#[cfg(test)]
+mod form_tests {
+    use super::*;
+
+    #[test]
+    fn form_every_pair_is_decided() {
+        use FormInput::*;
+        use FormState::*;
+        let states = [Preamble, AfterBoundary, PartHeaders, FieldBody, FileBody, Epilogue];
+        let inputs = [Boundary, NextPart, Close, FieldPart, FilePart, Malformed];
+        let m = Err(FORM_MALFORMED);
+        let mut decided = 0;
+        for &file_seen in &[false, true] {
+            for &s in &states {
+                for &i in &inputs {
+                    let want = match (s, i) {
+                        (Epilogue, _) => Ok(Epilogue),
+                        (_, Malformed) => m,
+                        (Preamble | FieldBody | FileBody, Boundary) => Ok(AfterBoundary),
+                        (AfterBoundary, NextPart) => {
+                            if file_seen {
+                                m
+                            } else {
+                                Ok(PartHeaders)
+                            }
+                        }
+                        (AfterBoundary, Close) => {
+                            if file_seen {
+                                Ok(Epilogue)
+                            } else {
+                                Err(FORM_NO_FILE)
+                            }
+                        }
+                        (PartHeaders, FieldPart) => Ok(FieldBody),
+                        (PartHeaders, FilePart) => Ok(FileBody),
+                        _ => m,
+                    };
+                    assert_eq!(form_step(s, i, file_seen), want, "{:?} + {:?} (file seen: {})", s, i, file_seen);
+                    decided += 1;
+                }
+            }
+        }
+        assert_eq!(decided, 2 * 6 * 6, "every state against every input, with and without the file");
+    }
+
+    #[test]
+    fn form_nothing_follows_the_file_and_the_body_needs_one() {
+        assert_eq!(form_step(FormState::AfterBoundary, FormInput::NextPart, true), Err(FORM_MALFORMED));
+        assert_eq!(form_step(FormState::AfterBoundary, FormInput::Close, false), Err(FORM_NO_FILE));
+        assert_eq!(form_step(FormState::AfterBoundary, FormInput::Close, true), Ok(FormState::Epilogue));
+        assert_eq!(form_step(FormState::Epilogue, FormInput::Malformed, true), Ok(FormState::Epilogue), "the epilogue is ignored");
+    }
+}

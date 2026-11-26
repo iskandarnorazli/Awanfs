@@ -59,6 +59,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "post_policy"
+path = "fuzz_targets/post_policy.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "cors_xml"
 path = "fuzz_targets/cors_xml.rs"
 test = false

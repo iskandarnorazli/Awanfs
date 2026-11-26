@@ -3,6 +3,7 @@ pub mod cors;
 pub mod lifecycle;
 pub mod multipart;
 pub mod object;
+pub mod post_object;
 pub mod service;
 pub mod tagging;
 
@@ -19,6 +20,7 @@ use crate::authz::{
 };
 use crate::bucket_config::BucketConfig;
 use crate::ffi_bridge::unpack_flags;
+use crate::fsm::Refusal;
 use crate::iam::{Iam, Principal, ROOT_ACCOUNT};
 use crate::meta_index::FLAG_ATTRS;
 use crate::s3_api::{
@@ -53,6 +55,7 @@ pub enum Operation {
     ListMultipartUploads,
     DeleteObjects,
     PutObject,
+    PostObject,
     CopyObject,
     GetObject,
     GetObjectAttributes,
@@ -274,6 +277,15 @@ pub const OPS: &[OpSpec] = &[
     OpSpec {
         op: Operation::PutObject,
         name: "PutObject",
+        iam_action: Some("s3:PutObject"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    // A browser form upload (#119): a PutObject whose key and credentials are in the form.
+    OpSpec {
+        op: Operation::PostObject,
+        name: "PostObject",
         iam_action: Some("s3:PutObject"),
         acl_permission: AclPermission::Write,
         target: TargetKind::Object,
@@ -510,6 +522,7 @@ pub fn classify(
             (&Method::GET, ["location"]) => Ok(Operation::GetBucketLocation),
             (&Method::GET, ["uploads"]) => Ok(Operation::ListMultipartUploads),
             (&Method::POST, ["delete"]) => Ok(Operation::DeleteObjects),
+            (&Method::POST, []) if post_object::is_form_upload(headers) => Ok(Operation::PostObject),
             (_, s) if !s.is_empty() => Err(ClassifyRefusal::NotImplemented("The requested sub-resource is not implemented.")),
             (&Method::PUT, []) => Ok(Operation::CreateBucket),
             (&Method::DELETE, []) => Ok(Operation::DeleteBucket),
@@ -586,6 +599,8 @@ pub struct Classified {
     pub query_map: HashMap<String, String>,
     pub parts: hyper::http::request::Parts,
     pub body: hyper::body::Incoming,
+    /// PostObject only: the form read by `post_object::read_form` (#119).
+    pub form: Option<Box<post_object::PostForm>>,
 }
 
 pub struct Authenticated {
@@ -672,6 +687,7 @@ pub fn classify_request(req: Request<hyper::body::Incoming>) -> Result<Classifie
         query_map,
         parts,
         body,
+        form: None,
     })
 }
 
@@ -680,6 +696,9 @@ pub fn authenticate(state: &S3ServiceState, c: Classified) -> Result<Authenticat
     let iam = state.iam.read().as_ref().map(|r| r.current());
     if c.op == Operation::CorsPreflight {
         return Ok(Authenticated { classified: c, principal: Principal::Anonymous, iam });
+    }
+    if c.op == Operation::PostObject {
+        return authenticate_form(state, c);
     }
     let path = c.parts.uri.path();
     let principal = match crate::auth::authenticate_with(
@@ -718,6 +737,48 @@ pub fn authenticate(state: &S3ServiceState, c: Classified) -> Result<Authenticat
         Principal::Anonymous => "anonymous".to_string(),
     };
     crate::request_log::note_principal(principal_label);
+    Ok(Authenticated { classified: c, principal, iam })
+}
+
+/// The authenticate stage for a form: the form's own signature stands in for the
+/// Authorization header. A signed form's policy is checked here too, once its signature is
+/// known to be good, so nothing the policy refuses reaches storage.
+fn authenticate_form(state: &S3ServiceState, mut c: Classified) -> Result<Authenticated, Response<ResponseBody>> {
+    let path = c.parts.uri.path().to_string();
+    let iam = state.iam.read().as_ref().map(|r| r.current());
+    let now = state.clock.now_ns() / 1_000_000_000;
+    let form = c.form.as_mut().expect("read_form ran for PostObject");
+    let refuse = |r: Refusal| post_object::refusal_response(r, &path);
+    let signature = crate::post_object::read_signature(&form.fields).map_err(refuse)?;
+    let no_keys = state.auth.credentials.is_none() && iam.as_deref().is_none_or(|i| i.is_empty());
+    let principal = match &signature {
+        None if state.auth.allow_anonymous => Principal::Anonymous,
+        None => return Err(post_object::refusal_response(Refusal { code: "AccessDenied", status: 403, why: "Access Denied" }, &path)),
+        Some(_) if no_keys && state.auth.allow_anonymous => Principal::Anonymous,
+        Some(_) if no_keys => return Err(refuse(crate::post_object::UNKNOWN_KEY)),
+        Some(sig) => {
+            let (principal, secret) =
+                crate::auth::secret_for(&state.auth, iam.as_deref(), &sig.access_key).ok_or_else(|| refuse(crate::post_object::UNKNOWN_KEY))?;
+            let want = crate::post_object::expected_signature(&state.sigv4_cache, secret, sig);
+            if !crate::auth::constant_time_eq(&want, &sig.signature) {
+                return Err(refuse(crate::post_object::BAD_SIGNATURE));
+            }
+            principal
+        }
+    };
+    if signature.is_some() {
+        let bucket = c.bucket.as_deref().unwrap_or("");
+        let key = c.key.as_deref().unwrap_or("");
+        let policy = crate::post_object::parse_policy(form.fields.get("policy").unwrap_or("")).map_err(refuse)?;
+        crate::post_object::check_policy(&policy, &form.fields, bucket, key, now).map_err(refuse)?;
+        form.policy = Some(policy);
+    }
+    crate::request_log::note_principal(match &principal {
+        Principal::Anonymous => "anonymous".to_string(),
+        Principal::Root => crate::iam::ROOT_ACCOUNT.to_string(),
+        Principal::User { account, name, .. } if account == name => name.clone(),
+        Principal::User { account, name, .. } => format!("{}:{}", account, name),
+    });
     Ok(Authenticated { classified: c, principal, iam })
 }
 
@@ -1115,11 +1176,16 @@ pub fn validate(a: Authorized) -> Result<Validated, Response<ResponseBody>> {
             key: k.clone(),
         },
     };
-    let body_limit = body_limit_for(&c.parts.method, &target);
-    let declared = c
-        .parts
-        .headers
-        .get("x-amz-decoded-content-length")
+    // A form carries the file and at most 2 MiB of fields (100 of 20 KiB) around it.
+    let body_limit = if c.op == Operation::PostObject {
+        crate::s3_api::MAX_OBJECT_BODY + crate::s3_api::MAX_XML_BODY
+    } else {
+        body_limit_for(&c.parts.method, &target)
+    };
+    // A form's size is its Content-Length; `x-amz-decoded-content-length` is for aws-chunked
+    // PUT bodies and must not let a form past the limit.
+    let decoded = if c.op == Operation::PostObject { None } else { c.parts.headers.get("x-amz-decoded-content-length") };
+    let declared = decoded
         .or_else(|| c.parts.headers.get(CONTENT_LENGTH))
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok());
@@ -1199,6 +1265,9 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
             let verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &c.parts.headers);
             object::put_object(state, b_id.unwrap(), bucket, key, &path, &c.parts.headers, writer_account, &bucket_owner, verifier, c.body).await
         }
+        Operation::PostObject => {
+            post_object::execute(state, b_id.unwrap(), bucket, key, &path, &c.parts.headers, writer_account, &bucket_owner, c.form, c.body).await
+        }
         Operation::CopyObject => object::copy_object(state, b_id.unwrap(), bucket, key, &c.parts.headers, writer_account, &bucket_owner).await,
         Operation::GetObject => {
             let auth_enabled = state.auth.credentials.is_some() || iam.as_deref().is_some_and(|i| !i.is_empty());
@@ -1265,6 +1334,7 @@ mod tests {
             (Operation::ListMultipartUploads, Method::GET, Some("bkt"), None, "uploads", None),
             (Operation::DeleteObjects, Method::POST, Some("bkt"), None, "delete", None),
             (Operation::PutObject, Method::PUT, Some("bkt"), Some("obj"), "", None),
+            (Operation::PostObject, Method::POST, Some("bkt"), None, "", None),
             (Operation::CopyObject, Method::PUT, Some("bkt"), Some("obj"), "", Some("/src/key")),
             (Operation::GetObject, Method::GET, Some("bkt"), Some("obj"), "", None),
             (Operation::GetObjectAttributes, Method::GET, Some("bkt"), Some("obj"), "attributes", None),
@@ -1291,6 +1361,9 @@ mod tests {
             if let Some(c) = copy {
                 hdrs.insert("x-amz-copy-source", c.parse().unwrap());
             }
+            if *expected == Operation::PostObject {
+                hdrs.insert(CONTENT_TYPE, "multipart/form-data; boundary=x".parse().unwrap());
+            }
             let got = classify(method, *b, *k, q, &hdrs).unwrap();
             assert_eq!(got, *expected, "for {:?} {:?} {:?} ?{}", method, b, k, q);
             seen.insert(got);
@@ -1307,6 +1380,10 @@ mod tests {
             let mut hdrs = HeaderMap::new();
             if let Some(c) = copy {
                 hdrs.insert("x-amz-copy-source", c.parse().unwrap());
+            }
+            if method == Method::POST && b.is_some() && k.is_none() && q.is_empty() {
+                // PostObject (#119): its key is in the form, so the old path-based function has no row.
+                continue;
             }
             let op = classify(&method, b, k, q, &hdrs).unwrap();
             if op == Operation::CorsPreflight {

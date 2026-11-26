@@ -1,0 +1,7 @@
+key=${filename}
+policy=p
+x-amz-algorithm=AWS4-HMAC-SHA256
+x-amz-credential=AK/20261126/us-east-1/s3/aws4_request
+x-amz-date=20261126T000000Z
+x-amz-signature=00
+success_action_redirect=http://h/b

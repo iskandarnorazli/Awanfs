@@ -257,7 +257,7 @@ fuzz = ["object_lock_xml"]
 [[feature]]
 id = "post-object"
 name = "Browser POST object form uploads (multipart/form-data)"
-status = "planned"
+status = "partial"
 issue = "#119"
 area = "post-object"
 design_section = "7.3"
@@ -269,10 +269,14 @@ mint = [
   "minio-go: testPresignedPostPolicyEmptyFileName::PresignedPostPolicy(policy)",
   "minio-go: testPresignedPostPolicyWrongFile::PresignedPostPolicy(policy)",
   "minio-java::getPresignedPostFormData()",
+  "minio-js::presignedPostPolicy(postPolicy)",
   "minio-js::presignedPostPolicy(postPolicy, cb)",
   "minio-py:test_presigned_post_policy",
 ]
-fuzz = ["form_upload"]
+# The suite signs every POST form with SigV2; each test has a SigV4 port (#119, tests/s3tests/PORTED.md).
+server_tests = ["server/tests/post_object_suite_test.rs"]
+drive = ["post"]
+fuzz = ["form_upload", "post_policy"]
 
 [[feature]]
 id = "cors"
@@ -854,6 +858,7 @@ mint = [
   "minio-js::presignedPutObject(bucketName, objectName, expires, cb)",
   "minio-js::presignedPutObject(bucketName, objectName, expires=1000, cb)",
   "minio-js::presignedUrl(httpMethod, bucketName, objectName, expires, cb)",
+  "minio-js::presignedUrl(httpMethod, bucketName, objectName, expires, reqParams, cb)",
   "minio-py:test_presigned_get_object_default_expiry",
   "minio-py:test_presigned_get_object_expiry",
   "minio-py:test_presigned_get_object_response_headers",
@@ -1098,6 +1103,8 @@ mint = [
   "minio-js::listBuckets()",
   "minio-js::listBuckets(cb)",
   "minio-js::listObjects(bucketName, prefix, recursive)",
+  "minio-js::listObjectsV2(bucketName, prefix, recursive, startAfter)",
+  "minio-js::listObjectsV2WithMetadata(bucketName, prefix, recursive, startAfter)",
   "minio-js::listObjectsV2(bucketName, prefix, recursive)",
   "minio-py:test_list_buckets::remove_bucket(bucket_name)",
   "minio-py:test_list_objects",
@@ -1178,7 +1185,6 @@ mint = [
   "minio-java::bucketExists()",
   "minio-java::makeBucket()",
   "minio-java::removeBucket()",
-  'minio-js::"after all" hook in "functional tests"',
   "minio-js::Check if bucket can be deleted:",
   "minio-js::bucketExists(bucketName)",
   "minio-js::bucketExists(bucketName, cb)",
