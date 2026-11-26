@@ -22,6 +22,7 @@ AWANFS_LOG=off \
     --auto-compaction off \
     --region default \
     --config "$USERS_FILE" \
+    --lifecycle-day-seconds 2 \
     </dev/null >"$LOG_FILE" 2>&1 &
 
 for _ in $(seq 1 50); do

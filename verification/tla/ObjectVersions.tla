@@ -91,7 +91,7 @@ Switches, so the same model checks the current code and the fixes:
 *)
 EXTENDS Naturals, FiniteSets, Sequences
 
-CONSTANTS Writers, Deleters, Updaters, UseKeyLock, WriteCanFail, RecoverSkipsGaps, DeleteLogsFirst,
+CONSTANTS Writers, Deleters, Updaters, Sweepers, UseKeyLock, SweepUsesKeyLock, WriteCanFail, RecoverSkipsGaps, DeleteLogsFirst,
           Streamers, Relocate, Compactor, CompactWaitsForWriters,
           FailLeavesRecord, IndexAfterLateFail, Versioning, ClockStepsBack, NullReplay,
           CondWriters, CheckCondUnderLock, ReplayAppliesAttrUpdates, AttrReplayByTime,
@@ -100,6 +100,8 @@ CONSTANTS Writers, Deleters, Updaters, UseKeyLock, WriteCanFail, RecoverSkipsGap
 ASSUME Streamers \subseteq Writers
 ASSUME CondWriters \subseteq Writers
 ASSUME Updaters \cap (Writers \cup Deleters) = {}
+ASSUME Sweepers \cap (Writers \cup Deleters \cup Updaters) = {}
+ASSUME SweepUsesKeyLock \in BOOLEAN
 ASSUME CheckCondUnderLock \in BOOLEAN
 ASSUME ReplayAppliesAttrUpdates \in BOOLEAN
 ASSUME AttrReplayByTime \in BOOLEAN
@@ -107,7 +109,7 @@ ASSUME EmitOnCommit \in BOOLEAN
 ASSUME Locking \in BOOLEAN
 ASSUME EnforceLock \in BOOLEAN
 
-Procs == Writers \cup Deleters \cup Updaters
+Procs == Writers \cup Deleters \cup Updaters \cup Sweepers
 Gone == [present |-> FALSE, val |-> "none", attr |-> "none"]
 Ts == 1..2
 Max(S) == CHOOSE m \in S : \A x \in S : x <= m
@@ -263,7 +265,7 @@ OwnVersioned(p) == \E r \in Own(p) : r.ver
 \* removed volume) the record it would have written.
 RecOf(p) == IF Own(p) # {} THEN CHOOSE r \in Own(p) : TRUE
             ELSE IF p \in Updaters THEN [o |-> 0, kind |-> "attr", val |-> p, ver |-> engine.hist, target |-> utarget[p], ts |-> AttrStamp(utarget[p])]
-            ELSE IF Locking /\ p \in Deleters THEN [o |-> 0, kind |-> "vdel", val |-> p, ver |-> TRUE, target |-> dtarget[p], ts |-> dtarget[p]]
+            ELSE IF Locking /\ p \in (Deleters \cup Sweepers) THEN [o |-> 0, kind |-> "vdel", val |-> p, ver |-> TRUE, target |-> dtarget[p], ts |-> dtarget[p]]
             ELSE [o |-> 0, kind |-> IF p \in Writers THEN "put" ELSE "tomb", val |-> p, ver |-> versioning, target |-> 0, ts |-> IF versioning THEN Stamp ELSE UnverWriteTs]
 
 ValidDeleteTargets ==
@@ -285,7 +287,7 @@ Init ==
     /\ versioning = Locking
     /\ condWon = [p \in CondWriters |-> FALSE]
     /\ utarget = [p \in Updaters |-> 0]
-    /\ dtarget = [p \in Deleters |-> 0]
+    /\ dtarget = [p \in (Deleters \cup Sweepers) |-> 0]
     /\ lockedVersions = {}
     /\ seq = 0
     /\ events = <<>>
@@ -315,7 +317,7 @@ Acquire(p) ==
     /\ pc[p] = IF p \in Streamers THEN "body"
                ELSE IF p \in CondWriters /\ ~CheckCondUnderLock THEN "checked"
                ELSE "start"
-    /\ IF UseKeyLock THEN lock = "free" /\ lock' = p ELSE UNCHANGED lock
+    /\ IF UseKeyLock /\ (p \notin Sweepers \/ SweepUsesKeyLock) THEN lock = "free" /\ lock' = p ELSE UNCHANGED lock
     /\ IF p \in CondWriters /\ CheckCondUnderLock /\ Visible(engine).present
        THEN /\ pc' = [pc EXCEPT ![p] = "release"]
             /\ UNCHANGED <<step, utarget, dtarget>>
@@ -328,7 +330,7 @@ Acquire(p) ==
                 /\ step' = [step EXCEPT ![p] = 1]
                 /\ pc' = [pc EXCEPT ![p] = Steps(p)[1]]
                 /\ UNCHANGED dtarget
-       ELSE IF Locking /\ p \in Deleters THEN
+       ELSE IF Locking /\ p \in (Deleters \cup Sweepers) THEN
             IF ValidDeleteTargets = {} THEN
                 /\ pc' = [pc EXCEPT ![p] = "release"]
                 /\ UNCHANGED <<step, utarget, dtarget>>
@@ -358,7 +360,7 @@ Write(p) ==
               ELSE IF p \in Updaters THEN
                   log \cup {[o |-> off[p], kind |-> "attr", val |-> p,
                              ver |-> engine.hist, target |-> utarget[p], ts |-> AttrStamp(utarget[p])]}
-              ELSE IF Locking /\ p \in Deleters THEN
+              ELSE IF Locking /\ p \in (Deleters \cup Sweepers) THEN
                   log \cup {[o |-> off[p], kind |-> "vdel", val |-> p,
                              ver |-> TRUE, target |-> dtarget[p], ts |-> dtarget[p]]}
               ELSE log \cup {[o |-> off[p], kind |-> IF p \in Writers THEN "put" ELSE "tomb", val |-> p,
@@ -446,7 +448,7 @@ Index(p) ==
 
 Release(p) ==
     /\ pc[p] = "release"
-    /\ IF UseKeyLock THEN lock' = "free" ELSE UNCHANGED lock
+    /\ IF UseKeyLock /\ (p \notin Sweepers \/ SweepUsesKeyLock) THEN lock' = "free" ELSE UNCHANGED lock
     /\ pc' = [pc EXCEPT ![p] = "done"]
     /\ UNCHANGED <<step, off, nextOff, log, engine, condWon, utarget, dtarget, lockedVersions>>
     /\ UNCHANGED cVars
@@ -539,7 +541,7 @@ AckedStateSurvivesRestart == AllDone => Visible(Recovered) = Visible(engine)
 
 \* Two conditional creates (If-None-Match: *) cannot both succeed when no deleter runs (#112).
 AtMostOneConditionalCreateWins ==
-    Deleters = {} => Cardinality({p \in CondWriters : condWon[p]}) <= 1
+    (Deleters \cup Sweepers) = {} => Cardinality({p \in CondWriters : condWon[p]}) <= 1
 
 \* ListObjectVersions shows the same history before and after a restart.
 HistorySurvivesRestart == AllDone => Recovered.hist = engine.hist /\ Recovered.store = engine.store
@@ -566,7 +568,7 @@ TypeOK ==
     /\ versioning \in BOOLEAN
     /\ condWon \in [CondWriters -> BOOLEAN]
     /\ utarget \in [Updaters -> Nat]
-    /\ dtarget \in [Deleters -> Nat]
+    /\ dtarget \in [(Deleters \cup Sweepers) -> Nat]
     /\ lockedVersions \subseteq Ts
     /\ seq \in Nat
 ====

@@ -1685,40 +1685,8 @@ impl S3ServiceState {
             }
         }
         self.hook("delete_start", key);
-        if let Some((extra, ts)) = self.version_stamp(b_id, key) {
-            let flags = AWAN_FLAG_TOMBSTONE | extra;
-            // A marker whole in the volume is replayed by recovery: it takes effect here too,
-            // and the request still answers an error (#184, owner decision 4B).
-            let (_loc, g, late) = match self.write_to_active_at(b_id, key, &[], flags, 0, 0, Some(ts)) {
-                Ok((vm, loc, g)) => {
-                    self.hook("delete_marker_written", key);
-                    self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                    let late = self.make_durable(&vm, loc.seq).await.err().map(|e| format!("could not sync the delete: {:?}", e));
-                    (loc, g, late)
-                }
-                Err(VolumeError::AfterRecord { loc, cause, .. }) => {
-                    self.hook("delete_marker_written", key);
-                    self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                    (loc, global_offset(loc.volume_id, loc.offset), Some(format!("could not record the delete: {}", cause)))
-                }
-                Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
-            };
-            self.mvcc.tombstone(b_id, key);
-            let v = crate::versions::Version { ts, modified: ts, null: flags & crate::meta_index::FLAG_NULL_ID != 0, marker: true, vol_offset: g, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags };
-            let ev_spec = VersionCommitEventSpec {
-                time: ts,
-                version: Some(v.id_string()),
-                kind: crate::events::CommitKind::DeleteMarker,
-                size: 0,
-                etag: String::new(),
-                acked: late.is_none(),
-            };
-            self.record_version_commit(b_id, key, crate::versions::Event::Put(v), None, Some(ev_spec))
-                .map_err(|c| DeleteError::Internal(format!("index error {} for the delete marker", c)))?;
-            if let Some(e) = late {
-                return Err(DeleteError::Internal(e));
-            }
-            return Ok(Some(v.id_string()));
+        if self.version_stamp(b_id, key).is_some() {
+            return self.write_delete_marker_locked(b_id, key).await.map(Some);
         }
         // Unversioned path (defense in depth: never delete a locked object even if unversioned).
         let unv_target = self
@@ -1734,22 +1702,89 @@ impl S3ServiceState {
                 return Err(DeleteError::AccessDenied);
             }
         }
-        // Log the tombstone first; only a logged delete removes the row, so a failed write is
-        // an error and the object stays (verification/tla, DeleteLogsFirst).
-        // A tombstone whole in the volume is replayed by recovery: the row is removed here
-        // too, and the request still answers an error (#184, owner decision 4B).
+        self.expire_unversioned_locked(b_id, key).await.map(|_| None)
+    }
+
+    /// Writes a versioned delete marker under `key_locks` (#31, #118). Caller holds `lock_key`.
+    async fn write_delete_marker_locked(&self, b_id: u32, key: &str) -> Result<String, DeleteError> {
+        let Some((extra, ts)) = self.version_stamp(b_id, key) else {
+            return Err(DeleteError::Internal("bucket is not versioned".to_string()));
+        };
+        let flags = AWAN_FLAG_TOMBSTONE | extra;
+        // A marker whole in the volume is replayed by recovery: it takes effect here too,
+        // and the request still answers an error (#184, owner decision 4B).
+        let (_loc, g, late) = match self.write_to_active_at(b_id, key, &[], flags, 0, 0, Some(ts)) {
+            Ok((vm, loc, g)) => {
+                self.hook("delete_marker_written", key);
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                let late = self
+                    .make_durable(&vm, loc.seq)
+                    .await
+                    .err()
+                    .map(|e| format!("could not sync the delete: {:?}", e));
+                (loc, g, late)
+            }
+            Err(VolumeError::AfterRecord { loc, cause, .. }) => {
+                self.hook("delete_marker_written", key);
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                (
+                    loc,
+                    global_offset(loc.volume_id, loc.offset),
+                    Some(format!("could not record the delete: {}", cause)),
+                )
+            }
+            Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
+        };
+        self.mvcc.tombstone(b_id, key);
+        let v = crate::versions::Version {
+            ts,
+            modified: ts,
+            null: flags & crate::meta_index::FLAG_NULL_ID != 0,
+            marker: true,
+            vol_offset: g,
+            size: 0,
+            etag_hi: 0,
+            etag_lo: 0,
+            part_count: 0,
+            flags,
+        };
+        let ev_spec = VersionCommitEventSpec {
+            time: ts,
+            version: Some(v.id_string()),
+            kind: crate::events::CommitKind::DeleteMarker,
+            size: 0,
+            etag: String::new(),
+            acked: late.is_none(),
+        };
+        self.record_version_commit(b_id, key, crate::versions::Event::Put(v), None, Some(ev_spec))
+            .map_err(|c| DeleteError::Internal(format!("index error {} for the delete marker", c)))?;
+        if let Some(e) = late {
+            return Err(DeleteError::Internal(e));
+        }
+        Ok(v.id_string())
+    }
+
+    /// Writes an unversioned tombstone under `key_locks` (#184, #118). Returns previous object's payload size.
+    async fn expire_unversioned_locked(&self, b_id: u32, key: &str) -> Result<u64, DeleteError> {
         let tomb_ts = self.unversioned_write_ts(b_id, key);
         let (tomb_g, late) = match self.write_to_active_at(b_id, key, &[], AWAN_FLAG_TOMBSTONE, 0, 0, Some(tomb_ts)) {
             Ok((vm, loc, g)) => {
                 self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                 self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                let l = self.make_durable(&vm, loc.seq).await.err().map(|e| format!("could not sync the delete: {:?}", e));
+                let l = self
+                    .make_durable(&vm, loc.seq)
+                    .await
+                    .err()
+                    .map(|e| format!("could not sync the delete: {:?}", e));
                 (g, l)
             }
             Err(VolumeError::AfterRecord { loc, cause, .. }) => {
                 self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                 self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                (global_offset(loc.volume_id, loc.offset), Some(format!("could not record the delete: {}", cause)))
+                (
+                    global_offset(loc.volume_id, loc.offset),
+                    Some(format!("could not record the delete: {}", cause)),
+                )
             }
             Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
         };
@@ -1799,6 +1834,7 @@ impl S3ServiceState {
         };
         let retired_updates = self.attr_updates.remove_target(b_id, key, 0, Some(&self.payload_cache));
         self.add_dead_attr_update_bytes(&retired_updates);
+        let expired_size = old_info.map_or(0, |x| x.1);
         if let Some((off, sz, old_flags, _)) = old_info {
             if off > 0 {
                 self.payload_cache.remove(b_id, off);
@@ -1808,8 +1844,104 @@ impl S3ServiceState {
         }
         match late {
             Some(e) => Err(DeleteError::Internal(e)),
-            None => Ok(None),
+            None => Ok(expired_size),
         }
+    }
+
+    /// Expires `key`'s current object (or pre-versioning null object) only if it is still at
+    /// `expected_offset` and unlocked under `lock_key` (#118).
+    pub async fn lifecycle_expire_current(
+        &self,
+        b_id: u32,
+        key: &str,
+        expected_offset: u64,
+        is_versioned: bool,
+        now_sec: u64,
+    ) -> Result<Option<u64>, DeleteError> {
+        let _key_guard = self.lock_key(b_id, key).await;
+        if is_versioned {
+            let before = self.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| null_version_of(&m));
+            let (cur, needs_start) = {
+                let vs = self.versions.read();
+                if vs.has(b_id, key) {
+                    (vs.current(b_id, key), false)
+                } else {
+                    (before, true)
+                }
+            };
+            let Some(v) = cur else {
+                return Ok(None);
+            };
+            if v.marker || v.vol_offset != expected_offset {
+                return Ok(None);
+            }
+            if needs_start {
+                self.versions.write().start(b_id, key, before);
+            }
+            self.write_delete_marker_locked(b_id, key).await?;
+            Ok(Some(0))
+        } else {
+            let Some(m) = self.engine.read().get_object(b_id, key.as_bytes()).ok() else {
+                return Ok(None);
+            };
+            if m.vol_offset != expected_offset || self.versions.read().has(b_id, key) {
+                return Ok(None);
+            }
+            let lock = self.version_lock_for(b_id, key, &null_version_of(&m))?;
+            if lock.may_delete(now_sec, false).is_err() {
+                return Ok(None);
+            }
+            let sz = self.expire_unversioned_locked(b_id, key).await?;
+            Ok(Some(sz))
+        }
+    }
+
+    /// Removes `marker_id` only if it is still the sole remaining version of `key` under `lock_key` (#118).
+    pub async fn lifecycle_remove_sole_marker(
+        &self,
+        b_id: u32,
+        key: &str,
+        marker_id: u64,
+    ) -> Result<bool, DeleteError> {
+        let _key_guard = self.lock_key(b_id, key).await;
+        let target = {
+            let vs = self.versions.read();
+            match vs.versions(b_id, key) {
+                Some(list) if list.len() == 1 && list[0].marker && list[0].id() == marker_id => list[0],
+                _ => return Ok(false),
+            }
+        };
+        let flags = AWAN_FLAG_TOMBSTONE | crate::meta_index::FLAG_VERSION_DELETE;
+        let late = match self.write_to_active(b_id, key, &marker_id.to_le_bytes(), flags, 0, 0) {
+            Ok((vm, loc, _)) => {
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                self.make_durable(&vm, loc.seq)
+                    .await
+                    .err()
+                    .map(|e| format!("could not sync the delete: {:?}", e))
+            }
+            Err(VolumeError::AfterRecord { loc, cause, .. }) => {
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                Some(format!("could not record the delete: {}", cause))
+            }
+            Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
+        };
+        let ev_spec = VersionCommitEventSpec {
+            time: self.clock.now_ns(),
+            version: Some(target.id_string()),
+            kind: crate::events::CommitKind::VersionDelete,
+            size: 0,
+            etag: String::new(),
+            acked: late.is_none(),
+        };
+        self.record_version_commit(b_id, key, crate::versions::Event::Remove(marker_id), None, Some(ev_spec))
+            .map_err(|c| DeleteError::Internal(format!("index error {} after removing delete marker", c)))?;
+        if let Some(e) = late {
+            return Err(DeleteError::Internal(e));
+        }
+        Ok(true)
     }
 
     /// `DELETE ?versionId=`: removes one version for good (#31). Returns it, or `None` when the
@@ -2255,6 +2387,13 @@ impl S3ServiceState {
             .and_then(|cfg| cfg.object_lock())
     }
 
+    /// Returns the bucket's parsed Lifecycle configuration, if set (#118).
+    pub fn bucket_lifecycle(&self, b_id: u32) -> Option<Arc<crate::lifecycle_config::LifecycleConfig>> {
+        self.bucket_config_reader
+            .load_bucket(b_id)
+            .and_then(|cfg| cfg.lifecycle())
+    }
+
     /// Loads the current `Lock` (retention + legal hold) of a version, returning an error if attributes are corrupt.
     pub fn version_lock_for(
         &self,
@@ -2496,6 +2635,21 @@ impl S3ServiceState {
             let now_ms = state.clock.now_ns() / 1_000_000;
             let (_removed, more) = state.multipart.cleanup_expired(now_ms, max_age_ms, budget);
             Ok(more)
+        });
+    }
+
+    /// Registers the periodic bucket lifecycle expiration sweep on the background scheduler (#118).
+    pub fn start_lifecycle_sweep(self: &Arc<Self>, every: std::time::Duration) {
+        let weak = Arc::downgrade(self);
+        let rt = tokio::runtime::Handle::current();
+        self.scheduler.register("lifecycle", every, move |budget| {
+            let Some(state) = weak.upgrade() else { return Ok(false) };
+            let now_ms = state.clock.now_ns() / 1_000_000;
+            Ok(rt.block_on(crate::lifecycle::run_lifecycle_sweep_async(
+                &state,
+                now_ms,
+                budget,
+            )))
         });
     }
 
@@ -4355,6 +4509,24 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
             "counter",
             "0x200 attribute-update needles ignored during recovery because their target was absent, deleted, or a delete marker.",
             state.attr_updates_ignored.load(Ordering::Relaxed),
+        ),
+        (
+            "awanfs_lifecycle_objects_expired_total",
+            "counter",
+            "Objects, versions, and sole delete markers expired by the lifecycle sweep (#118).",
+            state.lifecycle.objects_expired(),
+        ),
+        (
+            "awanfs_lifecycle_bytes_expired_total",
+            "counter",
+            "Payload bytes expired by the lifecycle sweep (#118).",
+            state.lifecycle.bytes_expired(),
+        ),
+        (
+            "awanfs_lifecycle_uploads_aborted_total",
+            "counter",
+            "Incomplete multipart uploads aborted by the lifecycle sweep (#118).",
+            state.lifecycle.uploads_aborted(),
         ),
     ];
     for (name, kind, help, v) in gauges {

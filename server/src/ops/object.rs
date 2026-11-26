@@ -100,6 +100,27 @@ fn put_ok_response(etag_hex: &str, version_id: Option<&str>, checksum: Option<(c
     b.body(empty_body()).unwrap()
 }
 
+fn with_expiration(mut resp: Response<ResponseBody>, exp: Option<String>) -> Response<ResponseBody> {
+    if resp.status().is_success() {
+        if let Some(val) = exp {
+            if let Ok(hv) = hyper::header::HeaderValue::from_str(&val) {
+                resp.headers_mut().insert("x-amz-expiration", hv);
+            }
+        }
+    }
+    resp
+}
+
+fn with_expiration_header(
+    mut builder: hyper::http::response::Builder,
+    exp: Option<&str>,
+) -> hyper::http::response::Builder {
+    if let Some(val) = exp {
+        builder = builder.header("x-amz-expiration", val);
+    }
+    builder
+}
+
 const MAX_USER_METADATA_BYTES: usize = 2048;
 
 fn valid_header_str<'a>(val: &'a hyper::header::HeaderValue, key: &str) -> Result<&'a str, Response<ResponseBody>> {
@@ -746,6 +767,13 @@ fn version_get_response(
         Ok(view) => view,
         Err(e) => return internal_error_response(key, &format!("could not read the version's attributes: {:?}", e)),
     };
+    let is_current = id.is_none() || state.versions.read().current(b_id, key).is_some_and(|c| c.id() == v.id());
+    let exp_hdr = if is_current {
+        crate::lifecycle::expiration_header_for_attrs(state, b_id, key, v.size, &view.attrs, v.modified)
+    } else {
+        None
+    };
+    let resp = (|| -> Response<ResponseBody> {
     if let Some(pn) = part_num {
         if v.flags & AWAN_FLAG_MULTIPART != 0 {
             let extents = match state
@@ -941,6 +969,8 @@ fn version_get_response(
         .header(CONTENT_LENGTH, v.size.to_string())
         .body(body)
         .unwrap()
+    })();
+    with_expiration(resp, exp_hdr)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1846,12 +1876,15 @@ where
             ) {
                 Ok(vid) => {
                     let resp_vid = (extra & crate::meta_index::FLAG_NULL_ID == 0).then_some(vid.as_str());
-                    put_ok_response(&etag_hex, resp_vid, stream_cksum_ref)
+                    let exp = crate::lifecycle::expiration_header_for_attrs(&state, b_id, key, len, &put_attrs_map, created_ns);
+                    with_expiration(put_ok_response(&etag_hex, resp_vid, stream_cksum_ref), exp)
                 }
                 Err(r) => r,
             }
         } else {
-            finish_put(&state, b_id, bucket, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns, stream_cksum_ref, reservation, late.is_none())
+            let resp = finish_put(&state, b_id, bucket, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns, stream_cksum_ref, reservation, late.is_none());
+            let exp = crate::lifecycle::expiration_header_for_attrs(&state, b_id, key, len, &put_attrs_map, created_ns);
+            with_expiration(resp, exp)
         };
         return Ok(after_late_failure(key, late, answer));
     }
@@ -2021,12 +2054,15 @@ where
         ) {
             Ok(vid) => {
                 let resp_vid = (extra & crate::meta_index::FLAG_NULL_ID == 0).then_some(vid.as_str());
-                put_ok_response(&final_etag_hex, resp_vid, buf_cksum_ref)
+                let exp = crate::lifecycle::expiration_header_for_attrs(&state, b_id, key, payload_len, &buf_attrs_map, created_ns);
+                with_expiration(put_ok_response(&final_etag_hex, resp_vid, buf_cksum_ref), exp)
             }
             Err(r) => r,
         }
     } else {
-        finish_put(&state, b_id, bucket, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns, buf_cksum_ref, reservation, late.is_none())
+        let resp = finish_put(&state, b_id, bucket, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns, buf_cksum_ref, reservation, late.is_none());
+        let exp = crate::lifecycle::expiration_header_for_attrs(&state, b_id, key, payload_len, &buf_attrs_map, created_ns);
+        with_expiration(resp, exp)
     };
     Ok(after_late_failure(key, late, answer))
 }
@@ -2123,6 +2159,14 @@ pub async fn get_or_head_object(
         PreconditionOutcome::Proceed => {}
         outcome => return Ok(precondition_failure_response(outcome, Some(&facts), key, is_head)),
     }
+    let exp_hdr = crate::lifecycle::expiration_header_for_attrs(
+        &state,
+        b_id,
+        key,
+        meta.size,
+        &view.attrs,
+        meta.created_at.saturating_mul(1_000_000),
+    );
 
     if let Some(pn) = part_num {
         if is_multipart {
@@ -2160,7 +2204,7 @@ pub async fn get_or_head_object(
                 };
                 full_body(b.slice(..(ext.part_size as usize).min(b.len())))
             };
-            return Ok(with_part_checksum_headers(
+            return Ok(with_expiration_header(with_part_checksum_headers(
                 Response::builder()
                     .status(StatusCode::OK)
                     .header(CONTENT_TYPE, view.content_type())
@@ -2171,7 +2215,7 @@ pub async fn get_or_head_object(
                     .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)),
                 &view.attrs,
                 ext.checksum.as_ref(),
-            )
+            ), exp_hdr.as_deref())
             .body(body)
             .unwrap());
         } else if pn > 1 {
@@ -2210,14 +2254,14 @@ pub async fn get_or_head_object(
                         Ok(b) => b,
                         Err(e) => return Ok(internal_error_response(key, &format!("could not read the object: {:?}", e))),
                     };
-                    return Ok(with_tagging_count(Response::builder()
+                    return Ok(with_expiration_header(with_tagging_count(Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
                         .with_object_metadata(&view, &overrides)
                         .header(ETAG, etag_val)
                         .header(ACCEPT_RANGES, "bytes")
                         .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
                         .header(CONTENT_LENGTH, len.to_string())
-                        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count)
+                        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count), exp_hdr.as_deref())
                         .body(body.boxed())
                         .unwrap());
                 }
@@ -2268,14 +2312,14 @@ pub async fn get_or_head_object(
                             if chunks.iter().map(|c| c.len() as u64).sum::<u64>() != range.end - range.start + 1 {
                                 return Ok(internal_error_response(key, "a part of the object is missing"));
                             }
-                            return Ok(with_tagging_count(Response::builder()
+                            return Ok(with_expiration_header(with_tagging_count(Response::builder()
                                 .status(StatusCode::PARTIAL_CONTENT)
                                 .with_object_metadata(&view, &overrides)
                                 .header(ETAG, etag_val)
                                 .header(ACCEPT_RANGES, "bytes")
                                 .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
                                 .header(CONTENT_LENGTH, (range.end - range.start + 1).to_string())
-                                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count)
+                                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count), exp_hdr.as_deref())
                                 .body(ChunksBody(chunks).boxed())
                                 .unwrap());
                         }
@@ -2308,14 +2352,14 @@ pub async fn get_or_head_object(
                 let content_range = format!("bytes {}-{}/{}", range.start, range.end, meta.size);
                 let body = if is_head { empty_body() } else { full_body(sub_bytes) };
 
-                return Ok(with_tagging_count(Response::builder()
+                return Ok(with_expiration_header(with_tagging_count(Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
                     .with_object_metadata(&view, &overrides)
                     .header(ETAG, etag_val)
                     .header(ACCEPT_RANGES, "bytes")
                     .header(CONTENT_RANGE, content_range)
                     .header(CONTENT_LENGTH, (range.end - range.start + 1).to_string())
-                    .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count)
+                    .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count), exp_hdr.as_deref())
                     .body(body)
                     .unwrap());
             }
@@ -2344,13 +2388,13 @@ pub async fn get_or_head_object(
                 Ok(b) => b,
                 Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
             };
-            return Ok(with_tagging_count(with_checksum_headers(Response::builder()
+            return Ok(with_expiration_header(with_tagging_count(with_checksum_headers(Response::builder()
                 .status(StatusCode::OK)
                 .with_object_metadata(&view, &overrides)
                 .header(ETAG, etag_val)
                 .header(ACCEPT_RANGES, "bytes")
                 .header(CONTENT_LENGTH, meta.size.to_string())
-                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count)
+                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count), exp_hdr.as_deref())
                 .body(body.boxed())
                 .unwrap());
         }
@@ -2366,13 +2410,13 @@ pub async fn get_or_head_object(
         if chunks.iter().map(|c| c.len() as u64).sum::<u64>() != meta.size {
             return Ok(internal_error_response(key, "a part of the object is missing"));
         }
-        return Ok(with_tagging_count(with_checksum_headers(Response::builder()
+        return Ok(with_expiration_header(with_tagging_count(with_checksum_headers(Response::builder()
             .status(StatusCode::OK)
             .with_object_metadata(&view, &overrides)
             .header(ETAG, etag_val)
             .header(ACCEPT_RANGES, "bytes")
             .header(CONTENT_LENGTH, meta.size.to_string())
-            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count)
+            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count), exp_hdr.as_deref())
             .body(ChunksBody(chunks).boxed())
             .unwrap());
     }
@@ -2390,13 +2434,13 @@ pub async fn get_or_head_object(
             Ok(b) => b,
             Err(e) => return Ok(internal_error_response(key, &format!("could not read the object: {:?}", e))),
         };
-        return Ok(with_tagging_count(with_checksum_headers(Response::builder()
+        return Ok(with_expiration_header(with_tagging_count(with_checksum_headers(Response::builder()
             .status(StatusCode::OK)
             .with_object_metadata(&view, &overrides)
             .header(ETAG, etag_val)
             .header(ACCEPT_RANGES, "bytes")
             .header(CONTENT_LENGTH, meta.size.to_string())
-            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count)
+            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count), exp_hdr.as_deref())
             .body(body.boxed())
             .unwrap());
     }
@@ -2424,13 +2468,13 @@ pub async fn get_or_head_object(
         return Ok(internal_error_response(key, "the object's bytes could not be read or failed verification"));
     }
     let body = if is_head { empty_body() } else { full_body(payload) };
-    Ok(with_tagging_count(with_checksum_headers(Response::builder()
+    Ok(with_expiration_header(with_tagging_count(with_checksum_headers(Response::builder()
         .status(StatusCode::OK)
         .with_object_metadata(&view, &overrides)
         .header(ETAG, etag_val)
         .header(ACCEPT_RANGES, "bytes")
         .header(CONTENT_LENGTH, meta.size.to_string())
-        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count)
+        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count), exp_hdr.as_deref())
         .body(body)
         .unwrap())
 }
