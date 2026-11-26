@@ -240,6 +240,66 @@ def matcher_hits(patterns: Sequence[str], test_name: str, markers: Sequence[str]
     return False
 
 
+def ported_md_rows(path: Path) -> Dict[str, str]:
+    """{suite test: AwanFS test} from `tests/s3tests/PORTED.md` (#433)."""
+    rows: Dict[str, str] = {}
+    if not path.is_file():
+        return rows
+    for line in path.read_text(encoding="utf-8").splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 3 or not cells[0].startswith("`"):
+            continue
+        rows[cells[0].strip("`")] = cells[-1].strip("`")
+    return rows
+
+
+def _check_port_target(root: Path, fid: str, test: str, target: str, passing: Set[str]) -> List[str]:
+    """A port is `path/to/file.rs::fn` (the file has that fn) or a suite test in passing.txt."""
+    if "::" not in target:
+        return [f"{fid}: ported {test!r} -> {target!r}: expected `file.rs::fn` or a suite test"]
+    path, fn = target.rsplit("::", 1)
+    if not path.endswith(".rs"):
+        if target in passing:
+            return []
+        return [f"{fid}: ported {test!r} -> {target!r}: that suite test is not in passing.txt"]
+    file = root / path
+    if not file.is_file():
+        return [f"{fid}: ported {test!r} -> {target!r}: no such file {path!r}"]
+    if not re.search(r"\bfn\s+" + re.escape(fn) + r"\s*[(<]", file.read_text(encoding="utf-8")):
+        return [f"{fid}: ported {test!r} -> {target!r}: no such fn {fn!r} in {path}"]
+    return []
+
+
+def _check_ported(root: Path, feats: List[dict], ceph_tests: "OrderedDict[str, List[str]]", passing: Set[str]) -> List[str]:
+    problems: List[str] = []
+    all_ported: Dict[str, str] = {}
+    for feat in feats:
+        fid = feat.get("id")
+        if not isinstance(fid, str):
+            continue
+        ported = feat.get("ported", {})
+        if not isinstance(ported, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in ported.items()):
+            problems.append(f"{fid}: ported must be a table of ceph test name = AwanFS test")
+            continue
+        for test, target in sorted(ported.items()):
+            marks = ceph_tests.get(test, [])
+            if not matcher_hits(feat.get("ceph", []), test, marks):
+                problems.append(f"{fid}: ported names {test!r}, which is not one of its tests")
+            problems.extend(_check_port_target(root, fid, test, target, passing))
+            all_ported[test] = target
+    md_path = root / "tests" / "s3tests" / "PORTED.md"
+    if md_path.is_file():
+        md = ported_md_rows(md_path)
+        for test, target in sorted(all_ported.items()):
+            if test not in md:
+                problems.append(f"PORTED.md: no row for ported {test!r}")
+            elif md[test] != target:
+                problems.append(f"PORTED.md: {test!r} names {md[test]!r}, features.toml names {target!r}")
+        for test in sorted(set(md) - set(all_ported)):
+            problems.append(f"PORTED.md: {test!r} is in no feature's ported table")
+    return problems
+
+
 def _validate_feature_schema(feats: List[dict]) -> Tuple[List[str], Dict[str, dict]]:
     problems: List[str] = []
     by_id: Dict[str, dict] = {}
@@ -318,8 +378,9 @@ def _check_done_means_passing(feats: List[dict], ceph_tests: "OrderedDict[str, L
                 problems.append(f"{fid}: waits_on {test!r} names {other!r}, which is done")
         if feat.get("status") != "done":
             continue
+        ported = feat.get("ported", {}) if isinstance(feat.get("ported"), dict) else {}
         for test in own:
-            if test not in passing and test not in waits:
+            if test not in passing and test not in waits and test not in ported:
                 problems.append(
                     f"{fid}: marked done, but its ceph test {test!r} is not in passing.txt: "
                     "make it pass, list it under waits_on with the feature it needs, or mark the feature partial"
@@ -441,6 +502,9 @@ def check_registry(
     if ceph_tests or verify_ceph_literals:
         problems.extend(_check_suite_coverage("ceph", feats, "ceph", ceph_tests, verify_ceph_literals))
 
+    passing_now = set(parse_passing_file(passing_path, default_prefix="test_s3::")) if passing_path.is_file() else set()
+    problems.extend(_check_ported(root, feats, ceph_tests, passing_now))
+
     # A feature is done only when its ceph tests pass, or each one that does not names, under
     # `waits_on`, the unfinished feature it needs (owner, 2026-11-21). Checked when the whole
     # suite is known, against passing.txt.
@@ -469,7 +533,9 @@ def check_registry(
     return problems
 
 
-def _format_owner(feat: dict) -> str:
+def _format_owner(feat: dict, covered: bool = False) -> str:
+    if feat.get("status") == "out-of-scope" and covered:
+        return "covered by own tests"
     if feat.get("status") == "out-of-scope":
         issue = feat.get("issue", "")
         if issue and issue != "out of scope":
@@ -504,7 +570,8 @@ def build_report(
         all_ceph.setdefault(name, [])
 
     mint_results = parse_mint_log(mint_logs) if mint_logs else {}
-    has_mint = bool(mint_results) or any(feat.get("mint") for feat in feats)
+    # Without a Mint log there are no Mint results to count: say so instead of 0/N.
+    has_mint = bool(mint_logs)
 
     # Effective ceph status per test (passing.txt overrides only if junit didn't fail; wait —
     # in report from a PR run, junit IS the live result; if passing_set is used without junit, mark pass).
@@ -538,6 +605,8 @@ def build_report(
             5,
             f"Mint: {len(mint_results)} tests ({mint_pass} pass).",
         )
+    else:
+        lines.insert(5, "Mint: not run for this report (no `--mint-log`).")
 
     lines += [
         "| feature | status | owner | ceph | mint | server_tests | drive | fuzz |",
@@ -545,21 +614,25 @@ def build_report(
     ]
 
     done_failing: List[Tuple[str, List[Tuple[str, str, str]]]] = []
+    covered_by_own: List[Tuple[str, str]] = []
     done_missing_layers: List[Tuple[str, List[str]]] = []
 
     for feat in feats:
         fid = feat["id"]
         status = feat["status"]
-        owner = _format_owner(feat)
         pats = feat.get("ceph", [])
+        ported = feat.get("ported", {}) if isinstance(feat.get("ported"), dict) else {}
         matched_ceph = [
             (name, *effective_ceph[name])
             for name, marks in all_ceph.items()
             if matcher_hits(pats, name, marks)
         ]
+        own = [(n, ported[n]) for n, st, _ in matched_ceph if st != "pass" and n in ported]
+        covered_by_own += own
+        owner = _format_owner(feat, covered=bool(matched_ceph) and all(st == "pass" or n in ported for n, st, _ in matched_ceph))
         if matched_ceph:
             cp = sum(1 for _, st, _ in matched_ceph if st == "pass")
-            ceph_cell = f"{cp}/{len(matched_ceph)}"
+            ceph_cell = f"{cp}/{len(matched_ceph)}" + (f" (+{len(own)} own)" if own else "")
         elif pats:
             ceph_cell = f"0/{len(pats)}"
         else:
@@ -595,7 +668,7 @@ def build_report(
         )
 
         if status == "done":
-            non_pass = [(n, st, why) for n, st, why in matched_ceph if st != "pass"]
+            non_pass = [(n, st, why) for n, st, why in matched_ceph if st != "pass" and n not in ported]
             non_pass += [(n, st, why) for n, st, why in matched_mint if st != "pass"]
             if non_pass:
                 done_failing.append((fid, non_pass))
@@ -622,6 +695,15 @@ def build_report(
             for name, st, why in items:
                 suffix = f": {why.replace('|', '/')}" if why else ""
                 lines.append(f"  - `{name}` ({st}){suffix}")
+    else:
+        lines.append("- None.")
+
+    lines += ["", "### Suite tests covered by own tests", ""]
+    lines.append("A suite test AwanFS cannot run as written (it signs with SigV2) counts by its own SigV4 version (`tests/s3tests/PORTED.md`).")
+    lines.append("")
+    if covered_by_own:
+        for name, target in covered_by_own:
+            lines.append(f"- `{name}`: covered by own test (`{target}`)")
     else:
         lines.append("- None.")
 
