@@ -520,7 +520,7 @@ class PatternAndSizeParsingTests(unittest.TestCase):
             cs.parse_concurrencies("0,4")
 
     def test_prefill_exceeds_stated_cache_size(self):
-        budget_bytes = cs.parse_size(cs.DEFAULT_MEMORY_BUDGET)
+        budget_bytes = cs.parse_size("32MiB")  # #423: a budget given by name; the default passes none
         cache_bytes = cs.stated_cache_bytes(budget_bytes)
         prefill_bytes = cs.parse_size(cs.DEFAULT_PREFILL_SIZE)
         self.assertGreater(prefill_bytes, cache_bytes)
@@ -529,6 +529,30 @@ class PatternAndSizeParsingTests(unittest.TestCase):
             cs.validate_prefill_exceeds_cache(cache_bytes, cache_bytes)
         with self.assertRaises(ValueError):
             cs.validate_prefill_exceeds_cache(cache_bytes - 1024, cache_bytes)
+
+
+class DefaultMemoryBudgetTests(unittest.TestCase):
+    """#423 (owner, 2026-11-26): AwanFS runs at its own default memory budget, like every other
+    server, on the same 48 MiB prefill."""
+
+    def test_the_default_passes_no_memory_budget_and_skips_the_cache_check(self):
+        self.assertEqual(cs.DEFAULT_MEMORY_BUDGET, "")
+        self.assertIsNone(cs.prefill_cache_check("", cs.DEFAULT_PREFILL_SIZE))
+        # A budget given by name still needs a prefill above its cache half.
+        self.assertEqual(cs.prefill_cache_check("32MiB", "48MiB"), 16 * 1024 * 1024)
+        with self.assertRaises(ValueError):
+            cs.prefill_cache_check("128MiB", "48MiB")
+
+    def test_the_matrix_report_names_the_default_budget(self):
+        patterns, sizes, cores, concs, results = _sample_matrix_results()
+        md = cs.render_matrix_report(
+            cmd="python benchmarks/core_scaling.py --matrix",
+            patterns=patterns, sizes=sizes, cores=cores, concurrencies=concs, results=results,
+            total_cores=16, runs=2, duration_sec=2.0, seed=42, memory_budget="",
+            prefill_bytes=48 * 1024 * 1024, chart_paths=[],
+        )
+        self.assertIn("AwanFS at its default `--memory-budget`", md)
+        self.assertNotIn("--memory-budget 0", md)
 
 
 class WorkloadSequenceTests(unittest.TestCase):

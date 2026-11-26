@@ -49,7 +49,9 @@ PATTERNS: Tuple[str, ...] = ("seq-write", "rand-write", "seq-read", "rand-read")
 DEFAULT_SIZES = "4KiB,1MiB"
 DEFAULT_CONCURRENCIES = "1,4,16,64,256"
 DEFAULT_SEED = 42
-DEFAULT_MEMORY_BUDGET = "32MiB"
+# AwanFS runs at its own default memory budget, like every other server (#423, owner 2026-11-26).
+# A budget given with --memory-budget is passed through, and then the prefill must exceed its cache.
+DEFAULT_MEMORY_BUDGET = ""
 DEFAULT_PREFILL_SIZE = "48MiB"
 DURABILITIES: Tuple[str, ...] = ("group", "fast", "strict")
 DEFAULT_PROFILE_THREAD_CORES: Tuple[int, ...] = (4, 8)
@@ -414,6 +416,16 @@ def parse_concurrencies(spec: str) -> List[int]:
 def stated_cache_bytes(memory_budget_bytes: int) -> int:
     """AwanFS splits `--memory-budget` in half between payload cache and in-flight bodies."""
     return memory_budget_bytes // 2
+
+
+def prefill_cache_check(memory_budget: str, prefill_size: str) -> Optional[int]:
+    """The stated cache of a budget given by name, checked against the prefill; `None` for the
+    server's default budget, whose cache is not known here (#423)."""
+    if not memory_budget:
+        return None
+    cache_bytes = stated_cache_bytes(parse_size(memory_budget))
+    validate_prefill_exceeds_cache(parse_size(prefill_size), cache_bytes)
+    return cache_bytes
 
 
 def validate_prefill_exceeds_cache(prefill_bytes: int, cache_bytes: int) -> None:
@@ -3384,8 +3396,11 @@ def render_matrix_report(
     if fast_results is not None:
         fast_sizes.setdefault(4 * KIB, fast_results)
     fast_results = fast_sizes.get(4 * KIB)
-    budget_bytes = parse_size(memory_budget)
-    cache_bytes = stated_cache_bytes(budget_bytes)
+    if memory_budget:
+        budget_bytes = parse_size(memory_budget)
+        budget_note = f"AwanFS `--memory-budget {format_size(budget_bytes)}` (stated cache half = {format_size(stated_cache_bytes(budget_bytes))})"
+    else:
+        budget_note = "AwanFS at its default `--memory-budget` (a quarter of RAM, held between 128 MiB and 2 GiB; half of it is the cache)"
     shared_ns = [n for n in cores if n >= total_cores]
     if shared_ns:
         sharing_note = (
@@ -3405,7 +3420,7 @@ def render_matrix_report(
         "",
         f"- **Machine:** {platform.node()} ({platform.platform()}, {total_cores} logical cores, {rwb.host_ram_gb()} GB RAM, CPU: {rwb.cpu_model()})",
         f"- **Methodology:** `patterns = {', '.join(patterns)}`, `sizes = {', '.join(format_size(s) for s in sizes)}`, `cores = {', '.join(str(n) for n in cores)}`, `concurrencies = {', '.join(str(c) for c in concurrencies)}`, `client_procs = {client_procs}`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase, seed = `{seed}`.",
-        f"- **Cache & Prefill:** AwanFS `--memory-budget {format_size(budget_bytes)}` (stated cache half = {format_size(cache_bytes)}). Read prefill size = {format_size(prefill_bytes)} ({describe_prefill_sets(prefill_bytes, patterns, sizes)}), identical deterministic bytes for every server, written before timing.",
+        f"- **Cache & Prefill:** {budget_note}. Read prefill size = {format_size(prefill_bytes)} ({describe_prefill_sets(prefill_bytes, patterns, sizes)}), identical deterministic bytes for every server, written before timing.",
         f"- **Core pinning:** {sharing_note}",
         f"- **Durability:** {_durability_label(durability)}. {rwb.minio_durability_note()} RustFS release defaults (durable, 3.09 syncs/PUT; measurements/2026-11-21-durability-probe.md, #334). Garage `metadata_fsync=false, data_fsync=false`. SeaweedFS `fsync` unset (`false`) by default.",
         "",
@@ -3980,10 +3995,8 @@ def _run_matrix_mode(
     patterns = parse_patterns(a.pattern)
     sizes = parse_sizes(a.sizes)
     concurrencies = parse_concurrencies(a.concurrencies)
-    budget_bytes = parse_size(a.memory_budget)
-    cache_bytes = stated_cache_bytes(budget_bytes)
     prefill_bytes = parse_size(a.prefill_size)
-    validate_prefill_exceeds_cache(prefill_bytes, cache_bytes)
+    prefill_cache_check(a.memory_budget, a.prefill_size)
     durability, profile_cores, compare_fast = _resolve_profile_config(a, cores, total_cores)
     put_pat = "seq-write" if "seq-write" in patterns else ("rand-write" if "rand-write" in patterns else None)
 
@@ -4168,7 +4181,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--sizes", default="", help="Comma-separated object sizes (e.g. 4KiB,1MiB or 4096,1048576)")
     ap.add_argument("--concurrencies", default="", help="Comma-separated concurrencies (e.g. 1,4,16,64,256)")
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED, help=f"RNG seed for random patterns and prefill (default: {DEFAULT_SEED})")
-    ap.add_argument("--memory-budget", default=DEFAULT_MEMORY_BUDGET, help=f"AwanFS --memory-budget (default: {DEFAULT_MEMORY_BUDGET})")
+    ap.add_argument("--memory-budget", default=DEFAULT_MEMORY_BUDGET, help="AwanFS --memory-budget (default: none passed, the server's own)")
     ap.add_argument("--prefill-size", default=DEFAULT_PREFILL_SIZE, help=f"Total prefill size per read set, > cache (default: {DEFAULT_PREFILL_SIZE})")
     ap.add_argument("--durability", default="group", choices=DURABILITIES, help="AwanFS --durability mode (default: group)")
     ap.add_argument("--compare-fast", dest="compare_fast", action="store_true", default=None,
