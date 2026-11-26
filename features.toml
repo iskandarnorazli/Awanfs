@@ -2144,3 +2144,14 @@ mint = [
   "minio-java::getBucketReplication()",
   "minio-java::setBucketReplication()",
 ]
+
+[[feature]]
+id = "static-website"
+name = "Static website hosting (bucket ?website configuration)"
+status = "planned"
+issue = "#364"
+notes = "Not built: `?website` on a bucket answers 501 NotImplemented (UNBUILT_S3_SUBRESOURCES in server/src/ops/mod.rs). The pinned ceph s3-tests (5b39871) have 0 website tests; Mint (pinned 12559d50) has none either (0 of the 380 Mint names in this file; 0 lines with 'website' in the mint job log of run 45843838414)."
+operations = []
+ceph = []
+mint = []
+server_tests = ["server/tests/static_website_test.rs"]
