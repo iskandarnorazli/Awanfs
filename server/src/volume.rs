@@ -547,7 +547,7 @@ const IDX_SCAN_CHUNK: usize = IDX_RECORD * 16_384;
 /// `--verify-payloads-at-boot` (#412): the open checks every payload's CRC, journaled or not.
 /// For the first start after upgrading from a build before #412, whose journals may record
 /// needles that were never synced, and after suspected disk trouble.
-static VERIFY_PAYLOADS_AT_BOOT: AtomicBool = AtomicBool::new(false);
+static VERIFY_PAYLOADS_AT_BOOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Makes every later open check every payload's CRC (`--verify-payloads-at-boot`).
 pub fn set_verify_payloads_at_boot(on: bool) {
