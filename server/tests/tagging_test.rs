@@ -32,6 +32,7 @@ fn tagging_xml(pairs: &[(&str, &str)]) -> String {
     s
 }
 
+// covers: GetObjectTagging, PutObjectTagging, DeleteObjectTagging
 #[tokio::test]
 async fn test_put_get_modify_delete_object_tagging() {
     let (base_url, _state, _handle) = spawn_server().await;
@@ -581,6 +582,7 @@ async fn test_get_object_tagging_sorted_by_key() {
     assert!(bar_pos < foo_pos, "expected bar before foo in:\n{xml}");
 }
 
+// covers: GetBucketTagging, PutBucketTagging, DeleteBucketTagging
 #[tokio::test]
 async fn test_bucket_tagging_put_get_delete_and_404_when_unset() {
     let dir = temp_dir("bucket_tagging");

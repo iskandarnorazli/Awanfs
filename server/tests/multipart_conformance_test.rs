@@ -163,6 +163,7 @@ async fn complete_multipart_xml_and_part_validation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// covers: UploadPartCopy
 #[tokio::test]
 async fn upload_part_copy_range_preconditions_and_errors() {
     let (handle, base, dir) = start_server("mpu_copy").await;
@@ -340,6 +341,7 @@ async fn get_and_head_with_part_number() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// covers: ListMultipartUploads, ListParts
 #[tokio::test]
 async fn list_parts_and_list_multipart_uploads_pagination() {
     let (handle, base, dir) = start_server("mpu_list").await;

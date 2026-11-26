@@ -40,6 +40,7 @@ async fn get_range(c: &reqwest::Client, url: &str, first: usize, last: usize) ->
     (status, res.bytes().await.unwrap().to_vec())
 }
 
+// covers: GetObject
 #[tokio::test]
 async fn a_range_of_a_large_object_verifies_nothing_and_a_full_get_verifies_it_once() {
     let (_dir, state, url, _h) = start("work").await;

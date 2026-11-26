@@ -102,6 +102,7 @@ async fn object_key_over_1024_utf8_bytes_rejected() {
     handle.shutdown();
 }
 
+// covers: GetBucketLocation
 #[tokio::test]
 async fn get_bucket_location_and_create_bucket_constraint() {
     // 1. Default us-east-1 returns empty LocationConstraint
