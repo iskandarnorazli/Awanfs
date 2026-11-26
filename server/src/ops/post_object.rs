@@ -20,10 +20,9 @@ use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION};
 use hyper::{HeaderMap, Response, StatusCode};
 use parking_lot::Mutex;
 
-use super::{Authenticated, Classified};
+use super::Classified;
 use crate::form_upload::{extract_boundary, FormEvent, FormLimits, FormParser};
 use crate::fsm::Refusal;
-use crate::iam::Principal;
 use crate::post_object::{self as po, FormFields, Policy};
 use crate::s3_api::{empty_body, full_body, request_timeout_response, ResponseBody, S3ServiceState, STREAM_PUT_MIN};
 use crate::xml::s3_error_xml;
@@ -54,7 +53,7 @@ pub struct PostForm {
     /// The parser has seen the closing delimiter.
     done: bool,
     file_offset: u64,
-    policy: Option<Policy>,
+    pub(crate) policy: Option<Policy>,
 }
 
 pub(crate) fn refusal_response(r: Refusal, resource: &str) -> Response<ResponseBody> {
@@ -118,48 +117,6 @@ pub async fn read_form(state: &S3ServiceState, mut c: Classified) -> Result<Clas
     c.key = Some(key);
     c.form = Some(Box::new(PostForm { fields, filename, parser, pending, done, file_offset, policy: None }));
     Ok(c)
-}
-
-/// The authenticate stage for a form: the form's own signature stands in for the
-/// Authorization header. A signed form's policy is checked here too, once its signature is
-/// known to be good, so nothing the policy refuses reaches storage.
-pub fn authenticate(state: &S3ServiceState, mut c: Classified) -> Result<Authenticated, Response<ResponseBody>> {
-    let path = c.parts.uri.path().to_string();
-    let iam = state.iam.read().as_ref().map(|r| r.current());
-    let now = state.clock.now_ns() / 1_000_000_000;
-    let form = c.form.as_mut().expect("read_form ran for PostObject");
-    let refuse = |r: Refusal| refusal_response(r, &path);
-    let signature = po::read_signature(&form.fields).map_err(refuse)?;
-    let no_keys = state.auth.credentials.is_none() && iam.as_deref().is_none_or(|i| i.is_empty());
-    let principal = match &signature {
-        None if state.auth.allow_anonymous => Principal::Anonymous,
-        None => return Err(refusal_response(Refusal { code: "AccessDenied", status: 403, why: "Access Denied" }, &path)),
-        Some(_) if no_keys && state.auth.allow_anonymous => Principal::Anonymous,
-        Some(_) if no_keys => return Err(refuse(po::UNKNOWN_KEY)),
-        Some(sig) => {
-            let (principal, secret) =
-                crate::auth::secret_for(&state.auth, iam.as_deref(), &sig.access_key).ok_or_else(|| refuse(po::UNKNOWN_KEY))?;
-            let want = po::expected_signature(&state.sigv4_cache, secret, sig);
-            if !crate::auth::constant_time_eq(&want, &sig.signature) {
-                return Err(refuse(po::BAD_SIGNATURE));
-            }
-            principal
-        }
-    };
-    if signature.is_some() {
-        let bucket = c.bucket.as_deref().unwrap_or("");
-        let key = c.key.as_deref().unwrap_or("");
-        let policy = po::parse_policy(form.fields.get("policy").unwrap_or("")).map_err(refuse)?;
-        po::check_policy(&policy, &form.fields, bucket, key, now).map_err(refuse)?;
-        form.policy = Some(policy);
-    }
-    crate::request_log::note_principal(match &principal {
-        Principal::Anonymous => "anonymous".to_string(),
-        Principal::Root => crate::iam::ROOT_ACCOUNT.to_string(),
-        Principal::User { account, name, .. } if account == name => name.clone(),
-        Principal::User { account, name, .. } => format!("{}:{}", account, name),
-    });
-    Ok(Authenticated { classified: c, principal, iam })
 }
 
 /// The file part as a request body for `put_object`.
