@@ -122,7 +122,6 @@ pub(crate) async fn read_body<B>(
 where
     B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Unpin,
 {
-    use hyper::body::Body as _;
     if body.size_hint().lower() > limit {
         return Ok(Err(entity_too_large(resource, limit)));
     }
@@ -243,7 +242,10 @@ pub const VERIFY_WHILE_SENDING_MIN: u64 = 4 * 1024 * 1024;
 pub const STREAM_PUT_MIN: u64 = 4 * 1024 * 1024;
 
 /// Reads and drops what is left of a request body, at most `limit` bytes.
-pub(crate) async fn drain_body(body: &mut hyper::body::Incoming, limit: u64) {
+pub(crate) async fn drain_body<B>(body: &mut B, limit: u64)
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
     let mut seen = 0u64;
     while seen < limit {
         match crate::body_timeout::next_frame_with_idle(body, crate::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT).await {
