@@ -147,3 +147,9 @@ name = "classify"
 path = "fuzz_targets/classify.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "list_objects_query"
+path = "fuzz_targets/list_objects_query.rs"
+test = false
+doc = false

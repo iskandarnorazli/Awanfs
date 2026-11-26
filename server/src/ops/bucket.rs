@@ -80,11 +80,11 @@ fn list_page(state: &S3ServiceState, b_id: u32, prefix: &[u8], delimiter: &[u8],
     page
 }
 
-pub(crate) fn encode_hex_token(b: &[u8]) -> String {
+pub fn encode_hex_token(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
-pub(crate) fn decode_hex_token(t: &str) -> Option<Vec<u8>> {
+pub fn decode_hex_token(t: &str) -> Option<Vec<u8>> {
     // Hex digits only: `u8::from_str_radix` also takes a leading `+` (#297).
     if t.len() % 2 != 0 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -409,24 +409,26 @@ pub async fn put_bucket_versioning(
     }
 }
 
-pub async fn list_objects(
-    state: Arc<S3ServiceState>,
-    b_id: u32,
-    bucket: &str,
-    query_map: &HashMap<String, String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListObjectsQuery<'a> {
+    pub prefix: &'a str,
+    pub delimiter: &'a str,
+    pub url_encode: bool,
+    pub fetch_owner: bool,
+    pub max_keys: usize,
+    pub start: Vec<u8>,
+}
+
+pub fn parse_list_objects_query<'a>(
+    query_map: &'a HashMap<String, String>,
     v2: bool,
-) -> Result<Response<ResponseBody>, hyper::Error> {
+) -> Result<ListObjectsQuery<'a>, (&'static str, &'static str)> {
     let q = |k: &str| query_map.get(k).map(|s| s.as_str()).unwrap_or("");
     let prefix = q("prefix");
     let delimiter = q("delimiter");
     if let Some(et) = query_map.get("encoding-type") {
         if !et.is_empty() && et != "url" {
-            let xml = s3_error_xml("InvalidArgument", "Invalid Encoding Method specified in Request", bucket, "req-list-obj");
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header(CONTENT_TYPE, "application/xml")
-                .body(full_body(Bytes::from(xml)))
-                .unwrap());
+            return Err(("InvalidArgument", "Invalid Encoding Method specified in Request"));
         }
     }
     let url_encode = q("encoding-type") == "url";
@@ -435,17 +437,10 @@ pub async fn list_objects(
         Some(s) => match s.parse::<i32>() {
             Ok(n) if n >= 0 => (n as usize).min(1000),
             _ => {
-                let xml = s3_error_xml(
+                return Err((
                     "InvalidArgument",
                     "Argument max-keys must be an integer between 0 and 2147483647",
-                    bucket,
-                    "req-list-obj",
-                );
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .header(CONTENT_TYPE, "application/xml")
-                    .body(full_body(Bytes::from(xml)))
-                    .unwrap());
+                ));
             }
         },
         None => 1000,
@@ -454,20 +449,50 @@ pub async fn list_objects(
         match query_map.get("continuation-token") {
             Some(t) => match decode_hex_token(t) {
                 Some(c) => c,
-                None => {
-                    let xml = s3_error_xml("InvalidArgument", "The continuation token provided is incorrect", bucket, "req-list-obj");
-                    return Ok(Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .header(CONTENT_TYPE, "application/xml")
-                        .body(full_body(Bytes::from(xml)))
-                        .unwrap());
-                }
+                None => return Err(("InvalidArgument", "The continuation token provided is incorrect")),
             },
             None => q("start-after").as_bytes().to_vec(),
         }
     } else {
         q("marker").as_bytes().to_vec()
     };
+    Ok(ListObjectsQuery {
+        prefix,
+        delimiter,
+        url_encode,
+        fetch_owner,
+        max_keys,
+        start,
+    })
+}
+
+pub async fn list_objects(
+    state: Arc<S3ServiceState>,
+    b_id: u32,
+    bucket: &str,
+    query_map: &HashMap<String, String>,
+    v2: bool,
+) -> Result<Response<ResponseBody>, hyper::Error> {
+    let parsed = match parse_list_objects_query(query_map, v2) {
+        Ok(p) => p,
+        Err((code, msg)) => {
+            let xml = s3_error_xml(code, msg, bucket, "req-list-obj");
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(full_body(Bytes::from(xml)))
+                .unwrap());
+        }
+    };
+    let (prefix, delimiter, url_encode, fetch_owner, max_keys, start) = (
+        parsed.prefix,
+        parsed.delimiter,
+        parsed.url_encode,
+        parsed.fetch_owner,
+        parsed.max_keys,
+        parsed.start,
+    );
+    let q = |k: &str| query_map.get(k).map(|s| s.as_str()).unwrap_or("");
     let page = list_page(&state, b_id, prefix.as_bytes(), delimiter.as_bytes(), &start, max_keys);
     let enc = |s: &str| if url_encode { s3_url_encode(s) } else { s.to_string() };
     let key_strings: Vec<String> = page.objects.iter().map(|(k, _)| enc(&String::from_utf8_lossy(k))).collect();
