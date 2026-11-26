@@ -9,6 +9,7 @@ use s3_server::bucket_config::{
     base64_decode as bucket_base64_decode, base64_encode as bucket_base64_encode,
 };
 use s3_server::checksum::{base64_decode, requested_checksum, ChecksumAlgorithm};
+use s3_server::ops::bucket::{decode_hex_token, encode_hex_token, parse_list_objects_query};
 use s3_server::ops::service::list_buckets;
 use s3_server::{
     base64_encode, parse_s3_target, percent_decode, percent_decode_path_bytes, raw_s3_key,
@@ -543,9 +544,125 @@ pub fn check_classify(data: &[u8]) {
     let _: Result<Operation, ClassifyRefusal> = classify(&Method::GET, Some("bkt"), None, raw_query, &HeaderMap::new());
 }
 
+fn assert_list_objects_oracle(query_map: &HashMap<String, String>, v2: bool) {
+    let res = parse_list_objects_query(query_map, v2);
+    assert_eq!(res, parse_list_objects_query(query_map, v2));
+
+    let bad_enc = query_map
+        .get("encoding-type")
+        .is_some_and(|et| !et.is_empty() && et != "url");
+    if bad_enc {
+        assert!(
+            matches!(res, Err(("InvalidArgument", _))),
+            "encoding-type={:?} must return InvalidArgument, got {:?}",
+            query_map.get("encoding-type"),
+            res
+        );
+        return;
+    }
+
+    let bad_max_keys = query_map
+        .get("max-keys")
+        .is_some_and(|s| s.parse::<i32>().ok().filter(|&n| n >= 0).is_none());
+    if bad_max_keys {
+        assert!(
+            matches!(res, Err(("InvalidArgument", _))),
+            "max-keys={:?} must return InvalidArgument, got {:?}",
+            query_map.get("max-keys"),
+            res
+        );
+        return;
+    }
+
+    let bad_tok = v2
+        && query_map
+            .get("continuation-token")
+            .is_some_and(|t| decode_hex_token(t).is_none());
+    if bad_tok {
+        assert!(
+            matches!(res, Err(("InvalidArgument", _))),
+            "continuation-token={:?} must return InvalidArgument, got {:?}",
+            query_map.get("continuation-token"),
+            res
+        );
+        return;
+    }
+
+    let parsed = res.unwrap_or_else(|e| panic!("valid ListObjects query {:?} failed: {:?}", query_map, e));
+    assert!(parsed.max_keys <= 1000);
+    if let Some(mk) = query_map.get("max-keys") {
+        let want = (mk.parse::<i32>().unwrap() as usize).min(1000);
+        assert_eq!(parsed.max_keys, want);
+    } else {
+        assert_eq!(parsed.max_keys, 1000);
+    }
+    assert_eq!(
+        parsed.url_encode,
+        query_map.get("encoding-type").is_some_and(|et| et == "url")
+    );
+    assert_eq!(
+        parsed.fetch_owner,
+        v2 && query_map
+            .get("fetch-owner")
+            .is_some_and(|f| f.eq_ignore_ascii_case("true"))
+    );
+    assert_eq!(parsed.prefix, query_map.get("prefix").map(String::as_str).unwrap_or(""));
+    assert_eq!(parsed.delimiter, query_map.get("delimiter").map(String::as_str).unwrap_or(""));
+    if v2 {
+        if let Some(t) = query_map.get("continuation-token") {
+            assert_eq!(parsed.start, decode_hex_token(t).unwrap());
+        } else {
+            assert_eq!(
+                parsed.start,
+                query_map.get("start-after").map(String::as_bytes).unwrap_or(&[])
+            );
+        }
+    } else {
+        assert_eq!(
+            parsed.start,
+            query_map.get("marker").map(String::as_bytes).unwrap_or(&[])
+        );
+    }
+}
+
+/// Oracle for `list_objects_query` (#114, #444):
+/// - `parse_list_objects_query` never panics for v1 or v2.
+/// - Every invalid `encoding-type`, `max-keys`, or v2 `continuation-token` returns `InvalidArgument`.
+/// - Server-issued hex tokens (`encode_hex_token`) always round-trip back to original bytes.
+pub fn check_list_objects_query(data: &[u8]) {
+    let text = String::from_utf8_lossy(data);
+    let mut query_map = HashMap::new();
+    for pair in text.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            query_map.insert(percent_decode(k), percent_decode(v));
+        }
+    }
+    for v2 in [false, true] {
+        assert_list_objects_oracle(&query_map, v2);
+    }
+
+    if !text.contains('=') {
+        for key in ["max-keys", "continuation-token", "encoding-type", "prefix", "delimiter"] {
+            let mut single = HashMap::new();
+            single.insert(key.to_string(), text.as_ref().to_string());
+            assert_list_objects_oracle(&single, false);
+            assert_list_objects_oracle(&single, true);
+        }
+    }
+
+    // Any token encoded by the server must decode back identically under v2.
+    let mut tok_map = HashMap::new();
+    tok_map.insert("continuation-token".to_string(), encode_hex_token(data));
+    let parsed = parse_list_objects_query(&tok_map, true).expect("server token must parse back");
+    assert_eq!(parsed.start.as_slice(), data);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{check_checksum_headers, check_classify, check_list_buckets_query, check_raw_s3_key};
+    use super::{
+        check_checksum_headers, check_classify, check_list_buckets_query,
+        check_list_objects_query, check_raw_s3_key,
+    };
 
     #[test]
     fn checksum_headers_canonical_vectors_and_invalid_inputs() {
@@ -680,6 +797,32 @@ mod tests {
         for path in entries {
             let bytes = std::fs::read(&path).expect("read corpus seed");
             check_classify(&bytes);
+        }
+    }
+
+    #[test]
+    fn list_objects_query_bounds_and_corpus_seeds() {
+        for sample in [
+            b"max-keys=-1".as_slice(),
+            b"max-keys=99999999999999999999".as_slice(),
+            b"continuation-token=%ZZ".as_slice(),
+            b"encoding-type=URL".as_slice(),
+            b"delimiter=".as_slice(),
+            b"list-type=2&prefix=a/&delimiter=/&max-keys=500&encoding-type=url&fetch-owner=true".as_slice(),
+        ] {
+            check_list_objects_query(sample);
+        }
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/list_objects_query");
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read list_objects_query corpus dir")
+            .map(|e| e.expect("corpus dir entry").path())
+            .collect();
+        entries.sort();
+        assert!(entries.len() >= 6, "expected at least 6 named seeds, got {}", entries.len());
+        for path in entries {
+            let bytes = std::fs::read(&path).expect("read corpus seed");
+            check_list_objects_query(&bytes);
         }
     }
 }

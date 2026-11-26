@@ -1264,7 +1264,6 @@ fuzz = ["version_id", "request_xml"]
 id = "listing"
 name = "Bucket listing (ListObjects, ListObjectsV2, paginated ListBuckets)"
 status = "done"
-gaps = { fuzz = "#444" }
 issue = "#114"
 area = "listing"
 design_section = "6.6"
@@ -1398,6 +1397,7 @@ server_tests = [
   "server/tests/listing_props_test.rs::prop_list_objects_thousand_batch_boundary",
 ]
 drive = ["listing"]
+fuzz = ["list_objects_query"]
 
 # Its other ceph tests pass; these fail only because each calls GetObjectAcl (owner, 2026-11-21).
 [feature.waits_on]
