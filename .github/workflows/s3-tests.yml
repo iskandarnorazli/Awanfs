@@ -33,6 +33,13 @@ jobs:
         id: changes
         shell: bash
         run: |
+          # The nightly dispatches this workflow on the map PR only so its required checks
+          # report: that map came from a full run of the suite minutes before.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.ref }}" = "refs/heads/bot/conformance-map" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "s3-tests skipped: conformance map refresh; the suite already ran in the nightly run that wrote it." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
@@ -201,7 +208,8 @@ jobs:
 
           # The required checks for the new head: see `actions: write` above.
           gh workflow run ci.yml --ref "$BRANCH"
-          echo "Dispatched ci.yml on $BRANCH for its required checks."
+          gh workflow run s3-tests.yml --ref "$BRANCH"
+          echo "Dispatched ci.yml and s3-tests.yml on $BRANCH for its required checks."
 
   s3tests-arm:
     name: s3tests (ubuntu-24.04-arm)
@@ -215,6 +223,13 @@ jobs:
         id: changes
         shell: bash
         run: |
+          # The nightly dispatches this workflow on the map PR only so its required checks
+          # report: that map came from a full run of the suite minutes before.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.ref }}" = "refs/heads/bot/conformance-map" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "s3-tests skipped: conformance map refresh; the suite already ran in the nightly run that wrote it." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
