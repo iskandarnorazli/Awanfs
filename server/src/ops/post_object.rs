@@ -361,8 +361,8 @@ pub async fn execute(
     let Some(content_length) = content_length(req_headers) else {
         return Ok(refusal_response(MISSING_LENGTH, path));
     };
-    // The file ends at the closing delimiter, so its size is known before it is read. A
-    // body that does not end there is refused, on every path.
+    // The file ends at the closing delimiter, so its size is known before it is read: the
+    // prediction assumes the delimiter ends with CRLF, as browsers and most SDKs send it.
     let Some(predicted) = content_length.checked_sub(form.file_offset + form.parser.closing_len()) else {
         return Ok(refusal_response(MALFORMED, path));
     };
@@ -371,12 +371,13 @@ pub async fn execute(
     }
     let failed = Arc::new(Mutex::new(None));
     let (size, file_body) = if form.done || predicted <= STREAM_PUT_MIN {
-        // Charged for the bytes this holds: the pending ones when the whole form came in one
-        // frame, else the predicted size (at most 4 MiB here).
-        let held: u64 = if form.done { form.pending.iter().map(|b| b.len() as u64).sum() } else { predicted };
-        if form.done && held != predicted {
-            return Ok(refusal_response(MALFORMED, path));
-        }
+        // Read into memory, so the size is the real one. The closing delimiter may lack its
+        // CRLF (Ruby's multipart-body gem, which Mint's aws-sdk-ruby test uses, sends
+        // `--<boundary>--` and nothing after it), making the file up to 2 bytes longer than
+        // predicted; an epilogue makes it shorter. Charged for the bytes this holds: the
+        // pending ones when the whole form came in one frame, else at most 4 MiB + 2.
+        let cap = predicted + 2;
+        let held: u64 = if form.done { form.pending.iter().map(|b| b.len() as u64).sum() } else { cap };
         let guard = match state.body_budget.acquire_async(held).await {
             Ok(g) => g,
             Err(_) => {
@@ -386,16 +387,13 @@ pub async fn execute(
                 ))
             }
         };
-        let data = match read_small_file(&state, &mut form, &mut body, predicted, path).await {
+        let data = match read_small_file(&state, &mut form, &mut body, cap, path).await {
             Ok(d) => d,
             Err(resp) => return Ok(resp),
         };
-        if data.len() as u64 != predicted {
-            return Ok(refusal_response(MALFORMED, path));
-        }
         // PUT charges these bytes itself when it reads them: charge them once.
         drop(guard);
-        (predicted, FormFileBody::Buffered(Some(data)))
+        (data.len() as u64, FormFileBody::Buffered(Some(data)))
     } else {
         let parser = std::mem::replace(&mut form.parser, FormParser::new("-", FormLimits::default()));
         let mut s = StreamingFile {

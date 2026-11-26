@@ -835,20 +835,37 @@ async fn raw_post(host: &str, bucket: &str, declared: u64, extra: &str, body: &[
     }
 }
 
-/// A whole form in fewer bytes than its Content-Length declares is refused, nothing is
-/// stored, and the next form goes through. Before the fix the form was stored, and with a
-/// large declared size its budget charge was the declared size, not the bytes held.
+/// A whole form that arrives in one frame with a much larger Content-Length (the rest would be
+/// an epilogue) is charged for the bytes it holds, not the declared size, so it does not hold
+/// the body budget: it is stored, and the next form goes through.
 #[tokio::test]
-async fn a_form_shorter_than_its_content_length_is_refused_without_holding_the_budget() {
+async fn a_form_shorter_than_its_content_length_does_not_hold_the_budget() {
     let srv = anonymous_server().await;
     let c = reqwest::Client::new();
     make_bucket(&c, &srv, "post-short").await;
     let body = form_body(&[field("key", "foo.txt")], None, b"bar");
     let status = raw_post(&srv.host, "post-short", body.len() as u64 + (1 << 20), "", &body, None).await;
-    assert_eq!(status, 400);
-    assert_eq!(get_body(&c, &srv, "post-short", "foo.txt").await.0, StatusCode::NOT_FOUND);
+    assert_eq!(status, 204);
+    assert_eq!(get_body(&c, &srv, "post-short", "foo.txt").await, (StatusCode::OK, b"bar".to_vec()));
     let ok = post(&c, &srv.host, "post-short", form_body(&[field("key", "next.txt")], None, b"bar")).await;
     assert_eq!(ok.status(), StatusCode::NO_CONTENT);
+}
+
+/// Ruby's multipart-body gem (Mint's aws-sdk-ruby presignedPost) ends the body with
+/// `--<boundary>--` and no CRLF. A file up to 4 MiB sent that way is stored byte for byte.
+#[tokio::test]
+async fn a_form_without_a_crlf_after_its_closing_delimiter_is_stored() {
+    let srv = signed_server().await;
+    let c = reqwest::Client::new();
+    make_bucket(&c, &srv, "post-nocrlf").await;
+    let s = Signer::new();
+    let p = policy(&s, "post-nocrlf", STD, 6000);
+    let mut body = form_body(&std_form(&s, &p, "foo.txt", &[]), None, b"bar");
+    assert!(body.ends_with(b"--\r\n"));
+    body.truncate(body.len() - 2);
+    let r = post(&c, &srv.host, "post-nocrlf", body).await;
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    assert_eq!(get_body(&c, &srv, "post-nocrlf", "foo.txt").await, (StatusCode::OK, b"bar".to_vec()));
 }
 
 /// A form whose file would be larger than 5 GiB is refused before the file is read, whether
