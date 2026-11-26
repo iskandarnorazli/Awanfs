@@ -58,6 +58,17 @@ class CheckGateCommentTest(unittest.TestCase):
         rc, out = self._run_main(body, comment)
         self.assertEqual(rc, 1, out)
 
+    def test_labelled_line_is_not_answered_by_another_lines_block(self):
+        # #120: the Docs line's first backtick, `README.md`, also appeared in the Drive block,
+        # which then answered the Docs line.
+        body = "## Gate\n- **Docs in step:** `README.md` and `FORMAT.md` updated.\n- **Driven:** `bash scripts/verify_drive.sh` passes.\n"
+        comment = "## Gate evidence\n- **Driven:** `bash scripts/verify_drive.sh` passed; documented in `README.md`.\n"
+        rc, out = self._run_main(body, comment)
+        self.assertEqual(rc, 1, out)
+        comment += "- **Docs in step:** `README.md` and `FORMAT.md` updated; `python3 scripts/check_docs.py` passed.\n"
+        rc, out = self._run_main(body, comment)
+        self.assertEqual(rc, 0, out)
+
     def test_command_containing_number_without_result_is_not_answered(self):
         body = "## Gate\n- `python3 scripts/check_gate_comment.py 219`: exit 0.\n"
         comment = "### Gate\n- `python3 scripts/check_gate_comment.py 219`\n"

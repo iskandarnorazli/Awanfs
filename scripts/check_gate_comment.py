@@ -34,6 +34,9 @@ TOP_BULLET_RE = re.compile(r"^[ \t]{0,1}[-*]\s+")
 FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})\s*$")
 BACKTICK_RE = re.compile(r"`([^`]+)`")
+# A gate line that opens with a bold label ("**Docs in step:**") is answered only by a block
+# that opens with the same label, compared up to its first comma, parenthesis or colon (#462).
+LABEL_RE = re.compile(r"\*\*([^*]+?)\*\*")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 GH_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+")
 FAILED_LINE_RE = re.compile(
@@ -221,8 +224,12 @@ def match_gate_line(gate_line: str, blocks: list[str]) -> tuple[bool, str]:
     cmd = cmd_match.group(1) if cmd_match else None
     words = _clean_text(gate_line).split()
     first_five = " ".join(words[:5]).rstrip(".,;:")
+    label_match = LABEL_RE.match(gate_line)
+    label = re.split(r"[,(:]", _clean_text(label_match.group(1)))[0].strip().lower() if label_match else None
 
     for block in blocks:
+        if label is not None and not _clean_text(TOP_BULLET_RE.sub("", block, count=1)).lower().startswith(label):
+            continue
         remainder = None
         if cmd and cmd in block:
             remainder = block.replace(cmd, "", 1)
