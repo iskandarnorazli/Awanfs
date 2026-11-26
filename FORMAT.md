@@ -222,10 +222,10 @@ A tag number is never reused. 0x8000 and above are for tests.
 |---|---|---|---|
 | 0x0001 | Content-Type, as sent | headers (write-time) | #150 |
 | 0x0010 | Object tags (`TagSet`) | tagging (mutable) | #115, #203 |
-| 0x0011 | Object ACL | acl (mutable) | #116, #203 |
-| 0x0012 | Object Lock retention (`Mode` + `RetainUntilDate`) | retention (mutable) | #120, #203 |
-| 0x0013 | Object Lock legal hold (`ON` / `OFF`) | legal hold (mutable) | #120, #203 |
-| 0x0014 | Storage class (`STANDARD`, etc.) | storage class (mutable) | #159, #203 |
+| 0x0011 | Retired, never written: registered for ACL by #402 before Decision 3A's numbers (#410) | — | #410 |
+| 0x0012 | Retired, never written: registered for retention by #402 (#410) | — | #410 |
+| 0x0013 | Retired, never written: registered for legal hold by #402 (#410) | — | #410 |
+| 0x0014 | Retired, never written: registered for storage class by #402 (#410) | — | #410 |
 | 0x0020 | Object checksum (`<ALG>:<TYPE>:<base64>`) | checksum (write-time) | #117 |
 | 0x0021 | Multipart part sizes (LE `u64` array) | multipart (write-time) | #117 |
 | 0x0002 | Content-Encoding (with `aws-chunked` stripped) | headers (write-time) | #152 |
@@ -236,6 +236,11 @@ A tag number is never reused. 0x8000 and above are for tests.
 | 0x0007 | x-amz-website-redirect-location | headers (write-time) | #152 |
 | 0x0008 | User metadata (`x-amz-meta-*`) | metadata | #152 |
 | 0x0030 | `TAG_OWNER`: object owner account ID (UTF-8, written only when different from bucket owner) | owner (write-time) | #151 (Decision 3A) |
+| 0x0031 | Object ACL | acl (mutable) | #116, #203 (Decision 3A) |
+| 0x0040 | Object Lock retention (`Mode` + `RetainUntilDate`) | retention (mutable) | #120, #203 (Decision 3A) |
+| 0x0041 | Object Lock legal hold (`ON` / `OFF`) | legal hold (mutable) | #120, #203 (Decision 3A) |
+| 0x0050 | Reserved for server-side encryption | — | #121 (Decision 3A) |
+| 0x0060 | Storage class (`STANDARD`, etc.) | storage class (mutable) | #159, #203 (Decision 3A) |
 
 ## Attribute update needle (flag 0x200, format 3, #203)
 

@@ -30,13 +30,13 @@ pub const TAG_USER_META: u16 = 0x0008;
 /// Object tags (`TagSet`, #115). Mutable via `0x200` attribute-update needles (#203).
 pub const TAG_TAGGING: u16 = 0x0010;
 /// Object ACL (#116). Replaceable via `0x200` attribute-update needles (#203).
-pub const TAG_ACL: u16 = 0x0011;
+pub const TAG_ACL: u16 = 0x0031;
 /// Object Lock retention (#120). Replaceable via `0x200` attribute-update needles (#203).
-pub const TAG_RETENTION: u16 = 0x0012;
+pub const TAG_RETENTION: u16 = 0x0040;
 /// Object Lock legal hold (#120). Replaceable via `0x200` attribute-update needles (#203).
-pub const TAG_LEGAL_HOLD: u16 = 0x0013;
+pub const TAG_LEGAL_HOLD: u16 = 0x0041;
 /// Object storage class (#159). Replaceable via `0x200` attribute-update needles (#203).
-pub const TAG_STORAGE_CLASS: u16 = 0x0014;
+pub const TAG_STORAGE_CLASS: u16 = 0x0060;
 /// Object checksum (`<ALG>:<TYPE>:<base64>`), #117. Write-time.
 pub const TAG_CHECKSUM: u16 = 0x0020;
 
