@@ -237,8 +237,8 @@ A tag number is never reused. 0x8000 and above are for tests.
 | 0x0008 | User metadata (`x-amz-meta-*`) | metadata | #152 |
 | 0x0030 | `TAG_OWNER`: object owner account ID (UTF-8, written only when different from bucket owner) | owner (write-time) | #151 (Decision 3A) |
 | 0x0031 | Object ACL | acl (mutable) | #116, #203 (Decision 3A) |
-| 0x0040 | Object Lock retention (`Mode` + `RetainUntilDate`) | retention (mutable) | #120, #203 (Decision 3A) |
-| 0x0041 | Object Lock legal hold (`ON` / `OFF`) | legal hold (mutable) | #120, #203 (Decision 3A) |
+| 0x0040 | Object Lock retention (`mode (u8: 0=Governance, 1=Compliance) \|\| retain_until_ns (u64 LE) \|\| iso_text (UTF-8)`; empty = cleared) | retention (mutable) | #120, #203 (Decision 3A) |
+| 0x0041 | Object Lock legal hold (`u8`: 0=OFF, 1=ON) | legal hold (mutable) | #120, #203 (Decision 3A) |
 | 0x0050 | Reserved for server-side encryption | — | #121 (Decision 3A) |
 | 0x0060 | Storage class (`STANDARD`, etc.) | storage class (mutable) | #159, #203 (Decision 3A) |
 

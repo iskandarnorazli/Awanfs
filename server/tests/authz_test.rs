@@ -50,7 +50,10 @@ fn op_class(op: Operation) -> OpClass {
         | Operation::GetObjectAttributes
         | Operation::HeadObject
         | Operation::ListParts
-        | Operation::GetObjectTagging => OpClass::Read,
+        | Operation::GetObjectTagging
+        | Operation::GetObjectLockConfiguration
+        | Operation::GetObjectRetention
+        | Operation::GetObjectLegalHold => OpClass::Read,
         Operation::PutObject
         | Operation::CopyObject
         | Operation::DeleteObject
@@ -61,7 +64,9 @@ fn op_class(op: Operation) -> OpClass {
         | Operation::CompleteMultipartUpload
         | Operation::AbortMultipartUpload
         | Operation::PutObjectTagging
-        | Operation::DeleteObjectTagging => OpClass::Write,
+        | Operation::DeleteObjectTagging
+        | Operation::PutObjectRetention
+        | Operation::PutObjectLegalHold => OpClass::Write,
         Operation::CreateBucket
         | Operation::DeleteBucket
         | Operation::PutBucketVersioning
@@ -70,7 +75,8 @@ fn op_class(op: Operation) -> OpClass {
         | Operation::PutBucketCors
         | Operation::DeleteBucketCors
         | Operation::PutBucketTagging
-        | Operation::DeleteBucketTagging => OpClass::BucketAdmin,
+        | Operation::DeleteBucketTagging
+        | Operation::PutObjectLockConfiguration => OpClass::BucketAdmin,
     }
 }
 

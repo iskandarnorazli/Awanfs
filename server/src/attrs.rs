@@ -228,6 +228,81 @@ impl Attrs {
         self.set(TAG_STORAGE_CLASS, storage_class.as_bytes());
     }
 
+    /// Stores `TAG_RETENTION` (`0x0040`): `mode (u8) | retain_until_ns (u64 LE) | iso_text (UTF-8)`,
+    /// or empty bytes when cleared via an attribute-update needle.
+    pub fn set_retention(&mut self, retention: Option<&crate::object_lock::Retention>) {
+        match retention {
+            None => self.set(TAG_RETENTION, &[]),
+            Some(r) => {
+                let mode = match r.mode {
+                    crate::fsm::RetentionMode::Governance => 0u8,
+                    crate::fsm::RetentionMode::Compliance => 1u8,
+                };
+                let retain_until_ns = r.retain_until_epoch.saturating_mul(1_000_000_000);
+                let iso = r.retain_until_date.as_bytes();
+                let mut buf = Vec::with_capacity(9 + iso.len());
+                buf.push(mode);
+                buf.extend_from_slice(&retain_until_ns.to_le_bytes());
+                buf.extend_from_slice(iso);
+                self.set(TAG_RETENTION, &buf);
+            }
+        }
+    }
+
+    /// Decodes `TAG_RETENTION` (`0x0040`), returning `Ok(None)` if absent or cleared.
+    pub fn retention(&self) -> Result<Option<crate::object_lock::Retention>, AttrsError> {
+        let Some(bytes) = self.get(TAG_RETENTION) else {
+            return Ok(None);
+        };
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        if bytes.len() < 9 {
+            return Err(AttrsError::Corrupt("retention block length"));
+        }
+        let mode = match bytes[0] {
+            0 => crate::fsm::RetentionMode::Governance,
+            1 => crate::fsm::RetentionMode::Compliance,
+            _ => return Err(AttrsError::Corrupt("retention mode")),
+        };
+        let _retain_until_ns = u64::from_le_bytes(bytes[1..9].try_into().unwrap());
+        let iso = std::str::from_utf8(&bytes[9..]).map_err(|_| AttrsError::Corrupt("retention iso utf8"))?;
+        let (retain_until_epoch, retain_until_date) = crate::object_lock::parse_iso8601_z(iso)
+            .ok_or(AttrsError::Corrupt("retention iso8601"))?;
+        Ok(Some(crate::object_lock::Retention {
+            mode,
+            retain_until_epoch,
+            retain_until_date,
+        }))
+    }
+
+    /// Stores `TAG_LEGAL_HOLD` (`0x0041`): 1 byte (`0 = OFF`, `1 = ON`).
+    pub fn set_legal_hold(&mut self, on: bool) {
+        self.set(TAG_LEGAL_HOLD, &[u8::from(on)]);
+    }
+
+    /// Decodes `TAG_LEGAL_HOLD` (`0x0041`), returning `Ok(None)` if never explicitly set.
+    pub fn legal_hold(&self) -> Result<Option<bool>, AttrsError> {
+        let Some(bytes) = self.get(TAG_LEGAL_HOLD) else {
+            return Ok(None);
+        };
+        match bytes {
+            [0] => Ok(Some(false)),
+            [1] => Ok(Some(true)),
+            _ => Err(AttrsError::Corrupt("legal hold value")),
+        }
+    }
+
+    /// Decodes combined retention and legal hold state for `fsm::lock_step` and `Lock::may_delete`.
+    pub fn lock_state(&self) -> Result<crate::fsm::Lock, AttrsError> {
+        let retention = self.retention()?.map(|r| (r.mode, r.retain_until_epoch));
+        let legal_hold = self.legal_hold()?.unwrap_or(false);
+        Ok(crate::fsm::Lock {
+            retention,
+            legal_hold,
+        })
+    }
+
     /// Merges every `(tag, value)` pair from `update` on top of `self`, replacing matching tags.
     pub fn merge_from(&mut self, update: &Attrs) {
         for &(tag, ref val) in &update.entries {
@@ -683,6 +758,46 @@ mod tests {
         assert_eq!(base.content_type(), Some("text/plain"));
         assert_eq!(base.storage_class(), Some("STANDARD_IA"));
         assert_eq!(base.owner(), Some("alice"));
+    }
+
+    #[test]
+    fn retention_and_legal_hold_round_trip_and_corrupt_checks() {
+        let mut a = Attrs::new();
+        assert_eq!(a.retention().unwrap(), None);
+        assert_eq!(a.legal_hold().unwrap(), None);
+        assert_eq!(a.lock_state().unwrap(), crate::fsm::Lock::default());
+
+        let ret = crate::object_lock::Retention {
+            mode: crate::fsm::RetentionMode::Compliance,
+            retain_until_epoch: 1_893_456_000,
+            retain_until_date: "2030-01-01T00:00:00.123456Z".to_string(),
+        };
+        a.set_retention(Some(&ret));
+        a.set_legal_hold(true);
+        let encoded = a.encode().unwrap();
+        let decoded = Attrs::decode(&encoded).unwrap();
+        assert_eq!(decoded.retention().unwrap(), Some(ret));
+        assert_eq!(decoded.legal_hold().unwrap(), Some(true));
+        assert_eq!(
+            decoded.lock_state().unwrap(),
+            crate::fsm::Lock {
+                retention: Some((crate::fsm::RetentionMode::Compliance, 1_893_456_000)),
+                legal_hold: true,
+            }
+        );
+
+        let mut clear = Attrs::new();
+        clear.set_retention(None);
+        clear.set_legal_hold(false);
+        a.merge_from(&clear);
+        assert_eq!(a.retention().unwrap(), None);
+        assert_eq!(a.legal_hold().unwrap(), Some(false));
+
+        let mut bad = Attrs::new();
+        bad.set(TAG_RETENTION, &[0, 1, 2]);
+        assert!(matches!(bad.retention(), Err(AttrsError::Corrupt(_))));
+        bad.set(TAG_LEGAL_HOLD, &[2]);
+        assert!(matches!(bad.legal_hold(), Err(AttrsError::Corrupt(_))));
     }
 }
 

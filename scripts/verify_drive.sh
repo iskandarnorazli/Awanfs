@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Drives a fresh s3-server the way a user does (aws CLI) and keeps the evidence.
-#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional (default: all)
+#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock (default: all)
 # Needs: a built server (cargo build --release --manifest-path server/Cargo.toml), the aws CLI, curl.
 # Evidence: verification/evidence/<UTC timestamp>/ (kept after cleanup). Exit 0 only if every journey passed.
 set -uo pipefail
@@ -301,6 +301,19 @@ j_conditional() { local et1 et2 et_k2 id p1;
   p1=$(S3 upload-part --bucket verify-cond --key mp-cond --part-number 1 --upload-id "$id" --body "$EVID/cond1.bin" --query ETag --output text) &&
   S3 complete-multipart-upload --bucket verify-cond --key mp-cond --upload-id "$id" --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$p1}]}" --if-none-match "*" >/dev/null &&
   S3 head-object --bucket verify-cond --key mp-cond >/dev/null; }
+j_lock() { local vid;
+  S3 create-bucket --bucket verify-lock --object-lock-enabled-for-bucket &&
+  ! S3 put-bucket-versioning --bucket verify-lock --versioning-configuration Status=Suspended 2>"$EVID/lock-suspend.err" && grep -q InvalidBucketState "$EVID/lock-suspend.err" &&
+  S3 put-object-lock-configuration --bucket verify-lock --object-lock-configuration '{"ObjectLockEnabled":"Enabled","Rule":{"DefaultRetention":{"Mode":"GOVERNANCE","Days":1}}}' &&
+  S3 get-object-lock-configuration --bucket verify-lock --query 'ObjectLockConfiguration.Rule.DefaultRetention.Mode' --output text | grep -qx GOVERNANCE &&
+  echo "locked-data" >"$EVID/lock.bin" &&
+  vid=$(S3 put-object --bucket verify-lock --key locked --body "$EVID/lock.bin" --checksum-algorithm SHA256 --query VersionId --output text) &&
+  S3 get-object-retention --bucket verify-lock --key locked --query 'Retention.Mode' --output text | grep -qx GOVERNANCE &&
+  S3 put-object-legal-hold --bucket verify-lock --key locked --legal-hold Status=ON &&
+  S3 head-object --bucket verify-lock --key locked --query ObjectLockLegalHoldStatus --output text | grep -qx ON &&
+  ! S3 delete-object --bucket verify-lock --key locked --version-id "$vid" 2>"$EVID/lock-del.err" && grep -q AccessDenied "$EVID/lock-del.err" &&
+  S3 put-object-legal-hold --bucket verify-lock --key locked --legal-hold Status=OFF &&
+  S3 delete-object --bucket verify-lock --key locked --version-id "$vid" --bypass-governance-retention; }
 
 # Refuse to run a journey whose && chain is split by a `local x;` (see the note above md5q).
 masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:]]+local [^;]*;|&& *local ' || true)
@@ -308,7 +321,7 @@ masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:
 
 start || exit 1
 check doctor doctor
-features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional)
+features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock)
 [[ " ${features[*]} " == *" buckets "* ]] || check buckets j_buckets
 for f in "${features[@]}"; do check "$f" "j_$f"; done
 ls -la "$DATA" >"$EVID/data-dir.txt" 2>&1

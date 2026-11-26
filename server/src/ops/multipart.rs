@@ -193,6 +193,9 @@ pub async fn create_multipart_upload(
         Ok(a) => a,
         Err(resp) => return Ok(resp),
     };
+    if let Err(resp) = super::object::apply_lock_headers_and_default(&state, b_id, key, headers, &mut attrs, false, false) {
+        return Ok(resp);
+    }
     super::object::apply_owner_attr(&mut attrs, writer_account, bucket_owner);
     let tag_set = match crate::ops::tagging::parse_tagging_header_from(headers, key) {
         Ok(t) => t,
@@ -865,6 +868,12 @@ pub async fn complete_multipart_upload(
                 None
             };
             let mut attrs = upload_attrs.clone().unwrap_or_default();
+            if matches!(attrs.retention(), Ok(None)) {
+                if let Some(dr) = state.bucket_object_lock(b_id).and_then(|c| c.default_retention) {
+                    let ret = crate::object_lock::compute_default_retention(dr, state.clock.now_ns());
+                    attrs.set_retention(Some(&ret));
+                }
+            }
             let part_sizes: Vec<u64> = extents.iter().map(|e| e.part_size).collect();
             attrs.set_part_sizes(&part_sizes);
             if let Some((alg, ref ct, ref val)) = final_cksum {

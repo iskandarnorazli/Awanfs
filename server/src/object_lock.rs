@@ -79,11 +79,11 @@ fn days_in_month(year: i64, month: i64) -> i64 {
     }
 }
 
-/// Parses an ISO 8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SS[.fffffffff]Z`) into seconds since
-/// the Unix epoch, preserving the validated string for exact round-trip serialization.
-fn parse_iso8601_z(s: &str) -> Option<(u64, String)> {
+/// Parses an ISO 8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SS[.fffffffff](Z|+HH:MM|-HH:MM)`)
+/// into seconds since the Unix epoch, preserving the validated string for exact round-trip.
+pub(crate) fn parse_iso8601_z(s: &str) -> Option<(u64, String)> {
     let b = s.as_bytes();
-    if b.len() < 20 || !s.is_ascii() || b[b.len() - 1] != b'Z' {
+    if b.len() < 20 || !s.is_ascii() {
         return None;
     }
     if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
@@ -96,16 +96,34 @@ fn parse_iso8601_z(s: &str) -> Option<(u64, String)> {
     let min: u64 = s[14..16].parse().ok()?;
     let sec: u64 = s[17..19].parse().ok()?;
 
-    // Fractional seconds: either `Z` at index 19, or `.` at 19 followed by 1..=9 ASCII digits before `Z`.
-    if b.len() > 20 {
-        if b[19] != b'.' {
+    let tz_start = if b.len() > 19 && b[19] == b'.' {
+        let mut idx = 20;
+        while idx < b.len() && b[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        let frac_len = idx - 20;
+        if frac_len == 0 || frac_len > 9 {
             return None;
         }
-        let frac = &b[20..b.len() - 1];
-        if frac.is_empty() || frac.len() > 9 || !frac.iter().all(|c| c.is_ascii_digit()) {
+        idx
+    } else {
+        19
+    };
+
+    let tz = &s[tz_start..];
+    let tz_offset_secs: i64 = if tz == "Z" {
+        0
+    } else if tz.len() == 6 && (tz.starts_with('+') || tz.starts_with('-')) && &tz[3..4] == ":" {
+        let sign: i64 = if tz.starts_with('+') { 1 } else { -1 };
+        let th: i64 = tz[1..3].parse().ok()?;
+        let tm: i64 = tz[4..6].parse().ok()?;
+        if th > 23 || tm > 59 {
             return None;
         }
-    }
+        sign * (th * 3600 + tm * 60)
+    } else {
+        return None;
+    };
 
     if !(1970..=9999).contains(&year)
         || !(1..=12).contains(&month)
@@ -117,16 +135,126 @@ fn parse_iso8601_z(s: &str) -> Option<(u64, String)> {
         return None;
     }
 
-    // Howard Hinnant's days_from_civil algorithm.
+    let days = days_from_civil(year, month, day);
+    let local_epoch = (days as i64) * 86_400 + (hour * 3600 + min * 60 + sec) as i64;
+    let utc_epoch = u64::try_from(local_epoch - tz_offset_secs).ok()?;
+    Some((utc_epoch, s.to_string()))
+}
+
+/// Howard Hinnant's `days_from_civil` algorithm (days since 1970-01-01).
+fn days_from_civil(year: i64, month: i64, day: i64) -> u64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
     let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = (era * 146_097 + doe - 719_468) as u64;
+    (era * 146_097 + doe - 719_468) as u64
+}
 
-    let epoch = days * 86_400 + hour * 3600 + min * 60 + sec;
-    Some((epoch, s.to_string()))
+/// Howard Hinnant's `civil_from_days` algorithm (year, month 1..=12, day 1..=31).
+fn civil_from_days(z: u64) -> (i64, i64, i64) {
+    let z = z as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year, m, d)
+}
+
+fn epoch_to_iso8601_z(epoch: u64) -> String {
+    let days = epoch / 86_400;
+    let secs = epoch % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hh = secs / 3600;
+    let mm = (secs % 3600) / 60;
+    let ss = secs % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Computes `RetainUntilDate` for a bucket's `DefaultRetention` rule relative to `now_ns`.
+pub fn compute_default_retention(default: DefaultRetention, now_ns: u64) -> Retention {
+    let now_sec = now_ns / 1_000_000_000;
+    let epoch = match default.period {
+        RetentionPeriod::Days(d) => now_sec.saturating_add(u64::from(d).saturating_mul(86_400)),
+        RetentionPeriod::Years(y) => {
+            let days = now_sec / 86_400;
+            let secs = now_sec % 86_400;
+            let (year, month, day) = civil_from_days(days);
+            let target_year = (year + y as i64).min(9999);
+            let target_day = day.min(days_in_month(target_year, month));
+            days_from_civil(target_year, month, target_day)
+                .saturating_mul(86_400)
+                .saturating_add(secs)
+        }
+    };
+    Retention {
+        mode: default.mode,
+        retain_until_epoch: epoch,
+        retain_until_date: epoch_to_iso8601_z(epoch),
+    }
+}
+
+/// Parses `<Retention>` XML, returning `Ok(None)` when `<Retention/>` / `<Retention></Retention>`
+/// is empty (indicating retention clear with `BypassGovernanceRetention`).
+pub fn parse_retention_or_clear(xml: &str) -> Result<Option<Retention>, Refusal> {
+    let mut mode: Option<String> = None;
+    let mut date: Option<String> = None;
+
+    read_xml_fields(
+        xml,
+        "Retention",
+        |path, val| match path {
+            ["Retention", "Mode"] => set_once(&mut mode, val),
+            ["Retention", "RetainUntilDate"] => set_once(&mut date, val),
+            _ => Ok(()),
+        },
+        |_| Ok(()),
+    )?;
+
+    match (mode.as_deref(), date.as_deref()) {
+        (None, None) => Ok(None),
+        (Some(m), Some(d)) => {
+            let parsed_mode = parse_mode(m).ok_or(MALFORMED_XML)?;
+            let (retain_until_epoch, retain_until_date) =
+                parse_iso8601_z(d).ok_or(MALFORMED_XML)?;
+            Ok(Some(Retention {
+                mode: parsed_mode,
+                retain_until_epoch,
+                retain_until_date,
+            }))
+        }
+        _ => Err(MALFORMED_XML),
+    }
+}
+
+/// Parses `x-amz-bypass-governance-retention: true` (case-insensitive).
+pub fn parse_bypass_governance_header(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-amz-bypass-governance-retention")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case("true"))
+}
+
+/// Parses `x-amz-bucket-object-lock-enabled` on `CreateBucket`.
+pub fn parse_bucket_object_lock_header(headers: &HeaderMap) -> Result<bool, Refusal> {
+    match headers.get("x-amz-bucket-object-lock-enabled") {
+        None => Ok(false),
+        Some(v) => {
+            let s = v.to_str().map_err(|_| INVALID_ARGUMENT)?.trim();
+            if s.eq_ignore_ascii_case("true") {
+                Ok(true)
+            } else if s.eq_ignore_ascii_case("false") {
+                Ok(false)
+            } else {
+                Err(INVALID_ARGUMENT)
+            }
+        }
+    }
 }
 
 fn read_xml_fields(
@@ -689,5 +817,44 @@ mod tests {
             let parsed = parse_legal_hold(&xml).expect("valid legal hold xml");
             prop_assert_eq!(parsed, on);
         }
+    }
+
+    #[test]
+    fn compute_default_retention_days_and_leap_years() {
+        // 2024-02-29T12:00:00Z
+        let (leap_epoch, _) = parse_iso8601_z("2024-02-29T12:00:00Z").unwrap();
+        let now_ns = leap_epoch * 1_000_000_000;
+
+        let d1 = compute_default_retention(
+            DefaultRetention {
+                mode: RetentionMode::Governance,
+                period: RetentionPeriod::Days(2),
+            },
+            now_ns,
+        );
+        assert_eq!(d1.retain_until_date, "2024-03-02T12:00:00Z");
+
+        let y1 = compute_default_retention(
+            DefaultRetention {
+                mode: RetentionMode::Compliance,
+                period: RetentionPeriod::Years(1),
+            },
+            now_ns,
+        );
+        assert_eq!(y1.retain_until_date, "2025-02-28T12:00:00Z");
+    }
+
+    #[test]
+    fn parse_retention_clear_and_bucket_lock_header() {
+        assert_eq!(parse_retention_or_clear("<Retention/>"), Ok(None));
+        assert_eq!(parse_retention_or_clear("<Retention></Retention>"), Ok(None));
+        assert_eq!(parse_retention_or_clear("<Retention><Mode>GOVERNANCE</Mode></Retention>"), Err(MALFORMED_XML));
+
+        let mut h = HeaderMap::new();
+        assert_eq!(parse_bucket_object_lock_header(&h), Ok(false));
+        h.insert("x-amz-bucket-object-lock-enabled", HeaderValue::from_static("TrUe"));
+        assert_eq!(parse_bucket_object_lock_header(&h), Ok(true));
+        h.insert("x-amz-bucket-object-lock-enabled", HeaderValue::from_static("maybe"));
+        assert_eq!(parse_bucket_object_lock_header(&h), Err(INVALID_ARGUMENT));
     }
 }
