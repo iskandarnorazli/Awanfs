@@ -164,7 +164,7 @@ fn canonical_headers(headers: &HeaderMap, signed: &[&str], how: HeaderText) -> R
     Ok(out)
 }
 
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
         return false;
@@ -204,7 +204,7 @@ pub fn authenticate(
 }
 
 /// The secret for an access key, and who it belongs to: the root pair, or a config user.
-fn secret_for<'a>(cfg: &'a AuthConfig, iam: Option<&'a Iam>, access_key: &str) -> Option<(Principal, &'a str)> {
+pub(crate) fn secret_for<'a>(cfg: &'a AuthConfig, iam: Option<&'a Iam>, access_key: &str) -> Option<(Principal, &'a str)> {
     if let Some((a, s)) = &cfg.credentials {
         if a == access_key {
             return Some((Principal::Root, s.as_str()));

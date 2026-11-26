@@ -55,6 +55,7 @@ fn op_class(op: Operation) -> OpClass {
         | Operation::GetObjectRetention
         | Operation::GetObjectLegalHold => OpClass::Read,
         Operation::PutObject
+        | Operation::PostObject
         | Operation::CopyObject
         | Operation::DeleteObject
         | Operation::DeleteObjects

@@ -11,7 +11,7 @@ use std::collections::HashSet;
 
 use bytes::Bytes;
 
-use crate::fsm::Refusal;
+use crate::fsm::{form_step, FormInput, FormState, Refusal, FORM_MALFORMED};
 
 /// Default maximum size of a single form field value (20 KiB).
 pub const DEFAULT_MAX_FIELD_BYTES: usize = 20 * 1024;
@@ -20,16 +20,7 @@ pub const DEFAULT_MAX_FIELDS: usize = 100;
 /// Default maximum size of a single part's headers (8 KiB).
 pub const DEFAULT_MAX_HEADER_BYTES: usize = 8 * 1024;
 
-const NO_FILE_PART: Refusal = Refusal {
-    code: "InvalidArgument",
-    status: 400,
-    why: "POST requires a file part",
-};
-const MALFORMED_POST_REQUEST: Refusal = Refusal {
-    code: "MalformedPOSTRequest",
-    status: 400,
-    why: "malformed multipart/form-data POST request",
-};
+const MALFORMED_POST_REQUEST: Refusal = FORM_MALFORMED;
 const MAX_PRE_DATA_EXCEEDED: Refusal = Refusal {
     code: "MaxPostPreDataLengthExceededError",
     status: 400,
@@ -143,15 +134,6 @@ fn parse_param_value(raw: &str) -> Result<String, Refusal> {
     }
 }
 
-#[derive(Debug)]
-enum State {
-    Preamble { at_start: bool },
-    AfterBoundary,
-    PartHeaders,
-    FieldBody { name: String },
-    FileBody,
-    Epilogue,
-}
 
 /// Streaming `multipart/form-data` parser with bounded internal buffers.
 pub struct FormParser {
@@ -159,11 +141,19 @@ pub struct FormParser {
     first_delim: Vec<u8>,
     delim: Vec<u8>,
     limits: FormLimits,
-    state: State,
+    state: FormState,
+    /// Still at the very start of the body (the first delimiter has no CRLF before it).
+    at_start: bool,
+    /// The field whose value is being read.
+    field_name: Option<String>,
     seen_fields: HashSet<String>,
     field_count: usize,
     file_seen: bool,
     buf: Vec<u8>,
+    /// Bytes fed to `push` so far.
+    pushed: u64,
+    /// Offset in the body of the file part's first byte, once its headers are read.
+    file_data_offset: Option<u64>,
 }
 
 impl FormParser {
@@ -182,11 +172,15 @@ impl FormParser {
             first_delim,
             delim,
             limits,
-            state: State::Preamble { at_start: true },
+            state: FormState::Preamble,
+            at_start: true,
+            field_name: None,
             seen_fields: HashSet::new(),
             field_count: 0,
             file_seen: false,
             buf: Vec::new(),
+            pushed: 0,
+            file_data_offset: None,
         }
     }
 
@@ -199,22 +193,34 @@ impl FormParser {
         self.buf.len()
     }
 
+    /// Offset in the body of the `file` part's first byte, known once its headers are read
+    /// (#119: with the request's Content-Length it gives the file's size before it streams).
+    pub fn file_data_offset(&self) -> Option<u64> {
+        self.file_data_offset
+    }
+
+    /// Bytes of the closing delimiter that follow the file part: `\r\n--<boundary>--\r\n`.
+    pub fn closing_len(&self) -> u64 {
+        (self.delim.len() + 4) as u64
+    }
+
     /// Feed the next chunk of the request body and return any events produced.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<FormEvent>, Refusal> {
         if self.boundary_invalid {
             return Err(MALFORMED_POST_REQUEST);
         }
         let mut events = Vec::new();
-        if matches!(self.state, State::Epilogue) {
+        if self.state == FormState::Epilogue {
             return Ok(events);
         }
 
         // Process in bounded slices so `self.buf` never grows proportional to huge chunks.
         let slice_cap = self.limits.max_field_bytes.max(self.limits.max_header_bytes).max(self.delim.len()).max(4096);
         for sub in chunk.chunks(slice_cap) {
+            self.pushed += sub.len() as u64;
             self.buf.extend_from_slice(sub);
             self.advance(&mut events)?;
-            if matches!(self.state, State::Epilogue) {
+            if self.state == FormState::Epilogue {
                 self.buf.clear();
                 break;
             }
@@ -228,26 +234,33 @@ impl FormParser {
             return Err(MALFORMED_POST_REQUEST);
         }
         match self.state {
-            State::Epilogue => Ok(Vec::new()),
+            FormState::Epilogue => Ok(Vec::new()),
             _ => Err(MALFORMED_POST_REQUEST),
         }
     }
 
+    /// Moves the parser on with `crate::fsm::form_step` (`STATE_MACHINES.md`, "POST object form
+    /// parser"): this method finds delimiters and part headers in the bytes and tells the
+    /// machine what it found; the machine decides the next state or refuses.
+    fn step(&mut self, input: FormInput) -> Result<(), Refusal> {
+        self.state = form_step(self.state, input, self.file_seen)?;
+        Ok(())
+    }
+
     fn advance(&mut self, events: &mut Vec<FormEvent>) -> Result<(), Refusal> {
         loop {
-            match &self.state {
-                State::Preamble { at_start } => {
-                    let at_start = *at_start;
-                    if at_start && self.buf.starts_with(&self.first_delim) {
-                        self.state = State::AfterBoundary;
+            match self.state {
+                FormState::Preamble => {
+                    if self.at_start && self.buf.starts_with(&self.first_delim) {
+                        self.step(FormInput::Boundary)?;
                         continue;
                     }
-                    if at_start && self.buf.len() < self.first_delim.len() && self.first_delim.starts_with(&self.buf) {
+                    if self.at_start && self.buf.len() < self.first_delim.len() && self.first_delim.starts_with(&self.buf) {
                         return Ok(());
                     }
                     if let Some(pos) = find_subslice(&self.buf, &self.delim) {
                         self.buf.drain(..pos + 2);
-                        self.state = State::AfterBoundary;
+                        self.step(FormInput::Boundary)?;
                         continue;
                     }
                     let keep = self.delim.len().saturating_sub(1);
@@ -255,34 +268,28 @@ impl FormParser {
                         let drop_n = self.buf.len() - keep;
                         self.buf.drain(..drop_n);
                     }
-                    self.state = State::Preamble { at_start: false };
+                    self.at_start = false;
                     return Ok(());
                 }
-                State::AfterBoundary => {
+                FormState::AfterBoundary => {
                     let need = self.first_delim.len() + 2;
                     if self.buf.len() < need {
                         return Ok(());
                     }
                     let suffix = &self.buf[self.first_delim.len()..need];
-                    if suffix == b"\r\n" {
-                        self.buf.drain(..need);
-                        if self.file_seen {
-                            return Err(MALFORMED_POST_REQUEST);
-                        }
-                        self.state = State::PartHeaders;
-                    } else if suffix == b"--" {
-                        self.buf.drain(..need);
-                        self.state = State::Epilogue;
-                        if !self.file_seen {
-                            return Err(NO_FILE_PART);
-                        }
+                    let input = match suffix {
+                        b"\r\n" => FormInput::NextPart,
+                        b"--" => FormInput::Close,
+                        _ => FormInput::Malformed,
+                    };
+                    self.buf.drain(..need);
+                    self.step(input)?;
+                    if self.state == FormState::Epilogue {
                         events.push(FormEvent::Done);
                         return Ok(());
-                    } else {
-                        return Err(MALFORMED_POST_REQUEST);
                     }
                 }
-                State::PartHeaders => {
+                FormState::PartHeaders => {
                     let Some(hdr_end) = find_subslice(&self.buf, b"\r\n\r\n") else {
                         if self.buf.len() > self.limits.max_header_bytes {
                             return Err(MALFORMED_POST_REQUEST);
@@ -296,9 +303,10 @@ impl FormParser {
                     self.buf.drain(..hdr_end + 4);
 
                     if name.eq_ignore_ascii_case("file") {
+                        self.step(FormInput::FilePart)?;
                         self.file_seen = true;
+                        self.file_data_offset = Some(self.pushed - self.buf.len() as u64);
                         events.push(FormEvent::FileStart { filename, content_type });
-                        self.state = State::FileBody;
                     } else {
                         if self.field_count >= self.limits.max_fields {
                             return Err(MAX_PRE_DATA_EXCEEDED);
@@ -307,11 +315,12 @@ impl FormParser {
                         if !self.seen_fields.insert(lower) {
                             return Err(MALFORMED_POST_REQUEST);
                         }
+                        self.step(FormInput::FieldPart)?;
                         self.field_count += 1;
-                        self.state = State::FieldBody { name };
+                        self.field_name = Some(name);
                     }
                 }
-                State::FieldBody { .. } => {
+                FormState::FieldBody => {
                     if let Some(pos) = find_subslice(&self.buf, &self.delim) {
                         if pos > self.limits.max_field_bytes {
                             return Err(MAX_PRE_DATA_EXCEEDED);
@@ -320,9 +329,8 @@ impl FormParser {
                             .map_err(|_| MALFORMED_POST_REQUEST)?
                             .to_string();
                         self.buf.drain(..pos + 2);
-                        let State::FieldBody { name } = std::mem::replace(&mut self.state, State::AfterBoundary) else {
-                            unreachable!();
-                        };
+                        self.step(FormInput::Boundary)?;
+                        let name = self.field_name.take().unwrap_or_default();
                         events.push(FormEvent::Field { name, value });
                     } else {
                         let safe = self.buf.len().saturating_sub(self.delim.len() - 1);
@@ -332,14 +340,14 @@ impl FormParser {
                         return Ok(());
                     }
                 }
-                State::FileBody => {
+                FormState::FileBody => {
                     if let Some(pos) = find_subslice(&self.buf, &self.delim) {
                         if pos > 0 {
                             events.push(FormEvent::FileData(Bytes::copy_from_slice(&self.buf[..pos])));
                         }
                         events.push(FormEvent::FileEnd);
                         self.buf.drain(..pos + 2);
-                        self.state = State::AfterBoundary;
+                        self.step(FormInput::Boundary)?;
                     } else {
                         let safe = self.buf.len().saturating_sub(self.delim.len() - 1);
                         if safe > 0 {
@@ -349,7 +357,7 @@ impl FormParser {
                         return Ok(());
                     }
                 }
-                State::Epilogue => return Ok(()),
+                FormState::Epilogue => return Ok(()),
             }
         }
     }
@@ -440,6 +448,59 @@ mod tests {
         body.extend_from_slice(boundary.as_bytes());
         body.extend_from_slice(b"--\r\n");
         body
+    }
+
+    /// #119: the file's size is `Content-Length - file_data_offset - closing_len` for a body
+    /// that ends at its closing delimiter, however the body is split into chunks.
+    #[test]
+    fn file_offset_and_closing_length_give_the_file_size_for_any_chunking() {
+        let file = vec![b'x'; 10_000];
+        let body = build_multipart(
+            "b0undary",
+            &[("key", None, None, b"foo.txt"), ("policy", None, None, b"p"), ("file", Some("f.txt"), Some("text/plain"), &file)],
+        );
+        for chunk in [1usize, 7, 64, 4096, body.len()] {
+            let mut parser = FormParser::new("b0undary", FormLimits::default());
+            for c in body.chunks(chunk) {
+                parser.push(c).unwrap();
+            }
+            let off = parser.file_data_offset().expect("file part seen");
+            assert_eq!(&body[off as usize..off as usize + 3], b"xxx", "chunk {}", chunk);
+            assert_eq!(body.len() as u64 - off - parser.closing_len(), file.len() as u64, "chunk {}", chunk);
+        }
+        let mut no_file = FormParser::new("b0undary", FormLimits::default());
+        no_file.push(b"--b0undary\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nk\r\n").unwrap();
+        assert_eq!(no_file.file_data_offset(), None);
+    }
+
+    /// #119 invariant: the parser's memory is bounded by a constant whatever the body, here a
+    /// 1 GiB file part fed in 1 MiB chunks.
+    #[test]
+    fn a_one_gib_file_part_keeps_the_parser_buffer_bounded() {
+        let limits = FormLimits::default();
+        let boundary = "b0undary";
+        let bound = limits.max_field_bytes.max(limits.max_header_bytes).max(boundary.len() + 4) + boundary.len() + 4;
+        let mut parser = FormParser::new(boundary, limits);
+        let head = format!("--{b}\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nk\r\n--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"f\"\r\n\r\n", b = boundary);
+        parser.push(head.as_bytes()).unwrap();
+        let chunk = vec![b'x'; 1 << 20];
+        let mut file_bytes = 0u64;
+        for _ in 0..1024 {
+            for ev in parser.push(&chunk).unwrap() {
+                if let FormEvent::FileData(b) = ev {
+                    file_bytes += b.len() as u64;
+                }
+            }
+            assert!(parser.buffered_bytes() <= bound, "{} > {}", parser.buffered_bytes(), bound);
+        }
+        let tail = format!("\r\n--{}--\r\n", boundary);
+        for ev in parser.push(tail.as_bytes()).unwrap() {
+            if let FormEvent::FileData(b) = ev {
+                file_bytes += b.len() as u64;
+            }
+        }
+        parser.finish().unwrap();
+        assert_eq!(file_bytes, 1 << 30);
     }
 
     fn collect_all(

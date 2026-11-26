@@ -1373,7 +1373,7 @@ impl StreamPipeline {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn put_object(
+pub async fn put_object<B>(
     state: Arc<S3ServiceState>,
     b_id: u32,
     bucket: &str,
@@ -1383,8 +1383,12 @@ pub async fn put_object(
     writer_account: &str,
     bucket_owner: &str,
     mut chunk_verifier: Option<crate::auth::ChunkVerifier>,
-    body: hyper::body::Incoming,
-) -> Result<Response<ResponseBody>, hyper::Error> {
+    body: B,
+) -> Result<Response<ResponseBody>, hyper::Error>
+where
+    // A request body, or a POST form's file part (#119).
+    B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Unpin + Send,
+{
     let expected_len = headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok());
     let is_chunked = crate::auth::is_aws_chunked(headers);
     let has_te_chunked = headers
