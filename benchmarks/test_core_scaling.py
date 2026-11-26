@@ -1,6 +1,7 @@
 """Self-tests for core_scaling.py: pinning, scaling, CPU %, unmeasured gaps, charts, and report."""
 import math
 import os
+import re
 import sys
 import tempfile
 import types
@@ -529,6 +530,22 @@ class PatternAndSizeParsingTests(unittest.TestCase):
             cs.validate_prefill_exceeds_cache(cache_bytes, cache_bytes)
         with self.assertRaises(ValueError):
             cs.validate_prefill_exceeds_cache(cache_bytes - 1024, cache_bytes)
+
+
+class WorkflowFastFlagTests(unittest.TestCase):
+    def test_every_bench_scaling_job_passes_compare_fast(self):
+        # #419 (owner, 2026-11-26): AwanFS --durability fast runs on every bench-scaling run,
+        # the self-hosted job's included. Each step that runs core_scaling.py for a benchmark
+        # (not the client ceiling probe) passes --compare-fast.
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".github", "workflows", "bench-scaling.yml")
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        steps = re.split(r"\n\s*- name: ", text)
+        runs = [s for s in steps if "benchmarks/core_scaling.py" in s and "--ceiling-probe" not in s
+                and "test_core_scaling" not in s]
+        self.assertGreaterEqual(len(runs), 2, "the hosted and the self-hosted benchmark steps")
+        for step in runs:
+            self.assertIn("--compare-fast", step, step.splitlines()[0])
 
 
 class DefaultMemoryBudgetTests(unittest.TestCase):
