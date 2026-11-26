@@ -356,14 +356,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
     if profile == s3_server::profile::Profile::Production {
-        let root_secret = auth.credentials.as_ref().map(|(_, s)| s.as_str());
+        let root_secret = state.auth.credentials.as_ref().map(|(_, s)| s.as_str());
         let users = state.iam.read().as_ref().map(|r| r.current());
         let user_secrets: Vec<(&str, &str)> = users
             .as_ref()
             .map(|u| u.users().map(|u| (u.name.as_str(), u.secret.as_str())).collect())
             .unwrap_or_default();
         let facts = s3_server::profile::StartupFacts {
-            anonymous: auth.allow_anonymous,
+            anonymous: state.auth.allow_anonymous,
             tls: https,
             plain_http_port: https && http_port.is_some(),
             listen: &listen,
