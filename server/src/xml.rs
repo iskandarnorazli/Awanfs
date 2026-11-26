@@ -382,6 +382,7 @@ pub struct DeleteItemResult<'a> {
 
 pub struct DeleteErrorItem<'a> {
     pub key: &'a str,
+    pub version_id: Option<&'a str>,
     pub code: &'a str,
     pub message: &'a str,
 }
@@ -411,6 +412,9 @@ pub fn delete_objects_result_xml(
     for err in errors {
         out.push_str("  <Error>\n");
         out.push_str(&format!("    <Key>{}</Key>\n", xml_escape(err.key)));
+        if let Some(v) = err.version_id {
+            out.push_str(&format!("    <VersionId>{}</VersionId>\n", xml_escape(v)));
+        }
         out.push_str(&format!("    <Code>{}</Code>\n", xml_escape(err.code)));
         out.push_str(&format!("    <Message>{}</Message>\n", xml_escape(err.message)));
         out.push_str("  </Error>\n");

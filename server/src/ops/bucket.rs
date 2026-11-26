@@ -153,6 +153,7 @@ pub async fn create_bucket(
     state: Arc<S3ServiceState>,
     bucket: &str,
     path: &str,
+    headers: &hyper::HeaderMap,
     caller_owner: &str,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
@@ -164,6 +165,11 @@ pub async fn create_bucket(
             .body(full_body(Bytes::from(xml)))
             .unwrap());
     }
+
+    let lock_requested = match crate::object_lock::parse_bucket_object_lock_header(headers) {
+        Ok(b) => b,
+        Err(refusal) => return Ok(refusal_response(refusal, bucket)),
+    };
 
     let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, &state.work, body, MAX_XML_BODY, None, state.body_idle_timeout(), path).await? {
         Ok(b) => b,
@@ -234,6 +240,18 @@ pub async fn create_bucket(
             let created_ns = state.clock.now_ns();
             state.bucket_created_ns.write().insert(id, created_ns);
             let _ = state.bucket_configs.lock().apply_bucket_create(id, bucket, created_ns, caller_owner, "");
+            if lock_requested {
+                let _ = state.set_versioning(id, crate::versions::Versioning::Enabled);
+                let default_lock_xml = crate::object_lock::lock_configuration_xml(&crate::object_lock::LockConfiguration {
+                    enabled: true,
+                    default_retention: None,
+                });
+                let _ = state.bucket_configs.lock().put_config(
+                    id,
+                    crate::bucket_config::ConfigKind::ObjectLock,
+                    default_lock_xml.as_bytes(),
+                );
+            }
             state.emit_bucket_config_event(id, bucket, "", crate::events::CommitKind::BucketCreate, 0);
             Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -377,14 +395,18 @@ pub async fn put_bucket_versioning(
         Ok(r) => r,
         Err(refusal) => return Ok(refusal_response(refusal, bucket)),
     };
-    if let Err(e) = state.set_versioning(b_id, req.status) {
-        return Ok(internal_error_response(bucket, &format!("could not record the versioning status: {}", e)));
+    match state.try_set_versioning(b_id, bucket, req.status) {
+        Ok(_) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_LENGTH, "0")
+            .body(empty_body())
+            .unwrap()),
+        Err(Ok(refusal)) => Ok(refusal_response(refusal, bucket)),
+        Err(Err(e)) => Ok(internal_error_response(
+            bucket,
+            &format!("could not record the versioning status: {}", e),
+        )),
     }
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_LENGTH, "0")
-        .body(empty_body())
-        .unwrap())
 }
 
 pub async fn list_objects(
@@ -727,6 +749,7 @@ pub async fn delete_objects(
     bucket: &str,
     path: &str,
     may_delete: impl Fn(&str) -> bool,
+    may_bypass: impl Fn(&str) -> bool,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, &state.work, body, MAX_XML_BODY, None, state.body_idle_timeout(), path).await? {
@@ -746,12 +769,12 @@ pub async fn delete_objects(
     };
 
     let mut ok_keys: Vec<DeletedOutcome<'_>> = Vec::new();
-    let mut failed: Vec<(String, &'static str, String)> = Vec::new();
+    let mut failed: Vec<(String, Option<String>, &'static str, String)> = Vec::new();
     for obj in &req.objects {
         let k = &obj.key;
         let vid = obj.version_id.as_deref();
         if !may_delete(k) {
-            failed.push((k.clone(), "AccessDenied", "Access Denied".to_string()));
+            failed.push((k.clone(), vid.map(str::to_string), "AccessDenied", "Access Denied".to_string()));
             continue;
         }
         let conds = crate::precondition::DeleteConditions {
@@ -762,7 +785,7 @@ pub async fn delete_objects(
         };
         match vid {
             Some(v) => match crate::versions::parse_id(v) {
-                Some(id) => match state.delete_version_conditional(b_id, k, id, &conds).await {
+                Some(id) => match state.delete_version_conditional(b_id, k, id, &conds, may_bypass(k)).await {
                     Ok(removed) => {
                         let is_dm = removed.is_some_and(|ver| ver.marker);
                         ok_keys.push(DeletedOutcome {
@@ -774,13 +797,21 @@ pub async fn delete_objects(
                     }
                     Err(crate::s3_api::DeleteError::PreconditionFailed(_)) => failed.push((
                         k.clone(),
+                        Some(v.to_string()),
                         "PreconditionFailed",
                         "At least one of the pre-conditions you specified did not hold.".to_string(),
                     )),
-                    Err(crate::s3_api::DeleteError::Internal(e)) => failed.push((k.clone(), "InternalError", e)),
+                    Err(crate::s3_api::DeleteError::AccessDenied) => failed.push((
+                        k.clone(),
+                        Some(v.to_string()),
+                        "AccessDenied",
+                        "Access Denied".to_string(),
+                    )),
+                    Err(crate::s3_api::DeleteError::Internal(e)) => failed.push((k.clone(), Some(v.to_string()), "InternalError", e)),
                 },
                 None => failed.push((
                     k.clone(),
+                    Some(v.to_string()),
                     "NoSuchVersion",
                     "The specified version does not exist.".to_string(),
                 )),
@@ -797,10 +828,17 @@ pub async fn delete_objects(
                 }
                 Err(crate::s3_api::DeleteError::PreconditionFailed(_)) => failed.push((
                     k.clone(),
+                    None,
                     "PreconditionFailed",
                     "At least one of the pre-conditions you specified did not hold.".to_string(),
                 )),
-                Err(crate::s3_api::DeleteError::Internal(e)) => failed.push((k.clone(), "InternalError", e)),
+                Err(crate::s3_api::DeleteError::AccessDenied) => failed.push((
+                    k.clone(),
+                    None,
+                    "AccessDenied",
+                    "Access Denied".to_string(),
+                )),
+                Err(crate::s3_api::DeleteError::Internal(e)) => failed.push((k.clone(), None, "InternalError", e)),
             },
         }
     }
@@ -817,7 +855,15 @@ pub async fn delete_objects(
             })
             .collect()
     };
-    let errors: Vec<DeleteErrorItem> = failed.iter().map(|(k, c, e)| DeleteErrorItem { key: k, code: c, message: e }).collect();
+    let errors: Vec<DeleteErrorItem> = failed
+        .iter()
+        .map(|(k, v, c, e)| DeleteErrorItem {
+            key: k,
+            version_id: v.as_deref(),
+            code: c,
+            message: e,
+        })
+        .collect();
     let xml = delete_objects_result_xml(&deleted, &errors);
     Ok(Response::builder()
         .status(StatusCode::OK)

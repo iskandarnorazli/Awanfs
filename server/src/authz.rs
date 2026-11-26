@@ -193,7 +193,44 @@ pub fn authorize(
     context: &AuthzContext<'_>,
 ) -> Decision {
     let op_spec = spec(op);
+    authorize_for(
+        principal,
+        op_spec.target,
+        op_spec.acl_permission,
+        op == Operation::CreateBucket && bucket.is_none(),
+        bucket,
+        object,
+        context,
+    )
+}
 
+/// Evaluates `s3:BypassGovernanceRetention` through the same 6-step model as `authorize`.
+pub fn authorize_bypass_governance(
+    principal: &Principal,
+    bucket: Option<&BucketTarget<'_>>,
+    object: Option<&ObjectTarget<'_>>,
+    context: &AuthzContext<'_>,
+) -> Decision {
+    authorize_for(
+        principal,
+        TargetKind::Object,
+        AclPermission::Write,
+        false,
+        bucket,
+        object,
+        context,
+    )
+}
+
+fn authorize_for(
+    principal: &Principal,
+    target_kind: TargetKind,
+    acl_permission: AclPermission,
+    create_new_bucket: bool,
+    bucket: Option<&BucketTarget<'_>>,
+    object: Option<&ObjectTarget<'_>>,
+    context: &AuthzContext<'_>,
+) -> Decision {
     // Step 1: Explicit Deny in identity policy or bucket policy.
     if matches!(principal, Principal::User { .. })
         && context.identity_policy == PolicyMatch::ExplicitDeny
@@ -217,10 +254,10 @@ pub fn authorize(
     let bucket_owner = bucket.map(|b| normalize_owner(b.owner_account));
     let caller_owns_bucket = caller_account.zip(bucket_owner).is_some_and(|(ca, bo)| ca == bo);
 
-    let caller_owns_resource = match op_spec.target {
+    let caller_owns_resource = match target_kind {
         TargetKind::Service => caller_account.is_some(),
         TargetKind::Bucket => {
-            if op == Operation::CreateBucket && bucket.is_none() {
+            if create_new_bucket {
                 caller_account.is_some()
             } else {
                 caller_owns_bucket
@@ -267,11 +304,11 @@ pub fn authorize(
     // Step 5: ACL on the resource grants the permission (unless BucketOwnerEnforced).
     if let Some(b) = bucket {
         if b.ownership != BucketOwnership::BucketOwnerEnforced {
-            let acl = match op_spec.target {
+            let acl = match target_kind {
                 TargetKind::Object => object.map(|o| o.acl).unwrap_or(b.acl),
                 TargetKind::Service | TargetKind::Bucket => b.acl,
             };
-            if acl_grants_permission(acl, principal, op_spec.acl_permission, pab.ignore_public_acls) {
+            if acl_grants_permission(acl, principal, acl_permission, pab.ignore_public_acls) {
                 return Decision::Allow(Reason::Acl);
             }
         }

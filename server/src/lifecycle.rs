@@ -198,7 +198,15 @@ pub fn run_lifecycle_sweep(state: &S3ServiceState, lifecycle: &LifecycleManager,
                 };
 
                 // Find all keys in bucket matching prefix
-                let mut keys_to_delete = Vec::new();
+                let mut candidates = Vec::new();
+                let now_sec = now_epoch_ms / 1000;
+                let versioned = state
+                    .versioning
+                    .read()
+                    .get(&b_id)
+                    .copied()
+                    .unwrap_or_default()
+                    != crate::versions::Versioning::Unset;
                 {
                     let engine = state.engine.read();
                     if let Some(bucket) = engine.buckets.get(&b_id) {
@@ -207,16 +215,21 @@ pub fn run_lifecycle_sweep(state: &S3ServiceState, lifecycle: &LifecycleManager,
                             let key_str = String::from_utf8_lossy(key_bytes);
 
                             let matches_prefix = disable_prefix || key_str.starts_with(&rule.prefix);
-                            if matches_prefix {
-                                if now_epoch_ms >= meta.created_at + ttl_ms {
-                                    keys_to_delete.push(key_bytes.clone());
-                                }
+                            if matches_prefix && now_epoch_ms >= meta.created_at + ttl_ms && !versioned {
+                                candidates.push(key_bytes.clone());
                             }
                         }
                     }
                 }
+                let keys_to_delete: Vec<Vec<u8>> = candidates
+                    .into_iter()
+                    .filter(|key_bytes| {
+                        let key_str = String::from_utf8_lossy(key_bytes);
+                        state.may_lifecycle_delete_current(b_id, &key_str, now_sec)
+                    })
+                    .collect();
 
-                // Tombstone expired keys
+                // Tombstone expired keys (only on unversioned/unlocked entries; locked versions never removed)
                 let mut engine = state.engine.write();
                 for k in keys_to_delete {
                     let _ = engine.delete_object(b_id, &k);

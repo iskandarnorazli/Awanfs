@@ -209,6 +209,96 @@ pub(crate) fn request_attrs_map(
     Ok(attrs)
 }
 
+fn has_integrity_checksum(headers: &HeaderMap) -> bool {
+    headers.contains_key("content-md5")
+        || matches!(crate::checksum::requested_checksum(headers), Ok(Some(_)))
+        || headers.contains_key("x-amz-sdk-checksum-algorithm")
+        || headers
+            .get_all("x-amz-trailer")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|s| s.to_ascii_lowercase().contains("x-amz-checksum-"))
+}
+
+pub(super) fn apply_lock_headers_and_default(
+    state: &S3ServiceState,
+    b_id: u32,
+    key: &str,
+    headers: &HeaderMap,
+    attrs: &mut crate::attrs::Attrs,
+    apply_default: bool,
+    require_integrity: bool,
+) -> Result<(), Response<ResponseBody>> {
+    let requested = match crate::object_lock::lock_headers(headers) {
+        Ok(r) => r,
+        Err(r) => return Err(bad_request(r.code, r.why, key)),
+    };
+    let bucket_lock = state.bucket_object_lock(b_id);
+    let Some(bucket_lock) = bucket_lock else {
+        if requested.retention.is_some() || requested.legal_hold.is_some() {
+            return Err(bad_request(
+                "InvalidRequest",
+                "Bucket is missing Object Lock Configuration",
+                key,
+            ));
+        }
+        return Ok(());
+    };
+
+    let now_ns = state.clock.now_ns();
+    let now_sec = now_ns / 1_000_000_000;
+    let final_retention = if let Some(ref ret) = requested.retention {
+        Some(ret.clone())
+    } else if apply_default {
+        bucket_lock
+            .default_retention
+            .map(|dr| crate::object_lock::compute_default_retention(dr, now_ns))
+    } else {
+        None
+    };
+
+    if require_integrity
+        && (requested.retention.is_some()
+            || requested.legal_hold.is_some()
+            || (apply_default && bucket_lock.default_retention.is_some()))
+        && !has_integrity_checksum(headers)
+    {
+        return Err(bad_request(
+            "InvalidRequest",
+            "Content-MD5 OR x-amz-checksum- HTTP header is required for Put Object requests with Object Lock parameters",
+            key,
+        ));
+    }
+
+    let mut fsm_state = crate::fsm::Lock::default();
+    if let Some(ref ret) = final_retention {
+        fsm_state = match crate::fsm::lock_step(
+            fsm_state,
+            crate::fsm::LockEvent::PutRetention {
+                mode: ret.mode,
+                until: ret.retain_until_epoch,
+                bypass_governance: false,
+            },
+            now_sec,
+        ) {
+            Ok(next) => next,
+            Err(r) => return Err(bad_request(r.code, r.why, key)),
+        };
+        attrs.set_retention(Some(ret));
+    }
+    if let Some(on) = requested.legal_hold {
+        if let Err(r) = crate::fsm::lock_step(
+            fsm_state,
+            crate::fsm::LockEvent::PutLegalHold { on },
+            now_sec,
+        ) {
+            return Err(bad_request(r.code, r.why, key));
+        }
+        attrs.set_legal_hold(on);
+    }
+    Ok(())
+}
+
 pub(super) fn apply_owner_attr(attrs: &mut crate::attrs::Attrs, writer_account: &str, bucket_owner: &str) {
     let eff_bucket = if bucket_owner.is_empty() { crate::iam::ROOT_ACCOUNT } else { bucket_owner };
     let eff_writer = if writer_account.is_empty() { crate::iam::ROOT_ACCOUNT } else { writer_account };
@@ -360,6 +450,18 @@ impl MetadataHeadersExt for hyper::http::response::Builder {
         }
         for (k, v) in view.attrs.user_meta() {
             self = self.header(format!("x-amz-meta-{}", k), header_bytes(v));
+        }
+        if let Ok(Some(ret)) = view.attrs.retention() {
+            let mode = match ret.mode {
+                crate::fsm::RetentionMode::Governance => "GOVERNANCE",
+                crate::fsm::RetentionMode::Compliance => "COMPLIANCE",
+            };
+            self = self
+                .header("x-amz-object-lock-mode", mode)
+                .header("x-amz-object-lock-retain-until-date", ret.retain_until_date);
+        }
+        if let Ok(Some(on)) = view.attrs.legal_hold() {
+            self = self.header("x-amz-object-lock-legal-hold", if on { "ON" } else { "OFF" });
         }
         self
     }
@@ -1024,6 +1126,11 @@ pub async fn copy_object(
             None => copy_attrs_obj.remove(crate::attrs::TAG_TAGGING),
         }
     }
+    copy_attrs_obj.remove(crate::attrs::TAG_RETENTION);
+    copy_attrs_obj.remove(crate::attrs::TAG_LEGAL_HOLD);
+    if let Err(resp) = apply_lock_headers_and_default(&state, b_id, key, headers, &mut copy_attrs_obj, true, false) {
+        return Ok(resp);
+    }
     apply_owner_attr(&mut copy_attrs_obj, writer_account, bucket_owner);
     let copy_attrs = match copy_attrs_obj.encode() {
         Ok(a) => a,
@@ -1337,15 +1444,21 @@ where
         Ok(c) => c,
         Err(r) => return Ok(bad_request(r.code, r.why, key)),
     };
-    let put_attrs = match request_attrs_with_checksum(
+    let mut put_attrs_map = match request_attrs_map(
         &signed_headers,
         key,
         req_checksum.as_ref().and_then(|(alg, exp)| exp.as_deref().map(|v| (*alg, "FULL_OBJECT", v))),
-        writer_account,
-        bucket_owner,
     ) {
         Ok(a) => a,
         Err(resp) => return Ok(resp),
+    };
+    if let Err(resp) = apply_lock_headers_and_default(&state, b_id, key, &signed_headers, &mut put_attrs_map, true, true) {
+        return Ok(resp);
+    }
+    apply_owner_attr(&mut put_attrs_map, writer_account, bucket_owner);
+    let put_attrs = match put_attrs_map.encode() {
+        Ok(a) => a,
+        Err(_) => return Ok(bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key)),
     };
     let stream_len = if is_chunked {
         signed_headers
@@ -1858,15 +1971,21 @@ where
     } else {
         None
     };
-    let buf_attrs = match request_attrs_with_checksum(
+    let mut buf_attrs_map = match request_attrs_map(
         &signed_headers,
         key,
         buf_cksum_out.as_ref().map(|(a, v)| (*a, "FULL_OBJECT", v.as_str())),
-        writer_account,
-        bucket_owner,
     ) {
         Ok(a) => a,
         Err(resp) => return Ok(resp),
+    };
+    if let Err(resp) = apply_lock_headers_and_default(&state, b_id, key, &signed_headers, &mut buf_attrs_map, true, true) {
+        return Ok(resp);
+    }
+    apply_owner_attr(&mut buf_attrs_map, writer_account, bucket_owner);
+    let buf_attrs = match buf_attrs_map.encode() {
+        Ok(a) => a,
+        Err(_) => return Ok(bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key)),
     };
     let stamp = state.version_stamp(b_id, key);
     let flags = flags | stamp.map_or(0, |s| s.0);
@@ -2322,6 +2441,7 @@ pub async fn delete_object(
     key: &str,
     query_map: &HashMap<String, String>,
     headers: &HeaderMap,
+    bypass_governance: bool,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let conds = match parse_delete_conditions(headers) {
         Ok(c) => c,
@@ -2331,7 +2451,7 @@ pub async fn delete_object(
         let Some(id) = crate::versions::parse_id(vid) else {
             return Ok(no_such_version(key, false));
         };
-        return Ok(match state.delete_version_conditional(b_id, key, id, &conds).await {
+        return Ok(match state.delete_version_conditional(b_id, key, id, &conds, bypass_governance).await {
             Ok(removed) => {
                 let mut b = Response::builder()
                     .status(StatusCode::NO_CONTENT)
@@ -2345,6 +2465,14 @@ pub async fn delete_object(
             Err(crate::s3_api::DeleteError::PreconditionFailed(facts)) => {
                 precondition_failure_response(PreconditionOutcome::PreconditionFailed, facts.as_ref(), key, false)
             }
+            Err(crate::s3_api::DeleteError::AccessDenied) => {
+                let xml = s3_error_xml("AccessDenied", "Access Denied", key, "req-lock");
+                Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(full_body(Bytes::from(xml)))
+                    .unwrap()
+            }
             Err(crate::s3_api::DeleteError::Internal(e)) => internal_error_response(key, &e),
         });
     }
@@ -2357,6 +2485,14 @@ pub async fn delete_object(
                 key,
                 false,
             ));
+        }
+        Err(crate::s3_api::DeleteError::AccessDenied) => {
+            let xml = s3_error_xml("AccessDenied", "Access Denied", key, "req-lock");
+            return Ok(Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(full_body(Bytes::from(xml)))
+                .unwrap());
         }
         Err(crate::s3_api::DeleteError::Internal(e)) => return Ok(internal_error_response(key, &e)),
     };

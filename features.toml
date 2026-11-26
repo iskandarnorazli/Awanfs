@@ -249,7 +249,7 @@ fuzz = ["lifecycle_xml", "lifecycle_config_xml"]
 [[feature]]
 id = "object-lock"
 name = "S3 Object Lock, governance/compliance retention, and legal hold"
-status = "planned"
+status = "done"
 issue = "#120"
 area = "object-lock"
 design_section = "8.1"
@@ -276,11 +276,15 @@ mint = [
   "minio-js::Set lock config on a bucket:",
   "minio-js::Update or replace lock config on a bucket:",
   "minio-js::getObjectLegalHold(bucketName, objectName, setOpts={})",
+  "minio-js::getObjectRetention(bucketName, objectName, getOpts)",
   "minio-js::putObjectRetention(bucketName, objectName, putOpts)",
   "minio-js::setObjectLegalHold(bucketName, objectName, setOpts={})",
   "minio-py:test_make_bucket_default_region::make_bucket(bucket_name, location, object_lock)",
   "minio-py:test_negative_make_bucket_invalid_name::make_bucket(bucket_name, location, object_lock)",
+  "versioning::/mint/build/versioning/legalhold.go:87: main.testLockingLegalhold",
 ]
+server_tests = ["server/tests/object_lock_test.rs"]
+drive = ["lock"]
 fuzz = ["object_lock_xml"]
 
 [[feature]]

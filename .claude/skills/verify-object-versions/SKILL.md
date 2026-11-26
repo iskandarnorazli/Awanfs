@@ -14,11 +14,12 @@ Yes if the diff changes any of these (coverage record):
 
 | Model step | Code |
 |---|---|
-| `Acquire` / `Release` | `S3ServiceState::lock_key` (s3_api.rs) and every caller: PUT, DELETE, CopyObject, CompleteMultipartUpload |
+| `Acquire` / `Release` | `S3ServiceState::lock_key` (s3_api.rs) and every caller: PUT, DELETE, CopyObject, CompleteMultipartUpload, `update_object_lock`, `delete_version_conditional` |
 | `Reserve` | `VolumeManager::write_needle`: `current_offset.fetch_add` (volume.rs) |
 | `Write` / `Fail` | `VolumeManager::write_needle`: `write_aligned_at` and its error path |
 | `Index` | the `engine.put_object` / `engine.delete_object` calls in those handlers, and their order against the needle write |
 | `Recover` | `S3ServiceState::with_data_dir` replay loop; `VolumeManager::open_mode` scan and `recover_needles` (the `next_indexed` gap jump, the `.idx` read) |
+| `RemoveVersion` / `LockedVersionIsNeverRemoved` | `versions.rs::tidy`, `delete_version_conditional` (`Lock::may_delete` in s3_api.rs), checked by `fixed_object_lock.cfg` and broken variant `object_lock_skip_delete_check.cfg` (#120) |
 
 Last confirmed to describe the code at commit `ba4ffd6` (branch `verify/object-versions`, PR #60). Move this forward only after you have checked the table above against the code at the new commit.
 

@@ -188,8 +188,21 @@ async fn warp_prepare_and_cleanup_trailing_slash_requests_succeed_without_weaken
     let body = res.text().await.unwrap();
     assert!(body.contains("<DeleteResult"), "expected DeleteResult XML, got: {}", body);
 
-    // 8. Decision 61 guard: unimplemented security sub-resources still answer 501 NotImplemented.
-    for sub in ["object-lock=", "policy=", "encryption=", "acl="] {
+    // 8. object-lock is now implemented (#120) and answers 404 when unset; unimplemented security
+    // sub-resources still answer 501 NotImplemented (Decision 61).
+    let lock_res = signed(&c, "warpkey", "warpsecret", Method::GET, &host, "/warp-benchmark-bucket/?object-lock=", b"")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lock_res.status(), StatusCode::NOT_FOUND, "expected 404 for /warp-benchmark-bucket/?object-lock=");
+    let lock_body = lock_res.text().await.unwrap();
+    assert!(
+        lock_body.contains("<Code>ObjectLockConfigurationNotFoundError</Code>"),
+        "expected ObjectLockConfigurationNotFoundError, got: {}",
+        lock_body
+    );
+
+    for sub in ["policy=", "encryption=", "acl="] {
         let path_q = format!("/warp-benchmark-bucket/?{}", sub);
         let res = signed(&c, "warpkey", "warpsecret", Method::GET, &host, &path_q, b"")
             .send()
