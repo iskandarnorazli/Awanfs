@@ -153,3 +153,9 @@ name = "list_objects_query"
 path = "fuzz_targets/list_objects_query.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "object_attributes_header"
+path = "fuzz_targets/object_attributes_header.rs"
+test = false
+doc = false
