@@ -1162,6 +1162,9 @@ fn scenario_gap_then_late_fail_journal_retry_and_compaction_with_inflight_stream
         }),
         StorageOp::Basic(SimOperation::Put { key: 3, len: 4096, fill: 33 }),
         StorageOp::Basic(SimOperation::Sync),
+        // #412: the armed journal write fault fires at the sync above, where B writes the
+        // records; this sync retries them and flushes the pending ones.
+        StorageOp::Basic(SimOperation::Sync),
         StorageOp::StreamStart { stream_id: 1, key: 4, len: 32768, fill: 44 },
         StorageOp::Basic(SimOperation::Put { key: 5, len: 49152, fill: 55 }),
         StorageOp::Basic(SimOperation::Put { key: 6, len: 49152, fill: 66 }),
