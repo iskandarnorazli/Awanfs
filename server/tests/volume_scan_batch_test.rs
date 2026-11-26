@@ -171,6 +171,8 @@ fn scan_batches_reads_across_1mib_boundaries_large_keys_and_gaps() {
         reads
     );
 
+    // #412: journal records are written by a sync; the reopen steps over the gaps through them.
+    vm.sync_now().unwrap();
     drop(vm);
     let reopened = VolumeManager::open_mode_with_clock(&dir.0, 1, false, clock).unwrap();
     let (reopened_got, reopened_reads) = collect_scan(&reopened);

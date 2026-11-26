@@ -863,6 +863,13 @@ impl SimStorageHarness {
             SimFileKind::Journal => idx_path(&self.dir, self.active_id),
         };
         let armed = self.fs.arm(&target, op, fault);
+        // #412: a record is queued at the write and reaches the file at the next sync, where the
+        // armed fault fires. The queueing step fails too, so the AfterRecord path stays covered.
+        if armed && matches!(file, SimFileKind::Journal) && op == SimOp::Write {
+            if let Some(vm) = self.volumes.get(&self.active_id) {
+                vm.fail_next_index();
+            }
+        }
         self.push_trace_u8(if armed { 32 } else { 33 });
     }
 
@@ -1154,6 +1161,9 @@ fn scenario_gap_then_late_fail_journal_retry_and_compaction_with_inflight_stream
             fault: SimFault::Eio,
         }),
         StorageOp::Basic(SimOperation::Put { key: 3, len: 4096, fill: 33 }),
+        StorageOp::Basic(SimOperation::Sync),
+        // #412: the armed journal write fault fires at the sync above, where B writes the
+        // records; this sync retries them and flushes the pending ones.
         StorageOp::Basic(SimOperation::Sync),
         StorageOp::StreamStart { stream_id: 1, key: 4, len: 32768, fill: 44 },
         StorageOp::Basic(SimOperation::Put { key: 5, len: 49152, fill: 55 }),

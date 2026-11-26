@@ -112,7 +112,13 @@ struct AlignedScanWindow<'a, F: VolFile> {
     buf: AlignedBuffer,
     buf_start: u64,
     buf_len: usize,
+    /// When set, the next refill reads at most this many bytes (at least what is needed).
+    next_refill_cap: Option<usize>,
 }
+
+/// What the open reads after a large journaled needle whose payload it skips (#412): the next
+/// header and its key, not a whole scan batch of the next payload.
+const SKIP_REFILL_BYTES: usize = 64 * 1024;
 
 impl<'a, F: VolFile> AlignedScanWindow<'a, F> {
     fn new(file: &'a F, file_len: u64, work: Option<&'a WorkCounters>) -> Self {
@@ -123,7 +129,13 @@ impl<'a, F: VolFile> AlignedScanWindow<'a, F> {
             buf: AlignedBuffer::new(SCAN_BATCH_BYTES),
             buf_start: 0,
             buf_len: 0,
+            next_refill_cap: None,
         }
+    }
+
+    /// The next refill reads at most `cap` bytes, or what it needs if more.
+    fn cap_next_refill(&mut self, cap: usize) {
+        self.next_refill_cap = Some(cap);
     }
 
     fn count_read(&self) {
@@ -157,7 +169,8 @@ impl<'a, F: VolFile> AlignedScanWindow<'a, F> {
         if avail_bytes < need_bytes as u64 {
             return Ok(None);
         }
-        let to_read = (self.buf.len() as u64).min(avail_bytes) as usize;
+        let cap = self.next_refill_cap.take().map_or(self.buf.len(), |c| c.max(need_bytes));
+        let to_read = (self.buf.len().min(cap) as u64).min(avail_bytes) as usize;
         self.buf_len = 0;
         self.count_read();
         if let Err(e) = self.file.read_aligned_at(offset, &mut self.buf[..to_read]) {
@@ -531,9 +544,41 @@ const IDX_RECORD: usize = 42;
 /// Streaming buffer size for `.idx` journal scans (~688 KiB, an exact multiple of `IDX_RECORD`).
 const IDX_SCAN_CHUNK: usize = IDX_RECORD * 16_384;
 
-/// Streams the `.idx` journal in `IDX_SCAN_CHUNK` pieces and returns the highest indexed needle
-/// offset (`>= SECTOR_SIZE`), or `None` when the journal has no valid offset.
-fn scan_journal_max_offset<F: VolFile>(journal: &F, journal_len: u64) -> Result<Option<u64>, VolumeError> {
+/// `--verify-payloads-at-boot` (#412): the open checks every payload's CRC, journaled or not.
+/// For the first start after upgrading from a build before #412, whose journals may record
+/// needles that were never synced, and after suspected disk trouble.
+static VERIFY_PAYLOADS_AT_BOOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Makes every later open check every payload's CRC (`--verify-payloads-at-boot`).
+pub fn set_verify_payloads_at_boot(on: bool) {
+    VERIFY_PAYLOADS_AT_BOOT.store(on, Ordering::SeqCst);
+}
+
+/// Offsets the `.idx` journal records, one bit per sector of the volume (#412): 1 MiB for a
+/// 32 GiB span. A recorded needle's bytes were synced before its record was written.
+struct Journaled(Vec<u64>);
+
+impl Journaled {
+    fn new(span: u64) -> Self {
+        Journaled(vec![0u64; (span / SECTOR_SIZE as u64).div_ceil(64) as usize])
+    }
+
+    fn set(&mut self, offset: u64) {
+        let s = offset / SECTOR_SIZE as u64;
+        if let Some(w) = self.0.get_mut((s / 64) as usize) {
+            *w |= 1 << (s % 64);
+        }
+    }
+
+    fn has(&self, offset: u64) -> bool {
+        let s = offset / SECTOR_SIZE as u64;
+        offset % SECTOR_SIZE as u64 == 0 && self.0.get((s / 64) as usize).is_some_and(|w| w & (1 << (s % 64)) != 0)
+    }
+}
+
+/// Streams the `.idx` journal in `IDX_SCAN_CHUNK` pieces, marks every recorded offset in
+/// `marks`, and returns the highest one (`>= SECTOR_SIZE`), or `None` when it has none.
+fn scan_journal<F: VolFile>(journal: &F, journal_len: u64, marks: &mut Journaled) -> Result<Option<u64>, VolumeError> {
     let valid_len = journal_len - (journal_len % IDX_RECORD as u64);
     if valid_len == 0 {
         return Ok(None);
@@ -548,6 +593,7 @@ fn scan_journal_max_offset<F: VolFile>(journal: &F, journal_len: u64) -> Result<
             let o = u64::from_le_bytes(r[12..20].try_into().unwrap());
             if o >= SECTOR_SIZE as u64 {
                 max_off = Some(max_off.map_or(o, |m| m.max(o)));
+                marks.set(o);
             }
         }
         pos += n as u64;
@@ -631,13 +677,16 @@ fn next_indexed_in_journal<F: VolFile>(journal: &F, journal_len: u64, after: u64
     Ok(best)
 }
 
-/// Appends the pending journal records in order. A write that fails is cut back off the file,
-/// so a partly written record never shifts the records after it, and it and the ones after
-/// it stay pending.
-fn write_pending<F: VolFile>(journal: &F, end: &mut u64, pending: &mut Vec<[u8; IDX_RECORD]>) -> Result<(), VolumeError> {
+/// Appends, in order, the pending journal records numbered below `limit`. A write that fails
+/// is cut back off the file, so a partly written record never shifts the records after it,
+/// and it and the ones after it stay pending.
+fn write_pending<F: VolFile>(journal: &F, end: &mut u64, pending: &mut Vec<(u64, [u8; IDX_RECORD])>, limit: u64) -> Result<(), VolumeError> {
     let mut written = 0;
     let mut result = Ok(());
-    for rec in pending.iter() {
+    for (n, rec) in pending.iter() {
+        if *n >= limit {
+            break;
+        }
         let start = *end;
         if let Err(e) = journal.write_at(start, rec) {
             let _ = journal.set_len(start);
@@ -651,10 +700,14 @@ fn write_pending<F: VolFile>(journal: &F, end: &mut u64, pending: &mut Vec<[u8; 
     result
 }
 
+/// Checks a needle found at open: its length, key hash and attributes, and, when `payload` is
+/// true, its payload CRC. Adds the payload bytes it hashed to `verified`.
 fn verify_needle_integrity<F: VolFile>(
     window: &mut AlignedScanWindow<'_, F>,
     offset: u64,
     hdr: &NeedleHeader,
+    payload: bool,
+    verified: &mut u64,
 ) -> Result<bool, VolumeError> {
     let key_end = 64usize + hdr.key_len as usize;
     let attrs_len = hdr.attrs_len as usize;
@@ -667,10 +720,12 @@ fn verify_needle_integrity<F: VolFile>(
         return Ok(false);
     }
     let meta_sectors = p_start.div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
+    // A journaled needle was synced before its record was written: only its metadata is read.
+    let read_to = if payload { total_len } else { (meta_sectors as u64).max(SECTOR_SIZE as u64).min(total_len) };
     let mut crc = 0u32;
     let mut pos = 0u64;
-    while pos < total_len {
-        let remain = ((total_len - pos) as usize).min(SCAN_BATCH_BYTES);
+    while pos < read_to {
+        let remain = ((read_to - pos) as usize).min(SCAN_BATCH_BYTES);
         let Some(chunk) = window.read_at(offset + pos, remain)? else {
             return Ok(false);
         };
@@ -685,14 +740,17 @@ fn verify_needle_integrity<F: VolFile>(
                 return Ok(false);
             }
         }
-        let lo = (p_start as u64).max(pos);
-        let hi = p_end.min(pos + remain as u64);
-        if lo < hi {
-            crc = crc32c::crc32c_append(crc, &chunk[(lo - pos) as usize..(hi - pos) as usize]);
+        if payload {
+            let lo = (p_start as u64).max(pos);
+            let hi = p_end.min(pos + remain as u64);
+            if lo < hi {
+                crc = crc32c::crc32c_append(crc, &chunk[(lo - pos) as usize..(hi - pos) as usize]);
+                *verified += hi - lo;
+            }
         }
         pos += remain as u64;
     }
-    Ok(crc == hdr.payload_crc32c)
+    Ok(!payload || crc == hdr.payload_crc32c)
 }
 /// One write counted in `VolumeManager::writers_in_flight` (#167).
 struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
@@ -736,8 +794,14 @@ pub struct VolumeManager<Fs: VolFs = DiskFs> {
     /// Tests: the next journal append fails, after the needle is on disk (#184).
     fail_next_index: std::sync::atomic::AtomicBool,
     fail_next_sync: std::sync::atomic::AtomicBool,
-    /// Journal records whose append failed, written before the next one (#184).
-    pending_journal: Mutex<Vec<[u8; IDX_RECORD]>>,
+    /// Journal records not yet written, numbered in the order their needles were written. A
+    /// record is written only by a sync, after the volume sync that covers its needle (#412),
+    /// so every record on disk names a needle whose bytes are on disk.
+    pending_journal: Mutex<Vec<(u64, [u8; IDX_RECORD])>>,
+    /// Records numbered so far; changed only under `pending_journal`'s lock.
+    journal_pushed: AtomicU64,
+    /// Payload bytes whose CRC the open checked (#412).
+    payload_verified_at_open: u64,
     /// Writes that have reserved an offset here and not yet written their header (#167). A
     /// streamed PUT counts from `begin_needle` until its `NeedleWriter` is dropped.
     writers_in_flight: std::sync::atomic::AtomicUsize,
@@ -800,10 +864,12 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             journal.set_len(journal_len)?;
             journal.sync_all()?;
         }
-        let max_indexed = scan_journal_max_offset(&*journal, journal_len)?;
         let mut open_gaps: BTreeMap<u64, u64> = BTreeMap::new();
 
         let mut file_len = aligned_file.len()?;
+        let mut journaled = Journaled::new(file_len.max(MAX_VOLUME_SPAN));
+        let max_indexed = scan_journal(&*journal, journal_len, &mut journaled)?;
+        let mut payload_verified_at_open = 0u64;
         if file_len >= MAX_VOLUME_SPAN {
             sparse = true;
         }
@@ -883,7 +949,8 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                     .flatten()
                 {
                     Some(hdr) if scan_offset.checked_add(hdr.total_len()).is_some_and(|end| end <= file_len) => {
-                        if verify_needle_integrity(&mut window, scan_offset, &hdr)? {
+                        let payload = VERIFY_PAYLOADS_AT_BOOT.load(Ordering::SeqCst) || !journaled.has(scan_offset);
+                        if verify_needle_integrity(&mut window, scan_offset, &hdr, payload, &mut payload_verified_at_open)? {
                             Some(hdr)
                         } else {
                             None
@@ -903,6 +970,9 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 };
 
                 let total_len = hdr.total_len();
+                if journaled.has(scan_offset) && !VERIFY_PAYLOADS_AT_BOOT.load(Ordering::SeqCst) && total_len > SCAN_BATCH_BYTES as u64 {
+                    window.cap_next_refill(SKIP_REFILL_BYTES);
+                }
                 last_valid_end = scan_offset + total_len;
                 scan_offset += total_len;
             }
@@ -952,6 +1022,8 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             fail_next_index: std::sync::atomic::AtomicBool::new(false),
             fail_next_sync: std::sync::atomic::AtomicBool::new(false),
             pending_journal: Mutex::new(Vec::new()),
+            journal_pushed: AtomicU64::new(0),
+            payload_verified_at_open,
             writers_in_flight: std::sync::atomic::AtomicUsize::new(0),
             sealed: std::sync::atomic::AtomicBool::new(false),
             gaps: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
@@ -1072,10 +1144,14 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         if self.fail_next_sync.swap(false, Ordering::SeqCst) {
             return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected sync failure")));
         }
+        // A write's seq is taken after its record is queued, so every write up to `target` has
+        // its record numbered below `limit`, and its bytes were written before this sync.
         let target = self.written_seq.load(Ordering::SeqCst);
-        self.flush_pending_journal()?;
+        let limit = self.journal_pushed.load(Ordering::SeqCst);
         self.file.sync_data()?;
         self.work.disk_sync();
+        // Records only after the volume sync: a record on disk names a needle on disk (#412).
+        self.flush_pending_journal(limit)?;
         self.journal.sync_data()?;
         self.work.disk_sync();
         let mut st = self.sync_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1098,20 +1174,25 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         rec[28..36].copy_from_slice(&payload_size.to_le_bytes());
         rec[36..38].copy_from_slice(&flags.to_le_bytes());
         rec[38..42].copy_from_slice(&crc.to_le_bytes());
-        let mut end = self.journal_end.lock();
         let mut pending = self.pending_journal.lock();
-        pending.push(rec);
+        let n = self.journal_pushed.fetch_add(1, Ordering::SeqCst);
+        pending.push((n, rec));
         if self.fail_next_index.swap(false, Ordering::SeqCst) {
             return Err(VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "injected index failure")));
         }
-        write_pending(&*self.journal, &mut end, &mut pending)
+        Ok(())
     }
 
-    /// Writes journal records left pending by a failed append (#184).
-    fn flush_pending_journal(&self) -> Result<(), VolumeError> {
+    /// Writes the pending journal records numbered below `limit` (#184, #412).
+    fn flush_pending_journal(&self, limit: u64) -> Result<(), VolumeError> {
         let mut end = self.journal_end.lock();
         let mut pending = self.pending_journal.lock();
-        write_pending(&*self.journal, &mut end, &mut pending)
+        write_pending(&*self.journal, &mut end, &mut pending, limit)
+    }
+
+    /// Payload bytes whose CRC the open checked: the needles the journal does not record (#412).
+    pub fn payload_verified_at_open(&self) -> u64 {
+        self.payload_verified_at_open
     }
 
     /// Tests: journal records not yet written.

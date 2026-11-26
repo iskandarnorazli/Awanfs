@@ -268,6 +268,11 @@ version was deleted or overwritten or whose update was superseded.
 key hash (8), volume id (4), offset (8), total length (8), payload length (8), flags (2),
 payload CRC32C (4). Recovery uses it to step over gaps left by writes that did not finish.
 
+A record is written only by a sync, after the sync of the volume that holds its needle (#412,
+option B), so a record on disk names a needle whose bytes were on disk first. The open checks
+the payload CRC only of needles the journal does not record; a recorded needle's header, key
+and attributes are still checked. The bytes of a record are unchanged.
+
 ### Replay order
 
 Recovery replays the volumes oldest first and each volume's needles in offset order. For a key
