@@ -32,6 +32,7 @@ pub mod multipart;
 pub mod mvcc;
 pub mod ops;
 pub mod precondition;
+pub mod profile;
 pub mod names;
 pub mod object_lock;
 pub mod reactor;

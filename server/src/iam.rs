@@ -301,6 +301,11 @@ impl Iam {
         self.users.len()
     }
 
+    /// Every user, in no particular order (the production profile checks their secrets, #358).
+    pub fn users(&self) -> impl Iterator<Item = &User> {
+        self.users.values()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.users.is_empty()
     }
