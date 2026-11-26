@@ -15,6 +15,11 @@ decisions are numbered in [`ARCHITECTURE.md`](ARCHITECTURE.md); stored bytes are
 ## Which issues
 
 - Work on any unblocked issue labelled `ready:antigravity` or `ready:claude` with no `wip:` label (owner, 2026-11-24). An empty queue means stop and say so.
+- **A bug you found yourself** may be fixed on an issue you file, without a `ready:*` label, when all of these hold ([owner, 2026-11-26](https://github.com/iskandarnorazli/Awanfs/issues/413#issuecomment-7181818860)):
+  - the issue has its gate written before any code;
+  - a test fails first, and the negative control is recorded;
+  - the fix touches neither stored bytes nor an `ARCHITECTURE.md` decision (those still stop with `needs-decision`);
+  - if it can change speed or memory, a measurement before and after is in the gate. #396 checked every needle at boot with no measurement, and #412 had to follow.
 - An issue blocked by another (GitHub's "blocked by" link, or a first line "Blocked by #N") waits until #N is closed.
 - Never start an issue labelled `outline` or `needs-decision`.
 - **An owner decision is a comment the owner wrote on the issue** (owner, 2026-11-19). Cite it by its link. A decision given anywhere else (a chat, a task file) is not one until the owner posts it there: stop with `needs-decision` and the options instead. On 2026-11-18 three evidence comments cited an "owner decision" that was on no issue, and two of them set aside a failing gate test.
