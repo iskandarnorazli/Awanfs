@@ -141,3 +141,9 @@ name = "raw_s3_key"
 path = "fuzz_targets/raw_s3_key.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "classify"
+path = "fuzz_targets/classify.rs"
+test = false
+doc = false

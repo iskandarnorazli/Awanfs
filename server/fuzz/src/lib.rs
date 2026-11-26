@@ -2,8 +2,9 @@
 //! `list_buckets_query`, `raw_s3_key`), called by both `fuzz_targets/*.rs` and unit tests.
 
 use http_body_util::BodyExt;
-use hyper::header::{HeaderMap, HeaderValue};
-use hyper::StatusCode;
+use hyper::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use hyper::{Method, StatusCode};
+use s3_server::ops::{classify, ClassifyRefusal, Operation, OPS};
 use s3_server::bucket_config::{
     base64_decode as bucket_base64_decode, base64_encode as bucket_base64_encode,
 };
@@ -382,9 +383,169 @@ pub fn check_raw_s3_key(data: &[u8]) {
     }
 }
 
+fn canonical_operation_cases() -> &'static [(
+    Operation,
+    Method,
+    Option<&'static str>,
+    Option<&'static str>,
+    &'static str,
+    Option<&'static str>,
+)] {
+    &[
+        (Operation::ListBuckets, Method::GET, None, None, "", None),
+        (Operation::CreateBucket, Method::PUT, Some("bkt"), None, "", None),
+        (Operation::DeleteBucket, Method::DELETE, Some("bkt"), None, "", None),
+        (Operation::HeadBucket, Method::HEAD, Some("bkt"), None, "", None),
+        (Operation::ListObjects, Method::GET, Some("bkt"), None, "", None),
+        (Operation::ListObjectsV2, Method::GET, Some("bkt"), None, "list-type=2", None),
+        (Operation::ListObjectVersions, Method::GET, Some("bkt"), None, "versions", None),
+        (Operation::GetBucketLocation, Method::GET, Some("bkt"), None, "location", None),
+        (Operation::GetBucketVersioning, Method::GET, Some("bkt"), None, "versioning", None),
+        (Operation::PutBucketVersioning, Method::PUT, Some("bkt"), None, "versioning", None),
+        (Operation::GetBucketLifecycle, Method::GET, Some("bkt"), None, "lifecycle", None),
+        (Operation::PutBucketLifecycle, Method::PUT, Some("bkt"), None, "lifecycle", None),
+        (Operation::DeleteBucketLifecycle, Method::DELETE, Some("bkt"), None, "lifecycle", None),
+        (Operation::GetBucketCors, Method::GET, Some("bkt"), None, "cors", None),
+        (Operation::PutBucketCors, Method::PUT, Some("bkt"), None, "cors", None),
+        (Operation::DeleteBucketCors, Method::DELETE, Some("bkt"), None, "cors", None),
+        (Operation::GetBucketTagging, Method::GET, Some("bkt"), None, "tagging", None),
+        (Operation::PutBucketTagging, Method::PUT, Some("bkt"), None, "tagging", None),
+        (Operation::DeleteBucketTagging, Method::DELETE, Some("bkt"), None, "tagging", None),
+        (Operation::CorsPreflight, Method::OPTIONS, Some("bkt"), None, "", None),
+        (Operation::ListMultipartUploads, Method::GET, Some("bkt"), None, "uploads", None),
+        (Operation::DeleteObjects, Method::POST, Some("bkt"), None, "delete", None),
+        (Operation::PutObject, Method::PUT, Some("bkt"), Some("obj"), "", None),
+        (Operation::PostObject, Method::POST, Some("bkt"), None, "", None),
+        (Operation::CopyObject, Method::PUT, Some("bkt"), Some("obj"), "", Some("/src/key")),
+        (Operation::GetObject, Method::GET, Some("bkt"), Some("obj"), "", None),
+        (Operation::GetObjectAttributes, Method::GET, Some("bkt"), Some("obj"), "attributes", None),
+        (Operation::HeadObject, Method::HEAD, Some("bkt"), Some("obj"), "", None),
+        (Operation::DeleteObject, Method::DELETE, Some("bkt"), Some("obj"), "", None),
+        (Operation::CreateMultipartUpload, Method::POST, Some("bkt"), Some("obj"), "uploads", None),
+        (Operation::UploadPart, Method::PUT, Some("bkt"), Some("obj"), "partNumber=1&uploadId=u1", None),
+        (Operation::UploadPartCopy, Method::PUT, Some("bkt"), Some("obj"), "partNumber=1&uploadId=u1", Some("/src/key")),
+        (Operation::CompleteMultipartUpload, Method::POST, Some("bkt"), Some("obj"), "uploadId=u1", None),
+        (Operation::AbortMultipartUpload, Method::DELETE, Some("bkt"), Some("obj"), "uploadId=u1", None),
+        (Operation::ListParts, Method::GET, Some("bkt"), Some("obj"), "uploadId=u1", None),
+        (Operation::GetObjectTagging, Method::GET, Some("bkt"), Some("obj"), "tagging", None),
+        (Operation::PutObjectTagging, Method::PUT, Some("bkt"), Some("obj"), "tagging", None),
+        (Operation::DeleteObjectTagging, Method::DELETE, Some("bkt"), Some("obj"), "tagging", None),
+        (Operation::GetObjectLockConfiguration, Method::GET, Some("bkt"), None, "object-lock", None),
+        (Operation::PutObjectLockConfiguration, Method::PUT, Some("bkt"), None, "object-lock", None),
+        (Operation::GetObjectRetention, Method::GET, Some("bkt"), Some("obj"), "retention", None),
+        (Operation::PutObjectRetention, Method::PUT, Some("bkt"), Some("obj"), "retention", None),
+        (Operation::GetObjectLegalHold, Method::GET, Some("bkt"), Some("obj"), "legal-hold", None),
+        (Operation::PutObjectLegalHold, Method::PUT, Some("bkt"), Some("obj"), "legal-hold", None),
+    ]
+}
+
+fn reorder_query(query: &str, sort_pairs: bool) -> String {
+    let mut parts: Vec<&str> = query.split('&').filter(|p| !p.is_empty()).collect();
+    if sort_pairs {
+        parts.sort_unstable();
+    } else {
+        parts.reverse();
+    }
+    parts.join("&")
+}
+
+fn check_classify_one(method: &Method, bucket: Option<&str>, key: Option<&str>, query: &str, hdrs: &HeaderMap) {
+    let r1 = classify(method, bucket, key, query, hdrs);
+    let rev_q = reorder_query(query, false);
+    let sort_q = reorder_query(query, true);
+    let r2 = classify(method, bucket, key, &rev_q, hdrs);
+    let r3 = classify(method, bucket, key, &sort_q, hdrs);
+    assert_eq!(
+        r1, r2,
+        "classify depended on query parameter order for {} {:?}/{:?} ?{:?} vs ?{:?}",
+        method, bucket, key, query, rev_q
+    );
+    assert_eq!(
+        r1, r3,
+        "classify depended on query parameter sort order for {} {:?}/{:?} ?{:?} vs ?{:?}",
+        method, bucket, key, query, sort_q
+    );
+}
+
+/// Oracle for `classify` (#148, #448):
+/// - Every input yields an `Operation` or `ClassifyRefusal` without panicking.
+/// - Reordering/sorting query parameters produces the identical classification.
+/// - Every `Operation` in `OPS` round-trips from its canonical request.
+pub fn check_classify(data: &[u8]) {
+    static CANONICAL_OK: OnceLock<()> = OnceLock::new();
+    CANONICAL_OK.get_or_init(|| {
+        let mut seen = Vec::new();
+        for (expected, method, bucket, key, query, copy) in canonical_operation_cases() {
+            let mut hdrs = HeaderMap::new();
+            if let Some(c) = copy {
+                hdrs.insert("x-amz-copy-source", HeaderValue::from_static(c));
+            }
+            if *expected == Operation::PostObject {
+                hdrs.insert(CONTENT_TYPE, HeaderValue::from_static("multipart/form-data; boundary=x"));
+            }
+            let got = classify(method, *bucket, *key, query, &hdrs)
+                .unwrap_or_else(|e| panic!("canonical {:?} refused: {:?}", expected, e));
+            assert_eq!(got, *expected, "canonical mismatch for {:?}", expected);
+            check_classify_one(method, *bucket, *key, query, &hdrs);
+            if !seen.contains(&got) {
+                seen.push(got);
+            }
+        }
+        assert_eq!(seen.len(), OPS.len(), "every Operation variant in OPS must be covered");
+    });
+
+    let text = String::from_utf8_lossy(data);
+    // Support structured multi-field seeds (`METHOD\nbucket\nkey\nheaders\nquery`) AND raw query strings.
+    let raw_query = if let Some(rest) = text.strip_prefix("REQ:") {
+        let mut lines = rest.splitn(5, '\n');
+        let m_str = lines.next().unwrap_or("GET");
+        let b_str = lines.next().unwrap_or("");
+        let k_str = lines.next().unwrap_or("");
+        let h_flags = lines.next().unwrap_or("");
+        let q = lines.next().unwrap_or("");
+        let method = Method::from_bytes(m_str.as_bytes()).unwrap_or(Method::GET);
+        let bucket = (!b_str.is_empty()).then_some(b_str);
+        let key = (!k_str.is_empty()).then_some(k_str);
+        let mut hdrs = HeaderMap::new();
+        if h_flags.contains('C') {
+            hdrs.insert("x-amz-copy-source", HeaderValue::from_static("/src/key"));
+        }
+        if h_flags.contains('F') {
+            hdrs.insert(CONTENT_TYPE, HeaderValue::from_static("multipart/form-data; boundary=x"));
+        }
+        check_classify_one(&method, bucket, key, q, &hdrs);
+        q
+    } else {
+        text.as_ref()
+    };
+
+    let methods = [Method::GET, Method::PUT, Method::POST, Method::DELETE, Method::HEAD, Method::OPTIONS];
+    let selector = data.first().copied().unwrap_or(0) as usize;
+    let bucket_opts = [None, Some("bkt"), Some("")];
+    let key_opts = [None, Some("obj"), Some("")];
+    let b = bucket_opts[(selector >> 3) % bucket_opts.len()];
+    let k = key_opts[(selector >> 5) % key_opts.len()];
+    let mut hdrs = HeaderMap::new();
+    if selector & 0x40 != 0 {
+        hdrs.insert("x-amz-copy-source", HeaderValue::from_static("/src/k"));
+    }
+    if selector & 0x80 != 0 {
+        hdrs.insert(CONTENT_TYPE, HeaderValue::from_static("multipart/form-data; boundary=x"));
+    }
+    for m in &methods {
+        check_classify_one(m, b, k, raw_query, &hdrs);
+    }
+    // Also exercise explicit arbitrary-order queries with PUT object + headers so sub-resource order bugs fail fast.
+    let mut empty_hdrs = HeaderMap::new();
+    check_classify_one(&Method::PUT, Some("bkt"), Some("obj"), raw_query, &empty_hdrs);
+    empty_hdrs.insert("x-amz-copy-source", HeaderValue::from_static("/src/k"));
+    check_classify_one(&Method::PUT, Some("bkt"), Some("obj"), raw_query, &empty_hdrs);
+    let _: Result<Operation, ClassifyRefusal> = classify(&Method::GET, Some("bkt"), None, raw_query, &HeaderMap::new());
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{check_checksum_headers, check_list_buckets_query, check_raw_s3_key};
+    use super::{check_checksum_headers, check_classify, check_list_buckets_query, check_raw_s3_key};
 
     #[test]
     fn checksum_headers_canonical_vectors_and_invalid_inputs() {
@@ -494,6 +655,31 @@ mod tests {
                 }
             }
             check_raw_s3_key(&buf);
+        }
+    }
+
+    #[test]
+    fn classify_canonical_operations_and_corpus_seeds() {
+        for sample in [
+            b"acl&versioning".as_slice(),
+            b"=%ZZ".as_slice(),
+            b"uploadId=1&partNumber=0".as_slice(),
+            b"list-type=3".as_slice(),
+            b"REQ:PUT\nbkt\nobj\n\nuploadId=1&partNumber=0".as_slice(),
+        ] {
+            check_classify(sample);
+        }
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/classify");
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read classify corpus dir")
+            .map(|e| e.expect("corpus dir entry").path())
+            .collect();
+        entries.sort();
+        assert!(entries.len() >= 48, "expected canonical + regression seeds, got {}", entries.len());
+        for path in entries {
+            let bytes = std::fs::read(&path).expect("read corpus seed");
+            check_classify(&bytes);
         }
     }
 }
