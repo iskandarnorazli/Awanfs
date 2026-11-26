@@ -2154,4 +2154,4 @@ notes = "Not built: `?website` on a bucket answers 501 NotImplemented (UNBUILT_S
 operations = []
 ceph = []
 mint = []
-server_tests = ["server/tests/static_website_test.rs"]
+server_tests = ["server/tests/static_website_test.rs::bucket_website_put_get_and_delete_answer_not_implemented"]
