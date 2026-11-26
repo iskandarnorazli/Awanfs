@@ -253,6 +253,7 @@ jobs:
               "--client-procs", "${{ inputs.client_procs || '4' }}",
               "--data-dir", os.environ["RUNNER_TEMP"],
               "--output", os.path.join(out_dir, "report.md"),
+              "--compare-fast",
           ]
           cores = "${{ inputs.cores }}".strip()
           if cores:
