@@ -863,6 +863,13 @@ impl SimStorageHarness {
             SimFileKind::Journal => idx_path(&self.dir, self.active_id),
         };
         let armed = self.fs.arm(&target, op, fault);
+        // #412: a record is queued at the write and reaches the file at the next sync, where the
+        // armed fault fires. The queueing step fails too, so the AfterRecord path stays covered.
+        if armed && matches!(file, SimFileKind::Journal) && op == SimOp::Write {
+            if let Some(vm) = self.volumes.get(&self.active_id) {
+                vm.fail_next_index();
+            }
+        }
         self.push_trace_u8(if armed { 32 } else { 33 });
     }
 

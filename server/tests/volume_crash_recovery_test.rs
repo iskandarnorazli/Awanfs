@@ -111,6 +111,10 @@ fn seeded_crash_tearing_idx_tail_recovers_aligned_journal_across_reopen() {
         vm.write_needle(1, "k1", &pattern(5000, 1), AWAN_FLAG_ACTIVE, 0, 0).unwrap();
         vm.sync_now().unwrap();
         vm.write_needle(1, "k2", &pattern(5000, 2), AWAN_FLAG_ACTIVE, 0, 0).unwrap();
+        // #412: k2's record is written by a sync, after the volume sync. The journal's own sync
+        // fails, so the record stays unsynced and a crash can tear it.
+        assert!(fs.arm(&idx_path, SimOp::Sync, SimFault::Eio));
+        assert!(vm.sync_now().is_err());
     }
 
     let mut saw_torn_idx = false;
@@ -455,6 +459,8 @@ fn seed_45_torn_mid_volume_streamed_needle_rejected_and_later_indexed_preserved(
 
     let loc3 = vm.write_needle(1, "k3", &p3, AWAN_FLAG_ACTIVE, 0, 0).unwrap();
     assert_eq!(loc3.offset, 61_440);
+    // #412: k3's record reaches the journal only through a sync.
+    vm.sync_now().unwrap();
 
     w.finish(0, 0).unwrap();
 
