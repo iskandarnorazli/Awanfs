@@ -456,6 +456,7 @@ fn derived_prefix(keys: &BTreeSet<String>, idx: usize, random_pfx: String) -> St
     random_pfx
 }
 
+// covers: ListBuckets
 #[test]
 fn prop_list_buckets_pagination_and_prefix() {
     let srv = TestServer::new();
@@ -579,6 +580,7 @@ fn prop_list_buckets_pagination_and_prefix() {
     });
 }
 
+// covers: ListObjectsV2
 #[test]
 fn prop_list_objects_v2_pagination_and_encoding() {
     let srv = TestServer::new();
@@ -708,6 +710,7 @@ fn prop_list_objects_v2_pagination_and_encoding() {
     );
 }
 
+// covers: ListObjects
 #[test]
 fn prop_list_objects_v1_pagination_and_prefix_encoding() {
     let srv = TestServer::new();

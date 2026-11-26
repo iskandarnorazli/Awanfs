@@ -48,6 +48,25 @@ MINIMAL_JUNIT_XML = """<testsuite>
 <testcase classname="s3tests.functional.test_s3" name="test_bad_aws2"><failure message="AuthorizationHeaderMalformed"/></testcase>
 </testsuite>"""
 
+OPS_RS = """
+pub enum Operation {
+    // A comment is not a variant.
+    PutBucketCors,
+    GetBucketCors,
+    DeleteBucketCors,
+}
+"""
+
+CORS_TEST_RS = """
+// covers: PutBucketCors, GetBucketCors
+#[tokio::test]
+async fn test_set_cors() {}
+
+#[tokio::test]
+// covers: DeleteBucketCors
+async fn test_delete_cors() {}
+"""
+
 VALID_TOML = """
 [[feature]]
 id = "cors"
@@ -56,7 +75,7 @@ status = "done"
 issue = "#116"
 operations = ["PutBucketCors", "GetBucketCors", "DeleteBucketCors"]
 ceph = ["test_s3::test_set_cors", "test_s3::test_cors_header_option"]
-server_tests = ["server/tests/cors_test.rs"]
+server_tests = ["server/tests/cors_test.rs::test_set_cors", "server/tests/cors_test.rs::test_delete_cors"]
 drive = ["cors"]
 fuzz = ["cors_xml"]
 
@@ -74,7 +93,8 @@ name = "Health endpoints"
 status = "done"
 issue = "#44"
 user_visible = false
-server_tests = ["server/tests/health_test.rs"]
+gaps = { fuzz = "not needed: parses no request input" }
+server_tests = ["server/tests/health_test.rs::test_live"]
 """
 
 
@@ -96,8 +116,10 @@ class FeaturesTest(unittest.TestCase):
         (self.root / "tests" / "s3tests").mkdir(parents=True)
 
         (self.root / "scripts" / "verify_drive.sh").write_text(MINIMAL_DRIVE_SH, encoding="utf-8")
-        (self.root / "server" / "tests" / "cors_test.rs").write_text("", encoding="utf-8")
-        (self.root / "server" / "tests" / "health_test.rs").write_text("", encoding="utf-8")
+        (self.root / "server" / "tests" / "cors_test.rs").write_text(CORS_TEST_RS, encoding="utf-8")
+        (self.root / "server" / "tests" / "health_test.rs").write_text("#[test]\nfn test_live() {}\n", encoding="utf-8")
+        (self.root / "server" / "src" / "ops").mkdir(parents=True)
+        (self.root / "server" / "src" / "ops" / "mod.rs").write_text(OPS_RS, encoding="utf-8")
         (self.root / "server" / "fuzz" / "Cargo.toml").write_text(MINIMAL_FUZZ_CARGO, encoding="utf-8")
         (self.root / "server" / "fuzz" / "fuzz_targets" / "cors_xml.rs").write_text("", encoding="utf-8")
         (self.root / "tests" / "s3tests" / "passing.txt").write_text(
@@ -158,8 +180,8 @@ class FeaturesTest(unittest.TestCase):
     def test_a_waits_on_entry_for_another_features_test_fails(self):
         self._passing("test_s3::test_set_cors")
         self.registry.write_text(
-            VALID_TOML.replace('server_tests = ["server/tests/health_test.rs"]',
-                               'server_tests = ["server/tests/health_test.rs"]\n\n[feature.waits_on]\n"test_s3::test_cors_header_option" = "sigv2"'),
+            VALID_TOML.replace('server_tests = ["server/tests/health_test.rs::test_live"]',
+                               'server_tests = ["server/tests/health_test.rs::test_live"]\n\n[feature.waits_on]\n"test_s3::test_cors_header_option" = "sigv2"'),
             encoding="utf-8",
         )
         probs = self._probs()
@@ -245,7 +267,7 @@ class FeaturesTest(unittest.TestCase):
 
     def test_done_feature_without_server_test_fails(self):
         self.registry.write_text(
-            VALID_TOML.replace('server_tests = ["server/tests/cors_test.rs"]', "server_tests = []"),
+            VALID_TOML.replace('server_tests = ["server/tests/cors_test.rs::test_set_cors", "server/tests/cors_test.rs::test_delete_cors"]', "server_tests = []"),
             encoding="utf-8",
         )
         probs = features.check_registry(
@@ -547,6 +569,70 @@ class FeaturesTest(unittest.TestCase):
         self.assertNotIn("Mint: 0 tests", text)
         self.assertIn("| cors | done | #116 | 1/2 | — |", text)
         self.assertIn("Mint: not run", text)
+
+    # Coverage guards (#434): every operation has one home and a test that sends it; every
+    # server test named is a real fn; a done feature has every layer or a listed gap.
+    def _with(self, toml=None, cors_rs=None):
+        if toml is not None:
+            self.registry.write_text(toml, encoding="utf-8")
+        if cors_rs is not None:
+            (self.root / "server" / "tests" / "cors_test.rs").write_text(cors_rs, encoding="utf-8")
+        return self._probs()
+
+    def test_every_operation_has_exactly_one_home(self):
+        probs = self._with(VALID_TOML.replace('"GetBucketCors", "DeleteBucketCors"]', '"GetBucketCors"]'))
+        self.assertTrue(any("DeleteBucketCors" in p and "no feature" in p for p in probs), probs)
+        probs = self._with(VALID_TOML.replace('user_visible = false\n', 'user_visible = false\noperations = ["DeleteBucketCors"]\n'))
+        self.assertTrue(any("DeleteBucketCors" in p and "cors" in p and "health" in p for p in probs), probs)
+        self.assertEqual(self._run_check(), 1)
+
+    def test_a_server_test_names_a_fn_that_exists(self):
+        probs = self._with(VALID_TOML.replace("server/tests/health_test.rs::test_live", "server/tests/health_test.rs"))
+        self.assertTrue(any("health" in p and "health_test.rs" in p and "names a file" in p for p in probs), probs)
+        probs = self._with(VALID_TOML.replace("health_test.rs::test_live", "health_test.rs::test_gone"))
+        self.assertTrue(any("health" in p and "test_gone" in p and "no such fn" in p for p in probs), probs)
+        self.assertEqual(self._run_check(), 1)
+
+    def test_every_operation_is_covered_or_a_listed_gap(self):
+        no_delete = CORS_TEST_RS.replace("// covers: DeleteBucketCors\n", "")
+        probs = self._with(cors_rs=no_delete)
+        self.assertTrue(any("DeleteBucketCors" in p and "no test covers" in p for p in probs), probs)
+        self.assertEqual(self._run_check(), 1)
+        gap = VALID_TOML.replace('fuzz = ["cors_xml"]\n', 'fuzz = ["cors_xml"]\ngaps = { DeleteBucketCors = "#9" }\n')
+        self.assertEqual(self._with(gap, no_delete), [])
+        # The gap is stale once a test covers it.
+        probs = self._with(gap, CORS_TEST_RS)
+        self.assertTrue(any("DeleteBucketCors" in p and "gap" in p and "covered" in p for p in probs), probs)
+
+    def test_a_covers_line_names_a_real_operation_on_a_named_test(self):
+        probs = self._with(cors_rs=CORS_TEST_RS + "\n// covers: PutBucketCorz\n#[test]\nfn test_x() {}\n")
+        self.assertTrue(any("PutBucketCorz" in p and "not an operation" in p for p in probs), probs)
+        unnamed = CORS_TEST_RS.replace("async fn test_delete_cors", "async fn test_other_name")
+        probs = self._with(cors_rs=unnamed)
+        self.assertTrue(any("DeleteBucketCors" in p and "no test covers" in p for p in probs), probs)
+
+    def test_a_done_feature_has_every_layer_or_a_listed_gap(self):
+        probs = self._with(VALID_TOML.replace('fuzz = ["cors_xml"]\n', ""))
+        self.assertTrue(any("cors" in p and "fuzz" in p and "gap" in p for p in probs), probs)
+        self.assertEqual(self._with(VALID_TOML.replace('fuzz = ["cors_xml"]\n', 'gaps = { fuzz = "#9" }\n')), [])
+        probs = self._with(VALID_TOML.replace('fuzz = ["cors_xml"]\n', 'gaps = { fuzz = "later" }\n'))
+        self.assertTrue(any("cors" in p and "later" in p for p in probs), probs)
+        probs = self._with(VALID_TOML.replace('gaps = { fuzz = "not needed: parses no request input" }\n', ""))
+        self.assertTrue(any("health" in p and "fuzz" in p for p in probs), probs)
+        # A gap for a layer the feature has is stale.
+        probs = self._with(VALID_TOML.replace('fuzz = ["cors_xml"]\n', 'fuzz = ["cors_xml"]\ngaps = { fuzz = "#9" }\n'))
+        self.assertTrue(any("cors" in p and "fuzz" in p and "stale" in p for p in probs), probs)
+
+    def test_report_counts_coverage_gaps_per_feature(self):
+        reg = VALID_TOML.replace('fuzz = ["cors_xml"]\n', 'gaps = { fuzz = "#9" }\n')
+        self.registry.write_text(reg, encoding="utf-8")
+        out_md = self.root / "FEATURES.md"
+        features.main(["report", "--root", str(self.root), "--registry", str(self.registry),
+                       "--ceph-junit", str(self.junit), "--run-id", "1", "--output", str(out_md)])
+        text = out_md.read_text(encoding="utf-8")
+        self.assertIn("## Coverage gaps", text)
+        self.assertIn("| cors | 1 | fuzz: #9 |", text)
+        self.assertIn("| health | 0 | fuzz: not needed: parses no request input |", text)
 
     def test_repo_registry_passes_check(self):
         repo_root = Path(__file__).resolve().parent.parent

@@ -7,6 +7,7 @@ use s3_server::{start_s3_reactor, S3ServiceState};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+// covers: ListObjectVersions
 #[tokio::test]
 async fn unversioned_objects_list_as_null_versions_and_can_be_removed() {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

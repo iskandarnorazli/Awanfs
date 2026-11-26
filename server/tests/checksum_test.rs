@@ -54,6 +54,7 @@ fn xml_tag(alg: ChecksumAlgorithm) -> &'static str {
     }
 }
 
+// covers: HeadObject
 #[tokio::test]
 async fn put_get_head_all_five_checksum_algorithms_and_restart_persistence() {
     let dir = temp_dir("all5");
@@ -275,6 +276,7 @@ async fn put_checksum_mismatch_returns_400_bad_digest_buffered_and_streamed() {
     handle.shutdown();
 }
 
+// covers: GetObjectAttributes
 #[tokio::test]
 async fn multipart_checksum_and_get_object_attributes_parts() {
     let dir = temp_dir("mpu");

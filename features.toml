@@ -42,7 +42,26 @@ mint = [
   "minio-go: testUserMetadataCopyingWrapper::CopyObject(destination, source)",
 ]
 # Each suite test has a SigV4 version (#433, tests/s3tests/PORTED.md): the 15 with no older test are ported here.
-server_tests = ["server/tests/sigv2_ports_test.rs", "server/tests/auth_test.rs"]
+server_tests = [
+  "server/tests/sigv2_ports_test.rs::test_object_create_bad_authorization_invalid_aws2",
+  "server/tests/sigv2_ports_test.rs::test_bucket_create_bad_authorization_invalid_aws2",
+  "server/tests/sigv2_ports_test.rs::test_object_create_bad_ua_empty_aws2",
+  "server/tests/sigv2_ports_test.rs::test_object_create_bad_ua_none_aws2",
+  "server/tests/sigv2_ports_test.rs::test_bucket_create_bad_ua_empty_aws2",
+  "server/tests/sigv2_ports_test.rs::test_bucket_create_bad_ua_none_aws2",
+  "server/tests/sigv2_ports_test.rs::test_object_create_bad_date_invalid_aws2",
+  "server/tests/sigv2_ports_test.rs::test_object_create_bad_date_empty_aws2",
+  "server/tests/sigv2_ports_test.rs::test_object_create_bad_date_none_aws2",
+  "server/tests/sigv2_ports_test.rs::test_object_create_bad_date_before_epoch_aws2",
+  "server/tests/sigv2_ports_test.rs::test_object_create_bad_date_after_end_aws2",
+  "server/tests/sigv2_ports_test.rs::test_bucket_create_bad_date_invalid_aws2",
+  "server/tests/sigv2_ports_test.rs::test_bucket_create_bad_date_empty_aws2",
+  "server/tests/sigv2_ports_test.rs::test_bucket_create_bad_date_none_aws2",
+  "server/tests/sigv2_ports_test.rs::test_bucket_create_bad_date_before_epoch_aws2",
+  "server/tests/sigv2_ports_test.rs::the_test_signer_formats_dates_like_aws",
+  "server/tests/auth_test.rs::a_changed_signature_or_secret_is_refused",
+  "server/tests/auth_test.rs::unknown_access_key_and_skewed_clock_are_refused",
+]
 
 [feature.ported]
 "test_s3::test_cors_presigned_get_object_v2" = "test_s3::test_cors_presigned_get_object"
@@ -90,7 +109,19 @@ area = "request-headers"
 design_section = "3"
 operations = ["PutObject (headers)", "CreateBucket (headers)"]
 ceph = ["re:^test_headers::(?!.*_aws2$)(?!test_object_create_bad_contentlength_none$).+"]
-server_tests = ["server/tests/s3_details_test.rs", "server/tests/parser_robustness_test.rs", "server/tests/operation_table_test.rs"]
+server_tests = [
+  "server/tests/s3_details_test.rs::expect_100_continue_valid_and_rejected_before_body",
+  "server/tests/s3_details_test.rs::other_expect_values_are_not_refused",
+  "server/tests/s3_details_test.rs::put_object_without_content_length_returns_411",
+  "server/tests/s3_details_test.rs::content_md5_rejects_non_canonical_base64",
+  "server/tests/parser_robustness_test.rs::range_header_agrees_with_the_rfc_reference",
+  "server/tests/parser_robustness_test.rs::no_parser_panics_on_generated_input",
+  "server/tests/parser_robustness_test.rs::s3_target_handles_non_ascii_host_and_requires_dot_separator",
+  "server/tests/parser_robustness_test.rs::iso8601_rejects_malformed_and_invalid_calendar_dates",
+  "server/tests/parser_robustness_test.rs::parse_s3_target_leading_slash_key_fuzz_regression",
+  "server/tests/parser_robustness_test.rs::parse_s3_target_vhost_slash_in_host_does_not_yield_slash_bucket",
+  "server/tests/operation_table_test.rs::unknown_subresources_answer_501_and_store_nothing",
+]
 moved = [
   { test = "test_headers::test_object_create_bad_contentlength_none", to = "request-headers-unsendable", decision = "https://github.com/iskandarnorazli/Awanfs/issues/160#issuecomment-6998463532" },
 ]
@@ -233,7 +264,7 @@ status = "done"
 issue = "#118"
 area = "lifecycle"
 design_section = "8.3"
-operations = ["PutBucketLifecycleConfiguration", "GetBucketLifecycleConfiguration", "DeleteBucketLifecycle"]
+operations = ["PutBucketLifecycleConfiguration", "GetBucketLifecycleConfiguration", "DeleteBucketLifecycle", "GetBucketLifecycle", "PutBucketLifecycle"]
 ceph = ["re:^test_s3::test_lifecycle_(?!.*(transition|cloud))", "test_s3::test_lifecyclev2_expiration", "test_s3::test_delete_marker_expiration"]
 mint = [
   "minio-java::deleteBucketLifecycle()",
@@ -243,7 +274,25 @@ mint = [
   "minio-js::Set lifecycle config of a bucket",
   "minio-js::Set lifecycle config on a bucket:",
 ]
-server_tests = ["server/tests/lifecycle_conformance_test.rs", "server/tests/lifecycle_test.rs", "server/tests/scheduler_test.rs", "server/tests/clock_and_dates_test.rs"]
+server_tests = [
+  "server/tests/lifecycle_conformance_test.rs::lifecycle_validation_errors_roundtrip_and_restart_persistence",
+  "server/tests/lifecycle_conformance_test.rs::lifecycle_filters_date_disabled_header_and_tags",
+  "server/tests/lifecycle_conformance_test.rs::lifecycle_versioned_noncurrent_delete_marker_and_restart",
+  "server/tests/lifecycle_conformance_test.rs::lifecycle_property_never_deletes_locked_version_or_premature_object",
+  "server/tests/lifecycle_conformance_test.rs::lifecycle_aborts_incomplete_multipart_uploads",
+  "server/tests/lifecycle_conformance_test.rs::lifecycle_rereads_state_tags_and_rules_under_key_lock",
+  "server/tests/lifecycle_test.rs::test_lifecycle_xml_roundtrip_and_deletion",
+  "server/tests/lifecycle_test.rs::test_prefix_scoped_expiration_and_negative_control",
+  "server/tests/lifecycle_test.rs::test_stale_multipart_abort_sweep",
+  "server/tests/scheduler_test.rs::scheduler_runs_one_at_a_time_and_stops_cleanly",
+  "server/tests/scheduler_test.rs::panicking_or_failing_task_is_retried_and_does_not_stop_others",
+  "server/tests/scheduler_test.rs::property_random_interleavings_match_fsm_oracle",
+  "server/tests/scheduler_test.rs::incomplete_multipart_cleanup_respects_clock_and_budget",
+  "server/tests/clock_and_dates_test.rs::no_system_time_now_outside_clock_rs",
+  "server/tests/clock_and_dates_test.rs::system_clock_and_manual_clock_work",
+  "server/tests/parser_robustness_test.rs::a_rule_id_and_prefix_keep_their_whitespace_through_the_serialiser",
+  "server/tests/parser_robustness_test.rs::lifecycle_xml_round_trips_through_its_serialiser",
+]
 drive = ["lifecycle"]
 fuzz = ["lifecycle_xml", "lifecycle_config_xml"]
 
@@ -284,7 +333,16 @@ mint = [
   "minio-py:test_negative_make_bucket_invalid_name::make_bucket(bucket_name, location, object_lock)",
   "versioning::/mint/build/versioning/legalhold.go:87: main.testLockingLegalhold",
 ]
-server_tests = ["server/tests/object_lock_test.rs"]
+server_tests = [
+  "server/tests/object_lock_test.rs::bucket_lock_config_enable_after_create_and_suspend_refused",
+  "server/tests/object_lock_test.rs::retention_legal_hold_headers_iso8601_md5_copy_and_multipart",
+  "server/tests/object_lock_test.rs::bypass_governance_permission_and_compliance_immutability",
+  "server/tests/object_lock_test.rs::lock_survives_compaction_and_restart_and_blocks_lifecycle",
+  "server/tests/object_lock_test.rs::batch_delete_objects_reports_version_id_in_errors_and_delete_marker_keeps_version",
+  "server/tests/object_lock_test.rs::randomized_sequence_never_deletes_version_while_may_delete_refuses",
+  "server/tests/object_lock_test.rs::pre_versioning_null_object_supports_put_and_get_lock_without_version_id",
+  "server/tests/object_lock_test.rs::grep_guard_no_retention_comparisons_outside_fsm_rs",
+]
 drive = ["lock"]
 fuzz = ["object_lock_xml"]
 
@@ -308,7 +366,54 @@ mint = [
   "minio-py:test_presigned_post_policy",
 ]
 # The suite signs every POST form with SigV2; each test has a SigV4 port (#119, tests/s3tests/PORTED.md).
-server_tests = ["server/tests/post_object_suite_test.rs"]
+server_tests = [
+  "server/tests/post_object_suite_test.rs::test_post_object_anonymous_request",
+  "server/tests/post_object_suite_test.rs::test_post_object_authenticated_request",
+  "server/tests/post_object_suite_test.rs::test_post_object_authenticated_no_content_type",
+  "server/tests/post_object_suite_test.rs::test_post_object_authenticated_request_bad_access_key",
+  "server/tests/post_object_suite_test.rs::test_post_object_set_success_code",
+  "server/tests/post_object_suite_test.rs::test_post_object_set_invalid_success_code",
+  "server/tests/post_object_suite_test.rs::test_post_object_upload_larger_than_chunk",
+  "server/tests/post_object_suite_test.rs::test_post_object_set_key_from_filename",
+  "server/tests/post_object_suite_test.rs::test_post_object_ignored_header",
+  "server/tests/post_object_suite_test.rs::test_post_object_case_insensitive_condition_fields",
+  "server/tests/post_object_suite_test.rs::test_post_object_escaped_field_values",
+  "server/tests/post_object_suite_test.rs::test_post_object_success_redirect_action",
+  "server/tests/post_object_suite_test.rs::test_post_object_invalid_signature",
+  "server/tests/post_object_suite_test.rs::test_post_object_invalid_access_key",
+  "server/tests/post_object_suite_test.rs::test_post_object_invalid_date_format",
+  "server/tests/post_object_suite_test.rs::test_post_object_no_key_specified",
+  "server/tests/post_object_suite_test.rs::test_post_object_missing_signature",
+  "server/tests/post_object_suite_test.rs::test_post_object_missing_policy_condition",
+  "server/tests/post_object_suite_test.rs::test_post_object_user_specified_header",
+  "server/tests/post_object_suite_test.rs::test_post_object_request_missing_policy_specified_field",
+  "server/tests/post_object_suite_test.rs::test_post_object_condition_is_case_sensitive",
+  "server/tests/post_object_suite_test.rs::test_post_object_expires_is_case_sensitive",
+  "server/tests/post_object_suite_test.rs::test_post_object_expired_policy",
+  "server/tests/post_object_suite_test.rs::test_post_object_wrong_bucket",
+  "server/tests/post_object_suite_test.rs::test_post_object_invalid_request_field_value",
+  "server/tests/post_object_suite_test.rs::test_post_object_missing_expires_condition",
+  "server/tests/post_object_suite_test.rs::test_post_object_missing_conditions_list",
+  "server/tests/post_object_suite_test.rs::test_post_object_upload_size_limit_exceeded",
+  "server/tests/post_object_suite_test.rs::test_post_object_missing_content_length_argument",
+  "server/tests/post_object_suite_test.rs::test_post_object_invalid_content_length_argument",
+  "server/tests/post_object_suite_test.rs::test_post_object_upload_size_below_minimum",
+  "server/tests/post_object_suite_test.rs::test_post_object_upload_size_rgw_chunk_size_bug",
+  "server/tests/post_object_suite_test.rs::test_post_object_empty_conditions",
+  "server/tests/post_object_suite_test.rs::test_post_object_tags_anonymous_request",
+  "server/tests/post_object_suite_test.rs::test_post_object_tags_authenticated_request",
+  "server/tests/post_object_suite_test.rs::test_post_object_upload_checksum",
+  "server/tests/post_object_suite_test.rs::a_sigv2_signed_form_is_refused",
+  "server/tests/post_object_suite_test.rs::an_unsigned_form_needs_anonymous_access",
+  "server/tests/post_object_suite_test.rs::a_streamed_file_that_does_not_end_at_its_predicted_size_leaves_no_object",
+  "server/tests/post_object_suite_test.rs::a_streamed_file_above_the_range_is_refused_before_storing",
+  "server/tests/post_object_suite_test.rs::a_field_after_the_file_is_malformed",
+  "server/tests/post_object_suite_test.rs::a_post_to_a_bucket_without_a_form_is_method_not_allowed",
+  "server/tests/post_object_suite_test.rs::a_form_shorter_than_its_content_length_does_not_hold_the_budget",
+  "server/tests/post_object_suite_test.rs::a_form_without_a_crlf_after_its_closing_delimiter_is_stored",
+  "server/tests/post_object_suite_test.rs::a_form_with_a_file_above_5_gib_is_refused_before_reading_it",
+  "server/tests/post_object_suite_test.rs::a_form_that_trickles_its_fields_gets_408",
+]
 drive = ["post"]
 fuzz = ["form_upload", "post_policy"]
 
@@ -362,6 +467,7 @@ operations = [
   "GetBucketCors",
   "DeleteBucketCors",
   "OPTIONS preflight",
+  "CorsPreflight",
 ]
 ceph = [
   "test_s3::test_set_cors",
@@ -378,7 +484,14 @@ mint = [
   "minio-java::getBucketCors()",
   "minio-java::setBucketCors()",
 ]
-server_tests = ["server/tests/cors_test.rs"]
+server_tests = [
+  "server/tests/cors_test.rs::test_set_cors",
+  "server/tests/cors_test.rs::test_cors_origin_response",
+  "server/tests/cors_test.rs::test_cors_origin_wildcard",
+  "server/tests/cors_test.rs::test_cors_header_option_and_expose",
+  "server/tests/cors_test.rs::test_cors_presigned_and_unauthenticated_options",
+  "server/tests/cors_test.rs::test_cors_restart_persistence",
+]
 drive = ["cors"]
 fuzz = ["cors_xml"]
 moved = [
@@ -419,7 +532,19 @@ mint = [
   "minio-go: testPutObjectWithChecksums::PutObject(bucketName, objectName, reader, size, opts)",
   "minio-go: testTrailingChecksums::PutObject(bucketName, objectName, reader,size, opts)",
 ]
-server_tests = ["server/tests/checksum_test.rs", "server/tests/streaming_digest_test.rs"]
+server_tests = [
+  "server/tests/checksum_test.rs::put_get_head_all_five_checksum_algorithms_and_restart_persistence",
+  "server/tests/checksum_test.rs::put_checksum_mismatch_returns_400_bad_digest_buffered_and_streamed",
+  "server/tests/checksum_test.rs::multipart_checksum_and_get_object_attributes_parts",
+  "server/tests/checksum_test.rs::range_get_omits_checksum_headers_while_whole_get_includes_them",
+  "server/tests/checksum_test.rs::complete_multipart_returns_checksum_in_xml_and_supports_full_object_crc32",
+  "server/tests/checksum_test.rs::get_object_part_number_returns_part_checksum_and_type",
+  "server/tests/checksum_test.rs::put_object_invalid_checksum_header_returns_400_bad_digest",
+  "server/tests/streaming_digest_test.rs::test_equivalence_hardware_simd_and_software_fallback",
+  "server/tests/streaming_digest_test.rs::test_streaming_put_object_computes_digests_during_ingest",
+  "server/tests/streaming_digest_test.rs::test_negative_control_content_md5_tamper_detected",
+  "server/tests/streaming_digest_test.rs::test_crc32c_implementation_path",
+]
 drive = ["checksums"]
 fuzz = ["attrs_values"]
 
@@ -427,6 +552,7 @@ fuzz = ["attrs_values"]
 id = "object-attributes-api"
 name = "GetObjectAttributes API (ETag, Checksum, ObjectParts, StorageClass, ObjectSize)"
 status = "done"
+gaps = { fuzz = "#447" }
 issue = "#117"
 area = "object-attributes-api"
 design_section = "7.1"
@@ -444,7 +570,10 @@ mint = [
   "minio-go: testPutObjectWithTrailingChecksums::GetObjectAttributes(...)",
   "minio-java::getObjectAttributes()",
 ]
-server_tests = ["server/tests/checksum_test.rs", "server/tests/attributes_test.rs"]
+server_tests = [
+  "server/tests/checksum_test.rs::put_get_head_all_five_checksum_algorithms_and_restart_persistence",
+  "server/tests/checksum_test.rs::multipart_checksum_and_get_object_attributes_parts",
+]
 drive = ["checksums"]
 
 [[feature]]
@@ -508,7 +637,17 @@ mint = [
   "versioning::testPutObjectWithTaggingAndMetadata",
   "versioning::testTagging",
 ]
-server_tests = ["server/tests/tagging_test.rs"]
+server_tests = [
+  "server/tests/tagging_test.rs::test_put_get_modify_delete_object_tagging",
+  "server/tests/tagging_test.rs::test_put_object_with_x_amz_tagging_header",
+  "server/tests/tagging_test.rs::test_tagging_limits_and_errors",
+  "server/tests/tagging_test.rs::test_versioned_object_tagging",
+  "server/tests/tagging_test.rs::test_tagging_restart_persistence",
+  "server/tests/tagging_test.rs::test_copy_object_tagging_directive",
+  "server/tests/tagging_test.rs::test_multipart_upload_tagging",
+  "server/tests/tagging_test.rs::test_get_object_tagging_sorted_by_key",
+  "server/tests/tagging_test.rs::test_bucket_tagging_put_get_delete_and_404_when_unset",
+]
 drive = ["tagging"]
 fuzz = ["tagging_xml"]
 
@@ -685,6 +824,7 @@ mint = [
 id = "conditional"
 name = "Conditional GET, HEAD, PUT, CopyObject, and DELETE (If-Match, If-None-Match, dates)"
 status = "done"
+gaps = { fuzz = "#446" }
 issue = "#112"
 area = "conditional"
 design_section = "6.3"
@@ -754,7 +894,22 @@ mint = [
   "minio-py:test_copy_object_negative_etag_match",
   "minio-py:test_copy_object_unmodified_since",
 ]
-server_tests = ["server/tests/precondition_test.rs", "server/tests/edge_cases_test.rs", "server/tests/conditional_writes_test.rs"]
+server_tests = [
+  "server/tests/precondition_test.rs::get_and_head_exhaustive_table_and_headers",
+  "server/tests/precondition_test.rs::conditional_304_and_412_read_zero_payload_bytes",
+  "server/tests/precondition_test.rs::copy_object_conditional_headers",
+  "server/tests/precondition_test.rs::versioned_get_and_head_respect_preconditions",
+  "server/tests/edge_cases_test.rs::test_if_none_match_atomic_mutex_contention",
+  "server/tests/conditional_writes_test.rs::put_if_match_and_if_none_match_semantics_and_headers",
+  "server/tests/conditional_writes_test.rs::versioned_put_treats_delete_marker_as_absent",
+  "server/tests/conditional_writes_test.rs::complete_multipart_conditional_headers_unversioned_and_versioned",
+  "server/tests/conditional_writes_test.rs::concurrent_if_none_match_star_100_rounds_one_winner_per_round",
+  "server/tests/conditional_writes_test.rs::concurrent_cas_if_match_writers_one_winner_and_survives_kill_restart",
+  "server/tests/conditional_writes_test.rs::failed_condition_writes_nothing_and_leaves_state_and_versions_untouched",
+  "server/tests/conditional_writes_test.rs::streamed_put_condition_decided_at_commit_not_body_start",
+  "server/tests/conditional_writes_test.rs::conditional_delete_and_delete_objects_by_etag_mtime_size_and_version",
+  "server/tests/conditional_writes_test.rs::copy_object_destination_preconditions_evaluated_under_key_lock",
+]
 drive = ["objects", "conditional"]
 
 [[feature]]
@@ -824,16 +979,29 @@ mint = [
   "s3cmd::test_put_object_multipart",
 ]
 server_tests = [
-  "server/tests/multipart_complete_test.rs",
-  "server/tests/multipart_conformance_test.rs",
-  "server/tests/multipart_sigv4_test.rs",
-  "server/tests/multipart_zero_copy_test.rs",
-  "server/tests/part_write_error_test.rs",
-  "server/tests/staged_mpu_test.rs",
-  "server/tests/streaming_part_test.rs",
-  "server/tests/upload_id_restart_test.rs",
-  "server/tests/upload_part_copy_test.rs",
-  "server/tests/test_boto3_compat.py",
+  "server/tests/multipart_complete_test.rs::a_failed_complete_can_be_retried",
+  "server/tests/multipart_conformance_test.rs::complete_multipart_xml_and_part_validation",
+  "server/tests/multipart_conformance_test.rs::upload_part_copy_range_preconditions_and_errors",
+  "server/tests/multipart_conformance_test.rs::get_and_head_with_part_number",
+  "server/tests/multipart_conformance_test.rs::list_parts_and_list_multipart_uploads_pagination",
+  "server/tests/multipart_conformance_test.rs::complete_multipart_is_idempotent_and_abort_after_complete_is_no_such_upload",
+  "server/tests/multipart_conformance_test.rs::complete_multipart_preserves_create_metadata_and_content_type",
+  "server/tests/multipart_conformance_test.rs::complete_multipart_resend_same_part_number_finishes_last",
+  "server/tests/multipart_conformance_test.rs::complete_multipart_versioning_return_version_id",
+  "server/tests/multipart_conformance_test.rs::cli_help_documents_allow_small_parts",
+  "server/tests/multipart_conformance_test.rs::cli_default_rejects_small_parts_and_flag_allows_them",
+  "server/tests/multipart_sigv4_test.rs::test_multipart_lifecycle_out_of_order_and_composite_etag",
+  "server/tests/multipart_sigv4_test.rs::test_multipart_negative_controls_and_abort",
+  "server/tests/multipart_zero_copy_test.rs::test_multipart_zero_copy_range_gets_and_boundary_crossing",
+  "server/tests/part_write_error_test.rs::a_part_that_cannot_be_staged_is_a_500_not_a_200",
+  "server/tests/staged_mpu_test.rs::test_16_parallel_workers_staged_multipart_upload",
+  "server/tests/staged_mpu_test.rs::test_negative_control_abort_cleans_staged_parts",
+  "server/tests/streaming_part_test.rs::a_large_part_is_written_in_pieces",
+  "server/tests/streaming_part_test.rs::a_failed_reupload_of_a_part_keeps_the_earlier_part",
+  "server/tests/streaming_part_test.rs::concurrent_streamed_parts_and_hash_mismatch_cleanup",
+  "server/tests/upload_id_restart_test.rs::a_new_upload_after_a_restart_does_not_touch_a_completed_object",
+  "server/tests/upload_part_copy_test.rs::a_part_with_a_copy_source_is_refused_and_stores_nothing",
+  "server/tests/test_boto3_compat.py::test_06_multipart_upload_workflow",
 ]
 drive = ["multipart"]
 fuzz = ["request_xml"]
@@ -881,7 +1049,18 @@ mint = [
   "minio-py:test_copy_object_with_metadata",
   "minio-py:test_fput_object_with_content_type",
 ]
-server_tests = ["server/tests/metadata_test.rs", "server/tests/attributes_test.rs"]
+server_tests = [
+  "server/tests/metadata_test.rs::all_standard_metadata_headers_round_trip_on_get_and_head",
+  "server/tests/metadata_test.rs::user_metadata_lower_cased_exact_and_empty_values",
+  "server/tests/metadata_test.rs::user_metadata_rejects_crlf_and_over_2kib_metadata_too_large",
+  "server/tests/metadata_test.rs::response_overrides_on_get_and_head_and_anon_refusal",
+  "server/tests/metadata_test.rs::metadata_survives_compaction_and_restart",
+  "server/tests/metadata_test.rs::prop_no_crlf_injection_and_exact_roundtrip_plus_aws_chunked_literal_encoding",
+  "server/tests/metadata_test.rs::non_ascii_user_metadata_bytes_come_back_as_they_were_sent",
+  "server/tests/attributes_test.rs::content_type_survives_a_restart_and_compaction",
+  "server/tests/attributes_test.rs::an_object_sent_without_content_type_has_no_block_and_the_default_type",
+  "server/tests/attributes_test.rs::copy_keeps_the_source_content_type_and_replace_takes_the_requests",
+]
 drive = ["metadata"]
 fuzz = ["attrs_block", "attrs_values", "iso8601"]
 
@@ -938,13 +1117,16 @@ mint = [
   "minio-py:test_presigned_put_object_default_expiry",
   "minio-py:test_presigned_put_object_expiry",
 ]
-server_tests = ["server/tests/multipart_sigv4_test.rs"]
+server_tests = [
+  "server/tests/multipart_sigv4_test.rs::test_sigv4_presigned_url_and_skew_checks",
+]
 fuzz = ["sigv4"]
 
 [[feature]]
 id = "copy"
 name = "CopyObject (same-bucket, cross-bucket, and versioned copy)"
 status = "done"
+gaps = { fuzz = "#445" }
 issue = "#152"
 area = "copy"
 design_section = "4"
@@ -973,10 +1155,12 @@ mint = [
   "minio-py:test_copy_object_no_copy_condition",
 ]
 server_tests = [
-  "server/tests/copy_version_test.rs",
-  "server/tests/metadata_test.rs",
-  "server/tests/key_encoding_test.rs",
-  "server/tests/test_boto3_compat.py",
+  "server/tests/copy_version_test.rs::a_copy_names_its_source_version_and_gets_that_version",
+  "server/tests/copy_version_test.rs::an_old_version_can_be_copied_when_the_key_is_deleted",
+  "server/tests/copy_version_test.rs::an_id_that_names_no_version_answers_no_such_version",
+  "server/tests/metadata_test.rs::copy_object_directives_and_copy_to_self",
+  "server/tests/key_encoding_test.rs::keys_are_the_decoded_path",
+  "server/tests/test_boto3_compat.py::test_04_copy_object",
 ]
 drive = ["copy"]
 
@@ -1057,10 +1241,17 @@ mint = [
   "versioning::testStatObject",
 ]
 server_tests = [
-  "server/tests/versioning_test.rs",
-  "server/tests/versioning_edge_test.rs",
-  "server/tests/versioning_stream_race_test.rs",
-  "server/tests/list_versions_test.rs",
+  "server/tests/versioning_test.rs::three_versions_a_delete_marker_and_a_killed_process",
+  "server/tests/versioning_test.rs::a_version_delete_survives_a_kill",
+  "server/tests/versioning_test.rs::compaction_keeps_every_version_and_their_order",
+  "server/tests/versioning_test.rs::unversioned_and_suspended_buckets_use_the_null_version",
+  "server/tests/versioning_edge_test.rs::put_bucket_versioning_xml_validation",
+  "server/tests/versioning_edge_test.rs::delete_objects_quiet_malformed_and_delete_markers",
+  "server/tests/versioning_edge_test.rs::get_head_delete_version_id_edge_cases",
+  "server/tests/versioning_edge_test.rs::list_object_versions_pagination_delimiter_and_encoding",
+  "server/tests/versioning_stream_race_test.rs::an_unversioned_delete_during_a_streamed_put_does_not_win_after_the_clock_steps_back",
+  "server/tests/versioning_stream_race_test.rs::an_unversioned_put_during_a_streamed_put_lists_the_same_versions_after_a_restart",
+  "server/tests/list_versions_test.rs::unversioned_objects_list_as_null_versions_and_can_be_removed",
 ]
 drive = ["versioning"]
 fuzz = ["version_id", "request_xml"]
@@ -1073,6 +1264,7 @@ fuzz = ["version_id", "request_xml"]
 id = "listing"
 name = "Bucket listing (ListObjects, ListObjectsV2, paginated ListBuckets)"
 status = "done"
+gaps = { fuzz = "#444" }
 issue = "#114"
 area = "listing"
 design_section = "6.6"
@@ -1186,10 +1378,24 @@ mint = [
   "s3cmd::test_sync_list_objects",
 ]
 server_tests = [
-  "server/tests/list_objects_test.rs",
-  "server/tests/listing_test.rs",
-  "server/tests/clock_and_dates_test.rs",
-  "server/tests/test_boto3_compat.py",
+  "server/tests/list_objects_test.rs::delimiter_paging_and_url_encoding",
+  "server/tests/list_objects_test.rs::spilled_keys_are_listed_with_their_own_names",
+  "server/tests/listing_test.rs::max_keys_zero_v1_and_v2",
+  "server/tests/listing_test.rs::max_keys_invalid_and_negative_returns_400",
+  "server/tests/listing_test.rs::v2_fetch_owner_and_v1_owner",
+  "server/tests/listing_test.rs::delimiter_not_skip_special_and_common_prefixes_dedup_sorted",
+  "server/tests/listing_test.rs::encoding_type_url_and_xml_escaping",
+  "server/tests/listing_test.rs::prefix_basic_alt_empty",
+  "server/tests/listing_test.rs::list_objects_v1_prefix_unreadable_not_url_encoded",
+  "server/tests/listing_test.rs::list_buckets_pagination_and_prefix",
+  "server/tests/clock_and_dates_test.rs::last_modified_survives_restart_and_compaction",
+  "server/tests/clock_and_dates_test.rs::two_objects_in_order_have_non_decreasing_last_modified_and_version_id_equals_creation_time",
+  "server/tests/clock_and_dates_test.rs::legacy_bucket_manifest_without_timestamp_defaults_to_started_at",
+  "server/tests/test_boto3_compat.py::test_05_list_objects_v2",
+  "server/tests/listing_props_test.rs::prop_list_objects_v2_pagination_and_encoding",
+  "server/tests/listing_props_test.rs::prop_list_objects_v1_pagination_and_prefix_encoding",
+  "server/tests/listing_props_test.rs::prop_list_objects_v1_and_v2_delimiter_pagination",
+  "server/tests/listing_props_test.rs::prop_list_objects_thousand_batch_boundary",
 ]
 drive = ["listing"]
 
@@ -1270,11 +1476,27 @@ mint = [
   "s3cmd::test_make_bucket_error",
 ]
 server_tests = [
-  "server/tests/s3_details_test.rs",
-  "server/tests/bucket_config_test.rs",
-  "server/tests/wire_test.rs",
-  "server/tests/test_aws_cli.py",
-  "server/tests/test_boto3_compat.py",
+  "server/tests/s3_details_test.rs::create_bucket_validates_bucket_names",
+  "server/tests/s3_details_test.rs::get_bucket_location_and_create_bucket_constraint",
+  "server/tests/s3_details_test.rs::bucket_already_exists_no_such_bucket_and_not_empty",
+  "server/tests/bucket_config_test.rs::config_survives_restart_byte_for_byte_and_delete_stays_deleted",
+  "server/tests/bucket_config_test.rs::latest_record_wins_and_delete_bucket_drops_all_kinds",
+  "server/tests/bucket_config_test.rs::existing_versioning_tilde_lines_still_read_and_written",
+  "server/tests/bucket_config_test.rs::unknown_kind_stops_startup_naming_the_kind",
+  "server/tests/bucket_config_test.rs::corrupt_middle_line_stops_startup_with_line_number",
+  "server/tests/bucket_config_test.rs::torn_last_line_at_every_truncation_offset_is_ignored_with_warning",
+  "server/tests/bucket_config_test.rs::size_limits_and_validator_enforcement",
+  "server/tests/bucket_config_test.rs::plus_record_optional_trailing_fields_parse",
+  "server/tests/bucket_config_test.rs::concurrent_readers_see_consistent_snapshot_without_locks",
+  "server/tests/bucket_config_test.rs::metrics_expose_writes_manifest_size_and_live_ratio",
+  "server/tests/bucket_config_test.rs::prop_replay_equals_live_and_compaction_preserves_state",
+  "server/tests/bucket_config_test.rs::base64_decode_refuses_bits_under_the_padding",
+  "server/tests/wire_test.rs::test_bucket_lifecycle_and_batch_delete",
+  "server/tests/wire_test.rs::test_virtual_host_vs_path_style_routing",
+  "server/tests/test_aws_cli.py::test_aws_cli_mb_cp_ls_rb",
+  "server/tests/test_boto3_compat.py::test_01_bucket_crud",
+  "server/tests/test_boto3_compat.py::test_08_batch_delete_and_bucket_cleanup",
+  "server/tests/listing_props_test.rs::prop_list_buckets_pagination_and_prefix",
 ]
 drive = ["buckets"]
 fuzz = ["s3_target"]
@@ -1308,13 +1530,20 @@ mint = [
   "minio-py:test_get_partial_object",
 ]
 server_tests = [
-  "server/tests/mmap_slice_test.rs",
-  "server/tests/large_get_test.rs",
-  "server/tests/stream_read_test.rs",
-  "server/tests/stream_read_disconnect_test.rs",
-  "server/tests/wire_test.rs",
-  "server/tests/property_tests.rs",
-  "server/tests/test_boto3_compat.py",
+  "server/tests/mmap_slice_test.rs::test_subslice_range_reads_across_boundaries",
+  "server/tests/mmap_slice_test.rs::test_concurrent_multi_worker_range_slicing_under_active_appends",
+  "server/tests/mmap_slice_test.rs::test_out_of_bounds_range_clamping_negative_controls",
+  "server/tests/large_get_test.rs::a_range_of_a_large_object_verifies_nothing_and_a_full_get_verifies_it_once",
+  "server/tests/stream_read_test.rs::a_full_get_and_ranges_of_a_large_object_do_not_use_the_mapping",
+  "server/tests/stream_read_test.rs::no_payload_byte_is_read_before_the_body_is_polled",
+  "server/tests/stream_read_test.rs::a_corrupted_byte_in_the_first_a_middle_or_the_last_chunk_cuts_a_full_get",
+  "server/tests/stream_read_test.rs::a_large_object_keeps_its_content_type_on_full_and_range_gets",
+  "server/tests/stream_read_disconnect_test.rs::a_client_that_leaves_mid_get_frees_its_reader",
+  "server/tests/wire_test.rs::test_rfc9110_range_requests_and_clamping",
+  "server/tests/wire_test.rs::test_range_clamping_negative_control",
+  "server/tests/property_tests.rs::prop_rfc9110_range_slicing_matches_reference",
+  "server/tests/property_tests.rs::test_negative_control_range_shrink_on_fault",
+  "server/tests/test_boto3_compat.py::test_03_range_requests",
 ]
 drive = ["ranges"]
 fuzz = ["range"]
@@ -1436,16 +1665,30 @@ mint = [
   "s3cmd::test_put_object_error",
 ]
 server_tests = [
-  "server/tests/delete_objects_test.rs",
-  "server/tests/edge_cases_test.rs",
-  "server/tests/key_encoding_test.rs",
-  "server/tests/large_get_test.rs",
-  "server/tests/s3_details_test.rs",
-  "server/tests/wire_test.rs",
-  "server/tests/property_tests.rs",
-  "server/tests/streaming_put_test.rs",
-  "server/tests/test_aws_cli.py",
-  "server/tests/test_boto3_compat.py",
+  "server/tests/delete_objects_test.rs::deleted_objects_stay_deleted_after_a_restart",
+  "server/tests/edge_cases_test.rs::test_zero_byte_object_and_folder_marker",
+  "server/tests/edge_cases_test.rs::test_key_validation_and_path_traversal_defenses",
+  "server/tests/edge_cases_test.rs::test_single_flight_coalescing_barrier",
+  "server/tests/edge_cases_test.rs::test_mvcc_isolation_and_negative_control",
+  "server/tests/edge_cases_test.rs::test_incomplete_body_disconnect_rollback",
+  "server/tests/key_encoding_test.rs::keys_are_the_decoded_path",
+  "server/tests/large_get_test.rs::a_range_of_a_large_object_verifies_nothing_and_a_full_get_verifies_it_once",
+  "server/tests/large_get_test.rs::an_object_up_to_4_mib_is_still_verified_before_it_is_sent",
+  "server/tests/large_get_test.rs::a_corrupted_large_object_cannot_be_received_whole",
+  "server/tests/s3_details_test.rs::object_key_over_1024_utf8_bytes_rejected",
+  "server/tests/s3_details_test.rs::invalid_utf8_and_control_char_keys_return_400",
+  "server/tests/wire_test.rs::test_bucket_lifecycle_and_batch_delete",
+  "server/tests/wire_test.rs::test_virtual_host_vs_path_style_routing",
+  "server/tests/property_tests.rs::prop_put_get_roundtrip_identity",
+  "server/tests/property_tests.rs::prop_stateful_model_equivalence_btreemap",
+  "server/tests/streaming_put_test.rs::a_large_put_is_written_in_pieces_and_survives_a_restart",
+  "server/tests/streaming_put_test.rs::a_body_cut_short_stores_nothing_and_later_objects_survive_a_restart",
+  "server/tests/streaming_put_test.rs::a_streamed_body_with_a_wrong_hash_or_md5_is_refused_and_not_stored",
+  "server/tests/streaming_put_test.rs::a_streamed_chunked_body_shorter_or_longer_than_declared_is_refused_and_releases_stream",
+  "server/tests/test_aws_cli.py::test_aws_cli_mb_cp_ls_rb",
+  "server/tests/test_boto3_compat.py::test_02_put_and_get_odd_sizes",
+  "server/tests/test_boto3_compat.py::test_07_corrupted_etag_negative_control",
+  "server/tests/test_boto3_compat.py::test_08_batch_delete_and_bucket_cleanup",
 ]
 drive = ["objects"]
 fuzz = ["request_xml", "s3_target"]
@@ -1458,25 +1701,64 @@ fuzz = ["request_xml", "s3_target"]
 id = "restart"
 name = "Crash durability, restart recovery, and volume persistence"
 status = "done"
+gaps = { fuzz = "#407", ceph = "not needed: the suites never restart the server; restart is checked by the TLA+ model, its Rust replays and the restart tests" }
 issue = "#29"
 operations = ["Server restart recovery", "Durability modes (group, strict, fast)"]
 server_tests = [
-  "server/tests/durability_test.rs",
-  "server/tests/process_restart_test.rs",
-  "server/tests/restart_durability_test.rs",
-  "server/tests/graceful_shutdown_test.rs",
-  "server/tests/key_order_test.rs",
-  "server/tests/delete_objects_test.rs",
-  "server/tests/integrity_test.rs",
-  "server/tests/late_failure_test.rs",
-  "server/tests/journal_retry_test.rs",
-  "server/tests/relocation_test.rs",
-  "server/tests/volume_gap_test.rs",
-  "server/tests/volume_packing_test.rs",
-  "server/tests/volume_rollover_test.rs",
-  "server/tests/sparse_mmap_test.rs",
-  "server/tests/stepped_growth_test.rs",
-  "server/tests/concurrent_io_test.rs",
+  "server/tests/durability_test.rs::group_mode_covers_a_batch_of_writes_with_one_sync_of_volume_and_journal",
+  "server/tests/durability_test.rs::strict_mode_syncs_every_write",
+  "server/tests/durability_test.rs::fast_mode_answers_without_a_sync_and_the_flusher_syncs_later",
+  "server/tests/durability_test.rs::group",
+  "server/tests/durability_test.rs::fast",
+  "server/tests/durability_test.rs::strict",
+  "server/tests/durability_test.rs::an_unknown_mode_stops_the_binary",
+  "server/tests/process_restart_test.rs::objects_survive_a_killed_server_process",
+  "server/tests/restart_durability_test.rs::test_bucket_persistence_across_restart",
+  "server/tests/restart_durability_test.rs::test_needle_objects_persistence_across_restart",
+  "server/tests/graceful_shutdown_test.rs::requests_in_flight_finish_and_survive_a_restart",
+  "server/tests/graceful_shutdown_test.rs::the_binary_stops_cleanly_on_sigterm",
+  "server/tests/key_order_test.rs::concurrent_puts_on_one_key_show_the_same_version_after_restart",
+  "server/tests/key_order_test.rs::put_and_delete_on_one_key_show_the_same_state_after_restart",
+  "server/tests/key_order_test.rs::zero_byte_objects_and_overwrites_survive_restart",
+  "server/tests/key_order_test.rs::copied_object_survives_source_overwrite_and_restart",
+  "server/tests/key_order_test.rs::bucket_answers_head_after_restart",
+  "server/tests/delete_objects_test.rs::deleted_objects_stay_deleted_after_a_restart",
+  "server/tests/integrity_test.rs::full_volume_refuses_writes_instead_of_overwriting_earlier_needles",
+  "server/tests/integrity_test.rs::put_that_cannot_be_written_is_an_error_not_a_200",
+  "server/tests/integrity_test.rs::get_of_a_corrupted_payload_is_an_error_not_zeros",
+  "server/tests/integrity_test.rs::completed_multipart_object_survives_restart",
+  "server/tests/integrity_test.rs::new_volume_superblock_holds_no_stale_heap_bytes",
+  "server/tests/late_failure_test.rs::a_put_whose_journal_append_fails_shows_the_same_object_before_and_after_a_restart",
+  "server/tests/late_failure_test.rs::a_put_whose_sync_fails_shows_the_same_object_before_and_after_a_restart",
+  "server/tests/late_failure_test.rs::a_streamed_put_whose_journal_append_fails_shows_the_same_object_before_and_after_a_restart",
+  "server/tests/late_failure_test.rs::a_streamed_put_whose_sync_fails_shows_the_same_object_before_and_after_a_restart",
+  "server/tests/late_failure_test.rs::a_delete_whose_journal_append_fails_is_gone_before_and_after_a_restart",
+  "server/tests/late_failure_test.rs::a_copy_whose_journal_append_fails_shows_the_same_object_before_and_after_a_restart",
+  "server/tests/late_failure_test.rs::a_multipart_complete_whose_journal_append_fails_shows_the_same_object_before_and_after_a_restart",
+  "server/tests/late_failure_test.rs::a_pre_header_write_failure_does_not_mark_streamed_put_for_relocation",
+  "server/tests/late_failure_test.rs::an_after_record_failure_notes_record_offset_and_relocates_streamed_put",
+  "server/tests/journal_retry_test.rs::a_late_record_after_a_gap_survives_a_restart_once_a_later_write_is_journaled",
+  "server/tests/journal_retry_test.rs::a_late_record_after_a_gap_at_the_end_survives_a_restart_once_synced",
+  "server/tests/relocation_test.rs::a_write_that_failed_after_its_header_does_not_win_after_a_restart",
+  "server/tests/relocation_test.rs::a_relocation_reads_the_needle_in_chunks_not_through_the_mapping",
+  "server/tests/relocation_test.rs::a_streamed_put_abandoned_before_its_header_does_not_make_another_relocate",
+  "server/tests/volume_gap_test.rs::needles_after_a_failed_write_survive_reopen",
+  "server/tests/volume_gap_test.rs::index_journal_is_appended_across_reopen",
+  "server/tests/volume_packing_test.rs::test_crash_recovery_torn_needle_truncation",
+  "server/tests/volume_packing_test.rs::test_s3_reactor_persists_needles_and_recovers_after_cache_eviction",
+  "server/tests/volume_packing_test.rs::test_detects_silent_bitrot_crc32c_negative_control",
+  "server/tests/volume_rollover_test.rs::writes_continue_past_a_full_volume_and_survive_a_restart",
+  "server/tests/volume_rollover_test.rs::a_multipart_object_recorded_in_a_later_volume_survives_a_restart",
+  "server/tests/volume_rollover_test.rs::a_needle_larger_than_a_whole_volume_is_refused_without_rolling",
+  "server/tests/sparse_mmap_test.rs::test_sparse_volume_preallocation_and_zero_remap_concurrency",
+  "server/tests/sparse_mmap_test.rs::test_sparse_recovery_stops_at_unwritten_boundary",
+  "server/tests/sparse_mmap_test.rs::test_negative_control_trailing_garbage_detection",
+  "server/tests/stepped_growth_test.rs::reading_each_object_right_after_its_write_remaps_once_per_extension",
+  "server/tests/stepped_growth_test.rs::a_small_volume_grows_by_its_writes_and_a_large_one_by_a_quarter_of_its_length",
+  "server/tests/stepped_growth_test.rs::a_restart_after_an_extension_recovers_to_the_written_end",
+  "server/tests/stepped_growth_test.rs::a_streamed_needle_is_allocated_once_when_it_is_reserved",
+  "server/tests/concurrent_io_test.rs::test_16_concurrent_threads_writing_needles",
+  "server/tests/concurrent_io_test.rs::test_negative_control_overlapping_offset_corruption_detected",
 ]
 drive = ["restart"]
 
@@ -1484,15 +1766,38 @@ drive = ["restart"]
 id = "sigv4-auth"
 name = "SigV4 header and aws-chunked payload authentication"
 status = "done"
+gaps = { ceph = "not needed: every ceph and Mint test signs with SigV4, so each passing suite test exercises it" }
 issue = "#35"
 operations = ["SigV4 authorization", "aws-chunked signature verification"]
 server_tests = [
-  "server/tests/auth_test.rs",
-  "server/tests/chunk_signature_test.rs",
-  "server/tests/multipart_sigv4_test.rs",
-  "server/tests/parser_robustness_test.rs",
-  "server/tests/sigv4_vectors_test.rs",
-  "server/tests/sigv4_differential_test.rs",
+  "server/tests/auth_test.rs::aws_documented_get_object_signature_is_accepted",
+  "server/tests/auth_test.rs::a_changed_signature_or_secret_is_refused",
+  "server/tests/auth_test.rs::unknown_access_key_and_skewed_clock_are_refused",
+  "server/tests/auth_test.rs::aws_documented_presigned_url_is_accepted_until_it_expires",
+  "server/tests/auth_test.rs::unsigned_requests_need_the_anonymous_switch",
+  "server/tests/auth_test.rs::the_binary_refuses_to_start_without_credentials_or_the_anonymous_switch",
+  "server/tests/auth_test.rs::a_body_must_match_its_declared_sha256",
+  "server/tests/auth_test.rs::a_put_whose_body_does_not_match_its_hash_is_refused",
+  "server/tests/auth_test.rs::a_signed_header_sent_as_latin1_bytes_verifies_against_its_text",
+  "server/tests/auth_test.rs::a_signed_header_sent_as_utf8_bytes_verifies",
+  "server/tests/auth_test.rs::a_non_ascii_header_still_needs_the_right_value_and_secret",
+  "server/tests/chunk_signature_test.rs::aws_documented_chunk_signatures_are_accepted_in_order_only",
+  "server/tests/chunk_signature_test.rs::a_tampered_chunk_is_refused_and_nothing_is_stored",
+  "server/tests/chunk_signature_test.rs::an_unsigned_trailer_body_is_decoded_not_stored_with_its_framing",
+  "server/tests/chunk_signature_test.rs::a_large_signed_chunked_put_is_streamed_and_still_checked",
+  "server/tests/multipart_sigv4_test.rs::test_aws_chunked_decoder_and_signature_tamper_control",
+  "server/tests/multipart_sigv4_test.rs::test_sigv4_presigned_url_and_skew_checks",
+  "server/tests/parser_robustness_test.rs::aws_chunked_round_trips_and_rejects_broken_framing",
+  "server/tests/parser_robustness_test.rs::authenticate_never_panics_on_generated_headers",
+  "server/tests/sigv4_vectors_test.rs::fixtures_include_license_and_every_directory_is_accounted_for",
+  "server/tests/sigv4_vectors_test.rs::applicable_aws_sigv4_vectors_match_expected_and_authenticate",
+  "server/tests/sigv4_differential_test.rs::differential_proptest_accepts_aws_sigv4_and_refuses_mutations",
+  "server/tests/sigv4_differential_test.rs::differential_http_error_codes_match_aws_s3",
+  "server/tests/sigv4_differential_test.rs::edge_1_clock_skew_15_minute_limit_exact_boundary",
+  "server/tests/sigv4_differential_test.rs::edge_2_presigned_expiry_and_seven_day_maximum",
+  "server/tests/sigv4_differential_test.rs::edge_3_content_sha256_mismatch_refused_with_aws_sigv4",
+  "server/tests/sigv4_differential_test.rs::edge_4_unsigned_payload_accepted_and_stored_verbatim",
+  "server/tests/sigv4_differential_test.rs::edge_5_streaming_with_trailing_checksums_unsigned_and_signed",
 ]
 drive = ["doctor"]
 fuzz = ["sigv4", "aws_chunked", "iso8601"]
@@ -1503,7 +1808,19 @@ name = "IAM users and identity policies via --config"
 status = "partial"
 issue = "#53"
 operations = ["User authentication (--config)", "Identity policy authorization"]
-server_tests = ["server/tests/iam_test.rs", "server/tests/anonymous_with_config_test.rs"]
+server_tests = [
+  "server/tests/iam_test.rs::admin_reader_and_scoped_users_get_what_their_policies_say",
+  "server/tests/iam_test.rs::unsupported_policy_parts_are_refused_instead_of_ignored",
+  "server/tests/iam_test.rs::glob_matching",
+  "server/tests/iam_test.rs::a_config_readable_by_others_is_refused",
+  "server/tests/iam_test.rs::a_config_users_streamed_chunked_upload_is_checked_with_its_own_secret",
+  "server/tests/iam_test.rs::users_file_fields_defaults_and_validation",
+  "server/tests/iam_test.rs::same_account_users_share_ownership_and_removing_user_preserves_ownership",
+  "server/tests/iam_test.rs::cross_account_isolation_blocks_other_account_even_with_wildcard_policy",
+  "server/tests/anonymous_with_config_test.rs::users_in_the_config_with_allow_anonymous_is_refused",
+  "server/tests/anonymous_with_config_test.rs::either_one_on_its_own_still_starts",
+  "server/tests/anonymous_with_config_test.rs::a_config_with_no_users_is_not_the_combination",
+]
 
 [[feature]]
 id = "compression"
@@ -1511,64 +1828,102 @@ name = "Opt-in per-bucket zstd compression in 64 KiB blocks"
 status = "partial"
 issue = "#51"
 operations = ["PutObject (zstd)", "GetObject (zstd range decode)"]
-server_tests = ["server/tests/compression_test.rs"]
+server_tests = [
+  "server/tests/compression_test.rs::compressible_objects_shrink_on_disk_and_read_back_whole_and_by_range",
+  "server/tests/compression_test.rs::a_compressed_object_never_lands_in_a_format_1_volume",
+  "server/tests/compression_test.rs::the_config_accepts_zstd_and_none_and_refuses_anything_else",
+]
 
 [[feature]]
 id = "compaction"
 name = "Volume compaction, auto-compaction, and I/O throttling"
 status = "done"
+gaps = { fuzz = "#407" }
 issue = "#14"
 user_visible = false
 server_tests = [
-  "server/tests/compactor_test.rs",
-  "server/tests/compaction_safety_test.rs",
-  "server/tests/compaction_inflight_test.rs",
-  "server/tests/auto_compaction_test.rs",
-  "server/tests/throttle_test.rs",
-  "server/tests/volume_packing_test.rs",
+  "server/tests/compactor_test.rs::test_online_compaction_reclaims_dead_space",
+  "server/tests/compaction_safety_test.rs::compacting_the_oldest_of_several_volumes_keeps_every_object_and_every_delete",
+  "server/tests/compaction_safety_test.rs::writes_racing_with_compaction_keep_the_last_acknowledged_version",
+  "server/tests/compaction_safety_test.rs::a_multipart_object_moved_by_compaction_survives_a_restart",
+  "server/tests/compaction_safety_test.rs::a_put_during_the_copy_of_its_key_wins",
+  "server/tests/compaction_inflight_test.rs::compaction_waits_for_a_streamed_put_still_writing_into_the_volume",
+  "server/tests/compaction_inflight_test.rs::an_abandoned_streamed_put_does_not_hold_compaction_back",
+  "server/tests/compaction_inflight_test.rs::an_object_after_an_abandoned_put_in_the_same_volume_survives_compaction",
+  "server/tests/compaction_inflight_test.rs::a_delete_marker_written_but_not_yet_recorded_survives_compaction",
+  "server/tests/auto_compaction_test.rs::the_oldest_volume_is_compacted_only_past_the_threshold",
+  "server/tests/auto_compaction_test.rs::a_lone_volume_is_sealed_and_compacted_only_above_the_minimum_size",
+  "server/tests/auto_compaction_test.rs::deleting_half_of_100_mb_and_compacting_halves_the_footprint",
+  "server/tests/throttle_test.rs::the_bucket_allows_one_second_of_burst_then_paces_to_the_rate",
+  "server/tests/volume_packing_test.rs::test_background_compaction_reclaims_dead_space",
+  "server/tests/volume_packing_test.rs::test_aligned_buffer_allocation",
+  "server/tests/volume_packing_test.rs::test_needle_4096_alignment_across_odd_sizes",
 ]
 
 [[feature]]
 id = "health"
 name = "Operator health endpoints (/_awanfs/health/live, /_awanfs/health/ready)"
 status = "done"
+gaps = { fuzz = "not needed: answers fixed paths and reads no request input" }
 issue = "#44"
 user_visible = false
 operations = ["GET /_awanfs/health/live", "GET /_awanfs/health/ready"]
-server_tests = ["server/tests/health_test.rs"]
+server_tests = [
+  "server/tests/health_test.rs::live_and_ready_answer_without_credentials",
+  "server/tests/health_test.rs::ready_is_503_while_recovering_and_when_no_needle_can_fit",
+  "server/tests/health_test.rs::buckets_named_health_still_work",
+]
 
 [[feature]]
 id = "metrics"
 name = "Prometheus metrics (/_awanfs/metrics) and dashboard alerts"
 status = "done"
+gaps = { fuzz = "not needed: answers a fixed path and reads no request input" }
 issue = "#42"
 user_visible = false
 operations = ["GET /_awanfs/metrics"]
-server_tests = ["server/tests/metrics_test.rs", "server/tests/deploy_metrics_test.rs"]
+server_tests = [
+  "server/tests/metrics_test.rs::metrics_count_requests_and_match_the_work_counters",
+  "server/tests/deploy_metrics_test.rs::every_metric_in_the_dashboard_and_alerts_is_exported",
+]
 
 [[feature]]
 id = "tls"
 name = "HTTPS TLS termination with rustls (--cert, --key, --http-port)"
 status = "done"
+gaps = { fuzz = "not needed: rustls parses the TLS records; AwanFS reads only its own certificate files" }
 issue = "#30"
 user_visible = false
-server_tests = ["server/tests/tls_test.rs"]
+server_tests = [
+  "server/tests/tls_test.rs::https_put_and_get_with_a_trusted_certificate_and_refused_otherwise",
+  "server/tests/tls_test.rs::plain_http_still_works_without_a_certificate",
+  "server/tests/tls_test.rs::cert_without_key_stops_the_binary",
+]
 
 [[feature]]
 id = "access-log"
 name = "S3 access log file (--access-log)"
 status = "done"
+gaps = { fuzz = "not needed: writes request fields to a log and parses no input" }
 issue = "#46"
 user_visible = false
-server_tests = ["server/tests/access_log_test.rs"]
+server_tests = [
+  "server/tests/access_log_test.rs::clf_time_matches_known_dates",
+  "server/tests/access_log_test.rs::put_get_and_a_denied_request_write_three_access_log_lines",
+]
 
 [[feature]]
 id = "request-log"
 name = "Structured JSON request log and request IDs (x-amz-request-id)"
 status = "done"
+gaps = { fuzz = "not needed: writes request fields to a log and parses no input" }
 issue = "#41"
 user_visible = false
-server_tests = ["server/tests/request_id_test.rs", "server/tests/stalled_log_test.rs"]
+server_tests = [
+  "server/tests/request_id_test.rs::request_ids_are_unique_and_match_the_error_body_and_the_log_line",
+  "server/tests/stalled_log_test.rs::a_server_whose_stderr_nobody_reads_keeps_answering",
+  "server/tests/stalled_log_test.rs::a_server_whose_access_log_nobody_reads_keeps_answering",
+]
 
 [[feature]]
 id = "otlp-tracing"
@@ -1576,7 +1931,11 @@ name = "OpenTelemetry OTLP trace export and W3C traceparent propagation"
 status = "done"
 issue = "#43"
 user_visible = false
-server_tests = ["server/tests/otlp_test.rs"]
+server_tests = [
+  "server/tests/otlp_test.rs::a_put_exports_a_request_span_with_write_and_sync_children",
+  "server/tests/otlp_test.rs::traceparent_parsing",
+  "server/tests/parser_robustness_test.rs::traceparent_enforces_w3c_grammar_without_panicking",
+]
 fuzz = ["traceparent"]
 
 [[feature]]
@@ -1586,15 +1945,39 @@ status = "done"
 issue = "#127"
 user_visible = false
 server_tests = [
-  "server/tests/memory_budget_test.rs",
-  "server/tests/memory_admit_test.rs",
-  "server/tests/memory_cache_test.rs",
-  "server/tests/payload_cache_test.rs",
-  "server/tests/lru_cache_test.rs",
-  "server/tests/spill_budget_test.rs",
-  "server/tests/body_limit_test.rs",
-  "server/tests/body_timeout_test.rs",
-  "server/tests/stalled_put_test.rs",
+  "server/tests/memory_budget_test.rs::the_flag_sets_the_budget_the_cache_and_the_metrics",
+  "server/tests/memory_budget_test.rs::the_environment_sets_it_and_the_flag_wins_over_the_environment",
+  "server/tests/memory_budget_test.rs::without_a_setting_the_budget_comes_from_this_machine_and_stays_inside_its_bounds",
+  "server/tests/memory_budget_test.rs::a_budget_that_cannot_work_stops_the_server_with_a_message",
+  "server/tests/memory_budget_test.rs::the_startup_line_says_what_was_done_to_the_allocator",
+  "server/tests/memory_admit_test.rs::body_budget_try_acquire_and_drop_releases",
+  "server/tests/memory_admit_test.rs::body_budget_clamps_oversized_request_so_it_can_run_alone",
+  "server/tests/memory_admit_test.rs::body_budget_acquire_async_waits_and_rejects_on_timeout",
+  "server/tests/memory_admit_test.rs::server_bounds_concurrent_puts_and_returns_503_slowdown_when_exhausted",
+  "server/tests/memory_admit_test.rs::server_admits_upload_part_and_xml_bodies_and_releases_on_error",
+  "server/tests/memory_cache_test.rs::a_put_does_not_cache_bytes_it_faulted_in_from_the_volume",
+  "server/tests/payload_cache_test.rs::payload_cache_does_not_pin_oversized_bytesmut_backing_buffers",
+  "server/tests/payload_cache_test.rs::payload_cache_does_not_pin_oversized_bytes_slices",
+  "server/tests/payload_cache_test.rs::eviction_by_entry_count_takes_the_entry_out_of_the_byte_count",
+  "server/tests/payload_cache_test.rs::new_keeps_a_million_entry_cap",
+  "server/tests/lru_cache_test.rs::test_lru_cache_capacity_clamp_and_eviction",
+  "server/tests/lru_cache_test.rs::test_lru_cache_overwrite_and_remove",
+  "server/tests/lru_cache_test.rs::test_lru_cache_oversized_item_negative_control",
+  "server/tests/lru_cache_test.rs::test_lru_cache_concurrent_multithreaded_stress",
+  "server/tests/spill_budget_test.rs::spill_cache_is_bounded_by_memory_budget_and_deducted_from_payload_cache",
+  "server/tests/body_limit_test.rs::a_put_declaring_more_than_5_gib_is_refused_before_the_body_is_read",
+  "server/tests/body_limit_test.rs::a_chunked_xml_body_past_the_cap_is_refused",
+  "server/tests/body_timeout_test.rs::stalled_buffered_put_returns_408_and_releases_key",
+  "server/tests/body_timeout_test.rs::stalled_streamed_put_returns_408_and_drops_writer_and_key_lock",
+  "server/tests/body_timeout_test.rs::slow_but_making_progress_put_succeeds",
+  "server/tests/body_timeout_test.rs::stalled_upload_part_returns_408",
+  "server/tests/body_timeout_test.rs::stalled_header_closes_connection",
+  "server/tests/stalled_put_test.rs::a_stalled_put_does_not_block_other_writers_and_the_last_commit_wins_after_a_restart",
+  "server/tests/stalled_put_test.rs::a_delete_during_a_stalled_put_does_not_win_after_a_restart",
+  "server/tests/stalled_put_test.rs::an_undisturbed_streamed_put_is_written_once",
+  "server/tests/stalled_put_test.rs::an_abandoned_streamed_put_is_no_longer_tracked",
+  "server/tests/stalled_put_test.rs::if_none_match_is_decided_at_commit",
+  "server/tests/stalled_put_test.rs::in_a_versioned_bucket_the_last_commit_is_the_current_version_and_nothing_is_copied",
 ]
 fuzz = ["parse_size"]
 
@@ -1602,9 +1985,28 @@ fuzz = ["parse_size"]
 id = "metadata-index"
 name = "In-memory columnar metadata index and spill index"
 status = "done"
+gaps = { fuzz = "#449" }
 issue = "#13"
 user_visible = false
-server_tests = ["server/tests/meta_index_test.rs", "server/tests/metadata_spill_test.rs", "server/tests/index_full_test.rs"]
+server_tests = [
+  "server/tests/meta_index_test.rs::test_metadata_struct_size_and_alignment",
+  "server/tests/meta_index_test.rs::test_bucket_lifecycle_and_invariants",
+  "server/tests/meta_index_test.rs::test_1m_metadata_index_ingest_lookup_and_overwrite",
+  "server/tests/meta_index_test.rs::test_hash_collision_full_key_check",
+  "server/tests/meta_index_test.rs::bench_1m_metadata_index",
+  "server/tests/meta_index_test.rs::test_lexicographical_prefix_scan",
+  "server/tests/meta_index_test.rs::test_c_abi_ffi_panic_safety",
+  "server/tests/meta_index_test.rs::put_object_without_a_time_stamps_the_current_time",
+  "server/tests/metadata_spill_test.rs::test_s3_reactor_spill_database_end_to_end",
+  "server/tests/metadata_spill_test.rs::test_spill_index_crud_and_prefix_scan",
+  "server/tests/metadata_spill_test.rs::test_storage_engine_spill_on_capacity_limit",
+  "server/tests/metadata_spill_test.rs::spill_holds_1_2_million_keys_in_bounded_memory",
+  "server/tests/metadata_spill_test.rs::a_data_dir_with_a_redb_metadata_db_starts_from_the_volumes",
+  "server/tests/index_full_test.rs::a_put_past_index_capacity_gets_503_and_the_server_keeps_serving",
+  "server/tests/index_full_test.rs::concurrent_slot_reservation_prevents_writes_and_preserves_multipart_for_retry",
+  "server/tests/index_full_test.rs::versioned_err_capacity_rejects_without_mutating_versions_or_uploads",
+  "server/tests/index_full_test.rs::versioned_complete_retry_and_midstream_delete_at_capacity_leave_no_object",
+]
 
 [[feature]]
 id = "volume-format"
@@ -1613,12 +2015,30 @@ status = "done"
 issue = "#50"
 user_visible = false
 server_tests = [
-  "server/tests/format_version_test.rs",
-  "server/tests/attributes_test.rs",
-  "server/tests/attr_update_test.rs",
-  "server/tests/needle_writer_state_test.rs",
-  "server/tests/work_count_test.rs",
-  "server/tests/commit_cost_probe.rs",
+  "server/tests/format_version_test.rs::a_volume_from_before_the_version_field_still_serves_its_objects",
+  "server/tests/format_version_test.rs::a_newer_volume_format_is_refused_naming_both_versions",
+  "server/tests/format_version_test.rs::the_binary_exits_2_on_a_newer_format",
+  "server/tests/format_version_test.rs::manifests_carry_their_version",
+  "server/tests/attributes_test.rs::a_needle_without_attributes_is_byte_identical_to_format_2",
+  "server/tests/attributes_test.rs::a_streamed_needle_with_a_block_larger_than_a_sector_reads_back",
+  "server/tests/attributes_test.rs::a_format_2_volume_keeps_serving_and_attributes_go_to_a_format_3_volume",
+  "server/tests/attributes_test.rs::a_relocated_streamed_put_keeps_its_block_and_its_bytes",
+  "server/tests/attr_update_test.rs::tagging_update_writes_0x200_delta_without_rewriting_payload_and_survives_restart_compaction",
+  "server/tests/attr_update_test.rs::absent_version_and_delete_marker_are_refused_without_writing_needles",
+  "server/tests/attr_update_test.rs::compaction_moves_base_past_update_keeps_latest_and_drops_dead_updates",
+  "server/tests/attr_update_test.rs::compaction_of_updates_keeps_only_latest_live_group_and_drops_superseded",
+  "server/tests/attr_update_test.rs::head_without_attrs_or_updates_does_zero_needle_reads_and_accounting_includes_attrs",
+  "server/tests/attr_update_test.rs::differential_10000_sequences_live_vs_restart",
+  "server/tests/attr_update_test.rs::copy_object_without_version_id_on_versioned_object_carries_0x200_tag_updates_and_deletes",
+  "server/tests/attr_update_test.rs::streamed_put_relocation_preserves_monotonic_created_at_over_concurrent_tag_update",
+  "server/tests/attr_update_test.rs::put_tagging_with_nonexistent_version_id_on_unversioned_key_returns_nosuchversion",
+  "server/tests/needle_writer_state_test.rs::a_refused_write_ends_the_needle",
+  "server/tests/needle_writer_state_test.rs::a_short_needle_does_not_commit",
+  "server/tests/needle_writer_state_test.rs::an_exact_needle_commits_and_is_recovered",
+  "server/tests/work_count_test.rs::single_object_put_get_range_delete",
+  "server/tests/work_count_test.rs::multipart_upload_and_reads",
+  "server/tests/work_count_test.rs::streamed_put_is_digested_while_it_is_written",
+  "server/tests/commit_cost_probe.rs::what_one_commit_costs_at_the_volume_layer",
 ]
 fuzz = ["attrs_block", "attrs_values"]
 
@@ -1626,9 +2046,13 @@ fuzz = ["attrs_block", "attrs_values"]
 id = "operation-table"
 name = "Central S3 operation table, 501 handling, and bucket config manifest"
 status = "done"
+gaps = { fuzz = "#448" }
 issue = "#148"
 user_visible = false
-server_tests = ["server/tests/operation_table_test.rs", "server/tests/bucket_config_test.rs"]
+server_tests = [
+  "server/tests/operation_table_test.rs::unknown_subresources_answer_501_and_store_nothing",
+  "server/tests/operation_table_test.rs::error_precedence_follows_pipeline_order",
+]
 
 [[feature]]
 id = "erasure-coding"
@@ -1636,7 +2060,11 @@ name = "Erasure coding and cluster gossip heartbeat scaffold"
 status = "planned"
 issue = "#52"
 user_visible = false
-server_tests = ["server/tests/erasure_coding_test.rs"]
+server_tests = [
+  "server/tests/erasure_coding_test.rs::test_erasure_coding_8_plus_4_roundtrip_and_fault_tolerance",
+  "server/tests/erasure_coding_test.rs::test_erasure_coding_4_plus_2_roundtrip_and_loss",
+  "server/tests/erasure_coding_test.rs::test_cluster_heartbeat_protocol_and_failure_detection",
+]
 
 [[feature]]
 id = "mint-vs-aws"
@@ -1733,4 +2161,4 @@ notes = "Not built: `?website` on a bucket answers 501 NotImplemented (UNBUILT_S
 operations = []
 ceph = []
 mint = []
-server_tests = ["server/tests/static_website_test.rs"]
+server_tests = ["server/tests/static_website_test.rs::bucket_website_put_get_and_delete_answer_not_implemented"]

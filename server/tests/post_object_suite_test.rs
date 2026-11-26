@@ -216,6 +216,7 @@ async fn test_post_object_anonymous_request() {
     assert_eq!(get_body(&c, &srv, "post-anon", "foo.txt").await, (StatusCode::OK, b"bar".to_vec()));
 }
 
+// covers: PostObject
 #[tokio::test]
 async fn test_post_object_authenticated_request() {
     let srv = signed_server().await;

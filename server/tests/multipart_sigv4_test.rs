@@ -20,6 +20,7 @@ async fn spawn_test_server(enforce_min_size: bool) -> (String, s3_server::Server
     (base_url, handle)
 }
 
+// covers: CreateMultipartUpload, UploadPart, CompleteMultipartUpload
 #[tokio::test]
 async fn test_multipart_lifecycle_out_of_order_and_composite_etag() {
     let (base_url, _handle) = spawn_test_server(false).await;
@@ -146,6 +147,7 @@ async fn test_multipart_lifecycle_out_of_order_and_composite_etag() {
     assert_eq!(range_bytes.as_ref(), &expected_payload[p1_len - 5..=p1_len + 5]);
 }
 
+// covers: AbortMultipartUpload
 #[tokio::test]
 async fn test_multipart_negative_controls_and_abort() {
     let (base_url, _handle) = spawn_test_server(true).await; // Enforce >= 5 MiB size validation

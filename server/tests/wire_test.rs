@@ -15,6 +15,7 @@ async fn spawn_test_server() -> (String, s3_server::ServerHandle) {
     (base_url, handle)
 }
 
+// covers: CreateBucket, HeadBucket, DeleteBucket, PutObject, DeleteObjects
 #[tokio::test]
 async fn test_bucket_lifecycle_and_batch_delete() {
     let (base_url, _handle) = spawn_test_server().await;
