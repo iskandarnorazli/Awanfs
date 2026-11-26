@@ -73,6 +73,9 @@ scheduled or PR-triggered run. A comparison of modes or builds is an experiment.
 on a branch that is not merged, and its result goes in `measurements/`. The nightly runs had grown
 too long.
 
+One exception: `bench-scaling.yml` also runs Garage, SeaweedFS and AwanFS `--durability fast`,
+at sizes up to 1 MiB ([owner, 2026-11-26](https://github.com/iskandarnorazli/Awanfs/issues/419#issuecomment-7183575108)).
+
 ## Traps this repository has hit
 
 - **Bucket names are 3 to 63 characters.** Tests with a two-character bucket fail for the wrong reason (it happened twice).
