@@ -1,0 +1,5 @@
+REQ:PUT
+bkt
+obj
+C
+partNumber=1&uploadId=u1

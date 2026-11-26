@@ -2046,13 +2046,13 @@ fuzz = ["attrs_block", "attrs_values"]
 id = "operation-table"
 name = "Central S3 operation table, 501 handling, and bucket config manifest"
 status = "done"
-gaps = { fuzz = "#448" }
 issue = "#148"
 user_visible = false
 server_tests = [
   "server/tests/operation_table_test.rs::unknown_subresources_answer_501_and_store_nothing",
   "server/tests/operation_table_test.rs::error_precedence_follows_pipeline_order",
 ]
+fuzz = ["classify"]
 
 [[feature]]
 id = "erasure-coding"
