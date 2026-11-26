@@ -1067,6 +1067,33 @@ class GarageAndSeaweedfsTests(unittest.TestCase):
         self.assertIn("| Garage | seq-write | 4 KiB | 1 | 1 | not measured (garage binary not found (upstream releases Linux binaries only)) |", md)
         self.assertIn("| SeaweedFS | seq-write | 4 KiB | 1 | 1 |", md)
 
+
+    def test_matrix_title_names_only_the_servers_that_ran(self):
+        # #439: `--servers AwanFS` wrote "AwanFS vs MinIO vs RustFS vs Garage vs SeaweedFS".
+        sizes, cores, concs = [4 * cs.KIB], [1], [1]
+        results = {
+            "seq-write": {
+                4 * cs.KIB: {"AwanFS": {1: {1: cs.PointResult(ops_per_sec=100.0, mib_per_sec=0.4, p50_ms=1.0, p99_ms=2.0)}}}
+            }
+        }
+        md = cs.render_matrix_report(
+            cmd="python benchmarks/core_scaling.py --matrix --servers AwanFS",
+            patterns=["seq-write"],
+            sizes=sizes,
+            cores=cores,
+            concurrencies=concs,
+            results=results,
+            total_cores=4,
+            runs=1,
+            duration_sec=1.0,
+            seed=42,
+            memory_budget="",
+            prefill_bytes=0,
+            servers=["AwanFS"],
+        )
+        title = next(l for l in md.splitlines() if l.startswith("# "))
+        self.assertTrue(title.startswith("# Pattern & Concurrency Scaling Benchmark: AwanFS ("), title)
+        self.assertNotIn("vs MinIO", title)
     def test_garage_config_toml_and_missing_binary_not_measured(self):
         cfg = cs.garage_config_toml("/tmp/meta", "/tmp/data", s3_port=3900, rpc_port=3901, rpc_secret="ab" * 32)
         self.assertIn("replication_factor = 1", cfg)

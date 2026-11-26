@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Drives a fresh s3-server the way a user does (aws CLI) and keeps the evidence.
-#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional (default: all)
+#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle (default: all)
 # Needs: a built server (cargo build --release --manifest-path server/Cargo.toml), the aws CLI, curl.
 # Evidence: verification/evidence/<UTC timestamp>/ (kept after cleanup). Exit 0 only if every journey passed.
 set -uo pipefail
@@ -301,6 +301,90 @@ j_conditional() { local et1 et2 et_k2 id p1;
   p1=$(S3 upload-part --bucket verify-cond --key mp-cond --part-number 1 --upload-id "$id" --body "$EVID/cond1.bin" --query ETag --output text) &&
   S3 complete-multipart-upload --bucket verify-cond --key mp-cond --upload-id "$id" --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$p1}]}" --if-none-match "*" >/dev/null &&
   S3 head-object --bucket verify-cond --key mp-cond >/dev/null; }
+j_lock() { local vid;
+  S3 create-bucket --bucket verify-lock --object-lock-enabled-for-bucket &&
+  ! S3 put-bucket-versioning --bucket verify-lock --versioning-configuration Status=Suspended 2>"$EVID/lock-suspend.err" && grep -q InvalidBucketState "$EVID/lock-suspend.err" &&
+  S3 put-object-lock-configuration --bucket verify-lock --object-lock-configuration '{"ObjectLockEnabled":"Enabled","Rule":{"DefaultRetention":{"Mode":"GOVERNANCE","Days":1}}}' &&
+  S3 get-object-lock-configuration --bucket verify-lock --query 'ObjectLockConfiguration.Rule.DefaultRetention.Mode' --output text | grep -qx GOVERNANCE &&
+  echo "locked-data" >"$EVID/lock.bin" &&
+  vid=$(S3 put-object --bucket verify-lock --key locked --body "$EVID/lock.bin" --checksum-algorithm SHA256 --query VersionId --output text) &&
+  S3 get-object-retention --bucket verify-lock --key locked --query 'Retention.Mode' --output text | grep -qx GOVERNANCE &&
+  S3 put-object-legal-hold --bucket verify-lock --key locked --legal-hold Status=ON &&
+  S3 head-object --bucket verify-lock --key locked --query ObjectLockLegalHoldStatus --output text | grep -qx ON &&
+  ! S3 delete-object --bucket verify-lock --key locked --version-id "$vid" 2>"$EVID/lock-del.err" && grep -q AccessDenied "$EVID/lock-del.err" &&
+  S3 put-object-legal-hold --bucket verify-lock --key locked --legal-hold Status=OFF &&
+  S3 delete-object --bucket verify-lock --key locked --version-id "$vid" --bypass-governance-retention; }
+
+# A browser form upload (#119), signed with SigV4 the way the AWS SDKs sign presigned POSTs.
+# postform BUCKET KEY FILE EXPIRY_SECONDS [success_action_status]: prints the HTTP status, then the body.
+postform() { python3 - "$URL" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$@" <<'PY'
+import base64, datetime, hashlib, hmac, json, sys, urllib.error, urllib.request
+url, ak, sk, bucket, key, path, expiry = sys.argv[1:8]
+status = sys.argv[8] if len(sys.argv) > 8 else ""
+now = datetime.datetime.now(datetime.timezone.utc)
+date = now.strftime("%Y%m%dT%H%M%SZ")
+cred = f"{ak}/{date[:8]}/us-east-1/s3/aws4_request"
+fields = [("key", key), ("Content-Type", "text/plain"), ("x-amz-meta-journey", "post"),
+          ("x-amz-algorithm", "AWS4-HMAC-SHA256"), ("x-amz-credential", cred), ("x-amz-date", date)]
+if status:
+    fields.append(("success_action_status", status))
+conds = [{"bucket": bucket}] + [{k: v} for k, v in fields] + [["content-length-range", 0, 10485760]]
+exp = (now + datetime.timedelta(seconds=int(expiry))).strftime("%Y-%m-%dT%H:%M:%SZ")
+policy = base64.b64encode(json.dumps({"expiration": exp, "conditions": conds}).encode()).decode()
+h = lambda k, m: hmac.new(k, m.encode(), hashlib.sha256).digest()
+skey = h(h(h(h(("AWS4" + sk).encode(), date[:8]), "us-east-1"), "s3"), "aws4_request")
+fields += [("policy", policy), ("x-amz-signature", hmac.new(skey, policy.encode(), hashlib.sha256).hexdigest())]
+b = "journeyboundary"
+body = b"".join(f'--{b}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode() for k, v in fields)
+body += f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="f"\r\n\r\n'.encode() + open(path, "rb").read() + f"\r\n--{b}--\r\n".encode()
+req = urllib.request.Request(f"{url}/{bucket}", data=body, method="POST", headers={"Content-Type": f"multipart/form-data; boundary={b}"})
+try:
+    with urllib.request.urlopen(req) as r:
+        print(r.status); print(r.read().decode())
+except urllib.error.HTTPError as e:
+    print(e.code); print(e.read().decode())
+PY
+}
+j_post() { S3 create-bucket --bucket verify-post && head -c 6000000 /dev/urandom >"$EVID/post-big.bin" && echo "posted by a form" >"$EVID/post.bin" &&
+  postform verify-post up/hello.txt "$EVID/post.bin" 600 | head -1 | grep -qx 204 &&
+  S3 get-object --bucket verify-post --key up/hello.txt "$EVID/post.out" >"$EVID/post-head.json" && same "$EVID/post.bin" "$EVID/post.out" &&
+  grep -q '"journey": "post"' "$EVID/post-head.json" && grep -q '"ContentType": "text/plain"' "$EVID/post-head.json" &&
+  postform verify-post up/big.bin "$EVID/post-big.bin" 600 201 >"$EVID/post-201.txt" && head -1 "$EVID/post-201.txt" | grep -qx 201 &&
+  grep -q '<Key>up/big.bin</Key>' "$EVID/post-201.txt" &&
+  S3 get-object --bucket verify-post --key up/big.bin "$EVID/post-big.out" >/dev/null && same "$EVID/post-big.bin" "$EVID/post-big.out" &&
+  postform verify-post up/late.txt "$EVID/post.bin" -60 >"$EVID/post-expired.txt" && head -1 "$EVID/post-expired.txt" | grep -qx 403 &&
+  grep -q AccessDenied "$EVID/post-expired.txt" && ! S3 head-object --bucket verify-post --key up/late.txt 2>/dev/null; }
+j_lifecycle() { local lc_data lc_port lc_url lc_pid="";
+  S3 create-bucket --bucket verify-lc &&
+  S3 put-bucket-lifecycle-configuration --bucket verify-lc --lifecycle-configuration '{"Rules":[{"ID":"r1","Filter":{"Prefix":"exp/"},"Status":"Enabled","Expiration":{"Days":5}}]}' &&
+  S3 get-bucket-lifecycle-configuration --bucket verify-lc --query 'Rules[0].ID' --output text | grep -qx r1 &&
+  echo "lc-body" >"$EVID/lc.bin" &&
+  S3 put-object --bucket verify-lc --key exp/a --body "$EVID/lc.bin" >"$EVID/lc-put.json" && grep -q 'rule-id=\\"r1\\"' "$EVID/lc-put.json" &&
+  S3 head-object --bucket verify-lc --key exp/a >"$EVID/lc-head.json" && grep -q 'rule-id=\\"r1\\"' "$EVID/lc-head.json" &&
+  ! S3 put-bucket-lifecycle-configuration --bucket verify-lc --lifecycle-configuration '{"Rules":[{"ID":"bad","Filter":{"Prefix":""},"Status":"Enabled","Expiration":{"Days":0}}]}' 2>"$EVID/lc-bad.err" &&
+  grep -q InvalidArgument "$EVID/lc-bad.err" &&
+  S3 delete-bucket-lifecycle --bucket verify-lc &&
+  ! S3 get-bucket-lifecycle-configuration --bucket verify-lc 2>"$EVID/lc-gone.err" && grep -q NoSuchLifecycleConfiguration "$EVID/lc-gone.err" &&
+  lc_data="$(mktemp -d)" &&
+  lc_port=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])') &&
+  lc_url="http://127.0.0.1:$lc_port" &&
+  (
+    trap '[ -n "${lc_pid:-}" ] && kill "$lc_pid" 2>/dev/null; wait "${lc_pid:-}" 2>/dev/null; rm -rf "$lc_data"' EXIT
+    AWANFS_ACCESS_KEY="$AWS_ACCESS_KEY_ID" AWANFS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" "$BIN" --port "$lc_port" --data-dir "$lc_data" --lifecycle-day-seconds 1 >>"$EVID/lc-server.log" 2>&1 & lc_pid=$!
+    ok=0; for _ in $(seq 1 100); do if curl -sf "$lc_url/_awanfs/health/ready" >/dev/null; then ok=1; break; fi; sleep 0.1; done; [ "$ok" -eq 1 ]
+    aws --endpoint-url "$lc_url" s3api create-bucket --bucket verify-lc-exp >/dev/null
+    aws --endpoint-url "$lc_url" s3api put-bucket-versioning --bucket verify-lc-exp --versioning-configuration Status=Enabled >/dev/null
+    aws --endpoint-url "$lc_url" s3api put-object --bucket verify-lc-exp --key k --body "$EVID/lc.bin" >/dev/null
+    aws --endpoint-url "$lc_url" s3api put-object --bucket verify-lc-exp --key k --body "$EVID/lc.bin" >/dev/null
+    aws --endpoint-url "$lc_url" s3api delete-object --bucket verify-lc-exp --key k >/dev/null
+    aws --endpoint-url "$lc_url" s3api put-bucket-lifecycle-configuration --bucket verify-lc-exp --lifecycle-configuration '{"Rules":[{"ID":"nc-dm","Filter":{"Prefix":""},"Status":"Enabled","Expiration":{"Days":1},"NoncurrentVersionExpiration":{"NoncurrentDays":1}}]}' >/dev/null
+    expired=0; for _ in $(seq 1 40); do
+      aws --endpoint-url "$lc_url" s3api list-object-versions --bucket verify-lc-exp >"$EVID/lc-vers.json"
+      if ! grep -q '"Key": "k"' "$EVID/lc-vers.json"; then expired=1; break; fi
+      sleep 0.2
+    done
+    [ "$expired" -eq 1 ]
+  ); }
 
 # Refuse to run a journey whose && chain is split by a `local x;` (see the note above md5q).
 masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:]]+local [^;]*;|&& *local ' || true)
@@ -308,7 +392,7 @@ masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:
 
 start || exit 1
 check doctor doctor
-features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional)
+features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle)
 [[ " ${features[*]} " == *" buckets "* ]] || check buckets j_buckets
 for f in "${features[@]}"; do check "$f" "j_$f"; done
 ls -la "$DATA" >"$EVID/data-dir.txt" 2>&1

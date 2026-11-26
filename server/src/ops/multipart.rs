@@ -193,6 +193,9 @@ pub async fn create_multipart_upload(
         Ok(a) => a,
         Err(resp) => return Ok(resp),
     };
+    if let Err(resp) = super::object::apply_lock_headers_and_default(&state, b_id, key, headers, &mut attrs, false, false) {
+        return Ok(resp);
+    }
     super::object::apply_owner_attr(&mut attrs, writer_account, bucket_owner);
     let tag_set = match crate::ops::tagging::parse_tagging_header_from(headers, key) {
         Ok(t) => t,
@@ -865,6 +868,25 @@ pub async fn complete_multipart_upload(
                 None
             };
             let mut attrs = upload_attrs.clone().unwrap_or_default();
+            if matches!(attrs.retention(), Ok(None)) {
+                if let Some(dr) = state.bucket_object_lock(b_id).and_then(|c| c.default_retention) {
+                    let now_ns = state.clock.now_ns();
+                    let now_sec = now_ns / 1_000_000_000;
+                    let ret = crate::object_lock::compute_default_retention(dr, now_ns);
+                    if let Err(r) = crate::fsm::lock_step(
+                        crate::fsm::Lock::default(),
+                        crate::fsm::LockEvent::PutRetention {
+                            mode: ret.mode,
+                            until: ret.retain_until_epoch,
+                            bypass_governance: false,
+                        },
+                        now_sec,
+                    ) {
+                        return Ok(bad_request(r.code, r.why, key));
+                    }
+                    attrs.set_retention(Some(&ret));
+                }
+            }
             let part_sizes: Vec<u64> = extents.iter().map(|e| e.part_size).collect();
             attrs.set_part_sizes(&part_sizes);
             if let Some((alg, ref ct, ref val)) = final_cksum {

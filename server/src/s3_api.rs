@@ -113,13 +113,15 @@ pub(crate) fn entity_too_large(resource: &str, limit: u64) -> Response<ResponseB
 /// Reads a request body of at most `limit` bytes, timing out if no frame arrives within
 /// `idle_timeout`. `Ok(Err(response))` is the answer to send when the body is too large,
 /// times out, or is cut short.
-pub(crate) async fn read_body(
-    mut body: hyper::body::Incoming,
+pub(crate) async fn read_body<B>(
+    mut body: B,
     limit: u64,
     idle_timeout: std::time::Duration,
     resource: &str,
-) -> Result<Result<Bytes, Response<ResponseBody>>, hyper::Error> {
-    use hyper::body::Body as _;
+) -> Result<Result<Bytes, Response<ResponseBody>>, hyper::Error>
+where
+    B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Unpin,
+{
     if body.size_hint().lower() > limit {
         return Ok(Err(entity_too_large(resource, limit)));
     }
@@ -167,16 +169,18 @@ pub(crate) fn slow_down_response(resource: &str, msg: &str) -> Response<Response
 
 /// Acquires against `budget` before buffering `body`, returning the `AdmissionGuard` and
 /// `InflightGuard` alongside the collected bytes so the caller holds both until consumed or dropped.
-pub(crate) async fn read_body_admitted(
+pub(crate) async fn read_body_admitted<B>(
     budget: &crate::memory::BodyBudget,
     work: &Arc<WorkCounters>,
-    body: hyper::body::Incoming,
+    body: B,
     limit: u64,
     estimated_bytes: Option<u64>,
     idle_timeout: std::time::Duration,
     resource: &str,
-) -> Result<Result<(Bytes, (crate::memory::AdmissionGuard, crate::work::InflightGuard)), Response<ResponseBody>>, hyper::Error> {
-    use hyper::body::Body as _;
+) -> Result<Result<(Bytes, (crate::memory::AdmissionGuard, crate::work::InflightGuard)), Response<ResponseBody>>, hyper::Error>
+where
+    B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Unpin,
+{
     let hint = estimated_bytes
         .or_else(|| body.size_hint().exact())
         .unwrap_or(limit)
@@ -238,7 +242,10 @@ pub const VERIFY_WHILE_SENDING_MIN: u64 = 4 * 1024 * 1024;
 pub const STREAM_PUT_MIN: u64 = 4 * 1024 * 1024;
 
 /// Reads and drops what is left of a request body, at most `limit` bytes.
-pub(crate) async fn drain_body(body: &mut hyper::body::Incoming, limit: u64) {
+pub(crate) async fn drain_body<B>(body: &mut B, limit: u64)
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
     let mut seen = 0u64;
     while seen < limit {
         match crate::body_timeout::next_frame_with_idle(body, crate::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT).await {
@@ -972,6 +979,7 @@ impl Default for OpenLimits {
 #[derive(Debug)]
 pub enum DeleteError {
     PreconditionFailed(Option<crate::precondition::ObjectFacts>),
+    AccessDenied,
     Internal(String),
 }
 
@@ -1604,6 +1612,7 @@ impl S3ServiceState {
             .await
             .map_err(|e| match e {
                 DeleteError::PreconditionFailed(_) => "PreconditionFailed".to_string(),
+                DeleteError::AccessDenied => "AccessDenied".to_string(),
                 DeleteError::Internal(s) => s,
             })
     }
@@ -1676,57 +1685,106 @@ impl S3ServiceState {
             }
         }
         self.hook("delete_start", key);
-        if let Some((extra, ts)) = self.version_stamp(b_id, key) {
-            let flags = AWAN_FLAG_TOMBSTONE | extra;
-            // A marker whole in the volume is replayed by recovery: it takes effect here too,
-            // and the request still answers an error (#184, owner decision 4B).
-            let (_loc, g, late) = match self.write_to_active_at(b_id, key, &[], flags, 0, 0, Some(ts)) {
-                Ok((vm, loc, g)) => {
-                    self.hook("delete_marker_written", key);
-                    self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                    let late = self.make_durable(&vm, loc.seq).await.err().map(|e| format!("could not sync the delete: {:?}", e));
-                    (loc, g, late)
-                }
-                Err(VolumeError::AfterRecord { loc, cause, .. }) => {
-                    self.hook("delete_marker_written", key);
-                    self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                    (loc, global_offset(loc.volume_id, loc.offset), Some(format!("could not record the delete: {}", cause)))
-                }
-                Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
-            };
-            self.mvcc.tombstone(b_id, key);
-            let v = crate::versions::Version { ts, modified: ts, null: flags & crate::meta_index::FLAG_NULL_ID != 0, marker: true, vol_offset: g, size: 0, etag_hi: 0, etag_lo: 0, part_count: 0, flags };
-            let ev_spec = VersionCommitEventSpec {
-                time: ts,
-                version: Some(v.id_string()),
-                kind: crate::events::CommitKind::DeleteMarker,
-                size: 0,
-                etag: String::new(),
-                acked: late.is_none(),
-            };
-            self.record_version_commit(b_id, key, crate::versions::Event::Put(v), None, Some(ev_spec))
-                .map_err(|c| DeleteError::Internal(format!("index error {} for the delete marker", c)))?;
-            if let Some(e) = late {
-                return Err(DeleteError::Internal(e));
-            }
-            return Ok(Some(v.id_string()));
+        if self.version_stamp(b_id, key).is_some() {
+            return self.write_delete_marker_locked(b_id, key).await.map(Some);
         }
-        // Log the tombstone first; only a logged delete removes the row, so a failed write is
-        // an error and the object stays (verification/tla, DeleteLogsFirst).
-        // A tombstone whole in the volume is replayed by recovery: the row is removed here
-        // too, and the request still answers an error (#184, owner decision 4B).
+        // Unversioned path (defense in depth: never delete a locked object even if unversioned).
+        let unv_target = self
+            .engine
+            .read()
+            .get_object(b_id, key.as_bytes())
+            .ok()
+            .map(|m| null_version_of(&m));
+        if let Some(ref v) = unv_target {
+            let lock = self.version_lock_for(b_id, key, v)?;
+            let now_sec = self.clock.now_ns() / 1_000_000_000;
+            if lock.may_delete(now_sec, false).is_err() {
+                return Err(DeleteError::AccessDenied);
+            }
+        }
+        self.expire_unversioned_locked(b_id, key).await.map(|_| None)
+    }
+
+    /// Writes a versioned delete marker under `key_locks` (#31, #118). Caller holds `lock_key`.
+    pub(crate) async fn write_delete_marker_locked(&self, b_id: u32, key: &str) -> Result<String, DeleteError> {
+        let Some((extra, ts)) = self.version_stamp(b_id, key) else {
+            return Err(DeleteError::Internal("bucket is not versioned".to_string()));
+        };
+        let flags = AWAN_FLAG_TOMBSTONE | extra;
+        // A marker whole in the volume is replayed by recovery: it takes effect here too,
+        // and the request still answers an error (#184, owner decision 4B).
+        let (_loc, g, late) = match self.write_to_active_at(b_id, key, &[], flags, 0, 0, Some(ts)) {
+            Ok((vm, loc, g)) => {
+                self.hook("delete_marker_written", key);
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                let late = self
+                    .make_durable(&vm, loc.seq)
+                    .await
+                    .err()
+                    .map(|e| format!("could not sync the delete: {:?}", e));
+                (loc, g, late)
+            }
+            Err(VolumeError::AfterRecord { loc, cause, .. }) => {
+                self.hook("delete_marker_written", key);
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                (
+                    loc,
+                    global_offset(loc.volume_id, loc.offset),
+                    Some(format!("could not record the delete: {}", cause)),
+                )
+            }
+            Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
+        };
+        self.mvcc.tombstone(b_id, key);
+        let v = crate::versions::Version {
+            ts,
+            modified: ts,
+            null: flags & crate::meta_index::FLAG_NULL_ID != 0,
+            marker: true,
+            vol_offset: g,
+            size: 0,
+            etag_hi: 0,
+            etag_lo: 0,
+            part_count: 0,
+            flags,
+        };
+        let ev_spec = VersionCommitEventSpec {
+            time: ts,
+            version: Some(v.id_string()),
+            kind: crate::events::CommitKind::DeleteMarker,
+            size: 0,
+            etag: String::new(),
+            acked: late.is_none(),
+        };
+        self.record_version_commit(b_id, key, crate::versions::Event::Put(v), None, Some(ev_spec))
+            .map_err(|c| DeleteError::Internal(format!("index error {} for the delete marker", c)))?;
+        if let Some(e) = late {
+            return Err(DeleteError::Internal(e));
+        }
+        Ok(v.id_string())
+    }
+
+    /// Writes an unversioned tombstone under `key_locks` (#184, #118). Returns previous object's payload size.
+    pub(crate) async fn expire_unversioned_locked(&self, b_id: u32, key: &str) -> Result<u64, DeleteError> {
         let tomb_ts = self.unversioned_write_ts(b_id, key);
         let (tomb_g, late) = match self.write_to_active_at(b_id, key, &[], AWAN_FLAG_TOMBSTONE, 0, 0, Some(tomb_ts)) {
             Ok((vm, loc, g)) => {
                 self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                 self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                let l = self.make_durable(&vm, loc.seq).await.err().map(|e| format!("could not sync the delete: {:?}", e));
+                let l = self
+                    .make_durable(&vm, loc.seq)
+                    .await
+                    .err()
+                    .map(|e| format!("could not sync the delete: {:?}", e));
                 (g, l)
             }
             Err(VolumeError::AfterRecord { loc, cause, .. }) => {
                 self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                 self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                (global_offset(loc.volume_id, loc.offset), Some(format!("could not record the delete: {}", cause)))
+                (
+                    global_offset(loc.volume_id, loc.offset),
+                    Some(format!("could not record the delete: {}", cause)),
+                )
             }
             Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
         };
@@ -1776,6 +1834,7 @@ impl S3ServiceState {
         };
         let retired_updates = self.attr_updates.remove_target(b_id, key, 0, Some(&self.payload_cache));
         self.add_dead_attr_update_bytes(&retired_updates);
+        let expired_size = old_info.map_or(0, |x| x.1);
         if let Some((off, sz, old_flags, _)) = old_info {
             if off > 0 {
                 self.payload_cache.remove(b_id, off);
@@ -1785,7 +1844,57 @@ impl S3ServiceState {
         }
         match late {
             Some(e) => Err(DeleteError::Internal(e)),
-            None => Ok(None),
+            None => Ok(expired_size),
+        }
+    }
+
+    /// Permanently removes one version (`FLAG_VERSION_DELETE` tombstone + `make_durable` + index remove).
+    /// Caller holds `lock_key` and has already checked lock, lifecycle/precondition rules.
+    pub(crate) async fn remove_version_commit_locked(
+        &self,
+        b_id: u32,
+        key: &str,
+        target: crate::versions::Version,
+        uncovers_object: bool,
+    ) -> Result<(), DeleteError> {
+        let id = target.id();
+        if uncovers_object {
+            if let Err(code) = self.engine.read().has_room_for(b_id, key.as_bytes()) {
+                return Err(DeleteError::Internal(format!("index error {} before deleting a version", code)));
+            }
+        }
+        let flags = AWAN_FLAG_TOMBSTONE | crate::meta_index::FLAG_VERSION_DELETE;
+        // A record whole in the volume is replayed by recovery: the version goes here too, and
+        // the request still answers an error (#184, owner decision 4B).
+        let late = match self.write_to_active(b_id, key, &id.to_le_bytes(), flags, 0, 0) {
+            Ok((vm, loc, _)) => {
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                self.make_durable(&vm, loc.seq)
+                    .await
+                    .err()
+                    .map(|e| format!("could not sync the delete: {:?}", e))
+            }
+            Err(VolumeError::AfterRecord { loc, cause, .. }) => {
+                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
+                Some(format!("could not record the delete: {}", cause))
+            }
+            Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
+        };
+        let ev_spec = VersionCommitEventSpec {
+            time: self.clock.now_ns(),
+            version: Some(target.id_string()),
+            kind: crate::events::CommitKind::VersionDelete,
+            size: target.size,
+            etag: String::new(),
+            acked: late.is_none(),
+        };
+        self.record_version_commit(b_id, key, crate::versions::Event::Remove(id), None, Some(ev_spec))
+            .map_err(|c| DeleteError::Internal(format!("index error {} after deleting a version", c)))?;
+        match late {
+            Some(e) => Err(DeleteError::Internal(e)),
+            None => Ok(()),
         }
     }
 
@@ -1793,10 +1902,11 @@ impl S3ServiceState {
     /// key has no such version.
     pub async fn delete_version(&self, b_id: u32, key: &str, id: u64) -> Result<Option<crate::versions::Version>, String> {
         let conds = crate::precondition::DeleteConditions::default();
-        self.delete_version_conditional(b_id, key, id, &conds)
+        self.delete_version_conditional(b_id, key, id, &conds, false)
             .await
             .map_err(|e| match e {
                 DeleteError::PreconditionFailed(_) => "PreconditionFailed".to_string(),
+                DeleteError::AccessDenied => "AccessDenied".to_string(),
                 DeleteError::Internal(s) => s,
             })
     }
@@ -1807,6 +1917,7 @@ impl S3ServiceState {
         key: &str,
         id: u64,
         conds: &crate::precondition::DeleteConditions,
+        bypass_governance: bool,
     ) -> Result<Option<crate::versions::Version>, DeleteError> {
         let _key_guard = self.lock_key(b_id, key).await;
         let before = self.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| null_version_of(&m));
@@ -1830,6 +1941,13 @@ impl S3ServiceState {
         let Some(target) = target else {
             return Ok(None);
         };
+        if !target.marker {
+            let lock = self.version_lock_for(b_id, key, &target)?;
+            let now_sec = self.clock.now_ns() / 1_000_000_000;
+            if lock.may_delete(now_sec, bypass_governance).is_err() {
+                return Err(DeleteError::AccessDenied);
+            }
+        }
         if !conds.is_empty() {
             let (del_target, facts_opt) = if target.marker {
                 (
@@ -1859,41 +1977,8 @@ impl S3ServiceState {
         if needs_start {
             self.versions.write().start(b_id, key, before);
         }
-        if uncovers_object {
-            if let Err(code) = self.engine.read().has_room_for(b_id, key.as_bytes()) {
-                return Err(DeleteError::Internal(format!("index error {} before deleting a version", code)));
-            }
-        }
-        let flags = AWAN_FLAG_TOMBSTONE | crate::meta_index::FLAG_VERSION_DELETE;
-        // A record whole in the volume is replayed by recovery: the version goes here too, and
-        // the request still answers an error (#184, owner decision 4B).
-        let late = match self.write_to_active(b_id, key, &id.to_le_bytes(), flags, 0, 0) {
-            Ok((vm, loc, _)) => {
-                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                self.make_durable(&vm, loc.seq).await.err().map(|e| format!("could not sync the delete: {:?}", e))
-            }
-            Err(VolumeError::AfterRecord { loc, cause, .. }) => {
-                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                Some(format!("could not record the delete: {}", cause))
-            }
-            Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
-        };
-        let ev_spec = VersionCommitEventSpec {
-            time: self.clock.now_ns(),
-            version: Some(target.id_string()),
-            kind: crate::events::CommitKind::VersionDelete,
-            size: target.size,
-            etag: String::new(),
-            acked: late.is_none(),
-        };
-        self.record_version_commit(b_id, key, crate::versions::Event::Remove(id), None, Some(ev_spec))
-            .map_err(|c| DeleteError::Internal(format!("index error {} after deleting a version", c)))?;
-        match late {
-            Some(e) => Err(DeleteError::Internal(e)),
-            None => Ok(Some(target)),
-        }
+        self.remove_version_commit_locked(b_id, key, target, uncovers_object).await?;
+        Ok(Some(target))
     }
 
     /// The flags and creation time a write of `key` takes in its bucket's versioning status;
@@ -2216,6 +2301,65 @@ impl S3ServiceState {
         Ok(())
     }
 
+    /// Returns the bucket's Object Lock configuration, if enabled (#120).
+    pub fn bucket_object_lock(&self, b_id: u32) -> Option<crate::object_lock::LockConfiguration> {
+        self.bucket_config_reader
+            .load_bucket(b_id)
+            .and_then(|cfg| cfg.object_lock())
+    }
+
+    /// Returns the bucket's parsed Lifecycle configuration, if set (#118).
+    pub fn bucket_lifecycle(&self, b_id: u32) -> Option<Arc<crate::lifecycle_config::LifecycleConfig>> {
+        self.bucket_config_reader
+            .load_bucket(b_id)
+            .and_then(|cfg| cfg.lifecycle())
+    }
+
+    /// Loads the current `Lock` (retention + legal hold) of a version, returning an error if attributes are corrupt.
+    pub fn version_lock_for(
+        &self,
+        b_id: u32,
+        key: &str,
+        v: &crate::versions::Version,
+    ) -> Result<crate::fsm::Lock, DeleteError> {
+        if v.marker {
+            return Ok(crate::fsm::Lock::default());
+        }
+        let view = self
+            .object_view_for(b_id, key, v.id(), v.vol_offset, v.flags)
+            .map_err(|e| DeleteError::Internal(format!("could not read version lock state: {:?}", e)))?;
+        view.attrs
+            .lock_state()
+            .map_err(|e| DeleteError::Internal(format!("corrupt lock attribute: {:?}", e)))
+    }
+
+    /// Returns whether lifecycle expiration may remove the current (unversioned or head) object of `key`.
+    pub fn may_lifecycle_delete_current(&self, b_id: u32, key: &str, now_sec: u64) -> bool {
+        let head = {
+            let vs = self.versions.read();
+            if vs.has(b_id, key) {
+                vs.current(b_id, key)
+            } else {
+                drop(vs);
+                self.engine
+                    .read()
+                    .get_object(b_id, key.as_bytes())
+                    .ok()
+                    .map(|m| null_version_of(&m))
+            }
+        };
+        let Some(v) = head else {
+            return true;
+        };
+        if v.marker {
+            return true;
+        }
+        match self.version_lock_for(b_id, key, &v) {
+            Ok(lock) => lock.may_delete(now_sec, false).is_ok(),
+            Err(_) => false,
+        }
+    }
+
     /// Records a bucket's versioning status in the manifest and in memory (#31).
     pub fn set_versioning(&self, b_id: u32, status: crate::versions::Versioning) -> std::io::Result<()> {
         let mut bc = self.bucket_configs.lock();
@@ -2232,6 +2376,71 @@ impl S3ServiceState {
                 status.as_str().len() as u64,
             );
         }
+        Ok(())
+    }
+
+    /// Atomically checks Object Lock + current versioning, steps `fsm::versioning_step`, and persists (#120).
+    pub fn try_set_versioning(
+        &self,
+        b_id: u32,
+        bucket: &str,
+        requested: crate::versions::Versioning,
+    ) -> Result<crate::versions::Versioning, Result<crate::fsm::Refusal, std::io::Error>> {
+        let mut bc = self.bucket_configs.lock();
+        let has_object_lock = bc
+            .load_bucket(b_id)
+            .and_then(|c| c.object_lock())
+            .is_some();
+        let mut ver = self.versioning.write();
+        let current = ver.get(&b_id).copied().unwrap_or_default();
+        let next = crate::fsm::versioning_step(current, requested, has_object_lock).map_err(Ok)?;
+        bc.apply_versioning(b_id, next)
+            .map_err(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        ver.insert(b_id, next);
+        drop(ver);
+        drop(bc);
+        self.emit_bucket_config_event(
+            b_id,
+            bucket,
+            "versioning",
+            crate::events::CommitKind::BucketVersioning,
+            next.as_str().len() as u64,
+        );
+        Ok(next)
+    }
+
+    /// Atomically verifies `Versioning::Enabled` (if lock is not already enabled) and stores `ObjectLock` config (#120).
+    pub fn enable_object_lock_config(
+        &self,
+        b_id: u32,
+        bucket: &str,
+        body: &[u8],
+    ) -> Result<(), Result<crate::fsm::Refusal, crate::bucket_config::ConfigError>> {
+        let mut bc = self.bucket_configs.lock();
+        let already_enabled = bc
+            .load_bucket(b_id)
+            .and_then(|c| c.object_lock())
+            .is_some();
+        if !already_enabled {
+            let ver = self.versioning.read().get(&b_id).copied().unwrap_or_default();
+            if ver != crate::versions::Versioning::Enabled {
+                return Err(Ok(crate::fsm::Refusal {
+                    status: 409,
+                    code: "InvalidBucketState",
+                    why: "Versioning must be 'Enabled' on the bucket to apply a Object Lock configuration",
+                }));
+            }
+        }
+        bc.put_config(b_id, crate::bucket_config::ConfigKind::ObjectLock, body)
+            .map_err(Err)?;
+        drop(bc);
+        self.emit_bucket_config_event(
+            b_id,
+            bucket,
+            crate::bucket_config::ConfigKind::ObjectLock.as_str(),
+            crate::events::CommitKind::BucketConfig,
+            body.len() as u64,
+        );
         Ok(())
     }
 
@@ -2347,6 +2556,21 @@ impl S3ServiceState {
             let now_ms = state.clock.now_ns() / 1_000_000;
             let (_removed, more) = state.multipart.cleanup_expired(now_ms, max_age_ms, budget);
             Ok(more)
+        });
+    }
+
+    /// Registers the periodic bucket lifecycle expiration sweep on the background scheduler (#118).
+    pub fn start_lifecycle_sweep(self: &Arc<Self>, every: std::time::Duration) {
+        let weak = Arc::downgrade(self);
+        let rt = tokio::runtime::Handle::current();
+        self.scheduler.register("lifecycle", every, move |budget| {
+            let Some(state) = weak.upgrade() else { return Ok(false) };
+            let now_ms = state.clock.now_ns() / 1_000_000;
+            Ok(rt.block_on(crate::lifecycle::run_lifecycle_sweep_async(
+                &state,
+                now_ms,
+                budget,
+            )))
         });
     }
 
@@ -3349,6 +3573,252 @@ impl S3ServiceState {
         vid: Option<&str>,
         update_attrs: crate::attrs::Attrs,
     ) -> Result<SetAttrOutcome, SetAttrError> {
+        let _key_guard = self.lock_key(b_id, key).await;
+        let (key_state, target_vid, resp_vid, base_upper_ns, dm_info, _) =
+            self.resolve_attr_target_locked(b_id, key, vid)?;
+        self.set_attribute_group_locked(
+            b_id,
+            key,
+            key_state,
+            target_vid,
+            resp_vid,
+            base_upper_ns,
+            dm_info,
+            update_attrs,
+        )
+        .await
+    }
+
+    /// Validates an object lock transition through `fsm::lock_step` under the per-key lock and
+    /// atomically appends the corresponding `0x200` attribute-update needle (`#120`).
+    pub async fn update_object_lock(
+        &self,
+        b_id: u32,
+        key: &str,
+        vid: Option<&str>,
+        event: crate::fsm::LockEvent,
+        retention: Option<&crate::object_lock::Retention>,
+    ) -> Result<SetAttrOutcome, SetAttrError> {
+        let group = match event {
+            crate::fsm::LockEvent::PutRetention { .. } | crate::fsm::LockEvent::ClearRetention { .. } => {
+                crate::attrs::AttrGroup::Retention
+            }
+            crate::fsm::LockEvent::PutLegalHold { .. } => crate::attrs::AttrGroup::LegalHold,
+        };
+        let _key_guard = self.lock_key(b_id, key).await;
+        let (key_state, target_vid, resp_vid, base_upper_ns, dm_info, target_loc) =
+            self.resolve_attr_target_locked(b_id, key, vid)?;
+
+        // Refuse missing target or delete marker via `fsm::key_step` before loading view.
+        if let Err(refusal) = crate::fsm::key_step(
+            key_state.clone(),
+            crate::fsm::KeyRecord::AttrUpdate {
+                target_version_id: target_vid,
+                group,
+                created_at_ns: base_upper_ns.saturating_add(1),
+                vol_offset: 1,
+                total_len: 1,
+            },
+        ) {
+            return Err(SetAttrError::Refused {
+                refusal,
+                delete_marker: dm_info,
+            });
+        }
+
+        let Some((vol_offset, flags)) = target_loc else {
+            return Err(SetAttrError::Refused {
+                refusal: crate::fsm::NO_SUCH_KEY,
+                delete_marker: dm_info,
+            });
+        };
+        let view = self
+            .object_view_for(b_id, key, target_vid, vol_offset, flags)
+            .map_err(|e| SetAttrError::Internal {
+                detail: format!("could not read the object's lock state: {:?}", e),
+                after_record: false,
+            })?;
+        let current_lock = view.attrs.lock_state().map_err(|e| SetAttrError::Internal {
+            detail: format!("corrupt lock attribute: {:?}", e),
+            after_record: false,
+        })?;
+        let now_sec = self.clock.now_ns() / 1_000_000_000;
+        if let Err(refusal) = crate::fsm::lock_step(current_lock, event, now_sec) {
+            return Err(SetAttrError::Refused {
+                refusal,
+                delete_marker: dm_info,
+            });
+        }
+
+        let mut update_attrs = crate::attrs::Attrs::new();
+        match event {
+            crate::fsm::LockEvent::PutRetention { .. } => update_attrs.set_retention(retention),
+            crate::fsm::LockEvent::ClearRetention { .. } => update_attrs.set_retention(None),
+            crate::fsm::LockEvent::PutLegalHold { on } => update_attrs.set_legal_hold(on),
+        }
+        self.set_attribute_group_locked(
+            b_id,
+            key,
+            key_state,
+            target_vid,
+            resp_vid,
+            base_upper_ns,
+            dm_info,
+            update_attrs,
+        )
+        .await
+    }
+
+    fn resolve_attr_target_locked(
+        &self,
+        b_id: u32,
+        key: &str,
+        vid: Option<&str>,
+    ) -> Result<
+        (
+            crate::fsm::KeyState,
+            u64,
+            Option<String>,
+            u64,
+            Option<(String, bool)>,
+            Option<(u64, u16)>,
+        ),
+        SetAttrError,
+    > {
+        if vid.is_some() || self.versions.read().has(b_id, key) {
+            let parsed_vid = match vid {
+                Some(s) => match crate::versions::parse_id(s) {
+                    Some(id) => Some(id),
+                    None => {
+                        return Err(SetAttrError::Refused {
+                            refusal: crate::fsm::NO_SUCH_VERSION,
+                            delete_marker: None,
+                        });
+                    }
+                },
+                None => None,
+            };
+            let vs = self.versions.read();
+            if !vs.has(b_id, key) {
+                let meta_opt = self.engine.read().get_object(b_id, key.as_bytes()).ok();
+                Ok(match (parsed_vid, meta_opt) {
+                    (Some(0), Some(m)) | (None, Some(m)) => {
+                        let updates = self.attr_updates.get(b_id, key, 0);
+                        let upper = (m.created_at + 1).saturating_mul(1_000_000);
+                        let flags = unpack_flags(m.bucket_flags);
+                        let ks = crate::fsm::KeyState::Unversioned(crate::fsm::KeyObject {
+                            version_id: 0,
+                            created_at_ns: m.created_at.saturating_mul(1_000_000),
+                            vol_offset: m.vol_offset,
+                            flags,
+                            updates,
+                        });
+                        (ks, 0u64, Some("null".to_string()), upper, None, Some((m.vol_offset, flags)))
+                    }
+                    (Some(req_vid), Some(m)) => {
+                        let updates = self.attr_updates.get(b_id, key, 0);
+                        let upper = (m.created_at + 1).saturating_mul(1_000_000);
+                        let flags = unpack_flags(m.bucket_flags);
+                        let ks = crate::fsm::KeyState::Unversioned(crate::fsm::KeyObject {
+                            version_id: 0,
+                            created_at_ns: m.created_at.saturating_mul(1_000_000),
+                            vol_offset: m.vol_offset,
+                            flags,
+                            updates,
+                        });
+                        (ks, req_vid, None, upper, None, None)
+                    }
+                    (Some(req_vid), None) => (crate::fsm::KeyState::Absent, req_vid, None, 0, None, None),
+                    (None, None) => (crate::fsm::KeyState::Absent, 0, None, 0, None, None),
+                })
+            } else {
+                let list = vs.versions(b_id, key).unwrap_or(&[]);
+                let entries: Vec<crate::fsm::KeyVersionEntry> = list
+                    .iter()
+                    .map(|v| {
+                        if v.marker {
+                            crate::fsm::KeyVersionEntry::DeleteMarker {
+                                version_id: v.id(),
+                                vol_offset: v.vol_offset,
+                            }
+                        } else {
+                            crate::fsm::KeyVersionEntry::Object(crate::fsm::KeyObject {
+                                version_id: v.id(),
+                                created_at_ns: v.ts,
+                                vol_offset: v.vol_offset,
+                                flags: v.flags,
+                                updates: self.attr_updates.get(b_id, key, v.id()),
+                            })
+                        }
+                    })
+                    .collect();
+                let ks = crate::fsm::KeyState::Versioned { versions: entries };
+                let target_v = match parsed_vid {
+                    Some(id) => vs.find(b_id, key, id),
+                    None => vs.current(b_id, key),
+                };
+                Ok(match target_v {
+                    None => {
+                        let tid = parsed_vid.unwrap_or(0);
+                        (
+                            if parsed_vid.is_some() { ks } else { crate::fsm::KeyState::Absent },
+                            tid,
+                            None,
+                            0,
+                            None,
+                            None,
+                        )
+                    }
+                    Some(v) if v.marker => (
+                        ks,
+                        v.id(),
+                        Some(v.id_string()),
+                        0,
+                        Some((v.id_string(), parsed_vid.is_some())),
+                        None,
+                    ),
+                    Some(v) => {
+                        let upper = if v.ts == 0 {
+                            ((v.modified / 1_000_000) + 1).saturating_mul(1_000_000)
+                        } else {
+                            v.ts
+                        };
+                        (ks, v.id(), Some(v.id_string()), upper, None, Some((v.vol_offset, v.flags)))
+                    }
+                })
+            }
+        } else {
+            Ok(match self.engine.read().get_object(b_id, key.as_bytes()) {
+                Ok(m) => {
+                    let updates = self.attr_updates.get(b_id, key, 0);
+                    let upper = (m.created_at + 1).saturating_mul(1_000_000);
+                    let flags = unpack_flags(m.bucket_flags);
+                    let ks = crate::fsm::KeyState::Unversioned(crate::fsm::KeyObject {
+                        version_id: 0,
+                        created_at_ns: m.created_at.saturating_mul(1_000_000),
+                        vol_offset: m.vol_offset,
+                        flags,
+                        updates,
+                    });
+                    (ks, 0u64, None, upper, None, Some((m.vol_offset, flags)))
+                }
+                Err(_) => (crate::fsm::KeyState::Absent, 0u64, None, 0, None, None),
+            })
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn set_attribute_group_locked(
+        &self,
+        b_id: u32,
+        key: &str,
+        mut key_state: crate::fsm::KeyState,
+        target_vid: u64,
+        resp_vid: Option<String>,
+        base_upper_ns: u64,
+        dm_info: Option<(String, bool)>,
+        update_attrs: crate::attrs::Attrs,
+    ) -> Result<SetAttrOutcome, SetAttrError> {
         let mut groups = Vec::new();
         for (tag, _) in update_attrs.iter() {
             let g = crate::attrs::AttrGroup::from_tag(tag);
@@ -3362,125 +3832,6 @@ impl S3ServiceState {
                 delete_marker: None,
             });
         }
-        let _key_guard = self.lock_key(b_id, key).await;
-
-        let (mut key_state, target_vid, resp_vid, base_upper_ns, dm_info) = {
-            if vid.is_some() || self.versions.read().has(b_id, key) {
-                let parsed_vid = match vid {
-                    Some(s) => match crate::versions::parse_id(s) {
-                        Some(id) => Some(id),
-                        None => {
-                            return Err(SetAttrError::Refused {
-                                refusal: crate::fsm::NO_SUCH_VERSION,
-                                delete_marker: None,
-                            });
-                        }
-                    },
-                    None => None,
-                };
-                let vs = self.versions.read();
-                if !vs.has(b_id, key) {
-                    let meta_opt = self.engine.read().get_object(b_id, key.as_bytes()).ok();
-                    match (parsed_vid, meta_opt) {
-                        (Some(0), Some(m)) | (None, Some(m)) => {
-                            let updates = self.attr_updates.get(b_id, key, 0);
-                            let upper = (m.created_at + 1).saturating_mul(1_000_000);
-                            let ks = crate::fsm::KeyState::Unversioned(crate::fsm::KeyObject {
-                                version_id: 0,
-                                created_at_ns: m.created_at.saturating_mul(1_000_000),
-                                vol_offset: m.vol_offset,
-                                flags: unpack_flags(m.bucket_flags),
-                                updates,
-                            });
-                            (ks, 0u64, Some("null".to_string()), upper, None)
-                        }
-                        (Some(req_vid), Some(m)) => {
-                            let updates = self.attr_updates.get(b_id, key, 0);
-                            let upper = (m.created_at + 1).saturating_mul(1_000_000);
-                            let ks = crate::fsm::KeyState::Unversioned(crate::fsm::KeyObject {
-                                version_id: 0,
-                                created_at_ns: m.created_at.saturating_mul(1_000_000),
-                                vol_offset: m.vol_offset,
-                                flags: unpack_flags(m.bucket_flags),
-                                updates,
-                            });
-                            (ks, req_vid, None, upper, None)
-                        }
-                        (Some(req_vid), None) => (crate::fsm::KeyState::Absent, req_vid, None, 0, None),
-                        (None, None) => (crate::fsm::KeyState::Absent, 0, None, 0, None),
-                    }
-                } else {
-                    let list = vs.versions(b_id, key).unwrap_or(&[]);
-                    let entries: Vec<crate::fsm::KeyVersionEntry> = list
-                        .iter()
-                        .map(|v| {
-                            if v.marker {
-                                crate::fsm::KeyVersionEntry::DeleteMarker {
-                                    version_id: v.id(),
-                                    vol_offset: v.vol_offset,
-                                }
-                            } else {
-                                crate::fsm::KeyVersionEntry::Object(crate::fsm::KeyObject {
-                                    version_id: v.id(),
-                                    created_at_ns: v.ts,
-                                    vol_offset: v.vol_offset,
-                                    flags: v.flags,
-                                    updates: self.attr_updates.get(b_id, key, v.id()),
-                                })
-                            }
-                        })
-                        .collect();
-                    let ks = crate::fsm::KeyState::Versioned { versions: entries };
-                    let target_v = match parsed_vid {
-                        Some(id) => vs.find(b_id, key, id),
-                        None => vs.current(b_id, key),
-                    };
-                    match target_v {
-                        None => {
-                            let tid = parsed_vid.unwrap_or(0);
-                            (
-                                if parsed_vid.is_some() { ks } else { crate::fsm::KeyState::Absent },
-                                tid,
-                                None,
-                                0,
-                                None,
-                            )
-                        }
-                        Some(v) if v.marker => (
-                            ks,
-                            v.id(),
-                            Some(v.id_string()),
-                            0,
-                            Some((v.id_string(), parsed_vid.is_some())),
-                        ),
-                        Some(v) => {
-                            let upper = if v.ts == 0 {
-                                ((v.modified / 1_000_000) + 1).saturating_mul(1_000_000)
-                            } else {
-                                v.ts
-                            };
-                            (ks, v.id(), Some(v.id_string()), upper, None)
-                        }
-                    }
-                }
-            } else {
-                match self.engine.read().get_object(b_id, key.as_bytes()) {
-                    Ok(m) => {
-                        let updates = self.attr_updates.get(b_id, key, 0);
-                        let upper = (m.created_at + 1).saturating_mul(1_000_000);
-                        let ks = crate::fsm::KeyState::Unversioned(crate::fsm::KeyObject {
-                            version_id: 0,
-                            created_at_ns: m.created_at.saturating_mul(1_000_000),
-                            vol_offset: m.vol_offset,
-                            flags: unpack_flags(m.bucket_flags),
-                            updates,
-                        });
-                        (ks, 0u64, None, upper, None)
-                    }
-                    Err(_) => (crate::fsm::KeyState::Absent, 0u64, None, 0, None),
-                }
-            }
-        };
 
         let existing_updates = self.attr_updates.get(b_id, key, target_vid);
         let max_u = existing_updates.iter().map(|u| u.created_at_ns).max().unwrap_or(0);
@@ -4080,6 +4431,24 @@ pub fn render_metrics(state: &S3ServiceState) -> String {
             "0x200 attribute-update needles ignored during recovery because their target was absent, deleted, or a delete marker.",
             state.attr_updates_ignored.load(Ordering::Relaxed),
         ),
+        (
+            "awanfs_lifecycle_objects_expired_total",
+            "counter",
+            "Objects, versions, and sole delete markers expired by the lifecycle sweep (#118).",
+            state.lifecycle.objects_expired(),
+        ),
+        (
+            "awanfs_lifecycle_bytes_expired_total",
+            "counter",
+            "Payload bytes expired by the lifecycle sweep (#118).",
+            state.lifecycle.bytes_expired(),
+        ),
+        (
+            "awanfs_lifecycle_uploads_aborted_total",
+            "counter",
+            "Incomplete multipart uploads aborted by the lifecycle sweep (#118).",
+            state.lifecycle.uploads_aborted(),
+        ),
     ];
     for (name, kind, help, v) in gauges {
         let _ = writeln!(out, "# HELP {} {}\n# TYPE {} {}\n{} {}", name, help, name, kind, name, v);
@@ -4247,6 +4616,15 @@ async fn handle_s3_inner(
     let classified = match crate::ops::classify_request(req) {
         Ok(c) => c,
         Err(resp) => return Ok(resp),
+    };
+    // A form upload's key and credentials are in its body (#119): read the fields first.
+    let classified = if classified.op == crate::ops::Operation::PostObject {
+        match crate::ops::post_object::read_form(&state, classified).await {
+            Ok(c) => c,
+            Err(resp) => return Ok(resp),
+        }
+    } else {
+        classified
     };
     let authenticated = match crate::ops::authenticate(&state, classified) {
         Ok(a) => a,

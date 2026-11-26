@@ -13,6 +13,7 @@ This document states the exact `s3-server` and client configuration that `tests/
 | `--auto-compaction` | `off` | `on` | All (avoids background compaction during short suite runs) | No (keep `on` in production to reclaim dead space) |
 | `--region` | `default` | `us-east-1` | `test_bucket_get_location` (`api_name = default` in `s3tests.conf`) | Yes (set to deployment region) |
 | `--config` | `/tmp/awanfs-users.toml` (copied from `tests/s3tests/users.toml` with mode `0600`) | none | Multi-user and policy tests (`alt`, `tenant`) | Yes (with real keys and scoped policies) |
+| `--lifecycle-day-seconds` | `2` | `86400` | Lifecycle expiration tests (`lc_debug_interval = 2` in `s3tests.conf`) | No (keep `86400` in production; test-only flag emits startup warning) |
 | `AWANFS_ACCESS_KEY` | `AWANFSMAINKEY0000000` | none | All (`[s3 main]` in `s3tests.conf`) | No (public test credential) |
 | `AWANFS_SECRET_KEY` | `awanfs-main-secret-for-s3-tests-0000000000` | none | All (`[s3 main]` in `s3tests.conf`) | No (public test credential) |
 | `AWANFS_LOG` | `off` | `on` (JSON line per request on stderr) | All (keeps `/tmp/awanfs.log` bounded) | Optional (keep `on` for request audit logs) |
@@ -38,7 +39,7 @@ Skipped tests in `tests/s3tests/CONFORMANCE_MAP.md` are skipped by `pytest` beca
 
 Area issues that add new profile settings update `start_server.sh` and the **Settings** table above in the same PR:
 
-- `#118`: shortened lifecycle day (`--lifecycle-day-seconds 10`, test-only flag with startup warning)
+- `#118`: implemented: `--lifecycle-day-seconds 2` (test-only flag with startup warning) matching `lc_debug_interval = 2` in `s3tests.conf`
 - `#122`: default object ownership (`D5`, ACLs enabled on new buckets for the suite)
 - `#121`: `--sse-master-key-file` and `kms_keyid` in `s3tests.conf`
 - `#140`: `--region` matching `api_name`
@@ -47,3 +48,4 @@ Area issues that add new profile settings update `start_server.sh` and the **Set
 ## Suite expectations differing from AWS
 
 - `#112` (conditional deletes): `ceph/s3-tests` marks conditional delete tests `fails_on_aws`. For `PUT` and `CompleteMultipartUpload`, a delete marker counts as absent (`If-Match` returns `404 NoSuchKey`, `If-None-Match` succeeds). For `DeleteObject` and `DeleteObjects`, missing keys/versions succeed (`204` / `<Deleted>`), while a delete marker is treated as an existing entry (`If-Match: *` succeeds; mismatched `ETag`, `LastModifiedTime`, or `Size` returns `PreconditionFailed`). No extra server flag is required.
+- `#118` (lifecycle delete markers & RGW behavior): `test_lifecycle_deletemarker_expiration_with_days_tag` sets `Expiration.Days = 5` and `NoncurrentVersionExpiration.NoncurrentDays = 1` without `ExpiredObjectDeleteMarker`, expecting a sole delete marker to remain until `Expiration.Days` elapses rather than disappearing immediately. When an `Expiration` rule applies to a key, AwanFS also suppresses immediate removal of a sole delete marker until `Days`/`Date` elapses, matching the suite.

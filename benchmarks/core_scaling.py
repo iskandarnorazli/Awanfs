@@ -3560,7 +3560,7 @@ def render_matrix_report(
     lines = [
         f"Command: `{cmd}`",
         "",
-        f"# Pattern & Concurrency Scaling Benchmark: AwanFS vs MinIO vs RustFS vs Garage vs SeaweedFS ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
+        f"# Pattern & Concurrency Scaling Benchmark: {' vs '.join(servers)} ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
         "",
         f"- **Machine:** {platform.node()} ({platform.platform()}, {total_cores} logical cores, {rwb.host_ram_gb()} GB RAM, CPU: {rwb.cpu_model()})",
         f"- **Methodology:** `patterns = {', '.join(patterns)}`, `sizes = {', '.join(format_size(s) for s in sizes)}`, `cores = {', '.join(str(n) for n in cores)}`, `concurrencies = {', '.join(str(c) for c in concurrencies)}`, `client_procs = {client_procs}`, {runs} alternating runs per point (median reported), {duration_sec:.1f}s per phase, seed = `{seed}`.",

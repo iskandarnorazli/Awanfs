@@ -41,6 +41,35 @@ mint = [
   "minio-go: testPutObjectsUnknownV2::PutObject(bucketName, objectName, reader,size,opts)",
   "minio-go: testUserMetadataCopyingWrapper::CopyObject(destination, source)",
 ]
+# Each suite test has a SigV4 version (#433, tests/s3tests/PORTED.md): the 15 with no older test are ported here.
+server_tests = ["server/tests/sigv2_ports_test.rs", "server/tests/auth_test.rs"]
+
+[feature.ported]
+"test_s3::test_cors_presigned_get_object_v2" = "test_s3::test_cors_presigned_get_object"
+"test_s3::test_cors_presigned_get_object_tenant_v2" = "test_s3::test_cors_presigned_get_object_tenant"
+"test_s3::test_cors_presigned_put_object_v2" = "test_s3::test_cors_presigned_put_object"
+"test_s3::test_cors_presigned_put_object_tenant_v2" = "test_s3::test_cors_presigned_put_object_tenant"
+"test_headers::test_object_create_bad_md5_invalid_garbage_aws2" = "server/tests/s3_details_test.rs::content_md5_rejects_non_canonical_base64"
+"test_headers::test_object_create_bad_contentlength_mismatch_below_aws2" = "server/tests/streaming_put_test.rs::a_streamed_chunked_body_shorter_or_longer_than_declared_is_refused_and_releases_stream"
+"test_headers::test_object_create_bad_authorization_incorrect_aws2" = "server/tests/auth_test.rs::a_changed_signature_or_secret_is_refused"
+"test_headers::test_object_create_bad_authorization_invalid_aws2" = "server/tests/sigv2_ports_test.rs::test_object_create_bad_authorization_invalid_aws2"
+"test_headers::test_object_create_bad_ua_empty_aws2" = "server/tests/sigv2_ports_test.rs::test_object_create_bad_ua_empty_aws2"
+"test_headers::test_object_create_bad_ua_none_aws2" = "server/tests/sigv2_ports_test.rs::test_object_create_bad_ua_none_aws2"
+"test_headers::test_object_create_bad_date_invalid_aws2" = "server/tests/sigv2_ports_test.rs::test_object_create_bad_date_invalid_aws2"
+"test_headers::test_object_create_bad_date_empty_aws2" = "server/tests/sigv2_ports_test.rs::test_object_create_bad_date_empty_aws2"
+"test_headers::test_object_create_bad_date_none_aws2" = "server/tests/sigv2_ports_test.rs::test_object_create_bad_date_none_aws2"
+"test_headers::test_object_create_bad_date_before_today_aws2" = "server/tests/auth_test.rs::unknown_access_key_and_skewed_clock_are_refused"
+"test_headers::test_object_create_bad_date_before_epoch_aws2" = "server/tests/sigv2_ports_test.rs::test_object_create_bad_date_before_epoch_aws2"
+"test_headers::test_object_create_bad_date_after_end_aws2" = "server/tests/sigv2_ports_test.rs::test_object_create_bad_date_after_end_aws2"
+"test_headers::test_bucket_create_bad_authorization_invalid_aws2" = "server/tests/sigv2_ports_test.rs::test_bucket_create_bad_authorization_invalid_aws2"
+"test_headers::test_bucket_create_bad_ua_empty_aws2" = "server/tests/sigv2_ports_test.rs::test_bucket_create_bad_ua_empty_aws2"
+"test_headers::test_bucket_create_bad_ua_none_aws2" = "server/tests/sigv2_ports_test.rs::test_bucket_create_bad_ua_none_aws2"
+"test_headers::test_bucket_create_bad_date_invalid_aws2" = "server/tests/sigv2_ports_test.rs::test_bucket_create_bad_date_invalid_aws2"
+"test_headers::test_bucket_create_bad_date_empty_aws2" = "server/tests/sigv2_ports_test.rs::test_bucket_create_bad_date_empty_aws2"
+"test_headers::test_bucket_create_bad_date_none_aws2" = "server/tests/sigv2_ports_test.rs::test_bucket_create_bad_date_none_aws2"
+"test_headers::test_bucket_create_bad_date_before_today_aws2" = "server/tests/auth_test.rs::unknown_access_key_and_skewed_clock_are_refused"
+"test_headers::test_bucket_create_bad_date_after_today_aws2" = "server/tests/auth_test.rs::unknown_access_key_and_skewed_clock_are_refused"
+"test_headers::test_bucket_create_bad_date_before_epoch_aws2" = "server/tests/sigv2_ports_test.rs::test_bucket_create_bad_date_before_epoch_aws2"
 
 [[feature]]
 id = "request-headers-unsendable"
@@ -200,7 +229,7 @@ mint = [
 [[feature]]
 id = "lifecycle"
 name = "Bucket lifecycle configuration and expiration sweep"
-status = "partial"
+status = "done"
 issue = "#118"
 area = "lifecycle"
 design_section = "8.3"
@@ -214,13 +243,14 @@ mint = [
   "minio-js::Set lifecycle config of a bucket",
   "minio-js::Set lifecycle config on a bucket:",
 ]
-server_tests = ["server/tests/lifecycle_test.rs", "server/tests/scheduler_test.rs", "server/tests/clock_and_dates_test.rs"]
+server_tests = ["server/tests/lifecycle_conformance_test.rs", "server/tests/lifecycle_test.rs", "server/tests/scheduler_test.rs", "server/tests/clock_and_dates_test.rs"]
+drive = ["lifecycle"]
 fuzz = ["lifecycle_xml", "lifecycle_config_xml"]
 
 [[feature]]
 id = "object-lock"
 name = "S3 Object Lock, governance/compliance retention, and legal hold"
-status = "planned"
+status = "done"
 issue = "#120"
 area = "object-lock"
 design_section = "8.1"
@@ -247,17 +277,21 @@ mint = [
   "minio-js::Set lock config on a bucket:",
   "minio-js::Update or replace lock config on a bucket:",
   "minio-js::getObjectLegalHold(bucketName, objectName, setOpts={})",
+  "minio-js::getObjectRetention(bucketName, objectName, getOpts)",
   "minio-js::putObjectRetention(bucketName, objectName, putOpts)",
   "minio-js::setObjectLegalHold(bucketName, objectName, setOpts={})",
   "minio-py:test_make_bucket_default_region::make_bucket(bucket_name, location, object_lock)",
   "minio-py:test_negative_make_bucket_invalid_name::make_bucket(bucket_name, location, object_lock)",
+  "versioning::/mint/build/versioning/legalhold.go:87: main.testLockingLegalhold",
 ]
+server_tests = ["server/tests/object_lock_test.rs"]
+drive = ["lock"]
 fuzz = ["object_lock_xml"]
 
 [[feature]]
 id = "post-object"
 name = "Browser POST object form uploads (multipart/form-data)"
-status = "planned"
+status = "partial"
 issue = "#119"
 area = "post-object"
 design_section = "7.3"
@@ -269,10 +303,52 @@ mint = [
   "minio-go: testPresignedPostPolicyEmptyFileName::PresignedPostPolicy(policy)",
   "minio-go: testPresignedPostPolicyWrongFile::PresignedPostPolicy(policy)",
   "minio-java::getPresignedPostFormData()",
+  "minio-js::presignedPostPolicy(postPolicy)",
   "minio-js::presignedPostPolicy(postPolicy, cb)",
   "minio-py:test_presigned_post_policy",
 ]
-fuzz = ["form_upload"]
+# The suite signs every POST form with SigV2; each test has a SigV4 port (#119, tests/s3tests/PORTED.md).
+server_tests = ["server/tests/post_object_suite_test.rs"]
+drive = ["post"]
+fuzz = ["form_upload", "post_policy"]
+
+[feature.ported]
+"test_s3::test_post_object_anonymous_request" = "server/tests/post_object_suite_test.rs::test_post_object_anonymous_request"
+"test_s3::test_post_object_authenticated_no_content_type" = "server/tests/post_object_suite_test.rs::test_post_object_authenticated_no_content_type"
+"test_s3::test_post_object_authenticated_request" = "server/tests/post_object_suite_test.rs::test_post_object_authenticated_request"
+"test_s3::test_post_object_authenticated_request_bad_access_key" = "server/tests/post_object_suite_test.rs::test_post_object_authenticated_request_bad_access_key"
+"test_s3::test_post_object_case_insensitive_condition_fields" = "server/tests/post_object_suite_test.rs::test_post_object_case_insensitive_condition_fields"
+"test_s3::test_post_object_condition_is_case_sensitive" = "server/tests/post_object_suite_test.rs::test_post_object_condition_is_case_sensitive"
+"test_s3::test_post_object_empty_conditions" = "server/tests/post_object_suite_test.rs::test_post_object_empty_conditions"
+"test_s3::test_post_object_escaped_field_values" = "server/tests/post_object_suite_test.rs::test_post_object_escaped_field_values"
+"test_s3::test_post_object_expired_policy" = "server/tests/post_object_suite_test.rs::test_post_object_expired_policy"
+"test_s3::test_post_object_expires_is_case_sensitive" = "server/tests/post_object_suite_test.rs::test_post_object_expires_is_case_sensitive"
+"test_s3::test_post_object_ignored_header" = "server/tests/post_object_suite_test.rs::test_post_object_ignored_header"
+"test_s3::test_post_object_invalid_access_key" = "server/tests/post_object_suite_test.rs::test_post_object_invalid_access_key"
+"test_s3::test_post_object_invalid_content_length_argument" = "server/tests/post_object_suite_test.rs::test_post_object_invalid_content_length_argument"
+"test_s3::test_post_object_invalid_date_format" = "server/tests/post_object_suite_test.rs::test_post_object_invalid_date_format"
+"test_s3::test_post_object_invalid_request_field_value" = "server/tests/post_object_suite_test.rs::test_post_object_invalid_request_field_value"
+"test_s3::test_post_object_invalid_signature" = "server/tests/post_object_suite_test.rs::test_post_object_invalid_signature"
+"test_s3::test_post_object_missing_conditions_list" = "server/tests/post_object_suite_test.rs::test_post_object_missing_conditions_list"
+"test_s3::test_post_object_missing_content_length_argument" = "server/tests/post_object_suite_test.rs::test_post_object_missing_content_length_argument"
+"test_s3::test_post_object_missing_expires_condition" = "server/tests/post_object_suite_test.rs::test_post_object_missing_expires_condition"
+"test_s3::test_post_object_missing_policy_condition" = "server/tests/post_object_suite_test.rs::test_post_object_missing_policy_condition"
+"test_s3::test_post_object_missing_signature" = "server/tests/post_object_suite_test.rs::test_post_object_missing_signature"
+"test_s3::test_post_object_no_key_specified" = "server/tests/post_object_suite_test.rs::test_post_object_no_key_specified"
+"test_s3::test_post_object_request_missing_policy_specified_field" = "server/tests/post_object_suite_test.rs::test_post_object_request_missing_policy_specified_field"
+"test_s3::test_post_object_set_invalid_success_code" = "server/tests/post_object_suite_test.rs::test_post_object_set_invalid_success_code"
+"test_s3::test_post_object_set_key_from_filename" = "server/tests/post_object_suite_test.rs::test_post_object_set_key_from_filename"
+"test_s3::test_post_object_set_success_code" = "server/tests/post_object_suite_test.rs::test_post_object_set_success_code"
+"test_s3::test_post_object_success_redirect_action" = "server/tests/post_object_suite_test.rs::test_post_object_success_redirect_action"
+"test_s3::test_post_object_tags_anonymous_request" = "server/tests/post_object_suite_test.rs::test_post_object_tags_anonymous_request"
+"test_s3::test_post_object_tags_authenticated_request" = "server/tests/post_object_suite_test.rs::test_post_object_tags_authenticated_request"
+"test_s3::test_post_object_upload_checksum" = "server/tests/post_object_suite_test.rs::test_post_object_upload_checksum"
+"test_s3::test_post_object_upload_larger_than_chunk" = "server/tests/post_object_suite_test.rs::test_post_object_upload_larger_than_chunk"
+"test_s3::test_post_object_upload_size_below_minimum" = "server/tests/post_object_suite_test.rs::test_post_object_upload_size_below_minimum"
+"test_s3::test_post_object_upload_size_limit_exceeded" = "server/tests/post_object_suite_test.rs::test_post_object_upload_size_limit_exceeded"
+"test_s3::test_post_object_upload_size_rgw_chunk_size_bug" = "server/tests/post_object_suite_test.rs::test_post_object_upload_size_rgw_chunk_size_bug"
+"test_s3::test_post_object_user_specified_header" = "server/tests/post_object_suite_test.rs::test_post_object_user_specified_header"
+"test_s3::test_post_object_wrong_bucket" = "server/tests/post_object_suite_test.rs::test_post_object_wrong_bucket"
 
 [[feature]]
 id = "cors"
@@ -854,6 +930,7 @@ mint = [
   "minio-js::presignedPutObject(bucketName, objectName, expires, cb)",
   "minio-js::presignedPutObject(bucketName, objectName, expires=1000, cb)",
   "minio-js::presignedUrl(httpMethod, bucketName, objectName, expires, cb)",
+  "minio-js::presignedUrl(httpMethod, bucketName, objectName, expires, reqParams, cb)",
   "minio-py:test_presigned_get_object_default_expiry",
   "minio-py:test_presigned_get_object_expiry",
   "minio-py:test_presigned_get_object_response_headers",
@@ -1098,6 +1175,8 @@ mint = [
   "minio-js::listBuckets()",
   "minio-js::listBuckets(cb)",
   "minio-js::listObjects(bucketName, prefix, recursive)",
+  "minio-js::listObjectsV2(bucketName, prefix, recursive, startAfter)",
+  "minio-js::listObjectsV2WithMetadata(bucketName, prefix, recursive, startAfter)",
   "minio-js::listObjectsV2(bucketName, prefix, recursive)",
   "minio-py:test_list_buckets::remove_bucket(bucket_name)",
   "minio-py:test_list_objects",
@@ -1178,7 +1257,6 @@ mint = [
   "minio-java::bucketExists()",
   "minio-java::makeBucket()",
   "minio-java::removeBucket()",
-  'minio-js::"after all" hook in "functional tests"',
   "minio-js::Check if bucket can be deleted:",
   "minio-js::bucketExists(bucketName)",
   "minio-js::bucketExists(bucketName, cb)",
@@ -1645,3 +1723,14 @@ mint = [
   "minio-java::getBucketReplication()",
   "minio-java::setBucketReplication()",
 ]
+
+[[feature]]
+id = "static-website"
+name = "Static website hosting (bucket ?website configuration)"
+status = "planned"
+issue = "#364"
+notes = "Not built: `?website` on a bucket answers 501 NotImplemented (UNBUILT_S3_SUBRESOURCES in server/src/ops/mod.rs). The pinned ceph s3-tests (5b39871) have 0 website tests; Mint (pinned 12559d50) has none either (0 of the 380 Mint names in this file; 0 lines with 'website' in the mint job log of run 45843838414)."
+operations = []
+ceph = []
+mint = []
+server_tests = ["server/tests/static_website_test.rs"]

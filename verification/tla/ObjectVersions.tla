@@ -91,21 +91,25 @@ Switches, so the same model checks the current code and the fixes:
 *)
 EXTENDS Naturals, FiniteSets, Sequences
 
-CONSTANTS Writers, Deleters, Updaters, UseKeyLock, WriteCanFail, RecoverSkipsGaps, DeleteLogsFirst,
+CONSTANTS Writers, Deleters, Updaters, Sweepers, UseKeyLock, SweepUsesKeyLock, WriteCanFail, RecoverSkipsGaps, DeleteLogsFirst,
           Streamers, Relocate, Compactor, CompactWaitsForWriters,
           FailLeavesRecord, IndexAfterLateFail, Versioning, ClockStepsBack, NullReplay,
           CondWriters, CheckCondUnderLock, ReplayAppliesAttrUpdates, AttrReplayByTime,
-          EmitOnCommit
+          EmitOnCommit, Locking, EnforceLock
 
 ASSUME Streamers \subseteq Writers
 ASSUME CondWriters \subseteq Writers
 ASSUME Updaters \cap (Writers \cup Deleters) = {}
+ASSUME Sweepers \cap (Writers \cup Deleters \cup Updaters) = {}
+ASSUME SweepUsesKeyLock \in BOOLEAN
 ASSUME CheckCondUnderLock \in BOOLEAN
 ASSUME ReplayAppliesAttrUpdates \in BOOLEAN
 ASSUME AttrReplayByTime \in BOOLEAN
 ASSUME EmitOnCommit \in BOOLEAN
+ASSUME Locking \in BOOLEAN
+ASSUME EnforceLock \in BOOLEAN
 
-Procs == Writers \cup Deleters \cup Updaters
+Procs == Writers \cup Deleters \cup Updaters \cup Sweepers
 Gone == [present |-> FALSE, val |-> "none", attr |-> "none"]
 Ts == 1..2
 Max(S) == CHOOSE m \in S : \A x \in S : x <= m
@@ -115,8 +119,8 @@ Max(S) == CHOOSE m \in S : \A x \in S : x <= m
 NoRow == [present |-> FALSE, val |-> "none", ts |-> 0, attr |-> "none", uts |-> 0]
 Empty == [row |-> NoRow, hist |-> FALSE, store |-> {}]
 RowOf(r) == IF r.kind = "put" THEN [present |-> TRUE, val |-> r.val, ts |-> r.ts, attr |-> "none", uts |-> 0] ELSE NoRow
-NullOf(row) == IF row.present THEN {[val |-> row.val, ts |-> 0, null |-> TRUE, marker |-> FALSE, attr |-> row.attr, uts |-> row.uts]} ELSE {}
-VersionOf(r) == [val |-> r.val, ts |-> r.ts, null |-> FALSE, marker |-> r.kind = "tomb", attr |-> "none", uts |-> 0]
+NullOf(row) == IF row.present THEN {[val |-> row.val, ts |-> 0, null |-> TRUE, marker |-> FALSE, attr |-> row.attr, uts |-> row.uts, locked |-> FALSE]} ELSE {}
+VersionOf(r) == [val |-> r.val, ts |-> r.ts, null |-> FALSE, marker |-> r.kind = "tomb", attr |-> "none", uts |-> 0, locked |-> FALSE]
 NonNull(s) == {v \in s : ~v.null}
 StartHist(k) == IF k.hist THEN k.store ELSE NullOf(k.row)
 
@@ -143,25 +147,33 @@ ApplyAttr(k, u, tombs) ==
         ELSE k
     ELSE IF k.hist /\ \E v \in k.store : ~v.null /\ v.ts = u.target /\ ~v.marker /\ u.ts > v.uts
     THEN LET tv == CHOOSE v \in k.store : ~v.null /\ v.ts = u.target IN
-         [k EXCEPT !.store = (k.store \ {tv}) \cup {[tv EXCEPT !.attr = u.val, !.uts = u.ts]}]
+         [k EXCEPT !.store = (k.store \ {tv}) \cup {[tv EXCEPT !.attr = u.val, !.uts = u.ts, !.locked = IF Locking THEN TRUE ELSE tv.locked]}]
     ELSE k
+
+\* Removes one version by ID (`DELETE ?versionId=`) when `r.kind = "vdel"` (#120).
+\* Matches `versions.rs::tidy`: removing the last version removes the key's history.
+RemoveVersion(k, tid) ==
+    LET rem == {v \in k.store : v.null \/ v.ts # tid} IN
+    IF rem = {} THEN Empty ELSE [k EXCEPT !.store = rem]
 
 \* The live index applies a committed record. An unversioned record never meets a history live:
 \* it was stamped while the bucket was unversioned, and a history needs a versioned write.
 LiveApply(k, r) ==
     IF r.kind = "attr" THEN ApplyAttr(k, r, {})
+    ELSE IF r.kind = "vdel" THEN RemoveVersion(k, r.target)
     ELSE IF r.ver THEN [row |-> k.row, hist |-> TRUE, store |-> StartHist(k) \cup {VersionOf(r)}]
     ELSE [k EXCEPT !.row = RowOf(r)]
 
 \* Recovery applies the next base record in log order.
 ReplayApply(k, r) ==
-    IF r.ver THEN [row |-> k.row, hist |-> TRUE, store |-> StartHist(k) \cup {VersionOf(r)}]
+    IF r.kind = "vdel" THEN RemoveVersion(k, r.target)
+    ELSE IF r.ver THEN [row |-> k.row, hist |-> TRUE, store |-> StartHist(k) \cup {VersionOf(r)}]
     ELSE IF ~k.hist THEN [k EXCEPT !.row = RowOf(r)]
     ELSE IF NullReplay
     THEN [k EXCEPT !.store = NonNull(k.store) \cup
-                   (IF r.kind = "put" THEN {[val |-> r.val, ts |-> 0, null |-> TRUE, marker |-> FALSE, attr |-> "none", uts |-> 0]} ELSE {})]
+                   (IF r.kind = "put" THEN {[val |-> r.val, ts |-> 0, null |-> TRUE, marker |-> FALSE, attr |-> "none", uts |-> 0, locked |-> FALSE]} ELSE {})]
     ELSE [k EXCEPT !.store = NonNull(k.store) \cup
-                   {[val |-> r.val, ts |-> r.ts, null |-> TRUE, marker |-> r.kind = "tomb", attr |-> "none", uts |-> 0]}]
+                   {[val |-> r.val, ts |-> r.ts, null |-> TRUE, marker |-> r.kind = "tomb", attr |-> "none", uts |-> 0, locked |-> FALSE]}]
 
 \* The order of a request's steps after it takes the lock.
 Steps(p) == IF p \in Deleters /\ ~DeleteLogsFirst
@@ -170,10 +182,10 @@ Steps(p) == IF p \in Deleters /\ ~DeleteLogsFirst
             THEN <<"write", "relocate", "index">>
             ELSE <<"reserve", "write", "index">>
 
-VARIABLES pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning, condWon, utarget, seq, events, commits
+VARIABLES pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning, condWon, utarget, dtarget, lockedVersions, seq, events, commits
 
-vars == <<pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning, condWon, utarget, seq, events, commits>>
-procVars == <<pc, step, off, nextOff, log, engine, lock, condWon, utarget>>
+vars == <<pc, step, off, nextOff, log, engine, lock, cpc, cut, snap, clock, versioning, condWon, utarget, dtarget, lockedVersions, seq, events, commits>>
+procVars == <<pc, step, off, nextOff, log, engine, lock, condWon, utarget, dtarget, lockedVersions>>
 cVars == <<cpc, cut, snap, clock, versioning, seq, events, commits>>
 Dropped == cpc = "done"
 
@@ -192,7 +204,7 @@ ScanEnd(o, limit) ==
 RECURSIVE ReplayBase(_, _, _)
 ReplayBase(o, limit, acc) ==
     IF o >= limit THEN acc
-    ELSE LET recs == {r \in log : r.o = o /\ r.kind \in {"put", "tomb"}} IN
+    ELSE LET recs == {r \in log : r.o = o /\ r.kind \in {"put", "tomb", "vdel"}} IN
          IF recs = {} THEN ReplayBase(o + 1, limit, acc)
          ELSE LET r == CHOOSE x \in recs : TRUE IN
               ReplayBase(o + 1, limit, ReplayApply(acc, r))
@@ -253,7 +265,12 @@ OwnVersioned(p) == \E r \in Own(p) : r.ver
 \* removed volume) the record it would have written.
 RecOf(p) == IF Own(p) # {} THEN CHOOSE r \in Own(p) : TRUE
             ELSE IF p \in Updaters THEN [o |-> 0, kind |-> "attr", val |-> p, ver |-> engine.hist, target |-> utarget[p], ts |-> AttrStamp(utarget[p])]
+            ELSE IF Locking /\ p \in (Deleters \cup Sweepers) THEN [o |-> 0, kind |-> "vdel", val |-> p, ver |-> TRUE, target |-> dtarget[p], ts |-> dtarget[p]]
             ELSE [o |-> 0, kind |-> IF p \in Writers THEN "put" ELSE "tomb", val |-> p, ver |-> versioning, target |-> 0, ts |-> IF versioning THEN Stamp ELSE UnverWriteTs]
+
+ValidDeleteTargets ==
+    IF ~engine.hist THEN {}
+    ELSE {v.ts : v \in {x \in engine.store : ~x.null /\ ~x.marker /\ (EnforceLock => ~x.locked)}}
 
 Init ==
     /\ pc = [p \in Procs |-> "start"]
@@ -267,9 +284,11 @@ Init ==
     /\ cut = 0
     /\ snap = {}
     /\ clock = 1
-    /\ versioning = FALSE
+    /\ versioning = Locking
     /\ condWon = [p \in CondWriters |-> FALSE]
     /\ utarget = [p \in Updaters |-> 0]
+    /\ dtarget = [p \in (Deleters \cup Sweepers) |-> 0]
+    /\ lockedVersions = {}
     /\ seq = 0
     /\ events = <<>>
     /\ commits = <<>>
@@ -280,7 +299,7 @@ PreCheck(p) ==
     /\ ~CheckCondUnderLock
     /\ pc[p] = "start"
     /\ pc' = [pc EXCEPT ![p] = IF Visible(engine).present THEN "done" ELSE "checked"]
-    /\ UNCHANGED <<step, off, nextOff, log, engine, lock, condWon, utarget>>
+    /\ UNCHANGED <<step, off, nextOff, log, engine, lock, condWon, utarget, dtarget, lockedVersions>>
     /\ UNCHANGED cVars
 
 \* A streamer reserves before it has the lock: the body arrives next, for as long as the
@@ -291,29 +310,39 @@ StreamReserve(p) ==
     /\ off' = [off EXCEPT ![p] = nextOff]
     /\ nextOff' = nextOff + 1
     /\ pc' = [pc EXCEPT ![p] = "body"]
-    /\ UNCHANGED <<step, log, engine, lock, condWon, utarget>>
+    /\ UNCHANGED <<step, log, engine, lock, condWon, utarget, dtarget, lockedVersions>>
     /\ UNCHANGED cVars
 
 Acquire(p) ==
     /\ pc[p] = IF p \in Streamers THEN "body"
                ELSE IF p \in CondWriters /\ ~CheckCondUnderLock THEN "checked"
                ELSE "start"
-    /\ IF UseKeyLock THEN lock = "free" /\ lock' = p ELSE UNCHANGED lock
+    /\ IF UseKeyLock /\ (p \notin Sweepers \/ SweepUsesKeyLock) THEN lock = "free" /\ lock' = p ELSE UNCHANGED lock
     /\ IF p \in CondWriters /\ CheckCondUnderLock /\ Visible(engine).present
        THEN /\ pc' = [pc EXCEPT ![p] = "release"]
-            /\ UNCHANGED <<step, utarget>>
+            /\ UNCHANGED <<step, utarget, dtarget>>
        ELSE IF p \in Updaters THEN
             IF ValidAttrTargets = {} THEN
                 /\ pc' = [pc EXCEPT ![p] = "release"]
-                /\ UNCHANGED <<step, utarget>>
+                /\ UNCHANGED <<step, utarget, dtarget>>
             ELSE \E t \in ValidAttrTargets :
                 /\ utarget' = [utarget EXCEPT ![p] = t]
                 /\ step' = [step EXCEPT ![p] = 1]
                 /\ pc' = [pc EXCEPT ![p] = Steps(p)[1]]
+                /\ UNCHANGED dtarget
+       ELSE IF Locking /\ p \in (Deleters \cup Sweepers) THEN
+            IF ValidDeleteTargets = {} THEN
+                /\ pc' = [pc EXCEPT ![p] = "release"]
+                /\ UNCHANGED <<step, utarget, dtarget>>
+            ELSE \E t \in ValidDeleteTargets :
+                /\ dtarget' = [dtarget EXCEPT ![p] = t]
+                /\ step' = [step EXCEPT ![p] = 1]
+                /\ pc' = [pc EXCEPT ![p] = Steps(p)[1]]
+                /\ UNCHANGED utarget
        ELSE /\ step' = [step EXCEPT ![p] = 1]
             /\ pc' = [pc EXCEPT ![p] = Steps(p)[1]]
-            /\ UNCHANGED utarget
-    /\ UNCHANGED <<off, nextOff, log, engine, condWon>>
+            /\ UNCHANGED <<utarget, dtarget>>
+    /\ UNCHANGED <<off, nextOff, log, engine, condWon, lockedVersions>>
     /\ UNCHANGED cVars
 
 Reserve(p) ==
@@ -321,7 +350,7 @@ Reserve(p) ==
     /\ off' = [off EXCEPT ![p] = nextOff]
     /\ nextOff' = nextOff + 1
     /\ Advance(p)
-    /\ UNCHANGED <<log, engine, lock, condWon, utarget>>
+    /\ UNCHANGED <<log, engine, lock, condWon, utarget, dtarget, lockedVersions>>
     /\ UNCHANGED cVars
 
 Write(p) ==
@@ -331,17 +360,20 @@ Write(p) ==
               ELSE IF p \in Updaters THEN
                   log \cup {[o |-> off[p], kind |-> "attr", val |-> p,
                              ver |-> engine.hist, target |-> utarget[p], ts |-> AttrStamp(utarget[p])]}
+              ELSE IF Locking /\ p \in (Deleters \cup Sweepers) THEN
+                  log \cup {[o |-> off[p], kind |-> "vdel", val |-> p,
+                             ver |-> TRUE, target |-> dtarget[p], ts |-> dtarget[p]]}
               ELSE log \cup {[o |-> off[p], kind |-> IF p \in Writers THEN "put" ELSE "tomb", val |-> p,
                               ver |-> versioning, target |-> 0, ts |-> IF versioning THEN Stamp ELSE UnverWriteTs]}
     /\ Advance(p)
-    /\ UNCHANGED <<off, nextOff, engine, lock, condWon, utarget>>
+    /\ UNCHANGED <<off, nextOff, engine, lock, condWon, utarget, dtarget, lockedVersions>>
     /\ UNCHANGED cVars
 
 Fail(p) ==
     /\ WriteCanFail
     /\ pc[p] = "write"
     /\ pc' = [pc EXCEPT ![p] = "release"]
-    /\ UNCHANGED <<step, off, nextOff, log, engine, lock, condWon, utarget>>
+    /\ UNCHANGED <<step, off, nextOff, log, engine, lock, condWon, utarget, dtarget, lockedVersions>>
     /\ UNCHANGED cVars
 
 \* Under the lock, after the streamer's own record is in the log: a record of this key at a
@@ -359,7 +391,7 @@ RelocateStep(p) ==
             /\ log' = log \cup {CopyOf(p)}
        ELSE UNCHANGED <<off, nextOff, log>>
     /\ Advance(p)
-    /\ UNCHANGED <<engine, lock, condWon, utarget>>
+    /\ UNCHANGED <<engine, lock, condWon, utarget, dtarget, lockedVersions>>
     /\ UNCHANGED cVars
 
 RelocateFail(p) ==
@@ -367,7 +399,7 @@ RelocateFail(p) ==
     /\ pc[p] = "relocate"
     /\ Relocate /\ LaterRecord(p)
     /\ pc' = [pc EXCEPT ![p] = "release"]
-    /\ UNCHANGED <<step, off, nextOff, log, engine, lock, condWon, utarget>>
+    /\ UNCHANGED <<step, off, nextOff, log, engine, lock, condWon, utarget, dtarget, lockedVersions>>
     /\ UNCHANGED cVars
 
 
@@ -378,8 +410,11 @@ LateFail(p) ==
     /\ pc[p] = "index"
     /\ \E r \in log : r.o = off[p]
     /\ engine' = IF IndexAfterLateFail THEN LiveApply(engine, RecOf(p)) ELSE engine
+    /\ lockedVersions' = IF Locking /\ IndexAfterLateFail /\ p \in Updaters /\ RecOf(p).kind = "attr" /\ RecOf(p).target # 0
+                         THEN lockedVersions \cup {RecOf(p).target}
+                         ELSE lockedVersions
     /\ pc' = [pc EXCEPT ![p] = "release"]
-    /\ UNCHANGED <<step, off, nextOff, log, lock, condWon, utarget>>
+    /\ UNCHANGED <<step, off, nextOff, log, lock, condWon, utarget, dtarget>>
     /\ UNCHANGED cVars
 
 \* A streamer's copy reaches the log, then the same failure: the copy is the newest record.
@@ -392,7 +427,7 @@ RelocateLateFail(p) ==
     /\ log' = log \cup {CopyOf(p)}
     /\ engine' = IF IndexAfterLateFail THEN LiveApply(engine, CopyOf(p)) ELSE engine
     /\ pc' = [pc EXCEPT ![p] = "release"]
-    /\ UNCHANGED <<step, lock, condWon, utarget>>
+    /\ UNCHANGED <<step, lock, condWon, utarget, dtarget, lockedVersions>>
     /\ UNCHANGED cVars
 
 Index(p) ==
@@ -404,15 +439,18 @@ Index(p) ==
           /\ seq' = nextSeq
           /\ commits' = Append(commits, ev)
           /\ events' = IF EmitOnCommit THEN Append(events, ev) ELSE events
+    /\ lockedVersions' = IF Locking /\ p \in Updaters /\ RecOf(p).kind = "attr" /\ RecOf(p).target # 0
+                         THEN lockedVersions \cup {RecOf(p).target}
+                         ELSE lockedVersions
     /\ condWon' = IF p \in CondWriters THEN [condWon EXCEPT ![p] = TRUE] ELSE condWon
     /\ Advance(p)
-    /\ UNCHANGED <<off, nextOff, log, lock, utarget, cpc, cut, snap, clock, versioning>>
+    /\ UNCHANGED <<off, nextOff, log, lock, utarget, dtarget, cpc, cut, snap, clock, versioning>>
 
 Release(p) ==
     /\ pc[p] = "release"
-    /\ IF UseKeyLock THEN lock' = "free" ELSE UNCHANGED lock
+    /\ IF UseKeyLock /\ (p \notin Sweepers \/ SweepUsesKeyLock) THEN lock' = "free" ELSE UNCHANGED lock
     /\ pc' = [pc EXCEPT ![p] = "done"]
-    /\ UNCHANGED <<step, off, nextOff, log, engine, condWon, utarget>>
+    /\ UNCHANGED <<step, off, nextOff, log, engine, condWon, utarget, dtarget, lockedVersions>>
     /\ UNCHANGED cVars
 
 \* The compaction pass (#167).
@@ -420,6 +458,13 @@ InFlightBelowCut == \E p \in Procs : off[p] > 0 /\ off[p] < cut /\ pc[p] \in {"b
 \* The record the index points at: the newest record of the value the engine holds.
 Points(r) == Visible(engine).present /\ r.kind = "put" /\ r.val = Visible(engine).val
              /\ ~\E r2 \in log : r2.kind = "put" /\ r2.val = r.val /\ r2.o > r.o
+PointsVersioned(r) ==
+    /\ engine.hist
+    /\ \E v \in engine.store :
+        /\ ~v.null /\ v.ts = r.ts /\ v.val = r.val
+        /\ r.kind = IF v.marker THEN "tomb" ELSE "put"
+        /\ r.ver
+    /\ ~\E r2 \in log : r2.ver /\ r2.ts = r.ts /\ r2.kind = r.kind /\ r2.o > r.o
 \* A 0x200 attribute update record is live only if it still provides the latest update for a live non-marker version.
 LiveAttr(u) ==
     /\ u.kind = "attr"
@@ -441,20 +486,21 @@ CScan ==
 CCopy ==
     /\ cpc = "scanned"
     /\ UseKeyLock => lock = "free"
-    /\ LET bases == IF \E r \in snap : Points(r) THEN {[CHOOSE r \in snap : Points(r) EXCEPT !.o = nextOff]} ELSE {}
-           offBase == nextOff + Cardinality(bases)
+    /\ LET liveBases == IF engine.hist THEN {r \in snap : PointsVersioned(r)} ELSE {r \in snap : Points(r)}
+           bases == {[r EXCEPT !.o = nextOff + Cardinality({b \in liveBases : b.o <= r.o}) - 1] : r \in liveBases}
+           offBase == nextOff + Cardinality(liveBases)
            liveAttrs == {u \in snap : LiveAttr(u)}
            copiedAttrs == IF liveAttrs = {} THEN {}
                           ELSE {[u EXCEPT !.o = offBase + Cardinality({v \in liveAttrs : BeforeAttr(v, u)}) - 1] : u \in liveAttrs}
        IN /\ log' = log \cup bases \cup copiedAttrs
           /\ nextOff' = offBase + Cardinality(liveAttrs)
     /\ cpc' = "copied"
-    /\ UNCHANGED <<cut, snap, pc, step, off, engine, lock, clock, versioning, condWon, utarget, seq, events, commits>>
+    /\ UNCHANGED <<cut, snap, pc, step, off, engine, lock, clock, versioning, condWon, utarget, dtarget, lockedVersions, seq, events, commits>>
 CDrop ==
     /\ cpc = "copied"
     /\ log' = {r \in log : r.o >= cut}
     /\ cpc' = "done"
-    /\ UNCHANGED <<cut, snap, pc, step, off, nextOff, engine, lock, clock, versioning, condWon, utarget, seq, events, commits>>
+    /\ UNCHANGED <<cut, snap, pc, step, off, nextOff, engine, lock, clock, versioning, condWon, utarget, dtarget, lockedVersions, seq, events, commits>>
 
 \* PutBucketVersioning: no key lock.
 VersionOn ==
@@ -495,7 +541,7 @@ AckedStateSurvivesRestart == AllDone => Visible(Recovered) = Visible(engine)
 
 \* Two conditional creates (If-None-Match: *) cannot both succeed when no deleter runs (#112).
 AtMostOneConditionalCreateWins ==
-    Deleters = {} => Cardinality({p \in CondWriters : condWon[p]}) <= 1
+    (Deleters \cup Sweepers) = {} => Cardinality({p \in CondWriters : condWon[p]}) <= 1
 
 \* ListObjectVersions shows the same history before and after a restart.
 HistorySurvivesRestart == AllDone => Recovered.hist = engine.hist /\ Recovered.store = engine.store
@@ -509,14 +555,20 @@ UpdateNeverResurrects ==
 
 EventsMatchCommits == events = commits
 
+LockedVersionIsNeverRemoved ==
+    /\ \A t \in lockedVersions : \E v \in engine.store : ~v.null /\ ~v.marker /\ v.ts = t /\ v.locked
+    /\ AllDone => \A t \in lockedVersions : \E v \in Recovered.store : ~v.null /\ ~v.marker /\ v.ts = t /\ v.locked
+
 TypeOK ==
     /\ pc \in [Procs -> {"start", "checked", "body", "reserve", "write", "relocate", "index", "release", "done"}]
     /\ step \in [Procs -> 0..4]
-    /\ nextOff \in 1..(Cardinality(Procs) + Cardinality(Streamers) + Cardinality(Updaters) + 3)
+    /\ nextOff \in 1..(Cardinality(Procs) + Cardinality(Streamers) + Cardinality(Updaters) + 4)
     /\ cpc \in {"idle", "sealed", "scanned", "copied", "done"}
     /\ clock \in Ts
     /\ versioning \in BOOLEAN
     /\ condWon \in [CondWriters -> BOOLEAN]
     /\ utarget \in [Updaters -> Nat]
+    /\ dtarget \in [(Deleters \cup Sweepers) -> Nat]
+    /\ lockedVersions \subseteq Ts
     /\ seq \in Nat
 ====

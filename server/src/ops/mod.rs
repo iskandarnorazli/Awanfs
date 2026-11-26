@@ -1,8 +1,10 @@
 pub mod bucket;
 pub mod cors;
 pub mod lifecycle;
+pub mod lock;
 pub mod multipart;
 pub mod object;
+pub mod post_object;
 pub mod service;
 pub mod tagging;
 
@@ -19,6 +21,7 @@ use crate::authz::{
 };
 use crate::bucket_config::BucketConfig;
 use crate::ffi_bridge::unpack_flags;
+use crate::fsm::Refusal;
 use crate::iam::{Iam, Principal, ROOT_ACCOUNT};
 use crate::meta_index::FLAG_ATTRS;
 use crate::s3_api::{
@@ -53,6 +56,7 @@ pub enum Operation {
     ListMultipartUploads,
     DeleteObjects,
     PutObject,
+    PostObject,
     CopyObject,
     GetObject,
     GetObjectAttributes,
@@ -67,6 +71,12 @@ pub enum Operation {
     GetObjectTagging,
     PutObjectTagging,
     DeleteObjectTagging,
+    GetObjectLockConfiguration,
+    PutObjectLockConfiguration,
+    GetObjectRetention,
+    PutObjectRetention,
+    GetObjectLegalHold,
+    PutObjectLegalHold,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +289,15 @@ pub const OPS: &[OpSpec] = &[
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
+    // A browser form upload (#119): a PutObject whose key and credentials are in the form.
+    OpSpec {
+        op: Operation::PostObject,
+        name: "PostObject",
+        iam_action: Some("s3:PutObject"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
     OpSpec {
         op: Operation::CopyObject,
         name: "CopyObject",
@@ -391,6 +410,54 @@ pub const OPS: &[OpSpec] = &[
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
+    OpSpec {
+        op: Operation::GetObjectLockConfiguration,
+        name: "GetObjectLockConfiguration",
+        iam_action: Some("s3:GetBucketObjectLockConfiguration"),
+        acl_permission: AclPermission::Read,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::PutObjectLockConfiguration,
+        name: "PutObjectLockConfiguration",
+        iam_action: Some("s3:PutBucketObjectLockConfiguration"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::GetObjectRetention,
+        name: "GetObjectRetention",
+        iam_action: Some("s3:GetObjectRetention"),
+        acl_permission: AclPermission::Read,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::PutObjectRetention,
+        name: "PutObjectRetention",
+        iam_action: Some("s3:PutObjectRetention"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::GetObjectLegalHold,
+        name: "GetObjectLegalHold",
+        iam_action: Some("s3:GetObjectLegalHold"),
+        acl_permission: AclPermission::Read,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::PutObjectLegalHold,
+        name: "PutObjectLegalHold",
+        iam_action: Some("s3:PutObjectLegalHold"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
 ];
 
 pub fn spec(op: Operation) -> &'static OpSpec {
@@ -416,6 +483,9 @@ const BUILT_SUBRESOURCES: &[&str] = &[
     "versionId",
     "tagging",
     "attributes",
+    "object-lock",
+    "retention",
+    "legal-hold",
 ];
 
 const UNBUILT_S3_SUBRESOURCES: &[&str] = &[
@@ -423,9 +493,6 @@ const UNBUILT_S3_SUBRESOURCES: &[&str] = &[
     "policy",
     "policyStatus",
     "encryption",
-    "object-lock",
-    "legal-hold",
-    "retention",
     "website",
     "notification",
     "replication",
@@ -506,10 +573,13 @@ pub fn classify(
             (&Method::PUT, ["tagging"]) => Ok(Operation::PutBucketTagging),
             (&Method::GET, ["tagging"]) => Ok(Operation::GetBucketTagging),
             (&Method::DELETE, ["tagging"]) => Ok(Operation::DeleteBucketTagging),
+            (&Method::GET, ["object-lock"]) => Ok(Operation::GetObjectLockConfiguration),
+            (&Method::PUT, ["object-lock"]) => Ok(Operation::PutObjectLockConfiguration),
             (&Method::OPTIONS, []) => Ok(Operation::CorsPreflight),
             (&Method::GET, ["location"]) => Ok(Operation::GetBucketLocation),
             (&Method::GET, ["uploads"]) => Ok(Operation::ListMultipartUploads),
             (&Method::POST, ["delete"]) => Ok(Operation::DeleteObjects),
+            (&Method::POST, []) if post_object::is_form_upload(headers) => Ok(Operation::PostObject),
             (_, s) if !s.is_empty() => Err(ClassifyRefusal::NotImplemented("The requested sub-resource is not implemented.")),
             (&Method::PUT, []) => Ok(Operation::CreateBucket),
             (&Method::DELETE, []) => Ok(Operation::DeleteBucket),
@@ -534,6 +604,18 @@ pub fn classify(
             (&Method::DELETE, ["tagging"]) | (&Method::DELETE, ["tagging", "versionId"]) => Ok(Operation::DeleteObjectTagging),
             (&Method::GET, ["attributes"]) | (&Method::GET, ["attributes", "versionId"]) => {
                 Ok(Operation::GetObjectAttributes)
+            }
+            (&Method::GET, ["retention"]) | (&Method::GET, ["retention", "versionId"]) => {
+                Ok(Operation::GetObjectRetention)
+            }
+            (&Method::PUT, ["retention"]) | (&Method::PUT, ["retention", "versionId"]) => {
+                Ok(Operation::PutObjectRetention)
+            }
+            (&Method::GET, ["legal-hold"]) | (&Method::GET, ["legal-hold", "versionId"]) => {
+                Ok(Operation::GetObjectLegalHold)
+            }
+            (&Method::PUT, ["legal-hold"]) | (&Method::PUT, ["legal-hold", "versionId"]) => {
+                Ok(Operation::PutObjectLegalHold)
             }
                         (&Method::GET, ["versionId"])
             | (&Method::GET, ["partNumber"])
@@ -586,6 +668,8 @@ pub struct Classified {
     pub query_map: HashMap<String, String>,
     pub parts: hyper::http::request::Parts,
     pub body: hyper::body::Incoming,
+    /// PostObject only: the form read by `post_object::read_form` (#119).
+    pub form: Option<Box<post_object::PostForm>>,
 }
 
 pub struct Authenticated {
@@ -611,6 +695,7 @@ pub struct Resolved {
 
 pub struct Authorized {
     pub resolved: Resolved,
+    pub bypass_governance: bool,
 }
 
 pub struct Validated {
@@ -672,6 +757,7 @@ pub fn classify_request(req: Request<hyper::body::Incoming>) -> Result<Classifie
         query_map,
         parts,
         body,
+        form: None,
     })
 }
 
@@ -680,6 +766,9 @@ pub fn authenticate(state: &S3ServiceState, c: Classified) -> Result<Authenticat
     let iam = state.iam.read().as_ref().map(|r| r.current());
     if c.op == Operation::CorsPreflight {
         return Ok(Authenticated { classified: c, principal: Principal::Anonymous, iam });
+    }
+    if c.op == Operation::PostObject {
+        return authenticate_form(state, c);
     }
     let path = c.parts.uri.path();
     let principal = match crate::auth::authenticate_with(
@@ -718,6 +807,48 @@ pub fn authenticate(state: &S3ServiceState, c: Classified) -> Result<Authenticat
         Principal::Anonymous => "anonymous".to_string(),
     };
     crate::request_log::note_principal(principal_label);
+    Ok(Authenticated { classified: c, principal, iam })
+}
+
+/// The authenticate stage for a form: the form's own signature stands in for the
+/// Authorization header. A signed form's policy is checked here too, once its signature is
+/// known to be good, so nothing the policy refuses reaches storage.
+fn authenticate_form(state: &S3ServiceState, mut c: Classified) -> Result<Authenticated, Response<ResponseBody>> {
+    let path = c.parts.uri.path().to_string();
+    let iam = state.iam.read().as_ref().map(|r| r.current());
+    let now = state.clock.now_ns() / 1_000_000_000;
+    let form = c.form.as_mut().expect("read_form ran for PostObject");
+    let refuse = |r: Refusal| post_object::refusal_response(r, &path);
+    let signature = crate::post_object::read_signature(&form.fields).map_err(refuse)?;
+    let no_keys = state.auth.credentials.is_none() && iam.as_deref().is_none_or(|i| i.is_empty());
+    let principal = match &signature {
+        None if state.auth.allow_anonymous => Principal::Anonymous,
+        None => return Err(post_object::refusal_response(Refusal { code: "AccessDenied", status: 403, why: "Access Denied" }, &path)),
+        Some(_) if no_keys && state.auth.allow_anonymous => Principal::Anonymous,
+        Some(_) if no_keys => return Err(refuse(crate::post_object::UNKNOWN_KEY)),
+        Some(sig) => {
+            let (principal, secret) =
+                crate::auth::secret_for(&state.auth, iam.as_deref(), &sig.access_key).ok_or_else(|| refuse(crate::post_object::UNKNOWN_KEY))?;
+            let want = crate::post_object::expected_signature(&state.sigv4_cache, secret, sig);
+            if !crate::auth::constant_time_eq(&want, &sig.signature) {
+                return Err(refuse(crate::post_object::BAD_SIGNATURE));
+            }
+            principal
+        }
+    };
+    if signature.is_some() {
+        let bucket = c.bucket.as_deref().unwrap_or("");
+        let key = c.key.as_deref().unwrap_or("");
+        let policy = crate::post_object::parse_policy(form.fields.get("policy").unwrap_or("")).map_err(refuse)?;
+        crate::post_object::check_policy(&policy, &form.fields, bucket, key, now).map_err(refuse)?;
+        form.policy = Some(policy);
+    }
+    crate::request_log::note_principal(match &principal {
+        Principal::Anonymous => "anonymous".to_string(),
+        Principal::Root => crate::iam::ROOT_ACCOUNT.to_string(),
+        Principal::User { account, name, .. } if account == name => name.clone(),
+        Principal::User { account, name, .. } => format!("{}:{}", account, name),
+    });
     Ok(Authenticated { classified: c, principal, iam })
 }
 
@@ -794,6 +925,10 @@ pub fn resolve_bucket(state: &S3ServiceState, a: Authenticated) -> Result<Resolv
                 | Operation::GetObjectTagging
                 | Operation::PutObjectTagging
                 | Operation::DeleteObjectTagging
+                | Operation::GetObjectRetention
+                | Operation::PutObjectRetention
+                | Operation::GetObjectLegalHold
+                | Operation::PutObjectLegalHold
         ) {
         let vid = a.classified.query_map.get("versionId").map(String::as_str);
         a.classified
@@ -952,14 +1087,22 @@ pub fn authorize(state: &S3ServiceState, r: Resolved) -> Result<Authorized, Resp
     let c = &r.auth.classified;
     if c.op == Operation::CorsPreflight {
         record_authz_reason("cors-preflight");
-        return Ok(Authorized { resolved: r });
+        return Ok(Authorized {
+            resolved: r,
+            bypass_governance: false,
+        });
     }
+    let wants_bypass = matches!(c.op, Operation::PutObjectRetention | Operation::DeleteObject)
+        && crate::object_lock::parse_bypass_governance_header(&c.parts.headers);
     if state.auth.allow_anonymous
         && matches!(r.auth.principal, Principal::Anonymous)
         && r.auth.iam.as_deref().is_none_or(|i| i.is_empty())
     {
         record_authz_reason("allow-anonymous");
-        return Ok(Authorized { resolved: r });
+        return Ok(Authorized {
+            resolved: r,
+            bypass_governance: wants_bypass,
+        });
     }
 
     let empty_acl = AclGrants::default();
@@ -1037,10 +1180,35 @@ pub fn authorize(state: &S3ServiceState, r: Resolved) -> Result<Authorized, Resp
         }
     }
 
-    Ok(Authorized { resolved: r })
+    let bypass_governance = if wants_bypass {
+        let bypass_pol = match (&r.auth.principal, r.auth.iam.as_deref(), c.bucket.as_deref(), c.key.as_deref()) {
+            (Principal::User { name, .. }, Some(iam), Some(b), Some(k)) => {
+                iam.evaluate_user(name, "s3:BypassGovernanceRetention", &format!("arn:aws:s3:::{}/{}", b, k))
+            }
+            _ => PolicyMatch::NoOpinion,
+        };
+        let bypass_ctx = AuthzContext {
+            identity_policy: bypass_pol,
+            _marker: PhantomData,
+        };
+        crate::authz::authorize_bypass_governance(
+            &r.auth.principal,
+            bucket_target.as_ref(),
+            object_target.as_ref(),
+            &bypass_ctx,
+        )
+        .is_allowed()
+    } else {
+        false
+    };
+
+    Ok(Authorized {
+        resolved: r,
+        bypass_governance,
+    })
 }
 
-fn authorize_delete_key(
+fn authorize_key_action(
     state: &S3ServiceState,
     principal: &Principal,
     iam: Option<&Iam>,
@@ -1048,6 +1216,7 @@ fn authorize_delete_key(
     bucket_cfg: Option<&BucketConfig>,
     bucket: &str,
     key: &str,
+    bypass: bool,
 ) -> bool {
     if state.auth.allow_anonymous
         && matches!(principal, Principal::Anonymous)
@@ -1067,19 +1236,52 @@ fn authorize_delete_key(
         owner_account: obj_owner.as_deref().unwrap_or(b_target.owner_account),
         acl: &empty_acl,
     };
-    let id_pol = identity_policy_for(principal, iam, Operation::DeleteObject, Some(bucket), Some(key));
-    let ctx = AuthzContext {
-        identity_policy: id_pol,
-        _marker: PhantomData,
-    };
-    crate::authz::authorize(
-        principal,
-        Operation::DeleteObject,
-        Some(&b_target),
-        Some(&o_target),
-        &ctx,
-    )
-    .is_allowed()
+    if bypass {
+        let id_pol = match (principal, iam) {
+            (Principal::User { name, .. }, Some(iam)) => iam.evaluate_user(
+                name,
+                "s3:BypassGovernanceRetention",
+                &format!("arn:aws:s3:::{}/{}", bucket, key),
+            ),
+            _ => PolicyMatch::NoOpinion,
+        };
+        let ctx = AuthzContext {
+            identity_policy: id_pol,
+            _marker: PhantomData,
+        };
+        crate::authz::authorize_bypass_governance(principal, Some(&b_target), Some(&o_target), &ctx).is_allowed()
+    } else {
+        let id_pol = identity_policy_for(principal, iam, Operation::DeleteObject, Some(bucket), Some(key));
+        let ctx = AuthzContext {
+            identity_policy: id_pol,
+            _marker: PhantomData,
+        };
+        crate::authz::authorize(principal, Operation::DeleteObject, Some(&b_target), Some(&o_target), &ctx).is_allowed()
+    }
+}
+
+fn authorize_delete_key(
+    state: &S3ServiceState,
+    principal: &Principal,
+    iam: Option<&Iam>,
+    b_id: u32,
+    bucket_cfg: Option<&BucketConfig>,
+    bucket: &str,
+    key: &str,
+) -> bool {
+    authorize_key_action(state, principal, iam, b_id, bucket_cfg, bucket, key, false)
+}
+
+fn authorize_bypass_key(
+    state: &S3ServiceState,
+    principal: &Principal,
+    iam: Option<&Iam>,
+    b_id: u32,
+    bucket_cfg: Option<&BucketConfig>,
+    bucket: &str,
+    key: &str,
+) -> bool {
+    authorize_key_action(state, principal, iam, b_id, bucket_cfg, bucket, key, true)
 }
 
 pub fn validate(a: Authorized) -> Result<Validated, Response<ResponseBody>> {
@@ -1115,11 +1317,16 @@ pub fn validate(a: Authorized) -> Result<Validated, Response<ResponseBody>> {
             key: k.clone(),
         },
     };
-    let body_limit = body_limit_for(&c.parts.method, &target);
-    let declared = c
-        .parts
-        .headers
-        .get("x-amz-decoded-content-length")
+    // A form carries the file and at most 2 MiB of fields (100 of 20 KiB) around it.
+    let body_limit = if c.op == Operation::PostObject {
+        crate::s3_api::MAX_OBJECT_BODY + crate::s3_api::MAX_XML_BODY
+    } else {
+        body_limit_for(&c.parts.method, &target)
+    };
+    // A form's size is its Content-Length; `x-amz-decoded-content-length` is for aws-chunked
+    // PUT bodies and must not let a form past the limit.
+    let decoded = if c.op == Operation::PostObject { None } else { c.parts.headers.get("x-amz-decoded-content-length") };
+    let declared = decoded
         .or_else(|| c.parts.headers.get(CONTENT_LENGTH))
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok());
@@ -1130,6 +1337,7 @@ pub fn validate(a: Authorized) -> Result<Validated, Response<ResponseBody>> {
 }
 
 pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Response<ResponseBody>, hyper::Error> {
+    let bypass_governance = v.authorized.bypass_governance;
     let resolved = v.authorized.resolved;
     let b_id = resolved.b_id;
     let bucket_cfg = resolved.bucket_cfg;
@@ -1148,7 +1356,7 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
 
     match c.op {
         Operation::ListBuckets => service::list_buckets(state, &c.query_map, principal.account()).await,
-        Operation::CreateBucket => bucket::create_bucket(state, bucket, &path, writer_account, c.body).await,
+        Operation::CreateBucket => bucket::create_bucket(state, bucket, &path, &c.parts.headers, writer_account, c.body).await,
         Operation::DeleteBucket => bucket::delete_bucket(state, b_id.unwrap(), bucket).await,
         Operation::HeadBucket => bucket::head_bucket().await,
         Operation::ListObjects => bucket::list_objects(state, b_id.unwrap(), bucket, &c.query_map, false).await,
@@ -1157,9 +1365,9 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         Operation::GetBucketLocation => bucket::get_bucket_location(state).await,
         Operation::GetBucketVersioning => bucket::get_bucket_versioning(state, b_id.unwrap()).await,
         Operation::PutBucketVersioning => bucket::put_bucket_versioning(state, b_id.unwrap(), bucket, &path, c.body).await,
-        Operation::GetBucketLifecycle => lifecycle::get_bucket_lifecycle(state, bucket).await,
-        Operation::PutBucketLifecycle => lifecycle::put_bucket_lifecycle(state, bucket, &path, c.body).await,
-        Operation::DeleteBucketLifecycle => lifecycle::delete_bucket_lifecycle(state, bucket).await,
+        Operation::GetBucketLifecycle => lifecycle::get_bucket_lifecycle(state, b_id.unwrap(), bucket).await,
+        Operation::PutBucketLifecycle => lifecycle::put_bucket_lifecycle(state, b_id.unwrap(), bucket, &path, c.body).await,
+        Operation::DeleteBucketLifecycle => lifecycle::delete_bucket_lifecycle(state, b_id.unwrap(), bucket).await,
         Operation::GetBucketCors => cors::get_bucket_cors(state, b_id.unwrap(), bucket).await,
         Operation::PutBucketCors => cors::put_bucket_cors(state, b_id.unwrap(), bucket, &path, c.body).await,
         Operation::DeleteBucketCors => cors::delete_bucket_cors(state, b_id.unwrap(), bucket).await,
@@ -1175,6 +1383,12 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
             let iam_for_del = iam.clone();
             let cfg_for_del = bucket_cfg.clone();
             let b_name = bucket.to_string();
+            let wants_bypass = crate::object_lock::parse_bypass_governance_header(&c.parts.headers);
+            let st_for_byp = Arc::clone(&state);
+            let p_for_byp = principal.clone();
+            let iam_for_byp = iam.clone();
+            let cfg_for_byp = bucket_cfg.clone();
+            let b_name_byp = bucket.to_string();
             bucket::delete_objects(
                 state,
                 bid,
@@ -1191,6 +1405,18 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
                         k,
                     )
                 },
+                move |k| {
+                    wants_bypass
+                        && authorize_bypass_key(
+                            &st_for_byp,
+                            &p_for_byp,
+                            iam_for_byp.as_deref(),
+                            bid,
+                            cfg_for_byp.as_deref(),
+                            &b_name_byp,
+                            k,
+                        )
+                },
                 c.body,
             )
             .await
@@ -1198,6 +1424,9 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         Operation::PutObject => {
             let verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &c.parts.headers);
             object::put_object(state, b_id.unwrap(), bucket, key, &path, &c.parts.headers, writer_account, &bucket_owner, verifier, c.body).await
+        }
+        Operation::PostObject => {
+            post_object::execute(state, b_id.unwrap(), bucket, key, &path, &c.parts.headers, writer_account, &bucket_owner, c.form, c.body).await
         }
         Operation::CopyObject => object::copy_object(state, b_id.unwrap(), bucket, key, &c.parts.headers, writer_account, &bucket_owner).await,
         Operation::GetObject => {
@@ -1213,7 +1442,7 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
             let is_anon_with_auth = auth_enabled && matches!(principal, Principal::Anonymous);
             object::get_or_head_object(state, b_id.unwrap(), bucket, key, &c.query_map, &c.parts.headers, true, is_anon_with_auth).await
         }
-        Operation::DeleteObject => object::delete_object(state, b_id.unwrap(), key, &c.query_map, &c.parts.headers).await,
+        Operation::DeleteObject => object::delete_object(state, b_id.unwrap(), key, &c.query_map, &c.parts.headers, bypass_governance).await,
         Operation::CreateMultipartUpload => {
             multipart::create_multipart_upload(state, b_id.unwrap(), bucket, key, &c.parts.headers, writer_account, &bucket_owner).await
         }
@@ -1232,6 +1461,12 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         Operation::GetObjectTagging => tagging::get_object_tagging(state, b_id.unwrap(), key, &c.query_map).await,
         Operation::PutObjectTagging => tagging::put_object_tagging(state, b_id.unwrap(), key, &path, &c.query_map, c.body).await,
         Operation::DeleteObjectTagging => tagging::delete_object_tagging(state, b_id.unwrap(), key, &c.query_map).await,
+        Operation::GetObjectLockConfiguration => lock::get_object_lock_configuration(state, b_id.unwrap(), bucket).await,
+        Operation::PutObjectLockConfiguration => lock::put_object_lock_configuration(state, b_id.unwrap(), bucket, &path, c.body).await,
+        Operation::GetObjectRetention => lock::get_object_retention(state, b_id.unwrap(), key, &c.query_map).await,
+        Operation::PutObjectRetention => lock::put_object_retention(state, b_id.unwrap(), key, &path, &c.query_map, bypass_governance, c.body).await,
+        Operation::GetObjectLegalHold => lock::get_object_legal_hold(state, b_id.unwrap(), key, &c.query_map).await,
+        Operation::PutObjectLegalHold => lock::put_object_legal_hold(state, b_id.unwrap(), key, &path, &c.query_map, c.body).await,
     }
 }
 
@@ -1265,6 +1500,7 @@ mod tests {
             (Operation::ListMultipartUploads, Method::GET, Some("bkt"), None, "uploads", None),
             (Operation::DeleteObjects, Method::POST, Some("bkt"), None, "delete", None),
             (Operation::PutObject, Method::PUT, Some("bkt"), Some("obj"), "", None),
+            (Operation::PostObject, Method::POST, Some("bkt"), None, "", None),
             (Operation::CopyObject, Method::PUT, Some("bkt"), Some("obj"), "", Some("/src/key")),
             (Operation::GetObject, Method::GET, Some("bkt"), Some("obj"), "", None),
             (Operation::GetObjectAttributes, Method::GET, Some("bkt"), Some("obj"), "attributes", None),
@@ -1279,6 +1515,12 @@ mod tests {
             (Operation::GetObjectTagging, Method::GET, Some("bkt"), Some("obj"), "tagging", None),
             (Operation::PutObjectTagging, Method::PUT, Some("bkt"), Some("obj"), "tagging", None),
             (Operation::DeleteObjectTagging, Method::DELETE, Some("bkt"), Some("obj"), "tagging", None),
+            (Operation::GetObjectLockConfiguration, Method::GET, Some("bkt"), None, "object-lock", None),
+            (Operation::PutObjectLockConfiguration, Method::PUT, Some("bkt"), None, "object-lock", None),
+            (Operation::GetObjectRetention, Method::GET, Some("bkt"), Some("obj"), "retention", None),
+            (Operation::PutObjectRetention, Method::PUT, Some("bkt"), Some("obj"), "retention", None),
+            (Operation::GetObjectLegalHold, Method::GET, Some("bkt"), Some("obj"), "legal-hold", None),
+            (Operation::PutObjectLegalHold, Method::PUT, Some("bkt"), Some("obj"), "legal-hold", None),
         ]
     }
 
@@ -1290,6 +1532,9 @@ mod tests {
             let mut hdrs = HeaderMap::new();
             if let Some(c) = copy {
                 hdrs.insert("x-amz-copy-source", c.parse().unwrap());
+            }
+            if *expected == Operation::PostObject {
+                hdrs.insert(CONTENT_TYPE, "multipart/form-data; boundary=x".parse().unwrap());
             }
             let got = classify(method, *b, *k, q, &hdrs).unwrap();
             assert_eq!(got, *expected, "for {:?} {:?} {:?} ?{}", method, b, k, q);
@@ -1307,6 +1552,10 @@ mod tests {
             let mut hdrs = HeaderMap::new();
             if let Some(c) = copy {
                 hdrs.insert("x-amz-copy-source", c.parse().unwrap());
+            }
+            if method == Method::POST && b.is_some() && k.is_none() && q.is_empty() {
+                // PostObject (#119): its key is in the form, so the old path-based function has no row.
+                continue;
             }
             let op = classify(&method, b, k, q, &hdrs).unwrap();
             if op == Operation::CorsPreflight {
