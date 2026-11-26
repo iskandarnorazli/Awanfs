@@ -1469,6 +1469,31 @@ class FastAndThreadReportTests(unittest.TestCase):
         self.assertIn("| group | 4 | 1002 | (unnamed) | 0.050 | 0.020 | 0.070 |", md)
         self.assertIn("| fast | 4 | 2001 | tokio-runtime-worker | 1.200 | 0.600 | 1.800 |", md)
 
+    def test_workloads_reach_1_mib_and_fast_rows_render_for_every_put_size(self):
+        sizes = {(mode, sz) for _k, _l, mode, sz in cs.WORKLOADS}
+        self.assertIn(("put", 1024 * cs.KIB), sizes)
+        self.assertIn(("get", 1024 * cs.KIB), sizes)
+        self.assertEqual([w[0] for w in cs.PUT_WORKLOADS], ["put_4k", "put_64k", "put_1m"])
+        self.assertEqual(cs.WORKLOADS[0][0], "put_4k")
+        cores, results = _sample_results()
+        pt = cs.PointResult(ops_per_sec=900.0, p50_ms=9.0, p99_ms=20.0, cpu_pct=80.0, ops_per_busy_core=1125.0)
+        fast = {wk: {n: pt for n in cores} for wk, *_ in cs.PUT_WORKLOADS}
+        md = cs.render_report(
+            cmd="python benchmarks/core_scaling.py --cores 1,2,4 --compare-fast",
+            cores=cores,
+            results=results,
+            total_cores=16,
+            runs=2,
+            duration_sec=2.0,
+            chart_paths=[],
+            fast_results=fast,
+        )
+        for label in ["PUT 4 KiB", "PUT 64 KiB", "PUT 1 MiB"]:
+            self.assertIn(f"| {label} |", md)
+            self.assertIn("AwanFS (--durability fast)", md.split(f"| {label} |", 1)[1].split("\n", 1)[0] + md)
+        self.assertEqual(md.count("| AwanFS (--durability fast) |"), 3 * 3, "throughput, CPU and client rows per PUT size")
+        self.assertIn("| GET 1 MiB |", md)
+
     def test_matrix_report_renders_fast_row_and_per_thread_cpu_table(self):
         patterns, sizes, cores, concs, results = _sample_matrix_results()
         results["seq-write"][4096]["AwanFS"][4][64] = cs.PointResult(
@@ -1506,6 +1531,29 @@ class FastAndThreadReportTests(unittest.TestCase):
         self.assertIn("## Per-Thread CPU Breakdown", md)
         self.assertIn("| group | 4 | 3001 | tokio-runtime-worker | 0.500 | 1.400 | 1.900 |", md)
         self.assertIn("| fast | 4 | 4001 | tokio-runtime-worker | 1.100 | 0.700 | 1.800 |", md)
+
+    def test_matrix_report_renders_fast_rows_for_every_put_size(self):
+        patterns, sizes, cores, concs, results = _sample_matrix_results()
+        pt = cs.PointResult(ops_per_sec=900.0, mib_per_sec=900.0, p50_ms=9.0, p99_ms=20.0, cpu_pct=80.0)
+        fast = {sz: {4: {64: pt}} for sz in sizes}
+        md = cs.render_matrix_report(
+            cmd="python benchmarks/core_scaling.py --matrix --compare-fast",
+            patterns=patterns,
+            sizes=sizes,
+            cores=cores,
+            concurrencies=concs,
+            results=results,
+            total_cores=16,
+            runs=2,
+            duration_sec=2.0,
+            seed=42,
+            memory_budget="32MiB",
+            prefill_bytes=48 * 1024 * 1024,
+            chart_paths=[],
+            fast_by_size=fast,
+        )
+        self.assertIn("| AwanFS (--durability fast) | seq-write | 4 KiB | 4 | 64 |", md)
+        self.assertIn("| AwanFS (--durability fast) | seq-write | 1 MiB | 4 | 64 |", md)
 
     def test_live_stub_phase_captures_thread_cpu_when_enabled(self):
         import threading
