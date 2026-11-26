@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections import OrderedDict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import conformance_map as cm  # noqa: E402
@@ -128,6 +129,27 @@ class Map(unittest.TestCase):
         self.assertEqual(cm.area_of("test_cors_presigned_put_object_tenant_v2", [])[0], "sigv2")
         self.assertEqual(cm.area_of("test_bucket_listv2_maxkeys_one", ["list_objects_v2"])[0], "listing", "ListObjectsV2 is not SigV2")
         self.assertEqual(cm.area_of("test_headers::test_object_create_bad_md5_invalid_short", ["auth_common"])[0], "request-headers")
+
+    def test_a_ported_test_is_covered_by_its_own_test(self):
+        """#433: a SigV2 suite test counts by its SigV4 port, named in features.toml."""
+        tests = OrderedDict([
+            ("test_headers::test_bucket_create_bad_ua_none_aws2", ["auth_aws2"]),
+            ("test_cors_presigned_get_object_v2", []),
+            ("test_put_obj_enc_conflict", ["encryption"]),
+        ])
+        junit = {n: ("fail", "AuthorizationHeaderMalformed") for n in tests}
+        rows, unassigned = cm.build(tests, set(), junit)
+        own = {r[0]: r[6] for r in rows}
+        self.assertEqual(own["test_headers::test_bucket_create_bad_ua_none_aws2"], "server/tests/sigv2_ports_test.rs::test_bucket_create_bad_ua_none_aws2")
+        self.assertEqual(own["test_cors_presigned_get_object_v2"], "test_s3::test_cors_presigned_get_object")
+        self.assertEqual(own["test_put_obj_enc_conflict"], "")
+        text = cm.render(rows, unassigned, "suite x")
+        self.assertIn("| sigv2 | covered by own tests | 9 | 0 | 2 | 0 |", text)
+        self.assertIn("3 test functions: 0 pass, 3 fail, 0 skipped, 0 unknown, 2 covered by own tests.", text)
+        self.assertIn("## sigv2: 2 covered by own tests", text)
+        self.assertIn("- `test_headers::test_bucket_create_bad_ua_none_aws2` (fail): covered by own test (`server/tests/sigv2_ports_test.rs::test_bucket_create_bad_ua_none_aws2`)", text)
+        self.assertNotIn("## sigv2: 2 not passing", text)
+        self.assertIn("## encryption: 1 not passing", text)
 
     def test_owner_decisions_of_2026_11_18(self):
         """#160: the request no client can send is out of scope; #140: the anonymous DELETE on a

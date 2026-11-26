@@ -461,6 +461,93 @@ class FeaturesTest(unittest.TestCase):
         self.assertTrue(any("test_set_cors" in p and "unassigned" in p.lower() for p in probs), probs)
         self.assertEqual(self._run_check(with_suite=False), 1)
 
+    # A suite test AwanFS cannot run as written (SigV2) is covered by its own port (#433).
+    def _ported(self, target, key="test_s3::test_bad_aws2"):
+        self.registry.write_text(
+            VALID_TOML.replace(
+                'ceph = ["mark:auth_aws2"]\n',
+                'ceph = ["mark:auth_aws2"]\n\n[feature.ported]\n"%s" = "%s"\n' % (key, target),
+            ),
+            encoding="utf-8",
+        )
+        return features.check_registry(root=self.root, registry_path=self.registry, ceph_suites=[self.suite])
+
+    def test_a_port_needs_its_file_and_fn(self):
+        probs = self._ported("server/tests/ports_test.rs::test_bad_aws2")
+        self.assertTrue(any("ports_test.rs" in p and "no such file" in p for p in probs), probs)
+        (self.root / "server" / "tests" / "ports_test.rs").write_text("fn other() {}\n", encoding="utf-8")
+        probs = self._ported("server/tests/ports_test.rs::test_bad_aws2")
+        self.assertTrue(any("test_bad_aws2" in p and "no such fn" in p for p in probs), probs)
+        self.assertEqual(self._run_check(), 1)
+        (self.root / "server" / "tests" / "ports_test.rs").write_text("#[tokio::test]\nasync fn test_bad_aws2() {}\n", encoding="utf-8")
+        self.assertEqual(self._ported("server/tests/ports_test.rs::test_bad_aws2"), [])
+        self.assertEqual(self._run_check(), 0)
+
+    def test_a_port_to_a_suite_test_needs_it_in_passing_txt(self):
+        self.assertEqual(self._ported("test_s3::test_set_cors"), [])
+        probs = self._ported("test_s3::test_not_listed")
+        self.assertTrue(any("test_not_listed" in p and "passing.txt" in p for p in probs), probs)
+
+    def test_a_port_must_be_for_one_of_the_features_tests(self):
+        (self.root / "server" / "tests" / "ports_test.rs").write_text("fn test_set_cors() {}\n", encoding="utf-8")
+        probs = self._ported("server/tests/ports_test.rs::test_set_cors", key="test_s3::test_set_cors")
+        self.assertTrue(any("sigv2" in p and "test_set_cors" in p and "not one of its tests" in p for p in probs), probs)
+
+    def test_ported_md_and_the_registry_agree(self):
+        (self.root / "server" / "tests" / "ports_test.rs").write_text("fn test_bad_aws2() {}\n", encoding="utf-8")
+        md = self.root / "tests" / "s3tests" / "PORTED.md"
+        md.write_text(
+            "| suite test | why ported | AwanFS test |\n|---|---|---|\n"
+            "| `test_s3::test_bad_aws2` | SigV2 | `server/tests/ports_test.rs::test_bad_aws2` |\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self._ported("server/tests/ports_test.rs::test_bad_aws2"), [])
+        md.write_text("| suite test | why ported | AwanFS test |\n|---|---|---|\n", encoding="utf-8")
+        probs = self._ported("server/tests/ports_test.rs::test_bad_aws2")
+        self.assertTrue(any("PORTED.md" in p and "test_bad_aws2" in p for p in probs), probs)
+        md.write_text(
+            "| suite test | why ported | AwanFS test |\n|---|---|---|\n"
+            "| `test_s3::test_bad_aws2` | SigV2 | `server/tests/ports_test.rs::other` |\n",
+            encoding="utf-8",
+        )
+        probs = self._ported("server/tests/ports_test.rs::test_bad_aws2")
+        self.assertTrue(any("PORTED.md" in p and "other" in p for p in probs), probs)
+
+    def test_a_ported_test_counts_for_a_done_feature(self):
+        (self.root / "server" / "tests" / "ports_test.rs").write_text("fn test_cors_header_option() {}\n", encoding="utf-8")
+        self._passing("test_s3::test_set_cors")
+        self.registry.write_text(
+            VALID_TOML.replace(
+                'fuzz = ["cors_xml"]\n',
+                'fuzz = ["cors_xml"]\n\n[feature.ported]\n"test_s3::test_cors_header_option" = "server/tests/ports_test.rs::test_cors_header_option"\n',
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(self._run_check(), 0)
+
+    def test_report_shows_a_ported_test_as_covered_by_its_own_test(self):
+        (self.root / "server" / "tests" / "ports_test.rs").write_text("fn test_bad_aws2() {}\n", encoding="utf-8")
+        self._ported("server/tests/ports_test.rs::test_bad_aws2")
+        out_md = self.root / "FEATURES.md"
+        rc = features.main([
+            "report", "--root", str(self.root), "--registry", str(self.registry),
+            "--ceph-junit", str(self.junit), "--ceph-suite", str(self.suite), "--run-id", "1", "--output", str(out_md),
+        ])
+        self.assertEqual(rc, 0)
+        text = out_md.read_text(encoding="utf-8")
+        self.assertIn("| sigv2 | out-of-scope | covered by own tests | 0/1 (+1 own) |", text)
+        self.assertIn("- `test_s3::test_bad_aws2`: covered by own test (`server/tests/ports_test.rs::test_bad_aws2`)", text)
+
+    def test_report_without_a_mint_log_does_not_claim_mint_results(self):
+        self.registry.write_text(VALID_TOML.replace('id = "cors"', 'id = "cors"\nmint = ["awscli::cors_test"]'), encoding="utf-8")
+        out_md = self.root / "FEATURES.md"
+        features.main(["report", "--root", str(self.root), "--registry", str(self.registry),
+                       "--ceph-junit", str(self.junit), "--run-id", "1", "--output", str(out_md)])
+        text = out_md.read_text(encoding="utf-8")
+        self.assertNotIn("Mint: 0 tests", text)
+        self.assertIn("| cors | done | #116 | 1/2 | — |", text)
+        self.assertIn("Mint: not run", text)
+
     def test_repo_registry_passes_check(self):
         repo_root = Path(__file__).resolve().parent.parent
         probs = features.check_registry(root=repo_root)
