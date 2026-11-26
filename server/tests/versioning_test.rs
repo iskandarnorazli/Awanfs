@@ -141,6 +141,7 @@ async fn check_after_delete(c: &reqwest::Client, url: &str, ids: &[String], mark
     assert_eq!(listed, want, "newest first, the marker latest");
 }
 
+// covers: GetBucketVersioning, PutBucketVersioning
 #[tokio::test]
 async fn three_versions_a_delete_marker_and_a_killed_process() {
     let dir = temp_dir("gate");

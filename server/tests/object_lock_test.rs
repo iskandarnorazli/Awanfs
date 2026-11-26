@@ -142,6 +142,7 @@ fn signed_req(
         .body(body.to_vec())
 }
 
+// covers: GetObjectLockConfiguration
 #[tokio::test]
 async fn bucket_lock_config_enable_after_create_and_suspend_refused() {
     let (base, _state, _clock, _h) = spawn_clocked(None, 1_750_000_000, None, AuthConfig::open()).await;
@@ -797,6 +798,7 @@ async fn randomized_sequence_never_deletes_version_while_may_delete_refuses() {
     }
 }
 
+// covers: PutObjectLockConfiguration, GetObjectRetention, PutObjectRetention, GetObjectLegalHold, PutObjectLegalHold
 #[tokio::test]
 async fn pre_versioning_null_object_supports_put_and_get_lock_without_version_id() {
     let dir = temp_dir("null_lock");

@@ -92,6 +92,7 @@ async fn a_copy_names_its_source_version_and_gets_that_version() {
     s.done();
 }
 
+// covers: CopyObject, DeleteObject
 #[tokio::test]
 async fn an_old_version_can_be_copied_when_the_key_is_deleted() {
     let s = Srv::new("marker").await;

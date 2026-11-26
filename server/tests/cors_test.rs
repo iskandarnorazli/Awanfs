@@ -62,6 +62,7 @@ async fn cors_request_and_check(
     resp_headers
 }
 
+// covers: GetBucketCors, PutBucketCors, DeleteBucketCors
 #[tokio::test]
 async fn test_set_cors() {
     let (base_url, _state, _handle) = spawn_server().await;
@@ -123,6 +124,7 @@ async fn test_set_cors() {
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
+// covers: CorsPreflight
 #[tokio::test]
 async fn test_cors_origin_response() {
     let (base_url, _state, _handle) = spawn_server().await;

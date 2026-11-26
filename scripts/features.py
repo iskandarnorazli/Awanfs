@@ -240,6 +240,131 @@ def matcher_hits(patterns: Sequence[str], test_name: str, markers: Sequence[str]
     return False
 
 
+# --- Coverage guards (#434) -------------------------------------------------------------
+
+LAYERS = ("server_tests", "drive", "ceph", "fuzz")
+ISSUE_RE = re.compile(r"#\d+")
+
+
+def operation_variants(root: Path) -> List[str]:
+    """The variants of `pub enum Operation` in server/src/ops/mod.rs (empty if there is none)."""
+    path = root / "server" / "src" / "ops" / "mod.rs"
+    if not path.is_file():
+        return []
+    m = re.search(r"pub enum Operation \{(.*?)\n\}", path.read_text(encoding="utf-8"), re.S)
+    if not m:
+        return []
+    body = re.sub(r"//[^\n]*", "", m.group(1))
+    return re.findall(r"^\s*([A-Z]\w*)\s*[,({]", body, re.M)
+
+
+def test_fns(path: Path) -> Dict[str, List[str]]:
+    """{fn name: operations its `// covers:` (or `# covers:`) lines name} for one test file.
+    A covers line belongs to the next fn (or def) after it."""
+    out: Dict[str, List[str]] = {}
+    pending: List[str] = []
+    fn_re = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?(?:fn|def)\s+(\w+)\s*[(<]")
+    cov_re = re.compile(r"^\s*(?://|#)\s*covers:\s*(.+?)\s*$")
+    for line in path.read_text(encoding="utf-8").splitlines():
+        c = cov_re.match(line)
+        if c:
+            pending += [x.strip() for x in c.group(1).split(",") if x.strip()]
+            continue
+        f = fn_re.match(line)
+        if f:
+            out.setdefault(f.group(1), []).extend(pending)
+            pending = []
+    return out
+
+
+def _gap_value_ok(v: object) -> bool:
+    return isinstance(v, str) and (bool(ISSUE_RE.search(v)) or v.startswith("not needed: "))
+
+
+def _check_coverage(root: Path, feats: List[dict]) -> List[str]:
+    problems: List[str] = []
+    variants = operation_variants(root)
+    homes: Dict[str, List[str]] = {}
+    named_tests: Set[str] = set()
+    file_cache: Dict[str, Optional[Dict[str, List[str]]]] = {}
+
+    def fns_of(rel: str) -> Optional[Dict[str, List[str]]]:
+        if rel not in file_cache:
+            path = root / rel
+            file_cache[rel] = test_fns(path) if path.is_file() else None
+        return file_cache[rel]
+
+    for feat in feats:
+        fid = feat.get("id")
+        if not isinstance(fid, str):
+            continue
+        for op in feat.get("operations", []):
+            if op in variants:
+                homes.setdefault(op, []).append(fid)
+        for entry in feat.get("server_tests", []):
+            if "::" not in entry:
+                problems.append(f"{fid}: server_tests entry {entry!r} names a file, not a test (`file.rs::fn`)")
+                continue
+            rel, fn = entry.rsplit("::", 1)
+            fns = fns_of(rel)
+            if fns is None:
+                problems.append(f"{fid}: missing server_tests file {rel!r}")
+            elif fn not in fns:
+                problems.append(f"{fid}: server_tests {entry!r}: no such fn {fn!r} in {rel}")
+            else:
+                named_tests.add(entry)
+
+    for op in variants:
+        owners = homes.get(op, [])
+        if not owners:
+            problems.append(f"operation {op} is in no feature's operations")
+        elif len(owners) > 1:
+            problems.append(f"operation {op} is in more than one feature: {', '.join(owners)}")
+
+    # Which named tests cover which operations.
+    covered: Dict[str, List[str]] = {}
+    for rel, fns in file_cache.items():
+        for fn, ops in (fns or {}).items():
+            for op in ops:
+                if variants and op not in variants:
+                    problems.append(f"{rel}::{fn}: covers {op!r}, which is not an operation")
+                elif f"{rel}::{fn}" in named_tests:
+                    covered.setdefault(op, []).append(f"{rel}::{fn}")
+
+    by_id = {f.get("id"): f for f in feats if isinstance(f.get("id"), str)}
+    for fid, feat in by_id.items():
+        gaps = feat.get("gaps", {})
+        if not isinstance(gaps, dict):
+            problems.append(f"{fid}: gaps must be a table of layer or operation = issue")
+            continue
+        for key, val in sorted(gaps.items()):
+            if not _gap_value_ok(val):
+                problems.append(f"{fid}: gap {key!r} = {val!r}: give an issue (#n) or 'not needed: <reason>'")
+            if key not in LAYERS and key not in feat.get("operations", []):
+                problems.append(f"{fid}: gap {key!r} is neither a layer ({', '.join(LAYERS)}) nor one of its operations")
+        for op in feat.get("operations", []):
+            if op not in variants:
+                continue
+            if op in covered and op in gaps:
+                problems.append(f"{fid}: gap {op!r} is stale: covered by {covered[op][0]}; remove the gap")
+            elif op not in covered and op not in gaps:
+                problems.append(f"{fid}: no test covers {op} (add `// covers: {op}` to a named test, or a gap with an issue)")
+        user_visible = feat.get("user_visible", True)
+        present = {
+            "server_tests": bool(feat.get("server_tests")),
+            "drive": bool(feat.get("drive")),
+            "ceph": bool(feat.get("ceph") or feat.get("mint") or feat.get("ported")),
+            "fuzz": bool(feat.get("fuzz")),
+        }
+        required = {"server_tests": True, "drive": user_visible, "ceph": user_visible, "fuzz": True}
+        for layer in LAYERS:
+            if present[layer] and layer in gaps:
+                problems.append(f"{fid}: gap {layer!r} is stale: the feature has that layer; remove the gap")
+            elif feat.get("status") == "done" and required[layer] and not present[layer] and layer not in gaps:
+                problems.append(f"{fid}: done without {layer}: add it, or a gap with an issue (or 'not needed: <reason>')")
+    return problems
+
+
 def ported_md_rows(path: Path) -> Dict[str, str]:
     """{suite test: AwanFS test} from `tests/s3tests/PORTED.md` (#433)."""
     rows: Dict[str, str] = {}
@@ -467,9 +592,6 @@ def check_registry(
         drv = feat.get("drive", [])
         fzz = feat.get("fuzz", [])
 
-        for rel in srv_tests:
-            if not (root / rel).is_file():
-                problems.append(f"{fid}: missing server_tests file {rel!r}")
         for j in drv:
             if j not in journeys:
                 problems.append(f"{fid}: missing drive journey {j!r} in scripts/verify_drive.sh")
@@ -501,6 +623,8 @@ def check_registry(
 
     if ceph_tests or verify_ceph_literals:
         problems.extend(_check_suite_coverage("ceph", feats, "ceph", ceph_tests, verify_ceph_literals))
+
+    problems.extend(_check_coverage(root, feats))
 
     passing_now = set(parse_passing_file(passing_path, default_prefix="test_s3::")) if passing_path.is_file() else set()
     problems.extend(_check_ported(root, feats, ceph_tests, passing_now))
@@ -697,6 +821,18 @@ def build_report(
                 lines.append(f"  - `{name}` ({st}){suffix}")
     else:
         lines.append("- None.")
+
+    lines += ["", "## Coverage gaps", ""]
+    lines.append("Each layer a feature lacks, or each operation no named test sends, listed with its issue (`[feature.gaps]` in `features.toml`, checked by `features.py check`, #434).")
+    lines.append("")
+    lines += ["| feature | gaps | listed |", "|---|---|---|"]
+    for feat in feats:
+        gaps = feat.get("gaps", {}) if isinstance(feat.get("gaps"), dict) else {}
+        if not gaps:
+            continue
+        real = [k for k, v in gaps.items() if not str(v).startswith("not needed: ")]
+        listed = "; ".join(f"{k}: {v}" for k, v in sorted(gaps.items()))
+        lines.append(f"| {feat['id']} | {len(real)} | {listed} |")
 
     lines += ["", "### Suite tests covered by own tests", ""]
     lines.append("A suite test AwanFS cannot run as written (it signs with SigV2) counts by its own SigV4 version (`tests/s3tests/PORTED.md`).")

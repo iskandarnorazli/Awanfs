@@ -17,6 +17,7 @@ async fn spawn_test_server() -> (String, Arc<S3ServiceState>, s3_server::ServerH
     (base_url, state, handle)
 }
 
+// covers: GetBucketLifecycle, PutBucketLifecycle, DeleteBucketLifecycle
 #[tokio::test]
 async fn test_lifecycle_xml_roundtrip_and_deletion() {
     let (base_url, _state, _handle) = spawn_test_server().await;
