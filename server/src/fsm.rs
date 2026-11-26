@@ -1897,11 +1897,25 @@ mod expiry_tests {
         use ExpiryRuleAction::*;
         use LifecycleTarget::*;
 
-        let locked = Lock {
-            retention: Some((RetentionMode::Compliance, 2_000)),
-            legal_hold: false,
-        };
-        let unlocked = Lock::default();
+        let locks = [
+            Lock::default(),
+            Lock {
+                retention: Some((RetentionMode::Governance, 2_000)),
+                legal_hold: false,
+            },
+            Lock {
+                retention: Some((RetentionMode::Governance, 500)),
+                legal_hold: false,
+            },
+            Lock {
+                retention: Some((RetentionMode::Compliance, 2_000)),
+                legal_hold: false,
+            },
+            Lock {
+                retention: None,
+                legal_hold: true,
+            },
+        ];
 
         let targets = [
             UnversionedObject { created_sec: 100 },
@@ -1929,13 +1943,24 @@ mod expiry_tests {
                 newer_noncurrent_count: 1,
                 is_marker: true,
             },
+            NoncurrentVersion {
+                noncurrent_since_sec: 100,
+                newer_noncurrent_count: 3,
+                is_marker: true,
+            },
             MultipartUpload { initiated_sec: 100 },
         ];
         let rules = [
             Disabled,
             ExpireDays(1),
             ExpireDate(1_000),
+            ExpireDate(2_000),
+            ExpiredObjectDeleteMarker(false),
             ExpiredObjectDeleteMarker(true),
+            NoncurrentExpiration {
+                noncurrent_days: 1,
+                newer_noncurrent_versions: None,
+            },
             NoncurrentExpiration {
                 noncurrent_days: 1,
                 newer_noncurrent_versions: Some(2),
@@ -1944,62 +1969,70 @@ mod expiry_tests {
         ];
 
         let mut decided = 0;
-        for &lock in &[unlocked, locked] {
-            for &target in &targets {
-                for &rule in &rules {
-                    let facts = ExpiryFacts {
-                        target,
-                        lock,
-                        now_sec: 1_000,
-                        day_seconds: 100,
-                    };
-                    let got = expiry_step(facts, &[rule]);
-                    let want = match (target, rule) {
-                        (_, Disabled) => Keep,
-                        (UnversionedObject { .. }, ExpireDays(_) | ExpireDate(_)) => {
-                            if lock.may_delete(1_000, false).is_err() {
-                                Keep
-                            } else {
-                                Expire
+        for &now_sec in &[150u64, 1_000u64] {
+            for &lock in &locks {
+                for &target in &targets {
+                    for &rule in &rules {
+                        let facts = ExpiryFacts {
+                            target,
+                            lock,
+                            now_sec,
+                            day_seconds: 100,
+                        };
+                        let got = expiry_step(facts, &[rule]);
+                        let age_ok = now_sec >= 200;
+                        let want = match (target, rule) {
+                            (_, Disabled) => Keep,
+                            (UnversionedObject { .. }, ExpireDays(_)) if age_ok => {
+                                if lock.may_delete(now_sec, false).is_err() { Keep } else { Expire }
                             }
-                        }
-                        (CurrentVersion { .. }, ExpireDays(_) | ExpireDate(_)) => AddDeleteMarker,
-                        (
-                            CurrentDeleteMarker {
-                                sole_version: true, ..
-                            },
-                            ExpiredObjectDeleteMarker(true) | ExpireDays(_) | ExpireDate(_),
-                        ) => RemoveMarker,
-                        (
-                            NoncurrentVersion {
-                                newer_noncurrent_count,
-                                is_marker,
-                                ..
-                            },
-                            NoncurrentExpiration {
-                                newer_noncurrent_versions: Some(n),
-                                ..
-                            },
-                        ) => {
-                            if !is_marker && lock.may_delete(1_000, false).is_err() {
-                                Keep
-                            } else if newer_noncurrent_count < n {
-                                Keep
-                            } else if is_marker {
+                            (UnversionedObject { .. }, ExpireDate(dt)) if now_sec >= dt => {
+                                if lock.may_delete(now_sec, false).is_err() { Keep } else { Expire }
+                            }
+                            (CurrentVersion { .. }, ExpireDays(_)) if age_ok => AddDeleteMarker,
+                            (CurrentVersion { .. }, ExpireDate(dt)) if now_sec >= dt => AddDeleteMarker,
+                            (CurrentDeleteMarker { sole_version: true, .. }, ExpiredObjectDeleteMarker(true)) => {
                                 RemoveMarker
-                            } else {
-                                RemoveVersion
                             }
-                        }
-                        (MultipartUpload { .. }, AbortMultipart(_)) => AbortUpload,
-                        _ => Keep,
-                    };
-                    assert_eq!(got, want, "{target:?} + {rule:?} (lock={lock:?})");
-                    decided += 1;
+                            (CurrentDeleteMarker { sole_version: true, .. }, ExpireDays(_)) if age_ok => {
+                                RemoveMarker
+                            }
+                            (CurrentDeleteMarker { sole_version: true, .. }, ExpireDate(dt)) if now_sec >= dt => {
+                                RemoveMarker
+                            }
+                            (
+                                NoncurrentVersion {
+                                    newer_noncurrent_count,
+                                    is_marker,
+                                    ..
+                                },
+                                NoncurrentExpiration {
+                                    newer_noncurrent_versions,
+                                    ..
+                                },
+                            ) if age_ok => {
+                                if !is_marker && lock.may_delete(now_sec, false).is_err() {
+                                    Keep
+                                } else if newer_noncurrent_versions
+                                    .is_some_and(|n| newer_noncurrent_count < n)
+                                {
+                                    Keep
+                                } else if is_marker {
+                                    RemoveMarker
+                                } else {
+                                    RemoveVersion
+                                }
+                            }
+                            (MultipartUpload { .. }, AbortMultipart(_)) if age_ok => AbortUpload,
+                            _ => Keep,
+                        };
+                        assert_eq!(got, want, "now={now_sec} {target:?} + {rule:?} (lock={lock:?})");
+                        decided += 1;
+                    }
                 }
             }
         }
-        assert_eq!(decided, 2 * targets.len() * rules.len());
+        assert_eq!(decided, 2 * locks.len() * targets.len() * rules.len());
     }
 
     #[test]

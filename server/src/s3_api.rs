@@ -1706,7 +1706,7 @@ impl S3ServiceState {
     }
 
     /// Writes a versioned delete marker under `key_locks` (#31, #118). Caller holds `lock_key`.
-    async fn write_delete_marker_locked(&self, b_id: u32, key: &str) -> Result<String, DeleteError> {
+    pub(crate) async fn write_delete_marker_locked(&self, b_id: u32, key: &str) -> Result<String, DeleteError> {
         let Some((extra, ts)) = self.version_stamp(b_id, key) else {
             return Err(DeleteError::Internal("bucket is not versioned".to_string()));
         };
@@ -1765,7 +1765,7 @@ impl S3ServiceState {
     }
 
     /// Writes an unversioned tombstone under `key_locks` (#184, #118). Returns previous object's payload size.
-    async fn expire_unversioned_locked(&self, b_id: u32, key: &str) -> Result<u64, DeleteError> {
+    pub(crate) async fn expire_unversioned_locked(&self, b_id: u32, key: &str) -> Result<u64, DeleteError> {
         let tomb_ts = self.unversioned_write_ts(b_id, key);
         let (tomb_g, late) = match self.write_to_active_at(b_id, key, &[], AWAN_FLAG_TOMBSTONE, 0, 0, Some(tomb_ts)) {
             Ok((vm, loc, g)) => {
@@ -1848,71 +1848,25 @@ impl S3ServiceState {
         }
     }
 
-    /// Expires `key`'s current object (or pre-versioning null object) only if it is still at
-    /// `expected_offset` and unlocked under `lock_key` (#118).
-    pub async fn lifecycle_expire_current(
+    /// Permanently removes one version (`FLAG_VERSION_DELETE` tombstone + `make_durable` + index remove).
+    /// Caller holds `lock_key` and has already checked lock, lifecycle/precondition rules.
+    pub(crate) async fn remove_version_commit_locked(
         &self,
         b_id: u32,
         key: &str,
-        expected_offset: u64,
-        is_versioned: bool,
-        now_sec: u64,
-    ) -> Result<Option<u64>, DeleteError> {
-        let _key_guard = self.lock_key(b_id, key).await;
-        if is_versioned {
-            let before = self.engine.read().get_object(b_id, key.as_bytes()).ok().map(|m| null_version_of(&m));
-            let (cur, needs_start) = {
-                let vs = self.versions.read();
-                if vs.has(b_id, key) {
-                    (vs.current(b_id, key), false)
-                } else {
-                    (before, true)
-                }
-            };
-            let Some(v) = cur else {
-                return Ok(None);
-            };
-            if v.marker || v.vol_offset != expected_offset {
-                return Ok(None);
+        target: crate::versions::Version,
+        uncovers_object: bool,
+    ) -> Result<(), DeleteError> {
+        let id = target.id();
+        if uncovers_object {
+            if let Err(code) = self.engine.read().has_room_for(b_id, key.as_bytes()) {
+                return Err(DeleteError::Internal(format!("index error {} before deleting a version", code)));
             }
-            if needs_start {
-                self.versions.write().start(b_id, key, before);
-            }
-            self.write_delete_marker_locked(b_id, key).await?;
-            Ok(Some(0))
-        } else {
-            let Some(m) = self.engine.read().get_object(b_id, key.as_bytes()).ok() else {
-                return Ok(None);
-            };
-            if m.vol_offset != expected_offset || self.versions.read().has(b_id, key) {
-                return Ok(None);
-            }
-            let lock = self.version_lock_for(b_id, key, &null_version_of(&m))?;
-            if lock.may_delete(now_sec, false).is_err() {
-                return Ok(None);
-            }
-            let sz = self.expire_unversioned_locked(b_id, key).await?;
-            Ok(Some(sz))
         }
-    }
-
-    /// Removes `marker_id` only if it is still the sole remaining version of `key` under `lock_key` (#118).
-    pub async fn lifecycle_remove_sole_marker(
-        &self,
-        b_id: u32,
-        key: &str,
-        marker_id: u64,
-    ) -> Result<bool, DeleteError> {
-        let _key_guard = self.lock_key(b_id, key).await;
-        let target = {
-            let vs = self.versions.read();
-            match vs.versions(b_id, key) {
-                Some(list) if list.len() == 1 && list[0].marker && list[0].id() == marker_id => list[0],
-                _ => return Ok(false),
-            }
-        };
         let flags = AWAN_FLAG_TOMBSTONE | crate::meta_index::FLAG_VERSION_DELETE;
-        let late = match self.write_to_active(b_id, key, &marker_id.to_le_bytes(), flags, 0, 0) {
+        // A record whole in the volume is replayed by recovery: the version goes here too, and
+        // the request still answers an error (#184, owner decision 4B).
+        let late = match self.write_to_active(b_id, key, &id.to_le_bytes(), flags, 0, 0) {
             Ok((vm, loc, _)) => {
                 self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
                 self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
@@ -1932,16 +1886,16 @@ impl S3ServiceState {
             time: self.clock.now_ns(),
             version: Some(target.id_string()),
             kind: crate::events::CommitKind::VersionDelete,
-            size: 0,
+            size: target.size,
             etag: String::new(),
             acked: late.is_none(),
         };
-        self.record_version_commit(b_id, key, crate::versions::Event::Remove(marker_id), None, Some(ev_spec))
-            .map_err(|c| DeleteError::Internal(format!("index error {} after removing delete marker", c)))?;
-        if let Some(e) = late {
-            return Err(DeleteError::Internal(e));
+        self.record_version_commit(b_id, key, crate::versions::Event::Remove(id), None, Some(ev_spec))
+            .map_err(|c| DeleteError::Internal(format!("index error {} after deleting a version", c)))?;
+        match late {
+            Some(e) => Err(DeleteError::Internal(e)),
+            None => Ok(()),
         }
-        Ok(true)
     }
 
     /// `DELETE ?versionId=`: removes one version for good (#31). Returns it, or `None` when the
@@ -2023,41 +1977,8 @@ impl S3ServiceState {
         if needs_start {
             self.versions.write().start(b_id, key, before);
         }
-        if uncovers_object {
-            if let Err(code) = self.engine.read().has_room_for(b_id, key.as_bytes()) {
-                return Err(DeleteError::Internal(format!("index error {} before deleting a version", code)));
-            }
-        }
-        let flags = AWAN_FLAG_TOMBSTONE | crate::meta_index::FLAG_VERSION_DELETE;
-        // A record whole in the volume is replayed by recovery: the version goes here too, and
-        // the request still answers an error (#184, owner decision 4B).
-        let late = match self.write_to_active(b_id, key, &id.to_le_bytes(), flags, 0, 0) {
-            Ok((vm, loc, _)) => {
-                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                self.make_durable(&vm, loc.seq).await.err().map(|e| format!("could not sync the delete: {:?}", e))
-            }
-            Err(VolumeError::AfterRecord { loc, cause, .. }) => {
-                self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                self.tombstone_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
-                Some(format!("could not record the delete: {}", cause))
-            }
-            Err(e) => return Err(DeleteError::Internal(format!("could not record the delete: {:?}", e))),
-        };
-        let ev_spec = VersionCommitEventSpec {
-            time: self.clock.now_ns(),
-            version: Some(target.id_string()),
-            kind: crate::events::CommitKind::VersionDelete,
-            size: target.size,
-            etag: String::new(),
-            acked: late.is_none(),
-        };
-        self.record_version_commit(b_id, key, crate::versions::Event::Remove(id), None, Some(ev_spec))
-            .map_err(|c| DeleteError::Internal(format!("index error {} after deleting a version", c)))?;
-        match late {
-            Some(e) => Err(DeleteError::Internal(e)),
-            None => Ok(Some(target)),
-        }
+        self.remove_version_commit_locked(b_id, key, target, uncovers_object).await?;
+        Ok(Some(target))
     }
 
     /// The flags and creation time a write of `key` takes in its bucket's versioning status;

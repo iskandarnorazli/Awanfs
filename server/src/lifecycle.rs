@@ -17,9 +17,8 @@ use crate::lifecycle_config::{
     RuleStatus,
 };
 use crate::meta_index::unpack_flags;
-use crate::precondition::DeleteConditions;
-use crate::s3_api::{DeleteError, S3ServiceState};
-use crate::versions::{Version, Versioning};
+use crate::s3_api::S3ServiceState;
+use crate::versions::Versioning;
 use crate::xml::xml_escape_exact;
 
 static FAULT_DISABLE_PREFIX_CHECK: AtomicBool = AtomicBool::new(false);
@@ -381,17 +380,224 @@ fn load_tags_and_lock(
     v_id: u64,
     vol_offset: u64,
     flags: u16,
-) -> (Vec<(String, String)>, Lock) {
-    let Ok(view) = state.object_view_for(b_id, key, v_id, vol_offset, flags) else {
-        return (Vec::new(), Lock::default());
+) -> Option<(Vec<(String, String)>, Lock)> {
+    let view = state.object_view_for(b_id, key, v_id, vol_offset, flags).ok()?;
+    let tag_set = view.attrs.tag_set().ok()?;
+    let tags = tag_set.tags.into_iter().map(|t| (t.key, t.value)).collect();
+    let lock = view.attrs.lock_state().ok()?;
+    Some((tags, lock))
+}
+
+fn current_bucket_lifecycle(
+    state: &S3ServiceState,
+    b_id: u32,
+    bucket_name: &str,
+) -> Option<Arc<LifecycleConfig>> {
+    if let Some(cfg) = state.bucket_lifecycle(b_id) {
+        return Some(cfg);
+    }
+    let guard = state.lifecycle.configs.read();
+    guard
+        .get(bucket_name)
+        .map(|rules| Arc::new(legacy_rules_to_config(rules)))
+}
+
+async fn sweep_versioned_key_locked(
+    state: &S3ServiceState,
+    b_id: u32,
+    key_str: &str,
+    lc_cfg: &LifecycleConfig,
+    now_sec: u64,
+    day_seconds: u64,
+    disable_prefix: bool,
+    remaining_budget: usize,
+) -> (usize, bool) {
+    let Some(mut list) = state.versions.read().versions(b_id, key_str).map(|s| s.to_vec()) else {
+        return (0, false);
     };
-    let tags = view
-        .attrs
-        .tag_set()
-        .map(|ts| ts.tags.into_iter().map(|t| (t.key, t.value)).collect())
-        .unwrap_or_default();
-    let lock = view.attrs.lock_state().unwrap_or_default();
-    (tags, lock)
+    if list.is_empty() {
+        return (0, false);
+    }
+
+    let mut actions_done = 0usize;
+
+    // Evaluate noncurrent versions oldest-to-newest so deleting an older entry keeps
+    // `newer_noncurrent_count` and `list[idx - 1]` accurate for every newer entry.
+    for idx in (1..list.len()).rev() {
+        if actions_done >= remaining_budget {
+            return (actions_done, true);
+        }
+        let v = list[idx];
+        let newer_nc = list[1..idx].iter().filter(|x| !x.marker).count() as u32;
+        let noncurrent_since_sec = list[idx - 1].ts / 1_000_000_000;
+        let (tags_owned, lock) = if v.marker {
+            (Vec::new(), Lock::default())
+        } else {
+            let Some(tl) = load_tags_and_lock(state, b_id, key_str, v.id(), v.vol_offset, v.flags) else {
+                continue;
+            };
+            tl
+        };
+        let tag_refs: Vec<(&str, &str)> = tags_owned
+            .iter()
+            .map(|(k, val)| (k.as_str(), val.as_str()))
+            .collect();
+        let acts = collect_rule_actions(lc_cfg, key_str, v.size, &tag_refs, disable_prefix);
+        let facts = ExpiryFacts {
+            target: LifecycleTarget::NoncurrentVersion {
+                noncurrent_since_sec,
+                newer_noncurrent_count: newer_nc,
+                is_marker: v.marker,
+            },
+            lock,
+            now_sec,
+            day_seconds,
+        };
+        match expiry_step(facts, &acts) {
+            ExpiryAction::RemoveVersion => {
+                let uncovers = idx == 1
+                    && list.len() > 2
+                    && !list[2].marker
+                    && list[0].marker;
+                if state
+                    .remove_version_commit_locked(b_id, key_str, v, uncovers)
+                    .await
+                    .is_ok()
+                {
+                    list.remove(idx);
+                    state.lifecycle.record_expired(v.size);
+                    actions_done += 1;
+                }
+            }
+            ExpiryAction::RemoveMarker => {
+                if state
+                    .remove_version_commit_locked(b_id, key_str, v, false)
+                    .await
+                    .is_ok()
+                {
+                    list.remove(idx);
+                    state.lifecycle.record_expired(0);
+                    actions_done += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if actions_done >= remaining_budget {
+        return (actions_done, true);
+    }
+
+    if let Some(&cur) = list.first() {
+        if cur.marker {
+            let acts = collect_rule_actions(lc_cfg, key_str, 0, &[], disable_prefix);
+            let facts = ExpiryFacts {
+                target: LifecycleTarget::CurrentDeleteMarker {
+                    created_sec: cur.ts / 1_000_000_000,
+                    sole_version: list.len() == 1,
+                },
+                lock: Lock::default(),
+                now_sec,
+                day_seconds,
+            };
+            if expiry_step(facts, &acts) == ExpiryAction::RemoveMarker
+                && state
+                    .remove_version_commit_locked(b_id, key_str, cur, false)
+                    .await
+                    .is_ok()
+            {
+                state.lifecycle.record_expired(0);
+                actions_done += 1;
+            }
+        } else if let Some((tags_owned, lock)) =
+            load_tags_and_lock(state, b_id, key_str, cur.id(), cur.vol_offset, cur.flags)
+        {
+            let tag_refs: Vec<(&str, &str)> = tags_owned
+                .iter()
+                .map(|(k, val)| (k.as_str(), val.as_str()))
+                .collect();
+            let acts = collect_rule_actions(lc_cfg, key_str, cur.size, &tag_refs, disable_prefix);
+            let facts = ExpiryFacts {
+                target: LifecycleTarget::CurrentVersion {
+                    created_sec: cur.modified / 1_000_000_000,
+                },
+                lock,
+                now_sec,
+                day_seconds,
+            };
+            if expiry_step(facts, &acts) == ExpiryAction::AddDeleteMarker
+                && state.write_delete_marker_locked(b_id, key_str).await.is_ok()
+            {
+                state.lifecycle.record_expired(0);
+                actions_done += 1;
+            }
+        }
+    }
+
+    (actions_done, false)
+}
+
+async fn sweep_unversioned_or_null_key_locked(
+    state: &S3ServiceState,
+    b_id: u32,
+    key_str: &str,
+    lc_cfg: &LifecycleConfig,
+    now_sec: u64,
+    day_seconds: u64,
+    disable_prefix: bool,
+) -> usize {
+    let Ok(m) = state.engine.read().get_object(b_id, key_str.as_bytes()) else {
+        return 0;
+    };
+    let flags = unpack_flags(m.bucket_flags);
+    let Some((tags_owned, lock)) = load_tags_and_lock(state, b_id, key_str, 0, m.vol_offset, flags) else {
+        return 0;
+    };
+    let is_versioned = state
+        .versioning
+        .read()
+        .get(&b_id)
+        .copied()
+        .unwrap_or_default()
+        != Versioning::Unset;
+    let tag_refs: Vec<(&str, &str)> = tags_owned
+        .iter()
+        .map(|(k, val)| (k.as_str(), val.as_str()))
+        .collect();
+    let acts = collect_rule_actions(lc_cfg, key_str, m.size, &tag_refs, disable_prefix);
+    let target = if is_versioned {
+        LifecycleTarget::CurrentVersion {
+            created_sec: m.created_at / 1000,
+        }
+    } else {
+        LifecycleTarget::UnversionedObject {
+            created_sec: m.created_at / 1000,
+        }
+    };
+    let facts = ExpiryFacts {
+        target,
+        lock,
+        now_sec,
+        day_seconds,
+    };
+    match expiry_step(facts, &acts) {
+        ExpiryAction::Expire => {
+            if let Ok(bytes) = state.expire_unversioned_locked(b_id, key_str).await {
+                state.lifecycle.record_expired(bytes);
+                return 1;
+            }
+        }
+        ExpiryAction::AddDeleteMarker => {
+            let before = Some(crate::ops::object::null_version_of(&m));
+            state.versions.write().start(b_id, key_str, before);
+            if state.write_delete_marker_locked(b_id, key_str).await.is_ok() {
+                state.lifecycle.record_expired(0);
+                return 1;
+            }
+        }
+        _ => {}
+    }
+    0
 }
 
 /// Runs one rate-limited lifecycle sweep tick using [`fsm::expiry_step`]. Returns `true` if
@@ -406,26 +612,20 @@ pub async fn run_lifecycle_sweep_async(
     let day_seconds = state.lifecycle_day_seconds.load(Ordering::Relaxed).max(1);
     let budget = budget.max(1);
 
-    let mut buckets: Vec<(u32, String, Arc<LifecycleConfig>)> = Vec::new();
+    let mut buckets: Vec<(u32, String)> = Vec::new();
     let mut seen_ids = HashSet::new();
     let snap = state.bucket_config_reader.snapshot();
     for (&b_id, cfg) in snap.iter() {
-        if let Some(lc) = cfg.lifecycle() {
-            buckets.push((b_id, cfg.name.clone(), lc));
+        if cfg.lifecycle().is_some() {
+            buckets.push((b_id, cfg.name.clone()));
             seen_ids.insert(b_id);
         }
     }
-    let legacy_snapshot: Vec<(String, Vec<LifecycleRule>)> = state
-        .lifecycle
-        .configs
-        .read()
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    for (bname, rules) in legacy_snapshot {
+    let legacy_buckets: Vec<String> = state.lifecycle.configs.read().keys().cloned().collect();
+    for bname in legacy_buckets {
         if let Ok(b_id) = state.engine.read().lookup_bucket(&bname) {
             if seen_ids.insert(b_id) {
-                buckets.push((b_id, bname, Arc::new(legacy_rules_to_config(&rules))));
+                buckets.push((b_id, bname));
             }
         }
     }
@@ -435,226 +635,81 @@ pub async fn run_lifecycle_sweep_async(
 
     let mut actions_done = 0usize;
 
-    for (b_id, bucket_name, lc_cfg) in buckets {
-        if lc_cfg.rules.iter().all(|r| r.status != RuleStatus::Enabled) {
+    for (b_id, bucket_name) in buckets {
+        // Quick skip before scanning keys; re-checked per key under `lock_key` below.
+        let Some(initial_cfg) = current_bucket_lifecycle(state, b_id, &bucket_name) else {
+            continue;
+        };
+        if initial_cfg.rules.iter().all(|r| r.status != RuleStatus::Enabled) {
             continue;
         }
 
-        let is_versioned = state
-            .versioning
-            .read()
-            .get(&b_id)
-            .copied()
-            .unwrap_or_default()
-            != Versioning::Unset;
-
-        // Collect snapshot of versioned keys + any unversioned/pre-versioning keys in the bucket.
-        let mut versioned_keys: Vec<(String, Vec<Version>)> = Vec::new();
-        let mut engine_only_keys: Vec<(String, u64, u64, u64, u16)> = Vec::new();
+        // Collect candidate keys from `versions` and `engine` without holding both locks together
+        // to preserve strict lock ordering (`engine` before `versions` elsewhere in `s3_api.rs`).
+        let v_keys = state.versions.read().keys_of(b_id, "");
+        let mut seen_keys: HashSet<String> = v_keys.iter().cloned().collect();
+        let mut candidate_keys: Vec<String> = v_keys.into_iter().collect();
         {
-            let vs = state.versions.read();
-            for k in vs.keys_of(b_id, "") {
-                if let Some(list) = vs.versions(b_id, &k) {
-                    if !list.is_empty() {
-                        versioned_keys.push((k, list.to_vec()));
-                    }
-                }
-            }
             let engine = state.engine.read();
             if let Some(bucket) = engine.buckets.get(&b_id) {
-                for (key_bytes, &row_idx) in &bucket.key_index {
+                for key_bytes in bucket.key_index.keys() {
                     let key_str = String::from_utf8_lossy(key_bytes).into_owned();
-                    if vs.has(b_id, &key_str) {
-                        continue;
+                    if seen_keys.insert(key_str.clone()) {
+                        candidate_keys.push(key_str);
                     }
-                    let meta = engine.table.get(row_idx);
-                    engine_only_keys.push((
-                        key_str,
-                        meta.created_at / 1000,
-                        meta.size,
-                        meta.vol_offset,
-                        unpack_flags(meta.bucket_flags),
-                    ));
                 }
             }
         }
 
-        // 1. Versioned histories: evaluate noncurrent versions first so a now-sole delete marker
-        // can be cleaned up in the same sweep pass.
-        for (key_str, list) in versioned_keys {
-            let mut noncurrent_remaining = list.len().saturating_sub(1);
-
-            for (idx, v) in list.iter().enumerate().skip(1) {
-                if actions_done >= budget {
-                    return true;
+        for key_str in candidate_keys {
+            if actions_done >= budget {
+                return true;
+            }
+            let (did, hit_budget) = {
+                let _key_guard = state.lock_key(b_id, &key_str).await;
+                let Some(lc_cfg) = current_bucket_lifecycle(state, b_id, &bucket_name) else {
+                    continue;
+                };
+                if lc_cfg.rules.iter().all(|r| r.status != RuleStatus::Enabled) {
+                    continue;
                 }
-                let newer_nc = list[1..idx].iter().filter(|x| !x.marker).count() as u32;
-                let noncurrent_since_sec = list[idx - 1].ts / 1_000_000_000;
-                let (tags_owned, lock) = if v.marker {
-                    (Vec::new(), Lock::default())
+                let has_versions = state.versions.read().has(b_id, &key_str);
+                if has_versions {
+                    sweep_versioned_key_locked(
+                        state,
+                        b_id,
+                        &key_str,
+                        &lc_cfg,
+                        now_sec,
+                        day_seconds,
+                        disable_prefix,
+                        budget - actions_done,
+                    )
+                    .await
                 } else {
-                    load_tags_and_lock(state, b_id, &key_str, v.id(), v.vol_offset, v.flags)
-                };
-                let tag_refs: Vec<(&str, &str)> = tags_owned
-                    .iter()
-                    .map(|(k, val)| (k.as_str(), val.as_str()))
-                    .collect();
-                let acts = collect_rule_actions(&lc_cfg, &key_str, v.size, &tag_refs, disable_prefix);
-                let facts = ExpiryFacts {
-                    target: LifecycleTarget::NoncurrentVersion {
-                        noncurrent_since_sec,
-                        newer_noncurrent_count: newer_nc,
-                        is_marker: v.marker,
-                    },
-                    lock,
-                    now_sec,
-                    day_seconds,
-                };
-                match expiry_step(facts, &acts) {
-                    ExpiryAction::RemoveVersion => {
-                        match state
-                            .delete_version_conditional(
-                                b_id,
-                                &key_str,
-                                v.id(),
-                                &DeleteConditions::default(),
-                                false,
-                            )
-                            .await
-                        {
-                            Ok(Some(removed)) => {
-                                noncurrent_remaining = noncurrent_remaining.saturating_sub(1);
-                                state.lifecycle.record_expired(removed.size);
-                                actions_done += 1;
-                            }
-                            Ok(None) | Err(DeleteError::AccessDenied) => {}
-                            Err(_) => {}
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                    ExpiryAction::RemoveMarker => {
-                        match state
-                            .delete_version_conditional(
-                                b_id,
-                                &key_str,
-                                v.id(),
-                                &DeleteConditions::default(),
-                                false,
-                            )
-                            .await
-                        {
-                            Ok(Some(_)) => {
-                                noncurrent_remaining = noncurrent_remaining.saturating_sub(1);
-                                state.lifecycle.record_expired(0);
-                                actions_done += 1;
-                            }
-                            Ok(None) | Err(_) => {}
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                    _ => {}
+                    let did = sweep_unversioned_or_null_key_locked(
+                        state,
+                        b_id,
+                        &key_str,
+                        &lc_cfg,
+                        now_sec,
+                        day_seconds,
+                        disable_prefix,
+                    )
+                    .await;
+                    (did, false)
                 }
+            };
+            actions_done += did;
+            if did > 0 {
+                tokio::task::yield_now().await;
             }
-
-            if actions_done >= budget {
+            if hit_budget || actions_done >= budget {
                 return true;
-            }
-            let cur = list[0];
-            if cur.marker {
-                let acts = collect_rule_actions(&lc_cfg, &key_str, 0, &[], disable_prefix);
-                let facts = ExpiryFacts {
-                    target: LifecycleTarget::CurrentDeleteMarker {
-                        created_sec: cur.ts / 1_000_000_000,
-                        sole_version: noncurrent_remaining == 0,
-                    },
-                    lock: Lock::default(),
-                    now_sec,
-                    day_seconds,
-                };
-                if expiry_step(facts, &acts) == ExpiryAction::RemoveMarker {
-                    if let Ok(true) = state.lifecycle_remove_sole_marker(b_id, &key_str, cur.id()).await {
-                        state.lifecycle.record_expired(0);
-                        actions_done += 1;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            } else {
-                let (tags_owned, lock) =
-                    load_tags_and_lock(state, b_id, &key_str, cur.id(), cur.vol_offset, cur.flags);
-                let tag_refs: Vec<(&str, &str)> = tags_owned
-                    .iter()
-                    .map(|(k, val)| (k.as_str(), val.as_str()))
-                    .collect();
-                let acts = collect_rule_actions(&lc_cfg, &key_str, cur.size, &tag_refs, disable_prefix);
-                let facts = ExpiryFacts {
-                    target: LifecycleTarget::CurrentVersion {
-                        created_sec: cur.modified / 1_000_000_000,
-                    },
-                    lock,
-                    now_sec,
-                    day_seconds,
-                };
-                if expiry_step(facts, &acts) == ExpiryAction::AddDeleteMarker {
-                    if let Ok(Some(_)) = state
-                        .lifecycle_expire_current(b_id, &key_str, cur.vol_offset, true, now_sec)
-                        .await
-                    {
-                        state.lifecycle.record_expired(0);
-                        actions_done += 1;
-                    }
-                    tokio::task::yield_now().await;
-                }
             }
         }
 
-        // 2. Keys in engine without a `VersionStore` entry (unversioned buckets or pre-versioning objects).
-        for (key_str, created_sec, size, vol_offset, flags) in engine_only_keys {
-            if actions_done >= budget {
-                return true;
-            }
-            let (tags_owned, lock) = load_tags_and_lock(state, b_id, &key_str, 0, vol_offset, flags);
-            let tag_refs: Vec<(&str, &str)> = tags_owned
-                .iter()
-                .map(|(k, val)| (k.as_str(), val.as_str()))
-                .collect();
-            let acts = collect_rule_actions(&lc_cfg, &key_str, size, &tag_refs, disable_prefix);
-            let target = if is_versioned {
-                LifecycleTarget::CurrentVersion { created_sec }
-            } else {
-                LifecycleTarget::UnversionedObject { created_sec }
-            };
-            let facts = ExpiryFacts {
-                target,
-                lock,
-                now_sec,
-                day_seconds,
-            };
-            match expiry_step(facts, &acts) {
-                ExpiryAction::Expire => {
-                    if let Ok(Some(bytes)) = state
-                        .lifecycle_expire_current(b_id, &key_str, vol_offset, false, now_sec)
-                        .await
-                    {
-                        state.lifecycle.record_expired(bytes);
-                        actions_done += 1;
-                    }
-                    tokio::task::yield_now().await;
-                }
-                ExpiryAction::AddDeleteMarker => {
-                    if let Ok(Some(_)) = state
-                        .lifecycle_expire_current(b_id, &key_str, vol_offset, true, now_sec)
-                        .await
-                    {
-                        state.lifecycle.record_expired(0);
-                        actions_done += 1;
-                    }
-                    tokio::task::yield_now().await;
-                }
-                _ => {}
-            }
-        }
-
-        // 3. Incomplete multipart upload aborts.
+        // Incomplete multipart upload aborts (re-reading bucket lifecycle rule right before abort).
         let uploads: Vec<(String, String, u64)> = {
             state
                 .multipart
@@ -669,6 +724,9 @@ pub async fn run_lifecycle_sweep_async(
             if actions_done >= budget {
                 return true;
             }
+            let Some(lc_cfg) = current_bucket_lifecycle(state, b_id, &bucket_name) else {
+                break;
+            };
             let acts = collect_rule_actions(&lc_cfg, &key_str, 0, &[], disable_prefix);
             let facts = ExpiryFacts {
                 target: LifecycleTarget::MultipartUpload { initiated_sec },

@@ -396,3 +396,52 @@ async fn lifecycle_aborts_incomplete_multipart_uploads() {
     let metrics = c.get(format!("{base}/_awanfs/metrics")).send().await.unwrap().text().await.unwrap();
     assert!(metrics.contains("awanfs_lifecycle_uploads_aborted_total 1"), "metrics:\n{metrics}");
 }
+
+#[tokio::test]
+async fn lifecycle_rereads_state_tags_and_rules_under_key_lock() {
+    let dir = temp_dir("toctou");
+    let (base, state, clock, _handle) = spawn_clocked(Some(&dir), 1_750_000_000, 10).await;
+    let c = reqwest::Client::new();
+    assert_eq!(c.put(format!("{base}/lc-race")).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        c.put(format!("{base}/lc-race?versioning"))
+            .body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+            .send().await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    // Put v1 then v2; delete v2 so v1 is promoted back to current.
+    // Noncurrent-only rule must NOT delete v1 once it is current again.
+    let v1_res = c.put(format!("{base}/lc-race/k")).body("v1").send().await.unwrap();
+    assert_eq!(v1_res.status(), StatusCode::OK);
+    let _v1 = v1_res.headers().get("x-amz-version-id").unwrap().to_str().unwrap().to_string();
+    clock.advance(1_000_000_000);
+    let v2_res = c.put(format!("{base}/lc-race/k")).body("v2").send().await.unwrap();
+    assert_eq!(v2_res.status(), StatusCode::OK);
+    let v2 = v2_res.headers().get("x-amz-version-id").unwrap().to_str().unwrap().to_string();
+    assert_eq!(c.delete(format!("{base}/lc-race/k?versionId={v2}")).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+
+    let nc_xml = "<LifecycleConfiguration><Rule><ID>nc-only</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status>\
+        <NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>";
+    assert_eq!(c.put(format!("{base}/lc-race?lifecycle")).body(nc_xml).send().await.unwrap().status(), StatusCode::OK);
+
+    // Put an object with expire=yes tag, then remove its tag before sweep -> must survive.
+    assert_eq!(
+        c.put(format!("{base}/lc-race/tagged"))
+            .header("x-amz-tagging", "expire=yes")
+            .body("stay")
+            .send().await.unwrap().status(),
+        StatusCode::OK
+    );
+    let tag_xml = "<LifecycleConfiguration><Rule><ID>tag-exp</ID><Filter><Tag><Key>expire</Key><Value>yes</Value></Tag></Filter><Status>Enabled</Status>\
+        <Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>";
+    assert_eq!(c.put(format!("{base}/lc-race?lifecycle")).body(tag_xml).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(c.delete(format!("{base}/lc-race/tagged?tagging")).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+
+    // Put k and tagged back on nc-only + tag-exp rule won't touch promoted v1 or untagged object.
+    assert_eq!(c.put(format!("{base}/lc-race?lifecycle")).body(nc_xml).send().await.unwrap().status(), StatusCode::OK);
+    clock.advance(20 * 1_000_000_000);
+    run_lifecycle_sweep(&state, &state.lifecycle, clock.now_ns() / 1_000_000);
+    assert_eq!(c.get(format!("{base}/lc-race/k")).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(c.get(format!("{base}/lc-race/tagged")).send().await.unwrap().status(), StatusCode::OK);
+}
