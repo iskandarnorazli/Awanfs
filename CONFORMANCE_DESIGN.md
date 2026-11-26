@@ -342,6 +342,12 @@ and its signature; conditions (`eq`, `starts-with`, `content-length-range`);
 ships with a fuzz target. Needs #150 for the form's metadata fields and #151 for the
 anonymous cases.
 
+Forms are signed with SigV4 only (section 9). The suite signs its POST forms with SigV2, so
+each of its 36 tests has an AwanFS version with the same request and expected answer, signed
+with SigV4, in `server/tests/post_object_suite_test.rs`; `tests/s3tests/PORTED.md` maps them
+(owner decision, #119, 2026-11-26). The ported version is how such a suite test counts as
+done.
+
 ## 8. Areas: data protection and background work
 
 ### 8.1 Object lock (#120)
@@ -389,7 +395,7 @@ wave 3 (decision 45).
 |---|---|---|
 | RGW-only | 11 | `X-RGW-*` usage headers, account usage, unordered listing, torrents, tenants: ceph extensions, not S3 |
 | Storage classes and cloud tiering | 19 | Need more than one storage class or a remote tier. AwanFS has one |
-| SigV2 request signing | 25 | Owner, 2026-11-17: AwanFS accepts SigV4 only. AWS deprecated SigV2, and supporting it would add an older, weaker signing scheme to secure and keep. The 21 `test_headers.py` tests marked `auth_aws2` and the four `test_cors_presigned_*_v2` tests |
+| SigV2 request signing | 25 | Owner, 2026-11-17: AwanFS accepts SigV4 only. AWS deprecated SigV2, and supporting it would add an older, weaker signing scheme to secure and keep. The 21 `test_headers.py` tests marked `auth_aws2` and the four `test_cors_presigned_*_v2` tests. POST forms are SigV4 only too; their tests are ported, not out of scope (7.3, `tests/s3tests/PORTED.md`), and #433 ports these 25 the same way |
 
 The map lists them under the areas `rgw-only`, `storage-classes` and `sigv2`, owner "out of
 scope", so they are counted apart from the work that is left.

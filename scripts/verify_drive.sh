@@ -302,13 +302,53 @@ j_conditional() { local et1 et2 et_k2 id p1;
   S3 complete-multipart-upload --bucket verify-cond --key mp-cond --upload-id "$id" --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$p1}]}" --if-none-match "*" >/dev/null &&
   S3 head-object --bucket verify-cond --key mp-cond >/dev/null; }
 
+# A browser form upload (#119), signed with SigV4 the way the AWS SDKs sign presigned POSTs.
+# postform BUCKET KEY FILE EXPIRY_SECONDS [success_action_status]: prints the HTTP status, then the body.
+postform() { python3 - "$URL" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$@" <<'PY'
+import base64, datetime, hashlib, hmac, json, sys, urllib.error, urllib.request
+url, ak, sk, bucket, key, path, expiry = sys.argv[1:8]
+status = sys.argv[8] if len(sys.argv) > 8 else ""
+now = datetime.datetime.now(datetime.timezone.utc)
+date = now.strftime("%Y%m%dT%H%M%SZ")
+cred = f"{ak}/{date[:8]}/us-east-1/s3/aws4_request"
+fields = [("key", key), ("Content-Type", "text/plain"), ("x-amz-meta-journey", "post"),
+          ("x-amz-algorithm", "AWS4-HMAC-SHA256"), ("x-amz-credential", cred), ("x-amz-date", date)]
+if status:
+    fields.append(("success_action_status", status))
+conds = [{"bucket": bucket}] + [{k: v} for k, v in fields] + [["content-length-range", 0, 10485760]]
+exp = (now + datetime.timedelta(seconds=int(expiry))).strftime("%Y-%m-%dT%H:%M:%SZ")
+policy = base64.b64encode(json.dumps({"expiration": exp, "conditions": conds}).encode()).decode()
+h = lambda k, m: hmac.new(k, m.encode(), hashlib.sha256).digest()
+skey = h(h(h(h(("AWS4" + sk).encode(), date[:8]), "us-east-1"), "s3"), "aws4_request")
+fields += [("policy", policy), ("x-amz-signature", hmac.new(skey, policy.encode(), hashlib.sha256).hexdigest())]
+b = "journeyboundary"
+body = b"".join(f'--{b}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode() for k, v in fields)
+body += f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="f"\r\n\r\n'.encode() + open(path, "rb").read() + f"\r\n--{b}--\r\n".encode()
+req = urllib.request.Request(f"{url}/{bucket}", data=body, method="POST", headers={"Content-Type": f"multipart/form-data; boundary={b}"})
+try:
+    with urllib.request.urlopen(req) as r:
+        print(r.status); print(r.read().decode())
+except urllib.error.HTTPError as e:
+    print(e.code); print(e.read().decode())
+PY
+}
+j_post() { S3 create-bucket --bucket verify-post && head -c 6000000 /dev/urandom >"$EVID/post-big.bin" && echo "posted by a form" >"$EVID/post.bin" &&
+  postform verify-post up/hello.txt "$EVID/post.bin" 600 | head -1 | grep -qx 204 &&
+  S3 get-object --bucket verify-post --key up/hello.txt "$EVID/post.out" >"$EVID/post-head.json" && same "$EVID/post.bin" "$EVID/post.out" &&
+  grep -q '"journey": "post"' "$EVID/post-head.json" && grep -q '"ContentType": "text/plain"' "$EVID/post-head.json" &&
+  postform verify-post up/big.bin "$EVID/post-big.bin" 600 201 >"$EVID/post-201.txt" && head -1 "$EVID/post-201.txt" | grep -qx 201 &&
+  grep -q '<Key>up/big.bin</Key>' "$EVID/post-201.txt" &&
+  S3 get-object --bucket verify-post --key up/big.bin "$EVID/post-big.out" >/dev/null && same "$EVID/post-big.bin" "$EVID/post-big.out" &&
+  postform verify-post up/late.txt "$EVID/post.bin" -60 >"$EVID/post-expired.txt" && head -1 "$EVID/post-expired.txt" | grep -qx 403 &&
+  grep -q AccessDenied "$EVID/post-expired.txt" && ! S3 head-object --bucket verify-post --key up/late.txt 2>/dev/null; }
+
 # Refuse to run a journey whose && chain is split by a `local x;` (see the note above md5q).
 masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:]]+local [^;]*;|&& *local ' || true)
 [ -z "$masked" ] || { echo "a journey splits its && chain with local:"; echo "$masked"; exit 2; }
 
 start || exit 1
 check doctor doctor
-features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional)
+features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional post)
 [[ " ${features[*]} " == *" buckets "* ]] || check buckets j_buckets
 for f in "${features[@]}"; do check "$f" "j_$f"; done
 ls -la "$DATA" >"$EVID/data-dir.txt" 2>&1

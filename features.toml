@@ -257,7 +257,7 @@ fuzz = ["object_lock_xml"]
 [[feature]]
 id = "post-object"
 name = "Browser POST object form uploads (multipart/form-data)"
-status = "planned"
+status = "partial"
 issue = "#119"
 area = "post-object"
 design_section = "7.3"
@@ -272,7 +272,10 @@ mint = [
   "minio-js::presignedPostPolicy(postPolicy, cb)",
   "minio-py:test_presigned_post_policy",
 ]
-fuzz = ["form_upload"]
+# The suite signs every POST form with SigV2; each test has a SigV4 port (#119, tests/s3tests/PORTED.md).
+server_tests = ["server/tests/post_object_suite_test.rs"]
+drive = ["post"]
+fuzz = ["form_upload", "post_policy"]
 
 [[feature]]
 id = "cors"

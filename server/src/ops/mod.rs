@@ -3,6 +3,7 @@ pub mod cors;
 pub mod lifecycle;
 pub mod multipart;
 pub mod object;
+pub mod post_object;
 pub mod service;
 pub mod tagging;
 
@@ -53,6 +54,7 @@ pub enum Operation {
     ListMultipartUploads,
     DeleteObjects,
     PutObject,
+    PostObject,
     CopyObject,
     GetObject,
     GetObjectAttributes,
@@ -274,6 +276,15 @@ pub const OPS: &[OpSpec] = &[
     OpSpec {
         op: Operation::PutObject,
         name: "PutObject",
+        iam_action: Some("s3:PutObject"),
+        acl_permission: AclPermission::Write,
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    // A browser form upload (#119): a PutObject whose key and credentials are in the form.
+    OpSpec {
+        op: Operation::PostObject,
+        name: "PostObject",
         iam_action: Some("s3:PutObject"),
         acl_permission: AclPermission::Write,
         target: TargetKind::Object,
@@ -510,6 +521,7 @@ pub fn classify(
             (&Method::GET, ["location"]) => Ok(Operation::GetBucketLocation),
             (&Method::GET, ["uploads"]) => Ok(Operation::ListMultipartUploads),
             (&Method::POST, ["delete"]) => Ok(Operation::DeleteObjects),
+            (&Method::POST, []) if post_object::is_form_upload(headers) => Ok(Operation::PostObject),
             (_, s) if !s.is_empty() => Err(ClassifyRefusal::NotImplemented("The requested sub-resource is not implemented.")),
             (&Method::PUT, []) => Ok(Operation::CreateBucket),
             (&Method::DELETE, []) => Ok(Operation::DeleteBucket),
@@ -586,6 +598,8 @@ pub struct Classified {
     pub query_map: HashMap<String, String>,
     pub parts: hyper::http::request::Parts,
     pub body: hyper::body::Incoming,
+    /// PostObject only: the form read by `post_object::read_form` (#119).
+    pub form: Option<Box<post_object::PostForm>>,
 }
 
 pub struct Authenticated {
@@ -672,6 +686,7 @@ pub fn classify_request(req: Request<hyper::body::Incoming>) -> Result<Classifie
         query_map,
         parts,
         body,
+        form: None,
     })
 }
 
@@ -680,6 +695,9 @@ pub fn authenticate(state: &S3ServiceState, c: Classified) -> Result<Authenticat
     let iam = state.iam.read().as_ref().map(|r| r.current());
     if c.op == Operation::CorsPreflight {
         return Ok(Authenticated { classified: c, principal: Principal::Anonymous, iam });
+    }
+    if c.op == Operation::PostObject {
+        return post_object::authenticate(state, c);
     }
     let path = c.parts.uri.path();
     let principal = match crate::auth::authenticate_with(
@@ -1115,7 +1133,12 @@ pub fn validate(a: Authorized) -> Result<Validated, Response<ResponseBody>> {
             key: k.clone(),
         },
     };
-    let body_limit = body_limit_for(&c.parts.method, &target);
+    // A form carries the file and at most 2 MiB of fields (100 of 20 KiB) around it.
+    let body_limit = if c.op == Operation::PostObject {
+        crate::s3_api::MAX_OBJECT_BODY + crate::s3_api::MAX_XML_BODY
+    } else {
+        body_limit_for(&c.parts.method, &target)
+    };
     let declared = c
         .parts
         .headers
@@ -1199,6 +1222,9 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
             let verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &c.parts.headers);
             object::put_object(state, b_id.unwrap(), bucket, key, &path, &c.parts.headers, writer_account, &bucket_owner, verifier, c.body).await
         }
+        Operation::PostObject => {
+            post_object::execute(state, b_id.unwrap(), bucket, key, &path, &c.parts.headers, writer_account, &bucket_owner, c.form, c.body).await
+        }
         Operation::CopyObject => object::copy_object(state, b_id.unwrap(), bucket, key, &c.parts.headers, writer_account, &bucket_owner).await,
         Operation::GetObject => {
             let auth_enabled = state.auth.credentials.is_some() || iam.as_deref().is_some_and(|i| !i.is_empty());
@@ -1265,6 +1291,7 @@ mod tests {
             (Operation::ListMultipartUploads, Method::GET, Some("bkt"), None, "uploads", None),
             (Operation::DeleteObjects, Method::POST, Some("bkt"), None, "delete", None),
             (Operation::PutObject, Method::PUT, Some("bkt"), Some("obj"), "", None),
+            (Operation::PostObject, Method::POST, Some("bkt"), None, "", None),
             (Operation::CopyObject, Method::PUT, Some("bkt"), Some("obj"), "", Some("/src/key")),
             (Operation::GetObject, Method::GET, Some("bkt"), Some("obj"), "", None),
             (Operation::GetObjectAttributes, Method::GET, Some("bkt"), Some("obj"), "attributes", None),
@@ -1291,6 +1318,9 @@ mod tests {
             if let Some(c) = copy {
                 hdrs.insert("x-amz-copy-source", c.parse().unwrap());
             }
+            if *expected == Operation::PostObject {
+                hdrs.insert(CONTENT_TYPE, "multipart/form-data; boundary=x".parse().unwrap());
+            }
             let got = classify(method, *b, *k, q, &hdrs).unwrap();
             assert_eq!(got, *expected, "for {:?} {:?} {:?} ?{}", method, b, k, q);
             seen.insert(got);
@@ -1307,6 +1337,10 @@ mod tests {
             let mut hdrs = HeaderMap::new();
             if let Some(c) = copy {
                 hdrs.insert("x-amz-copy-source", c.parse().unwrap());
+            }
+            if method == Method::POST && b.is_some() && k.is_none() && q.is_empty() {
+                // PostObject (#119): its key is in the form, so the old path-based function has no row.
+                continue;
             }
             let op = classify(&method, b, k, q, &hdrs).unwrap();
             if op == Operation::CorsPreflight {

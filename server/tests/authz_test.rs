@@ -52,6 +52,7 @@ fn op_class(op: Operation) -> OpClass {
         | Operation::ListParts
         | Operation::GetObjectTagging => OpClass::Read,
         Operation::PutObject
+        | Operation::PostObject
         | Operation::CopyObject
         | Operation::DeleteObject
         | Operation::DeleteObjects

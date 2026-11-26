@@ -20,6 +20,7 @@ pub mod error;
 pub mod events;
 pub mod ffi_bridge;
 pub mod form_upload;
+pub mod post_object;
 pub mod fsm;
 pub mod lifecycle;
 pub mod lifecycle_config;
