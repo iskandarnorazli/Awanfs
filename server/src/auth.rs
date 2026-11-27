@@ -262,12 +262,7 @@ pub fn authenticate_with(
             }
         }
         let (access_key, date8, region, service) = parse_credential(cred.ok_or("AuthorizationHeaderMalformed")?)?;
-        let amz_date = headers
-            .get("x-amz-date")
-            .and_then(|v| v.to_str().ok())
-            .ok_or("AuthorizationHeaderMalformed")?
-            .to_string();
-        let req_epoch = parse_iso8601_epoch(&amz_date).ok_or("AuthorizationHeaderMalformed")?;
+        let (amz_date, req_epoch) = crate::sigv4::sigv4_request_time(headers).ok_or("AuthorizationHeaderMalformed")?;
         if req_epoch.abs_diff(now_sec) > 900 {
             return Err("RequestTimeTooSkewed");
         }
@@ -393,7 +388,7 @@ impl ChunkVerifier {
             date8: date8.to_string(),
             region: region.to_string(),
             service: service.to_string(),
-            amz_date: headers.get("x-amz-date")?.to_str().ok()?.to_string(),
+            amz_date: crate::sigv4::sigv4_request_time(headers)?.0,
             previous: sig?.to_ascii_lowercase(),
         })
     }
