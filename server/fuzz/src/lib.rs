@@ -10,6 +10,7 @@ use s3_server::bucket_config::{
 };
 use s3_server::checksum::{base64_decode, requested_checksum, ChecksumAlgorithm};
 use s3_server::ops::bucket::{decode_hex_token, encode_hex_token, parse_list_objects_query};
+use s3_server::ops::object::{parse_object_attributes_headers, ObjectAttributesQuery};
 use s3_server::ops::service::list_buckets;
 use s3_server::{
     base64_encode, parse_s3_target, percent_decode, percent_decode_path_bytes, raw_s3_key,
@@ -657,11 +658,174 @@ pub fn check_list_objects_query(data: &[u8]) {
     assert_eq!(parsed.start.as_slice(), data);
 }
 
+fn expected_object_attributes(
+    headers: &HeaderMap,
+) -> Result<ObjectAttributesQuery, &'static str> {
+    let mut out = ObjectAttributesQuery {
+        want_etag: false,
+        want_checksum: false,
+        want_parts: false,
+        want_storage_class: false,
+        want_size: false,
+        max_parts: 1000,
+        part_marker: 0,
+    };
+    let mut any_attr = false;
+    for val in headers.get_all("x-amz-object-attributes") {
+        let Ok(raw) = val.to_str() else {
+            return Err("InvalidArgument");
+        };
+        for tok in raw.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
+            any_attr = true;
+            match tok {
+                "ETag" => out.want_etag = true,
+                "Checksum" => out.want_checksum = true,
+                "ObjectParts" => out.want_parts = true,
+                "StorageClass" => out.want_storage_class = true,
+                "ObjectSize" => out.want_size = true,
+                _ => return Err("InvalidArgument"),
+            }
+        }
+    }
+    if !any_attr {
+        return Err("InvalidArgument");
+    }
+    if let Some(s) = headers.get("x-amz-max-parts").and_then(|v| v.to_str().ok()) {
+        match s.trim().parse::<usize>() {
+            Ok(n) if n > 0 => out.max_parts = n.min(1000),
+            _ => return Err("InvalidArgument"),
+        }
+    }
+    if let Some(s) = headers
+        .get("x-amz-part-number-marker")
+        .and_then(|v| v.to_str().ok())
+    {
+        match s.trim().parse::<usize>() {
+            Ok(n) => out.part_marker = n,
+            Err(_) => return Err("InvalidArgument"),
+        }
+    }
+    Ok(out)
+}
+
+fn assert_object_attributes_oracle(headers: &HeaderMap) {
+    let got = parse_object_attributes_headers(headers);
+    let want = expected_object_attributes(headers);
+    match want {
+        Ok(expected) => assert_eq!(
+            got,
+            Ok(expected),
+            "parse_object_attributes_headers mismatch for {:?}",
+            headers
+        ),
+        Err(code) => assert!(
+            matches!(got, Err((c, _)) if c == code),
+            "expected Err(({:?}, _)) for {:?}, got {:?}",
+            code,
+            headers,
+            got
+        ),
+    }
+}
+
+/// Oracle for `object_attributes_header` (#117, #447):
+/// - Case-sensitive trimmed matching of `ETag`, `Checksum`, `ObjectParts`, `StorageClass`, `ObjectSize`.
+/// - Unknown/empty attributes and invalid `x-amz-max-parts` / `x-amz-part-number-marker` return `InvalidArgument`.
+/// - Splitting attributes across multiple `x-amz-object-attributes` header lines gives the same result as one comma-joined header.
+pub fn check_object_attributes_header(data: &[u8]) {
+    if let Ok(hv) = HeaderValue::from_bytes(data) {
+        let mut raw_attr = HeaderMap::new();
+        raw_attr.insert("x-amz-object-attributes", hv.clone());
+        assert_object_attributes_oracle(&raw_attr);
+
+        let mut raw_max = HeaderMap::new();
+        raw_max.insert("x-amz-object-attributes", HeaderValue::from_static("ObjectParts"));
+        raw_max.insert("x-amz-max-parts", hv);
+        assert_object_attributes_oracle(&raw_max);
+    }
+
+    let text = String::from_utf8_lossy(data);
+    let mut headers = HeaderMap::new();
+    let mut combined_attr_vals: Vec<String> = Vec::new();
+    let mut split_tokens: Vec<String> = Vec::new();
+    let mut opt_max_parts: Option<HeaderValue> = None;
+    let mut opt_part_marker: Option<HeaderValue> = None;
+
+    for line in text.split('\n') {
+        if let Some(v) = line.strip_prefix("x-amz-max-parts:") {
+            if let Ok(hv) = HeaderValue::from_str(v) {
+                headers.insert("x-amz-max-parts", hv.clone());
+                opt_max_parts = Some(hv);
+            }
+        } else if let Some(v) = line.strip_prefix("x-amz-part-number-marker:") {
+            if let Ok(hv) = HeaderValue::from_str(v) {
+                headers.insert("x-amz-part-number-marker", hv.clone());
+                opt_part_marker = Some(hv);
+            }
+        } else if let Ok(hv) = HeaderValue::from_str(line) {
+            headers.append("x-amz-object-attributes", hv);
+            combined_attr_vals.push(line.to_string());
+            for tok in line.split(',') {
+                split_tokens.push(tok.to_string());
+            }
+        }
+    }
+
+    assert_object_attributes_oracle(&headers);
+
+    if !combined_attr_vals.is_empty() {
+        let mut single = HeaderMap::new();
+        if let Ok(hv) = HeaderValue::from_str(&combined_attr_vals.join(",")) {
+            single.insert("x-amz-object-attributes", hv);
+            if let Some(ref mp) = opt_max_parts {
+                single.insert("x-amz-max-parts", mp.clone());
+            }
+            if let Some(ref pm) = opt_part_marker {
+                single.insert("x-amz-part-number-marker", pm.clone());
+            }
+            assert_object_attributes_oracle(&single);
+
+            let mut split = HeaderMap::new();
+            for tok in &split_tokens {
+                if let Ok(hv) = HeaderValue::from_str(tok) {
+                    split.append("x-amz-object-attributes", hv);
+                }
+            }
+            if let Some(ref mp) = opt_max_parts {
+                split.insert("x-amz-max-parts", mp.clone());
+            }
+            if let Some(ref pm) = opt_part_marker {
+                split.insert("x-amz-part-number-marker", pm.clone());
+            }
+            assert_object_attributes_oracle(&split);
+            match (
+                parse_object_attributes_headers(&single),
+                parse_object_attributes_headers(&split),
+            ) {
+                (Ok(a), Ok(b)) => assert_eq!(
+                    a, b,
+                    "multi-header split disagreed with single comma header for {:?}",
+                    combined_attr_vals
+                ),
+                (Err((ca, _)), Err((cb, _))) => assert_eq!(ca, cb),
+                (a, b) => panic!("multi-header equivalence mismatch: {:?} vs {:?}", a, b),
+            }
+        }
+    }
+
+    // Absent x-amz-object-attributes header must always return InvalidArgument.
+    let empty_hdrs = HeaderMap::new();
+    assert!(matches!(
+        parse_object_attributes_headers(&empty_hdrs),
+        Err(("InvalidArgument", _))
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         check_checksum_headers, check_classify, check_list_buckets_query,
-        check_list_objects_query, check_raw_s3_key,
+        check_list_objects_query, check_object_attributes_header, check_raw_s3_key,
     };
 
     #[test]
@@ -823,6 +987,36 @@ mod tests {
         for path in entries {
             let bytes = std::fs::read(&path).expect("read corpus seed");
             check_list_objects_query(&bytes);
+        }
+    }
+
+    #[test]
+    fn object_attributes_header_bounds_and_corpus_seeds() {
+        for sample in [
+            b"ETag".as_slice(),
+            b"ETag,ObjectSize".as_slice(),
+            b" ETag , Checksum".as_slice(),
+            b"etag".as_slice(),
+            b"ETag,,".as_slice(),
+            b"".as_slice(),
+            b"ObjectParts\nx-amz-max-parts: -1".as_slice(),
+            b"ETag\nStorageClass\nChecksum\nObjectParts\nObjectSize\nx-amz-max-parts: 2000\nx-amz-part-number-marker: 7".as_slice(),
+            b"ObjectParts\nx-amz-max-parts: 0".as_slice(),
+            b"ObjectParts\nx-amz-part-number-marker: nope".as_slice(),
+        ] {
+            check_object_attributes_header(sample);
+        }
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/object_attributes_header");
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read object_attributes_header corpus dir")
+            .map(|e| e.expect("corpus dir entry").path())
+            .collect();
+        entries.sort();
+        assert!(entries.len() >= 7, "expected at least 7 named seeds, got {}", entries.len());
+        for path in entries {
+            let bytes = std::fs::read(&path).expect("read corpus seed");
+            check_object_attributes_header(&bytes);
         }
     }
 }

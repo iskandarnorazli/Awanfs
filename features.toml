@@ -552,7 +552,6 @@ fuzz = ["attrs_values"]
 id = "object-attributes-api"
 name = "GetObjectAttributes API (ETag, Checksum, ObjectParts, StorageClass, ObjectSize)"
 status = "done"
-gaps = { fuzz = "#447" }
 issue = "#117"
 area = "object-attributes-api"
 design_section = "7.1"
@@ -575,6 +574,7 @@ server_tests = [
   "server/tests/checksum_test.rs::multipart_checksum_and_get_object_attributes_parts",
 ]
 drive = ["checksums"]
+fuzz = ["object_attributes_header"]
 
 [[feature]]
 id = "tagging"
