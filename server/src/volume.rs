@@ -768,6 +768,57 @@ impl<Fs: VolFs> Drop for NeedleWriter<Fs> {
     }
 }
 
+/// Needle buffers kept for the next write (#454). A fresh zeroed buffer per write cost a page
+/// fault for every 4 KiB of payload: about 14% of the server's CPU at PUT 1 MiB. Buffers are
+/// sized in steps of `WRITE_POOL_STEP` so writes of nearly the same size share them; at most
+/// `WRITE_POOL_BYTES` are kept, and none larger than `WRITE_POOL_MAX_BUFFER`.
+const WRITE_POOL_STEP: usize = 64 * 1024;
+const WRITE_POOL_BYTES: usize = 8 * 1024 * 1024;
+const WRITE_POOL_MAX_BUFFER: usize = 4 * 1024 * 1024 + 2 * WRITE_POOL_STEP;
+
+#[derive(Default)]
+struct WritePool {
+    bufs: std::collections::VecDeque<AlignedBuffer>,
+    bytes: usize,
+}
+
+/// A buffer from `WritePool`, given back when dropped.
+struct PooledBuffer<'a> {
+    pool: &'a Mutex<WritePool>,
+    buf: Option<AlignedBuffer>,
+}
+
+impl std::ops::Deref for PooledBuffer<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.buf.as_deref().expect("buffer present until drop")
+    }
+}
+
+impl std::ops::DerefMut for PooledBuffer<'_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.buf.as_deref_mut().expect("buffer present until drop")
+    }
+}
+
+impl Drop for PooledBuffer<'_> {
+    fn drop(&mut self) {
+        let Some(buf) = self.buf.take() else { return };
+        if buf.len() > WRITE_POOL_MAX_BUFFER {
+            return;
+        }
+        let mut pool = self.pool.lock();
+        while pool.bytes + buf.len() > WRITE_POOL_BYTES {
+            match pool.bufs.pop_front() {
+                Some(old) => pool.bytes -= old.len(),
+                None => return,
+            }
+        }
+        pool.bytes += buf.len();
+        pool.bufs.push_back(buf);
+    }
+}
+
 pub struct VolumeManager<Fs: VolFs = DiskFs> {
     dir: PathBuf,
     volume_id: u32,
@@ -805,6 +856,10 @@ pub struct VolumeManager<Fs: VolFs = DiskFs> {
     /// Writes that have reserved an offset here and not yet written their header (#167). A
     /// streamed PUT counts from `begin_needle` until its `NeedleWriter` is dropped.
     writers_in_flight: std::sync::atomic::AtomicUsize,
+    /// Needle buffers for `write_needle_with_attrs` (#454); emptied by `seal`.
+    write_pool: Mutex<WritePool>,
+    /// Needle buffers allocated, not taken from `write_pool` (#454).
+    needle_buffer_allocs: AtomicU64,
     /// Set by compaction before it lists the needles: no new reservation lands here after it.
     sealed: std::sync::atomic::AtomicBool,
     /// Reservations made in this process that may never get a header: a streamed needle from
@@ -1025,6 +1080,8 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             journal_pushed: AtomicU64::new(0),
             payload_verified_at_open,
             writers_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            write_pool: Mutex::new(WritePool::default()),
+            needle_buffer_allocs: AtomicU64::new(0),
             sealed: std::sync::atomic::AtomicBool::new(false),
             gaps: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             open_gaps,
@@ -1417,7 +1474,7 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         let raw_len = p_start + payload.len();
         let total_len = (((raw_len + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE) as u64;
 
-        let mut buf = AlignedBuffer::new(total_len as usize);
+        let mut buf = self.needle_buffer(total_len as usize);
 
         let now = created_at.unwrap_or_else(|| self.clock.now_ns());
         let mut header = NeedleHeader {
@@ -1467,11 +1524,12 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             // Write payload tail sectors before sector 0 (NeedleHeader) so a crash never leaves
             // a valid header pointing at unwritten tail sectors (matching NeedleWriter::finish).
             self.ensure_allocated(offset + total_len).and_then(|()| {
+                let needle = &buf[..total_len as usize];
                 if total_len > SECTOR_SIZE as u64 {
-                    self.file.write_aligned_at(offset + SECTOR_SIZE as u64, &buf[SECTOR_SIZE..])?;
-                    self.file.write_aligned_at(offset, &buf[..SECTOR_SIZE])?;
+                    self.file.write_aligned_at(offset + SECTOR_SIZE as u64, &needle[SECTOR_SIZE..])?;
+                    self.file.write_aligned_at(offset, &needle[..SECTOR_SIZE])?;
                 } else {
-                    self.file.write_aligned_at(offset, &buf)?;
+                    self.file.write_aligned_at(offset, needle)?;
                 }
                 Ok(())
             })
@@ -1573,6 +1631,34 @@ impl<Fs: VolFs> VolumeManager<Fs> {
     /// volume it is about to list; writers still holding it are sent to the active volume.
     pub fn seal(&self) {
         self.sealed.store(true, Ordering::SeqCst);
+        *self.write_pool.lock() = WritePool::default();
+    }
+
+    /// Needle buffers allocated for whole-needle writes, not reused from the pool (#454).
+    pub fn needle_buffer_allocs(&self) -> u64 {
+        self.needle_buffer_allocs.load(Ordering::Relaxed)
+    }
+
+    /// A buffer of at least `len` bytes (a multiple of the sector size) for one needle. Its
+    /// bytes are not zeroed: the caller writes every byte it sends to disk.
+    fn needle_buffer(&self, len: usize) -> PooledBuffer<'_> {
+        let class = len.div_ceil(WRITE_POOL_STEP) * WRITE_POOL_STEP;
+        let reused = {
+            let mut pool = self.write_pool.lock();
+            match pool.bufs.iter().position(|b| b.len() == class) {
+                Some(i) => {
+                    let b = pool.bufs.remove(i).expect("index from position");
+                    pool.bytes -= b.len();
+                    Some(b)
+                }
+                None => None,
+            }
+        };
+        let buf = reused.unwrap_or_else(|| {
+            self.needle_buffer_allocs.fetch_add(1, Ordering::Relaxed);
+            AlignedBuffer::new(class)
+        });
+        PooledBuffer { pool: &self.write_pool, buf: Some(buf) }
     }
 
     /// Writes that reserved an offset here and have not written their header yet.

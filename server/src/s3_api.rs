@@ -112,12 +112,15 @@ pub(crate) fn entity_too_large(resource: &str, limit: u64) -> Response<ResponseB
 
 /// Reads a request body of at most `limit` bytes, timing out if no frame arrives within
 /// `idle_timeout`. `Ok(Err(response))` is the answer to send when the body is too large,
-/// times out, or is cut short.
-pub(crate) async fn read_body<B>(
+/// times out, or is cut short. The buffer starts at `capacity` bytes; a body that outgrows it
+/// is counted in `work` (#454).
+pub(crate) async fn read_body_sized<B>(
     mut body: B,
     limit: u64,
     idle_timeout: std::time::Duration,
     resource: &str,
+    capacity: usize,
+    work: Option<&WorkCounters>,
 ) -> Result<Result<Bytes, Response<ResponseBody>>, hyper::Error>
 where
     B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Unpin,
@@ -125,7 +128,7 @@ where
     if body.size_hint().lower() > limit {
         return Ok(Err(entity_too_large(resource, limit)));
     }
-    let mut buf = bytes::BytesMut::new();
+    let mut buf = bytes::BytesMut::with_capacity(capacity);
     loop {
         match crate::body_timeout::next_frame_with_idle(&mut body, idle_timeout).await {
             Err(crate::body_timeout::BodyIdleTimeout) => {
@@ -141,7 +144,13 @@ where
                     if buf.is_empty() && body.is_end_stream() {
                         return Ok(Ok(data));
                     }
+                    let cap = buf.capacity();
                     buf.extend_from_slice(&data);
+                    if let Some(work) = work {
+                        if cap != 0 && buf.capacity() != cap {
+                            work.body_regrowth();
+                        }
+                    }
                 }
             }
         }
@@ -195,7 +204,10 @@ where
         }
     };
     let inflight = work.hold_inflight(guard.bytes());
-    match read_body(body, limit, idle_timeout, resource).await? {
+    // The buffer is the size the budget admitted when the length was declared, so a body
+    // arriving in many frames is not moved to a larger buffer as it grows (#454).
+    let capacity = estimated_bytes.map_or(0, |n| n.min(guard.bytes()) as usize);
+    match read_body_sized(body, limit, idle_timeout, resource, capacity, Some(work.as_ref())).await? {
         Ok(bytes) => {
             let actual = if (bytes.len() as u64) != guard.bytes() {
                 drop(inflight);
