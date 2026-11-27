@@ -61,6 +61,7 @@ pub mod stream_read;
 pub mod tagging;
 pub mod attrs;
 pub mod work;
+pub mod workers;
 pub mod xml;
 
 pub use aws_chunked::*;
