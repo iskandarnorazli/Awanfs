@@ -23,4 +23,4 @@ The cost of one pass does not change with #486; how often it runs does. From the
 | Period | Passes per hour | CPU per hour at 1M objects | Share of one core |
 |---|---|---|---|
 | 60 s (before #486) | 60 | 167 to 171 s | 4.6% to 4.7% |
-| 1 h (default after #486) | 1 | 2.8 s | 0.08% |
+| 1 h (default after #486: 1/24 of a 86,400 s day) | 1 | 2.8 s | 0.08% |

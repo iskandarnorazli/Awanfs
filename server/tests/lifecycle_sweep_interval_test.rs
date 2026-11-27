@@ -1,10 +1,10 @@
-//! #486 (owner decision 2026-11-27): the server sweeps for expired objects every hour by
-//! default, and `--lifecycle-sweep-interval` (or `AWANFS_LIFECYCLE_SWEEP_INTERVAL`) sets the
-//! period. It printed nothing and swept every 60 s before; one pass over 1M objects cost 2.8 s
-//! of CPU (`measurements/2026-11-27-lifecycle-sweep-cost.md`). These tests start the binary and
-//! read the period it prints.
+//! #486 (owner decision 2026-11-27): the server sweeps for expired objects every 1/24 of a
+//! lifecycle day (`--lifecycle-day-seconds`), between 500 ms and 1 hour: hourly by default. It
+//! printed nothing and swept every 60 s before; one pass over 1M objects cost 2.8 s of CPU
+//! (`measurements/2026-11-27-lifecycle-sweep-cost.md`). These tests start the binary and read
+//! the period it prints.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -32,7 +32,6 @@ fn command(name: &str, extra: &[&str], env: &[(&str, &str)]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-server"));
     cmd.args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous"])
         .args(extra)
-        .env_remove("AWANFS_LIFECYCLE_SWEEP_INTERVAL")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (k, v) in env {
@@ -68,28 +67,14 @@ fn the_server_sweeps_hourly_by_default() {
 }
 
 #[test]
-fn the_flag_and_the_environment_set_the_period() {
+fn the_period_follows_the_lifecycle_day() {
     assert_eq!(
-        sweep_line(command("flag", &["--lifecycle-sweep-interval", "30m"], &[])).as_deref(),
-        Some("Lifecycle sweep every 1800s")
+        sweep_line(command("day-2400", &["--lifecycle-day-seconds", "2400"], &[])).as_deref(),
+        Some("Lifecycle sweep every 100s")
     );
+    // The suite's 2-second day keeps its short period.
     assert_eq!(
-        sweep_line(command("env", &[], &[("AWANFS_LIFECYCLE_SWEEP_INTERVAL", "2h")])).as_deref(),
-        Some("Lifecycle sweep every 7200s")
-    );
-    // The test setting keeps its short period.
-    assert_eq!(
-        sweep_line(command("test-days", &["--lifecycle-day-seconds", "2"], &[])).as_deref(),
+        sweep_line(command("day-2", &["--lifecycle-day-seconds", "2"], &[])).as_deref(),
         Some("Lifecycle sweep every 500ms")
     );
-}
-
-#[test]
-fn an_invalid_period_stops_the_server() {
-    let mut child = Server(command("bad", &["--lifecycle-sweep-interval", "soon"], &[]).spawn().expect("spawn s3-server"));
-    let status = child.0.wait().expect("wait");
-    let mut err = String::new();
-    child.0.stderr.take().unwrap().read_to_string(&mut err).unwrap();
-    assert_eq!(status.code(), Some(2), "{}", err);
-    assert!(err.contains("--lifecycle-sweep-interval must be a positive duration"), "{}", err);
 }

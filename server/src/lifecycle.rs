@@ -602,42 +602,17 @@ async fn sweep_unversioned_or_null_key_locked(
 
 /// Runs one rate-limited lifecycle sweep tick using [`fsm::expiry_step`]. Returns `true` if
 /// the work budget was exhausted and another tick should run promptly.
-/// How often the server runs a lifecycle sweep by default (#486, owner decision 2026-11-27): a
-/// pass over 1M objects cost 2.8 s of CPU (`measurements/2026-11-27-lifecycle-sweep-cost.md`),
-/// and rules count in days.
-pub const DEFAULT_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+/// The lifecycle sweep runs every 1/24 of a lifecycle day, kept between these bounds (#486,
+/// owner decision 2026-11-27): hourly at the default day of 86,400 s, every 500 ms under the
+/// suite's 2-second day. A pass over 1M objects cost 2.8 s of CPU
+/// (`measurements/2026-11-27-lifecycle-sweep-cost.md`), and rules count in days.
+pub const MIN_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+pub const MAX_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// The sweep period: `--lifecycle-sweep-interval`, else `AWANFS_LIFECYCLE_SWEEP_INTERVAL`, else
-/// 500 ms when `--lifecycle-day-seconds` makes a day shorter than a minute (the test setting),
-/// else `DEFAULT_SWEEP_INTERVAL`. Values are a whole number with `ms`, `s`, `m` or `h`, or
-/// seconds with no suffix; zero and anything else are errors naming their source.
-pub fn sweep_interval(flag: Option<&str>, env: Option<&str>, day_seconds: u64) -> Result<std::time::Duration, String> {
-    use std::time::Duration;
-    let parse = |raw: &str, what: &str| -> Result<Duration, String> {
-        let s = raw.trim();
-        let (num, unit) = if let Some(n) = s.strip_suffix("ms") {
-            (n, 1u64)
-        } else if let Some(n) = s.strip_suffix('s') {
-            (n, 1_000)
-        } else if let Some(n) = s.strip_suffix('m') {
-            (n, 60_000)
-        } else if let Some(n) = s.strip_suffix('h') {
-            (n, 3_600_000)
-        } else {
-            (s, 1_000)
-        };
-        match num.trim().parse::<u64>().ok().and_then(|n| n.checked_mul(unit)) {
-            Some(ms) if ms > 0 => Ok(Duration::from_millis(ms)),
-            _ => Err(format!("{} must be a positive duration such as 30m or 1h, not {:?}", what, raw)),
-        }
-    };
-    if let Some(v) = flag {
-        return parse(v, "--lifecycle-sweep-interval");
-    }
-    if let Some(v) = env.filter(|v| !v.trim().is_empty()) {
-        return parse(v, "AWANFS_LIFECYCLE_SWEEP_INTERVAL");
-    }
-    Ok(if day_seconds < 60 { Duration::from_millis(500) } else { DEFAULT_SWEEP_INTERVAL })
+/// How often to sweep for a lifecycle day of `day_seconds` (`--lifecycle-day-seconds`).
+pub fn sweep_interval(day_seconds: u64) -> std::time::Duration {
+    let ms = day_seconds.max(1).saturating_mul(1000) / 24;
+    std::time::Duration::from_millis(ms).clamp(MIN_SWEEP_INTERVAL, MAX_SWEEP_INTERVAL)
 }
 
 /// Keys the sweep lists from the engine at a time (#475).
@@ -821,21 +796,15 @@ pub fn run_lifecycle_sweep(
 #[cfg(test)]
 mod sweep_interval_tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
-    fn the_sweep_runs_hourly_by_default_and_the_setting_overrides_it() {
-        use std::time::Duration;
-        assert_eq!(sweep_interval(None, None, 86_400), Ok(Duration::from_secs(3600)));
-        assert_eq!(sweep_interval(None, None, 2), Ok(Duration::from_millis(500)));
-        assert_eq!(sweep_interval(Some("30m"), Some("2h"), 86_400), Ok(Duration::from_secs(1800)));
-        assert_eq!(sweep_interval(None, Some("2h"), 86_400), Ok(Duration::from_secs(7200)));
-        assert_eq!(sweep_interval(None, Some(" "), 86_400), Ok(Duration::from_secs(3600)));
-        assert_eq!(sweep_interval(Some("90"), None, 2), Ok(Duration::from_secs(90)));
-        assert_eq!(sweep_interval(Some("250ms"), None, 86_400), Ok(Duration::from_millis(250)));
-        for bad in ["0", "0s", "", "soon", "-5m", "1.5h"] {
-            let e = sweep_interval(Some(bad), None, 86_400).unwrap_err();
-            assert!(e.starts_with("--lifecycle-sweep-interval must be"), "{}", e);
-        }
-        assert!(sweep_interval(None, Some("x"), 86_400).unwrap_err().starts_with("AWANFS_LIFECYCLE_SWEEP_INTERVAL must be"));
+    fn the_sweep_runs_every_twenty_fourth_of_a_day_within_bounds() {
+        assert_eq!(sweep_interval(86_400), Duration::from_secs(3600));
+        assert_eq!(sweep_interval(2_400), Duration::from_secs(100));
+        assert_eq!(sweep_interval(2), Duration::from_millis(500));
+        assert_eq!(sweep_interval(0), Duration::from_millis(500));
+        assert_eq!(sweep_interval(30 * 86_400), Duration::from_secs(3600));
+        assert_eq!(sweep_interval(u64::MAX), Duration::from_secs(3600));
     }
 }
