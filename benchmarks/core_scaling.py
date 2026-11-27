@@ -1346,16 +1346,51 @@ def _stop_proc(proc: Optional[subprocess.Popen]) -> None:
             proc.wait(timeout=5)
 
 
+class _InheritedAffinity:
+    """Narrows this process to `cores` for a spawn on Windows, so the child starts pinned and
+    anything it sizes from its affinity at startup sees only those cores (#474); restores the
+    old affinity afterwards. Without psutil, or elsewhere, it does nothing."""
+
+    def __init__(self, cores: List[int], enabled: bool):
+        self.cores = cores
+        self.enabled = enabled
+        self.saved: Optional[List[int]] = None
+        self.me = None
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        try:
+            import psutil  # type: ignore
+            self.me = psutil.Process()
+            self.saved = list(self.me.cpu_affinity())
+            self.me.cpu_affinity(self.cores)
+        except Exception:
+            self.saved = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.saved is not None and self.me is not None:
+            try:
+                self.me.cpu_affinity(self.saved)
+            except Exception:
+                pass
+        return False
+
+
 def _spawn_pinned(argv: List[str], n_cores: int, log_path: str, env: Optional[dict] = None) -> subprocess.Popen:
     cmd = pinning_command(argv, n_cores)
     use_taskset = sys.platform.startswith("linux") and cmd[0] == "taskset" and shutil.which("taskset") is not None
     launch_argv = cmd if use_taskset else argv
+    cores = list(range(n_cores))
     log = open(log_path, "ab")
     try:
-        proc = subprocess.Popen(launch_argv, env=env, stdout=log, stderr=subprocess.STDOUT)
+        # Windows has no taskset: the child inherits this process's affinity at creation.
+        with _InheritedAffinity(cores, enabled=sys.platform == "win32"):
+            proc = subprocess.Popen(launch_argv, env=env, stdout=log, stderr=subprocess.STDOUT)
     finally:
         log.close()
-    pin_process(proc.pid, list(range(n_cores)))
+    pin_process(proc.pid, cores)
     return proc
 
 
