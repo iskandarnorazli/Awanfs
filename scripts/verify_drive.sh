@@ -402,11 +402,12 @@ j_encryption() { local upid p1 p2 k1 k2;
   S3 get-object --bucket verify-ssec --key rotated --sse-customer-algorithm AES256 --sse-customer-key "$k2" --sse-customer-key-md5 "arxBvwY2V4SiOne6yppVPQ==" "$EVID/ssec-rot.out" >/dev/null &&
   same "$EVID/ssec.bin" "$EVID/ssec-rot.out" &&
   upid=$(S3 create-multipart-upload --bucket verify-ssec --key mp-ssec --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" --query UploadId --output text) &&
-  p1=$(S3 upload-part --bucket verify-ssec --key mp-ssec --part-number 1 --upload-id "$upid" --body "$EVID/ssec.bin" --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" --query ETag --output text) &&
+  head -c 5242880 /dev/urandom >"$EVID/ssec-p1.bin" &&
+  p1=$(S3 upload-part --bucket verify-ssec --key mp-ssec --part-number 1 --upload-id "$upid" --body "$EVID/ssec-p1.bin" --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" --query ETag --output text) &&
   p2=$(S3 upload-part --bucket verify-ssec --key mp-ssec --part-number 2 --upload-id "$upid" --body "$EVID/ssec.bin" --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" --query ETag --output text) &&
   S3 complete-multipart-upload --bucket verify-ssec --key mp-ssec --upload-id "$upid" --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$p1},{\"PartNumber\":2,\"ETag\":$p2}]}" >/dev/null &&
   S3 get-object --bucket verify-ssec --key mp-ssec --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" "$EVID/ssec-mp.out" >/dev/null &&
-  cat "$EVID/ssec.bin" "$EVID/ssec.bin" >"$EVID/ssec-mp.want" &&
+  cat "$EVID/ssec-p1.bin" "$EVID/ssec.bin" >"$EVID/ssec-mp.want" &&
   same "$EVID/ssec-mp.want" "$EVID/ssec-mp.out"; }
 
 # Refuse to run a journey whose && chain is split by a `local x;` (see the note above md5q).
