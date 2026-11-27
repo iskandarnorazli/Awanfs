@@ -12,7 +12,7 @@ Split from `awan-lang/awan-storage` on 2026-11-12, with its git history. Measure
 
 Read this before you run it anywhere that matters. Plan of record: the Phase 1-4 milestones and [`ROADMAP_AND_DEPENDENCIES.md`](ROADMAP_AND_DEPENDENCIES.md); decisions in [`ARCHITECTURE.md`](ARCHITECTURE.md#0-decisions-2026-11-12); on-disk format in [`FORMAT.md`](FORMAT.md).
 
-- **Access:** SigV4 with a root key from the environment, plus users with IAM-style JSON policies in a TOML file (`--config`, #53). The server listens on 127.0.0.1 by default. HTTPS with `--cert`/`--key`, reloaded when the files change (#30).
+- **Access:** SigV4 with a root key from the environment (the request time from `x-amz-date`, or from `Date` when a client sends no `x-amz-date`, as AWS does; #457), plus users with IAM-style JSON policies in a TOML file (`--config`, #53). The server listens on 127.0.0.1 by default. HTTPS with `--cert`/`--key`, reloaded when the files change (#30).
 - **Durability:** writes are synced before the 200 by default (`group` durability, #29). The 16-core laptop benchmarks below were re-run with `group`, `strict`, and `fast` durability ([`measurements/2026-11-18-market-claims.md`](measurements/2026-11-18-market-claims.md)).
 - **Volumes** of 32 GiB, rolled over when full (#37), compacted in the background when at least 20 % is dead (#14), at most 50 MB/s (`--compaction-rate`, #28).
 - **Bodies:** a PUT or UploadPart above 4 MiB streams to disk, `aws-chunked` included (#36); bodies above 5 GiB get 400 `EntityTooLarge` before they are read. GETs above 4 MiB and multipart GETs stream via positioned reads outside the volume mapping (#155).

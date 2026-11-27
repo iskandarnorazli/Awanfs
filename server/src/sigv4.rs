@@ -80,6 +80,45 @@ impl Default for SigV4KeyCache {
     }
 }
 
+/// Epoch seconds as an ISO 8601 basic timestamp (`YYYYMMDDTHHMMSSZ`), the form the SigV4
+/// string to sign uses; `None` outside the years `parse_iso8601_epoch` accepts.
+pub fn format_iso8601_basic(epoch: u64) -> Option<String> {
+    let days = (epoch / 86_400) as i64;
+    let rem = epoch % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    if !(1970..=9999).contains(&y) {
+        return None;
+    }
+    Some(format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", y, m, d, rem / 3600, (rem / 60) % 60, rem % 60))
+}
+
+/// A SigV4 request time from an HTTP `Date` header, for a request without `x-amz-date`
+/// (#457): the timestamp the string to sign uses, and its epoch seconds.
+pub fn sigv4_time_from_http_date(raw: &str) -> Option<(String, u64)> {
+    let epoch = crate::precondition::parse_http_date(raw)?;
+    Some((format_iso8601_basic(epoch)?, epoch))
+}
+
+/// The SigV4 request time of a header-signed request: `x-amz-date`, or without it the `Date`
+/// header, as AWS reads it (#457). The timestamp is in the form the string to sign uses.
+pub fn sigv4_request_time(headers: &hyper::HeaderMap) -> Option<(String, u64)> {
+    match headers.get("x-amz-date") {
+        Some(v) => {
+            let s = v.to_str().ok()?;
+            Some((s.to_string(), parse_iso8601_epoch(s)?))
+        }
+        None => sigv4_time_from_http_date(headers.get(hyper::header::DATE)?.to_str().ok()?),
+    }
+}
+
 pub fn parse_iso8601_epoch(dt: &str) -> Option<u64> {
     // Basic format: "20261110T120000Z"
     let b = dt.as_bytes();

@@ -213,3 +213,104 @@ fn a_non_ascii_header_still_needs_the_right_value_and_secret() {
     let h = meta_put_headers(b"Hello World\xe9", &sign_meta("another-secret", "Hello World\u{e9}"));
     assert_eq!(authenticate(&keys(SK), &cache, "PUT", "/bucket/foo", "", &h, now()), Err("SignatureDoesNotMatch"));
 }
+
+/// #457: a SigV4 signature over GET /bucket/k whose request time is `sts_time`, with
+/// `date_line` (the canonical `date` or `x-amz-date` header) signed. Computed here with hmac
+/// and sha2 rather than the server's signer.
+fn sign_get(secret: &str, signed: &str, date_line: &str, sts_time: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+    let mac = |key: &[u8], data: &[u8]| {
+        let mut m = Hmac::<Sha256>::new_from_slice(key).unwrap();
+        m.update(data);
+        m.finalize().into_bytes().to_vec()
+    };
+    let hexs = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+    let canonical = format!(
+        "GET\n/bucket/k\n\n{}\nhost:examplebucket.s3.amazonaws.com\nx-amz-content-sha256:UNSIGNED-PAYLOAD\n\n{}\nUNSIGNED-PAYLOAD",
+        date_line, signed
+    );
+    let sts = format!(
+        "AWS4-HMAC-SHA256\n{}\n20130524/us-east-1/s3/aws4_request\n{}",
+        sts_time,
+        hexs(&Sha256::digest(canonical.as_bytes()))
+    );
+    let k = mac(format!("AWS4{}", secret).as_bytes(), b"20130524");
+    let k = mac(&k, b"us-east-1");
+    let k = mac(&k, b"s3");
+    let k = mac(&k, b"aws4_request");
+    hexs(&mac(&k, sts.as_bytes()))
+}
+
+fn date_get_headers(date: Option<&str>, amz_date: Option<&str>, signed: &str, signature: &str) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    h.insert("host", HeaderValue::from_static("examplebucket.s3.amazonaws.com"));
+    h.insert("x-amz-content-sha256", HeaderValue::from_static("UNSIGNED-PAYLOAD"));
+    if let Some(d) = date {
+        h.insert("date", HeaderValue::from_str(d).unwrap());
+    }
+    if let Some(d) = amz_date {
+        h.insert("x-amz-date", HeaderValue::from_str(d).unwrap());
+    }
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={}/20130524/us-east-1/s3/aws4_request,SignedHeaders={},Signature={}",
+        AK, signed, signature
+    );
+    h.insert("authorization", HeaderValue::from_str(&auth).unwrap());
+    h
+}
+
+const HTTP_DATE: &str = "Fri, 24 May 2013 00:00:00 GMT";
+const DATE_SIGNED: &str = "date;host;x-amz-content-sha256";
+
+#[test]
+fn a_request_signed_with_only_the_date_header_is_accepted() {
+    let sig = sign_get(SK, DATE_SIGNED, &format!("date:{}", HTTP_DATE), "20130524T000000Z");
+    let h = date_get_headers(Some(HTTP_DATE), None, DATE_SIGNED, &sig);
+    assert_eq!(authenticate(&keys(SK), &SigV4KeyCache::new(), "GET", "/bucket/k", "", &h, now()), Ok(()));
+    // The Date header is covered by the signature.
+    let h = date_get_headers(Some("Fri, 24 May 2013 00:00:01 GMT"), None, DATE_SIGNED, &sig);
+    assert_eq!(authenticate(&keys(SK), &SigV4KeyCache::new(), "GET", "/bucket/k", "", &h, now()), Err("SignatureDoesNotMatch"));
+}
+
+#[test]
+fn a_date_header_an_hour_away_is_too_skewed() {
+    let sig = sign_get(SK, DATE_SIGNED, &format!("date:{}", HTTP_DATE), "20130524T000000Z");
+    let h = date_get_headers(Some(HTTP_DATE), None, DATE_SIGNED, &sig);
+    assert_eq!(authenticate(&keys(SK), &SigV4KeyCache::new(), "GET", "/bucket/k", "", &h, now() + 3600), Err("RequestTimeTooSkewed"));
+}
+
+#[test]
+fn an_unreadable_date_without_x_amz_date_is_malformed() {
+    let h = date_get_headers(Some("yesterday at noon"), None, DATE_SIGNED, &"0".repeat(64));
+    assert_eq!(authenticate(&keys(SK), &SigV4KeyCache::new(), "GET", "/bucket/k", "", &h, now()), Err("AuthorizationHeaderMalformed"));
+    let h = date_get_headers(None, None, "host;x-amz-content-sha256", &"0".repeat(64));
+    assert_eq!(authenticate(&keys(SK), &SigV4KeyCache::new(), "GET", "/bucket/k", "", &h, now()), Err("AuthorizationHeaderMalformed"));
+}
+
+#[test]
+fn x_amz_date_wins_over_the_date_header() {
+    let signed = "host;x-amz-content-sha256;x-amz-date";
+    let canonical_headers = "host:examplebucket.s3.amazonaws.com\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-date:20130524T000000Z";
+    // sign_get puts its date line first; here the canonical headers are host, sha256, x-amz-date.
+    let sig = {
+        use hmac::{Hmac, Mac};
+        use sha2::{Digest, Sha256};
+        let mac = |key: &[u8], data: &[u8]| {
+            let mut m = Hmac::<Sha256>::new_from_slice(key).unwrap();
+            m.update(data);
+            m.finalize().into_bytes().to_vec()
+        };
+        let hexs = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+        let canonical = format!("GET\n/bucket/k\n\n{}\n\n{}\nUNSIGNED-PAYLOAD", canonical_headers, signed);
+        let sts = format!("AWS4-HMAC-SHA256\n20130524T000000Z\n20130524/us-east-1/s3/aws4_request\n{}", hexs(&Sha256::digest(canonical.as_bytes())));
+        let k = mac(format!("AWS4{}", SK).as_bytes(), b"20130524");
+        let k = mac(&k, b"us-east-1");
+        let k = mac(&k, b"s3");
+        let k = mac(&k, b"aws4_request");
+        hexs(&mac(&k, sts.as_bytes()))
+    };
+    // An unsigned Date an hour later: if it were read, the request would be too skewed.
+    let h = date_get_headers(Some("Fri, 24 May 2013 01:00:00 GMT"), Some("20130524T000000Z"), signed, &sig);
+    assert_eq!(authenticate(&keys(SK), &SigV4KeyCache::new(), "GET", "/bucket/k", "", &h, now()), Ok(()));
+}
