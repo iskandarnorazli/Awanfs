@@ -25,6 +25,7 @@ permissions:
 
 env:
   MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+  MC_RELEASE: RELEASE.2025-08-13T08-35-41Z
 
 jobs:
   probe:
@@ -72,7 +73,7 @@ jobs:
         id: minio-cache
         with:
           path: .tmp/minio
-          key: minio-${{ env.MINIO_RELEASE }}-mc-v1-${{ runner.os }}
+          key: minio-${{ env.MINIO_RELEASE }}-mc-${{ env.MC_RELEASE }}-v1-${{ runner.os }}
       - uses: actions/setup-go@v5
         if: steps.minio-cache.outputs.cache-hit != 'true'
         with:
@@ -93,9 +94,9 @@ jobs:
             git clone -q --depth 1 --branch "${MINIO_RELEASE}" https://github.com/minio/minio "$RUNNER_TEMP/minio-src"
             (cd "$RUNNER_TEMP/minio-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/minio$exe" .)
           fi
-          if ! from_image quay.io/minio/mc:latest /usr/bin/mc ".tmp/minio/mc$exe"; then
-            git clone -q --depth 1 https://github.com/minio/mc "$RUNNER_TEMP/mc-src"
-            (cd "$RUNNER_TEMP/mc-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/mc$exe" .)
+          if ! from_image "quay.io/minio/mc:${MC_RELEASE}" /usr/bin/mc ".tmp/minio/mc$exe"; then
+            git clone -q --depth 1 --branch "${MC_RELEASE}" https://github.com/minio/mc "$RUNNER_TEMP/mc-src"
+            (cd "$RUNNER_TEMP/mc-src" && commit=$(git rev-parse HEAD) && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/minio/mc/cmd.Version=${MC_RELEASE} -X github.com/minio/mc/cmd.ReleaseTag=${MC_RELEASE} -X github.com/minio/mc/cmd.CommitID=${commit} -X github.com/minio/mc/cmd.ShortCommitID=${commit:0:12}" -o "$GITHUB_WORKSPACE/.tmp/minio/mc$exe" .)
           fi
           chmod +x ".tmp/minio/minio$exe" ".tmp/minio/mc$exe" || true
       - name: MinIO versions

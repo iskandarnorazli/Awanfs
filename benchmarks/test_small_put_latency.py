@@ -161,6 +161,21 @@ class AggregationAndFormattingTests(unittest.TestCase):
         self.assertIn("If-Match", md)
         self.assertIn("not measured (10 requests failed (HTTP 501 x10))", md)
 
+    def test_format_markdown_report_names_mc_version_when_provided(self):
+        specs = spl.build_workloads([4096], [1], include_conditional=False)
+        results = {"put_4kib_c1": self._sample("put_4kib_c1", 0.4, 1.0)}
+        md = spl.format_markdown_report(
+            cmd="python benchmarks/small_put_latency.py --runs 1 --duration 1s",
+            hw_info={"os": "Windows", "cores": "4", "ram_gb": "16.0"},
+            workloads=specs,
+            target_results=[("RustFS", results)],
+            runs=1,
+            duration_sec=1.0,
+            durability_notes=[],
+            mc_version="mc version RELEASE.2025-08-13T08-35-41Z",
+        )
+        self.assertIn("- **mc:** mc version RELEASE.2025-08-13T08-35-41Z", md)
+
 
 class ConditionalPutStubPhaseTests(unittest.TestCase):
     def _start_conditional_stub(self, reject_if_match: bool = False):
@@ -295,6 +310,28 @@ class WorkflowWiringTests(unittest.TestCase):
         with open(ci_path, encoding="utf-8") as fh:
             wf = fh.read()
         self.assertIn("benchmarks/test_small_put_latency.py", wf)
+
+    def test_all_workflows_pin_mc_release_and_cache_key(self):
+        import glob
+        import re
+
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        wf_dir = os.path.join(repo_root, ".github", "workflows")
+        paths = sorted(glob.glob(os.path.join(wf_dir, "*.yml")))
+        self.assertTrue(paths)
+        mc_clone_re = re.compile(r"git clone\b[^\n]*--branch\b[^\n]*MC_RELEASE[^\n]*github\.com/minio/mc")
+        for p in paths:
+            name = os.path.basename(p)
+            with open(p, encoding="utf-8") as fh:
+                wf = fh.read()
+            self.assertNotIn("quay.io/minio/mc:latest", wf, f"{name} must pin quay.io/minio/mc image tag")
+            if "github.com/minio/mc" in wf:
+                self.assertIn("MC_RELEASE: RELEASE.2025-08-13T08-35-41Z", wf, f"{name} missing MC_RELEASE")
+                self.assertRegex(wf, mc_clone_re, f"{name} must clone minio/mc at MC_RELEASE")
+                self.assertIn("github.com/minio/mc/cmd.Version=", wf, f"{name} must set cmd.Version via -ldflags")
+                self.assertIn("github.com/minio/mc/cmd.ReleaseTag=", wf, f"{name} must set cmd.ReleaseTag via -ldflags")
+                if "uses: actions/cache@" in wf:
+                    self.assertIn("env.MC_RELEASE", wf, f"{name} tool cache key must include env.MC_RELEASE")
 
 
 if __name__ == "__main__":
