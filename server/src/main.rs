@@ -309,7 +309,13 @@ async fn serve(
     state.set_body_idle_timeout(body_idle_timeout);
     state.multipart.enforce_min_part_size.store(!allow_small_parts, std::sync::atomic::Ordering::SeqCst);
     // Compaction copies at most this many MB/s (#28, decision 24); 0 = no limit.
-    state.compaction_rate.store(compaction_mb.unwrap_or(50) * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+    let compaction_rate_mb = compaction_mb.unwrap_or(50);
+    state.compaction_rate.store(compaction_rate_mb * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "Compaction: auto={} rate={} MB/s",
+        if auto_compaction { "on" } else { "off" },
+        compaction_rate_mb
+    );
     state.lifecycle_day_seconds.store(lifecycle_day_seconds, std::sync::atomic::Ordering::Relaxed);
     let lifecycle_period = s3_server::lifecycle::sweep_interval(lifecycle_day_seconds);
     println!("Lifecycle sweep every {:?}", lifecycle_period);
