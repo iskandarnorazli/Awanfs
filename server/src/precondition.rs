@@ -433,16 +433,21 @@ fn parse_hms(s: &str) -> Option<(u32, u32, u32)> {
     Some((hh, mm, ss))
 }
 
+/// Years past this are refused before `days_from_civil`, whose `i64` arithmetic would overflow;
+/// an instant that does not fit in `u64` seconds is refused below it (#480).
+const MAX_YEAR: i64 = 1_000_000_000_000;
+
 fn to_unix_secs(year: i64, month: u32, day: u32, hh: u32, mm: u32, ss: u32) -> Option<u64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || year < 1970 {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || !(1970..=MAX_YEAR).contains(&year) {
         return None;
     }
     let days = days_from_civil(year, month, day);
     if days < 0 {
         return None;
     }
-    let total = (days as u64) * 86_400 + (hh as u64) * 3600 + (mm as u64) * 60 + (ss as u64);
-    Some(total)
+    (days as u64)
+        .checked_mul(86_400)?
+        .checked_add(u64::from(hh) * 3600 + u64::from(mm) * 60 + u64::from(ss))
 }
 
 /// Howard Hinnant's civil-from-days algorithm (1970-01-01 = day 0).
@@ -625,6 +630,18 @@ mod tests {
         assert_eq!(parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT"), Some(784_111_777));
         assert_eq!(parse_http_date("Sun Nov  6 08:49:37 1994"), Some(784_111_777));
         assert_eq!(parse_http_date("not-a-date"), None);
+    }
+
+    /// #480: the fuzzer's input; the instant does not fit in u64 seconds.
+    #[test]
+    fn a_date_too_far_ahead_is_refused_not_wrapped() {
+        assert_eq!(parse_http_date("ju May 23 00:00:00 20132330223302"), None);
+        assert_eq!(parse_http_date("Thu May 23 00:00:00 20132330223302"), None);
+        assert_eq!(parse_http_date("Thu May 23 00:00:00 9223372036854775807"), None);
+        assert_eq!(parse_http_date("Thu, 23 May 20132330223302 00:00:00 GMT"), None);
+        assert_eq!(parse_http_date_or_iso("20132330223302-05-23T00:00:00Z"), None);
+        // The largest year accepted still parses, to a value that fits.
+        assert!(parse_http_date("Thu May 23 00:00:00 100000").is_some());
     }
 
     #[test]
