@@ -41,6 +41,9 @@ on:
         description: "Also run on the self-hosted bench runner"
         type: boolean
         default: false
+      build_b_ref:
+        description: "Matrix only: a git ref to build as AwanFS build B and run alternately with this run's build (A); empty runs one build (#459)"
+        default: ""
   pull_request:
     paths:
       - "benchmarks/core_scaling.py"
@@ -79,6 +82,15 @@ jobs:
           workspaces: server
       - name: Build s3-server (--release)
         run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Build B (${{ inputs.build_b_ref }})
+        if: inputs.build_b_ref != ''
+        run: |
+          git fetch -q origin "${{ inputs.build_b_ref }}"
+          git worktree add -q "$RUNNER_TEMP/build_b_src" FETCH_HEAD
+          (cd "$RUNNER_TEMP/build_b_src" && git log --oneline -1 && CARGO_TARGET_DIR="$RUNNER_TEMP/build_b_target" cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml)
+          exe=""; [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
+          mkdir -p "$RUNNER_TEMP/build_b"
+          cp "$RUNNER_TEMP/build_b_target/release/s3-server$exe" "$RUNNER_TEMP/build_b/s3-server$exe"
 
       - uses: actions/cache@v4
         id: tools
@@ -168,6 +180,10 @@ jobs:
               --concurrencies "${{ inputs.concurrencies || '1,4,16,64,256' }}"
               --seed "${{ inputs.seed || '42' }}"
             )
+            if [ -n "${{ inputs.build_b_ref }}" ]; then
+              exe=""; [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
+              extra_args+=(--server-bin-b "$RUNNER_TEMP/build_b/s3-server$exe")
+            fi
           fi
           python -u benchmarks/core_scaling.py \
             --cores "$cores_arg" \
@@ -240,6 +256,52 @@ jobs:
         run: py -3.12 -c "import os, sys; open(os.environ['GITHUB_PATH'], 'a').write(os.path.dirname(sys.executable) + '\n')"
       - name: Install Python benchmark dependencies
         run: python -m pip install -q psutil matplotlib
+      - name: Build B (${{ inputs.build_b_ref }})
+        if: inputs.build_b_ref != ''
+        shell: python
+        run: |
+          import os, shutil, subprocess
+          tmp = os.environ["RUNNER_TEMP"]
+          src, target = os.path.join(tmp, "build_b_src"), os.path.join(tmp, "build_b_target")
+          shutil.rmtree(src, ignore_errors=True)
+          subprocess.run(["git", "worktree", "prune"], check=True)
+          subprocess.run(["git", "fetch", "-q", "origin", "${{ inputs.build_b_ref }}"], check=True)
+          subprocess.run(["git", "worktree", "add", "-q", src, "FETCH_HEAD"], check=True)
+          env = dict(os.environ, CARGO_TARGET_DIR=target)
+          subprocess.run(["cargo", "build", "--locked", "--release", "--bin", "s3-server", "--manifest-path", "server/Cargo.toml"], cwd=src, env=env, check=True)
+          exe = ".exe" if os.name == "nt" else ""
+          os.makedirs(os.path.join(tmp, "build_b"), exist_ok=True)
+          shutil.copy(os.path.join(target, "release", "s3-server" + exe), os.path.join(tmp, "build_b", "s3-server" + exe))
+      - name: Disk check (before)
+        shell: python
+        run: |
+          # The laptop's disk wrote the same 2 GiB at 156 to 1,210 MiB/s in one week (#459):
+          # record a durable-append probe and a 2 GiB sequential write before and after the run.
+          import os, subprocess, sys, time
+          tmp = os.environ["RUNNER_TEMP"]
+          out_dir = os.path.join(tmp, "core_scaling")
+          os.makedirs(out_dir, exist_ok=True)
+          phase = "before" if not os.path.exists(os.path.join(out_dir, "disk_before.md")) else "after"
+          probe_dir = os.path.join(tmp, "disk_check")
+          os.makedirs(probe_dir, exist_ok=True)
+          probe_md = os.path.join(out_dir, f"sync_probe_{phase}.md")
+          subprocess.run([sys.executable, "benchmarks/sync_probe.py", "--dir", probe_dir, "--report", probe_md], check=False)
+          path = os.path.join(probe_dir, "seq_write.bin")
+          block = os.urandom(8 << 20)
+          t = time.perf_counter()
+          with open(path, "wb") as f:
+              for _ in range(256):
+                  f.write(block)
+              f.flush()
+              os.fsync(f.fileno())
+          secs = time.perf_counter() - t
+          os.remove(path)
+          lines = [f"### Disk check ({phase})", "", f"- 2 GiB sequential write with one fsync: {2048 / secs:.1f} MiB/s ({secs:.2f} s), in `{probe_dir}`"]
+          if os.path.exists(probe_md):
+              lines += ["", open(probe_md, encoding="utf-8").read().strip()]
+          text = "\n".join(lines) + "\n"
+          print(text)
+          open(os.path.join(out_dir, f"disk_{phase}.md"), "w", encoding="utf-8").write(text)
       - name: Run core scaling benchmark (self-hosted)
         shell: python
         run: |
@@ -266,7 +328,52 @@ jobs:
                   "--concurrencies", "${{ inputs.concurrencies || '1,4,16,64,256' }}",
                   "--seed", "${{ inputs.seed || '42' }}",
               ])
+              if "${{ inputs.build_b_ref }}".strip():
+                  exe = ".exe" if os.name == "nt" else ""
+                  cmd.extend(["--server-bin-b", os.path.join(os.environ["RUNNER_TEMP"], "build_b", "s3-server" + exe)])
           subprocess.run(cmd, check=True)
+      - name: Disk check (after)
+        if: always()
+        shell: python
+        run: |
+          # The laptop's disk wrote the same 2 GiB at 156 to 1,210 MiB/s in one week (#459):
+          # record a durable-append probe and a 2 GiB sequential write before and after the run.
+          import os, subprocess, sys, time
+          tmp = os.environ["RUNNER_TEMP"]
+          out_dir = os.path.join(tmp, "core_scaling")
+          os.makedirs(out_dir, exist_ok=True)
+          phase = "before" if not os.path.exists(os.path.join(out_dir, "disk_before.md")) else "after"
+          probe_dir = os.path.join(tmp, "disk_check")
+          os.makedirs(probe_dir, exist_ok=True)
+          probe_md = os.path.join(out_dir, f"sync_probe_{phase}.md")
+          subprocess.run([sys.executable, "benchmarks/sync_probe.py", "--dir", probe_dir, "--report", probe_md], check=False)
+          path = os.path.join(probe_dir, "seq_write.bin")
+          block = os.urandom(8 << 20)
+          t = time.perf_counter()
+          with open(path, "wb") as f:
+              for _ in range(256):
+                  f.write(block)
+              f.flush()
+              os.fsync(f.fileno())
+          secs = time.perf_counter() - t
+          os.remove(path)
+          lines = [f"### Disk check ({phase})", "", f"- 2 GiB sequential write with one fsync: {2048 / secs:.1f} MiB/s ({secs:.2f} s), in `{probe_dir}`"]
+          if os.path.exists(probe_md):
+              lines += ["", open(probe_md, encoding="utf-8").read().strip()]
+          text = "\n".join(lines) + "\n"
+          print(text)
+          open(os.path.join(out_dir, f"disk_{phase}.md"), "w", encoding="utf-8").write(text)
+      - name: Add the disk checks to the report
+        if: always()
+        shell: python
+        run: |
+          import os
+          out_dir = os.path.join(os.environ["RUNNER_TEMP"], "core_scaling")
+          report = os.path.join(out_dir, "report.md")
+          parts = [open(os.path.join(out_dir, f"disk_{p}.md"), encoding="utf-8").read() for p in ("before", "after") if os.path.exists(os.path.join(out_dir, f"disk_{p}.md"))]
+          if parts and os.path.exists(report):
+              with open(report, "a", encoding="utf-8") as f:
+                  f.write("\n## Disk check, before and after the run\n\n" + "\n".join(parts))
       - name: Report to the job summary
         if: always()
         shell: python
