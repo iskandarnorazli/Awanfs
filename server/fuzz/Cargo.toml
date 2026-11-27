@@ -177,3 +177,9 @@ name = "precondition_headers"
 path = "fuzz_targets/precondition_headers.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "sim_storage"
+path = "fuzz_targets/sim_storage.rs"
+test = false
+doc = false
