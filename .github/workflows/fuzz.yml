@@ -18,6 +18,7 @@ on:
       - "server/src/aws_chunked.rs"
       - "server/src/lifecycle.rs"
       - "server/src/lifecycle_config.rs"
+      - "server/src/manifest.rs"
       - "server/src/cors.rs"
       - "server/src/object_lock.rs"
       - "server/src/request_xml.rs"
@@ -26,6 +27,7 @@ on:
       - "server/src/form_upload.rs"
       - "server/src/post_object.rs"
       - "server/src/s3_api.rs"
+      - "server/src/segment.rs"
       - "server/src/trace.rs"
       - "server/src/versions.rs"
       - "server/src/memory.rs"
@@ -46,7 +48,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, attrs_values, form_upload, post_policy, cors_xml, object_lock_xml, request_xml, lifecycle_config_xml, tagging_xml, s3_target, iso8601, traceparent, version_id, parse_size, checksum_headers, list_buckets_query, raw_s3_key, classify, list_objects_query, object_attributes_header ]
+        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, attrs_values, form_upload, post_policy, cors_xml, object_lock_xml, request_xml, lifecycle_config_xml, tagging_xml, s3_target, iso8601, traceparent, version_id, parse_size, checksum_headers, list_buckets_query, raw_s3_key, classify, list_objects_query, object_attributes_header, meta_segment ]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

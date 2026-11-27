@@ -1081,6 +1081,13 @@ fn parse_copy_source_range(raw: &str) -> Result<(u64, u64), ()> {
         return Err(());
     }
     let (s_str, e_str) = rest.split_once('-').ok_or(())?;
+    if s_str.is_empty()
+        || e_str.is_empty()
+        || !s_str.bytes().all(|b| b.is_ascii_digit())
+        || !e_str.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(());
+    }
     let start: u64 = s_str.parse().map_err(|_| ())?;
     let end: u64 = e_str.parse().map_err(|_| ())?;
     if start > end {
@@ -1389,5 +1396,20 @@ pub async fn list_parts(
                 .body(full_body(Bytes::from(xml)))
                 .unwrap())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_copy_source_range;
+
+    #[test]
+    fn copy_source_range_requires_strict_ascii_digits_and_order() {
+        assert_eq!(parse_copy_source_range("bytes=0-0"), Ok((0, 0)));
+        assert_eq!(parse_copy_source_range("bytes=5-4"), Err(()));
+        assert_eq!(parse_copy_source_range("bytes=-1"), Err(()));
+        assert_eq!(parse_copy_source_range("bytes=+0-5"), Err(()));
+        assert_eq!(parse_copy_source_range("bytes=0-+5"), Err(()));
+        assert_eq!(parse_copy_source_range("bytes=0-18446744073709551616"), Err(()));
     }
 }
