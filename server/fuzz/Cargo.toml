@@ -159,3 +159,9 @@ name = "object_attributes_header"
 path = "fuzz_targets/object_attributes_header.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "meta_segment"
+path = "fuzz_targets/meta_segment.rs"
+test = false
+doc = false

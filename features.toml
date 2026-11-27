@@ -1985,7 +1985,6 @@ fuzz = ["parse_size"]
 id = "metadata-index"
 name = "In-memory columnar metadata index and spill index"
 status = "done"
-gaps = { fuzz = "#449" }
 issue = "#13"
 user_visible = false
 server_tests = [
@@ -2007,6 +2006,7 @@ server_tests = [
   "server/tests/index_full_test.rs::versioned_err_capacity_rejects_without_mutating_versions_or_uploads",
   "server/tests/index_full_test.rs::versioned_complete_retry_and_midstream_delete_at_capacity_leave_no_object",
 ]
+fuzz = ["meta_segment"]
 
 [[feature]]
 id = "volume-format"
