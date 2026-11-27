@@ -1,6 +1,6 @@
-# S3 Storage Server (`s3-server`): Tutorial & Migration Guide
+# S3 Storage Server (`awanfs`): Tutorial & Migration Guide
 
-`s3-server` is a standalone, single-node S3-compatible object storage daemon in Rust ([`server/src/main.rs`](server/src/main.rs)). It stores payloads in 4096-byte sector-aligned format-3 WORM needle volumes (growing on write up to `32 GiB`, rolled over automatically), indexes hot rows in a 64-byte columnar `ObjectMeta` table with leveled [`SpillIndex`](server/src/spill.rs) disk segments (`meta/`), and stages multipart upload parts in `.staging/` files.
+`awanfs` is a standalone, single-node S3-compatible object storage daemon in Rust ([`server/src/main.rs`](server/src/main.rs)). It stores payloads in 4096-byte sector-aligned format-3 WORM needle volumes (growing on write up to `32 GiB`, rolled over automatically), indexes hot rows in a 64-byte columnar `ObjectMeta` table with leveled [`SpillIndex`](server/src/spill.rs) disk segments (`meta/`), and stages multipart upload parts in `.staging/` files.
 
 You can switch supported S3 tools (`aws` CLI, `boto3`, and S3 clients speaking the implemented subset in [`API_SPECIFICATION.md`](API_SPECIFICATION.md)) by pointing `endpoint_url` at `http://127.0.0.1:9000` (path-style by default) and supplying matching SigV4 credentials. Features outside that subset return `501 NotImplemented` or are tracked in [Not yet](#not-yet) and [`features.toml`](features.toml).
 
@@ -8,7 +8,7 @@ You can switch supported S3 tools (`aws` CLI, `boto3`, and S3 clients speaking t
 
 ## Table of Contents
 
-1. [Quickstart: Starting `s3-server` & Verifying with AWS CLI](#1-quickstart-starting-s3-server--verifying-with-aws-cli)
+1. [Quickstart: Starting `awanfs` & Verifying with AWS CLI](#1-quickstart-starting-awanfs--verifying-with-aws-cli)
    - [CLI Flags & Environment Variables](#cli-flags--environment-variables)
 2. [Using S3 SDKs (`boto3`, JS v3, Go v2, Rust)](#2-using-s3-sdks-boto3-js-v3-go-v2-rust)
 3. [CLI Tools (`aws s3`, `s5cmd`, `rclone`)](#3-cli-tools-aws-s3-s5cmd-rclone)
@@ -21,7 +21,7 @@ You can switch supported S3 tools (`aws` CLI, `boto3`, and S3 clients speaking t
 
 ---
 
-## 1. Quickstart: Starting `s3-server` & Verifying with AWS CLI
+## 1. Quickstart: Starting `awanfs` & Verifying with AWS CLI
 
 Build the release binary from the repository root:
 
@@ -31,18 +31,18 @@ cargo build --locked --release --manifest-path server/Cargo.toml
 
 (Prebuilt archives for Windows `x86_64`, Linux `x86_64` glibc/musl, and macOS `aarch64` are built by [`.github/workflows/release.yml`](.github/workflows/release.yml) on releases/dispatch; the `dist/` directory in git tracks only `dist/SHA256SUMS.txt` unless [`scripts/build_release_matrix.py`](scripts/build_release_matrix.py) is run locally on Windows.)
 
-Start `s3-server` with static root keys (`AWANFS_ACCESS_KEY` and `AWANFS_SECRET_KEY`). Running `s3-server` without credentials, `--config`, or `--allow-anonymous` exits with status code `2` ([`sigv4-auth`](features.toml#L1014), [`server/tests/auth_test.rs`](server/tests/auth_test.rs)):
+Start `awanfs` with static root keys (`AWANFS_ACCESS_KEY` and `AWANFS_SECRET_KEY`). Running `awanfs` without credentials, `--config`, or `--allow-anonymous` exits with status code `2` ([`sigv4-auth`](features.toml#L1014), [`server/tests/auth_test.rs`](server/tests/auth_test.rs)):
 
 ```bash
 AWANFS_ACCESS_KEY=s3admin AWANFS_SECRET_KEY=s3secret \
-  ./server/target/release/s3-server --port 9000 --data-dir ./s3-data
+  ./server/target/release/awanfs --port 9000 --data-dir ./s3-data
 ```
 
 On Windows PowerShell:
 
 ```powershell
 $env:AWANFS_ACCESS_KEY="s3admin"; $env:AWANFS_SECRET_KEY="s3secret"
-.\server\target\release\s3-server.exe --port 9000 --data-dir .\s3-data
+.\server\target\release\awanfs.exe --port 9000 --data-dir .\s3-data
 ```
 
 In a second terminal, check [`health`](features.toml#L1060) readiness and run end-to-end [`buckets`](features.toml#L847) and [`objects`](features.toml#L930) operations with `aws` (verified continuously by `j_quickstart` in [`scripts/verify_drive.sh`](scripts/verify_drive.sh)):
@@ -65,7 +65,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rb s3://quickstart-bkt
 
 ### CLI Flags & Environment Variables
 
-All CLI options accepted by `s3-server` are defined in [`server/src/main.rs`](server/src/main.rs):
+All CLI options accepted by `awanfs` are defined in [`server/src/main.rs`](server/src/main.rs):
 
 | Flag | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -94,13 +94,13 @@ Additional environment variables read by the server:
 - **Request log:** `AWANFS_LOG=off` disables the per-request JSON line written asynchronously to stderr ([`request-log`](features.toml#L1094)).
 - **Volume/I/O tuning:** `AWAN_SPARSE_VOLUME=1` (opt into legacy 32 GiB sparse volume files instead of growing volumes), `AWAN_VOLUME_GROWTH_STEP` (default `256 MiB`), `AWAN_READ_CHUNK` (default `1 MiB`), `AWAN_READ_AHEAD` (1..8, default `1`), `AWAN_DIRECT_READ_MIN` (off by default), `AWAN_DIRECT_IO=1`, and `MALLOC_MMAP_THRESHOLD_` (on Linux glibc, server pins `M_MMAP_THRESHOLD` to `128 KiB` unless overridden).
 
-*(Note: `--sizes`, `--concurrent`, and `--duration` are arguments to [`benchmarks/run_warp_benchmark.py`](benchmarks/run_warp_benchmark.py), not `s3-server`.)*
+*(Note: `--sizes`, `--concurrent`, and `--duration` are arguments to [`benchmarks/run_warp_benchmark.py`](benchmarks/run_warp_benchmark.py), not `awanfs`.)*
 
 ---
 
 ## 2. Using S3 SDKs (`boto3`, JS v3, Go v2, Rust)
 
-Start `s3-server` with matching credentials (`AWANFS_ACCESS_KEY=s3admin AWANFS_SECRET_KEY=s3secret`) before running any of the examples below. Note: among client SDKs, **`boto3`** (via [`server/tests/test_boto3_compat.py`](server/tests/test_boto3_compat.py) and `ceph/s3-tests`), **`aws` CLI**, **`reqwest`**, and **`warp put`** are continuously tested in CI; examples for JS/Go/Rust/Polars/DuckDB are standard S3 path-style configurations not run in CI.
+Start `awanfs` with matching credentials (`AWANFS_ACCESS_KEY=s3admin AWANFS_SECRET_KEY=s3secret`) before running any of the examples below. Note: among client SDKs, **`boto3`** (via [`server/tests/test_boto3_compat.py`](server/tests/test_boto3_compat.py) and `ceph/s3-tests`), **`aws` CLI**, **`reqwest`**, and **`warp put`** are continuously tested in CI; examples for JS/Go/Rust/Polars/DuckDB are standard S3 path-style configurations not run in CI.
 
 ### 2.1 Python (`boto3`, `s3fs`, Polars, DuckDB)
 
@@ -248,11 +248,11 @@ s5cmd --endpoint-url http://127.0.0.1:9000 cp ./local-folder/ s3://my-bucket/
 
 ### Docker / Docker Compose (Matches [`Dockerfile`](Dockerfile) & [`.github/workflows/docker.yml`](.github/workflows/docker.yml))
 
-`Dockerfile` compiles `s3-server`, sets `ENV AWANFS_LISTEN=0.0.0.0`, and invokes `ENTRYPOINT ["/usr/local/bin/s3-server", "--port", "9000", "--data-dir", "/data"]`:
+`Dockerfile` compiles `awanfs`, sets `ENV AWANFS_LISTEN=0.0.0.0`, and invokes `ENTRYPOINT ["/usr/local/bin/awanfs", "--port", "9000", "--data-dir", "/data"]`:
 
 ```yaml
 services:
-  s3-server:
+  awanfs:
     build: .
     container_name: awanfs
     ports:
@@ -277,7 +277,7 @@ volumes:
 
 ### Linux Production `systemd` Service ([`deploy/systemd/awanfs.service`](deploy/systemd/awanfs.service))
 
-Install `s3-server` to `/usr/local/bin/s3-server`, copy [`deploy/systemd/awanfs.service`](deploy/systemd/awanfs.service) to `/etc/systemd/system/awanfs.service`, and create `/etc/awanfs/awanfs.env` (`chmod 0600`) with:
+Install `awanfs` to `/usr/local/bin/awanfs`, copy [`deploy/systemd/awanfs.service`](deploy/systemd/awanfs.service) to `/etc/systemd/system/awanfs.service`, and create `/etc/awanfs/awanfs.env` (`chmod 0600`) with:
 
 ```ini
 AWANFS_ACCESS_KEY=s3admin
@@ -286,7 +286,7 @@ AWANFS_SECRET_KEY=s3secret
 # AWANFS_DURABILITY=group
 ```
 
-[`deploy/systemd/awanfs.service`](deploy/systemd/awanfs.service) runs with `DynamicUser=yes`, `StateDirectory=awanfs`, `ExecStart=/usr/local/bin/s3-server --port 9000 --data-dir /var/lib/awanfs`, `TimeoutStopSec=45`, and `LimitNOFILE=65536`.
+[`deploy/systemd/awanfs.service`](deploy/systemd/awanfs.service) runs with `DynamicUser=yes`, `StateDirectory=awanfs`, `ExecStart=/usr/local/bin/awanfs --port 9000 --data-dir /var/lib/awanfs`, `TimeoutStopSec=45`, and `LimitNOFILE=65536`.
 
 ---
 
@@ -308,7 +308,7 @@ AWANFS_SECRET_KEY=s3secret
 ### 5.4 Live Migration Example with `rclone` (Not Run in CI)
 1. Configure `rclone.conf` (using server credentials matching `AWANFS_ACCESS_KEY`/`AWANFS_SECRET_KEY`):
    ```ini
-   [new-s3-server]
+   [new-awanfs]
    type = s3
    provider = Other
    access_key_id = s3admin
@@ -318,8 +318,8 @@ AWANFS_SECRET_KEY=s3secret
    ```
 2. Run bulk transfer and final delta sync:
    ```bash
-   rclone sync legacy-minio:my-production-bucket new-s3-server:my-production-bucket --transfers 32 --checkers 64 -P
-   rclone sync legacy-minio:my-production-bucket new-s3-server:my-production-bucket --checksum
+   rclone sync legacy-minio:my-production-bucket new-awanfs:my-production-bucket --transfers 32 --checkers 64 -P
+   rclone sync legacy-minio:my-production-bucket new-awanfs:my-production-bucket --checksum
    ```
 
 ---
@@ -358,7 +358,7 @@ AWANFS_SECRET_KEY=s3secret
 
 ### 8.1 Multi-OS Release Builds
 - CI release workflow ([`.github/workflows/release.yml`](.github/workflows/release.yml)) builds binaries for `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, and `aarch64-apple-darwin`.
-- On Windows, run [`scripts/build_release_matrix.py`](scripts/build_release_matrix.py) to compile `dist/s3-server-x86_64-windows.exe` + `dist/SHA256SUMS.txt` and `cargo check` the three Linux targets:
+- On Windows, run [`scripts/build_release_matrix.py`](scripts/build_release_matrix.py) to compile `dist/awanfs-x86_64-windows.exe` + `dist/SHA256SUMS.txt` and `cargo check` the three Linux targets:
   ```bash
   python scripts/build_release_matrix.py
   ```
@@ -383,7 +383,7 @@ Representative suites in [`server/tests/`](server/tests/):
 - End-to-end AWS CLI drive script: `bash scripts/verify_drive.sh`.
 
 ### 8.3 Running the Benchmark Harness
-[`benchmarks/run_warp_benchmark.py`](benchmarks/run_warp_benchmark.py) drives `AwanFS`, MinIO, and RustFS comparisons (`--sizes`, `--concurrent`, `--duration`, `--runs`, `--rss-ceiling-mib`, `--output` are flags of that benchmark script, not `s3-server`):
+[`benchmarks/run_warp_benchmark.py`](benchmarks/run_warp_benchmark.py) drives `AwanFS`, MinIO, and RustFS comparisons (`--sizes`, `--concurrent`, `--duration`, `--runs`, `--rss-ceiling-mib`, `--output` are flags of that benchmark script, not `awanfs`):
 
 ```bash
 python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB,10GiB --concurrent 64 --duration 3s --output measurements/s3_warp_minio_vs_awan.md

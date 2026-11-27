@@ -77,8 +77,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
-      - name: Build s3-server (--release)
-        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Build awanfs (--release)
+        run: cargo build --locked --release --bin awanfs --manifest-path server/Cargo.toml
 
       - uses: actions/cache@v4
         id: tools
@@ -222,8 +222,8 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-      - name: Build s3-server (--release)
-        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Build awanfs (--release)
+        run: cargo build --locked --release --bin awanfs --manifest-path server/Cargo.toml
       - name: Fetch RustFS if missing
         continue-on-error: true
         run: python benchmarks/fetch_rustfs.py

@@ -1,8 +1,8 @@
 # Conformance profile
 
-This document states the exact `s3-server` and client configuration that `tests/s3tests/start_server.sh` uses when running `ceph/s3-tests`. Every "passes N tests" count is under this profile.
+This document states the exact `awanfs` and client configuration that `tests/s3tests/start_server.sh` uses when running `ceph/s3-tests`. Every "passes N tests" count is under this profile.
 
-`scripts/check_profile.py` enforces that every flag and `AWANFS_*` setting in `start_server.sh` has a row here (and vice versa), that `.github/workflows/s3-tests.yml` does not invoke `s3-server` outside `start_server.sh`, and that skip reasons in `CONFORMANCE_MAP.md` are listed here.
+`scripts/check_profile.py` enforces that every flag and `AWANFS_*` setting in `start_server.sh` has a row here (and vice versa), that `.github/workflows/s3-tests.yml` does not invoke `awanfs` outside `start_server.sh`, and that skip reasons in `CONFORMANCE_MAP.md` are listed here.
 
 ## Settings
 

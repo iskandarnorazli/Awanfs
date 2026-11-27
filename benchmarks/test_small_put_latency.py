@@ -54,14 +54,14 @@ class CliAndParsingTests(unittest.TestCase):
         self.assertTrue(args.include_conditional)
 
     def test_build_awanfs_server_argv_omits_durability_for_default_group(self):
-        argv_default = spl.build_awanfs_server_argv("s3-server", 9000, "/tmp/d", durability="group")
-        self.assertEqual(argv_default, ["s3-server", "--port", "9000", "--data-dir", "/tmp/d", "--allow-anonymous"])
+        argv_default = spl.build_awanfs_server_argv("awanfs", 9000, "/tmp/d", durability="group")
+        self.assertEqual(argv_default, ["awanfs", "--port", "9000", "--data-dir", "/tmp/d", "--allow-anonymous"])
         self.assertNotIn("--durability", argv_default)
 
-        argv_strict = spl.build_awanfs_server_argv("s3-server", 9001, "/tmp/d", durability="strict")
+        argv_strict = spl.build_awanfs_server_argv("awanfs", 9001, "/tmp/d", durability="strict")
         self.assertEqual(
             argv_strict,
-            ["s3-server", "--port", "9001", "--data-dir", "/tmp/d", "--allow-anonymous", "--durability", "strict"],
+            ["awanfs", "--port", "9001", "--data-dir", "/tmp/d", "--allow-anonymous", "--durability", "strict"],
         )
 
     def test_build_workloads_covers_sizes_conditions_and_concurrencies(self):

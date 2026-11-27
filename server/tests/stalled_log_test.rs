@@ -44,12 +44,12 @@ fn a_server_whose_stderr_nobody_reads_keeps_answering() {
     std::fs::create_dir_all(&dir).unwrap();
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     // stderr is a pipe this test never reads: what a stalled log collector looks like.
-    let child = Command::new(env!("CARGO_BIN_EXE_s3-server"))
+    let child = Command::new(env!("CARGO_BIN_EXE_awanfs"))
         .args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn s3-server");
+        .expect("spawn awanfs");
     let _server = Server(child);
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -97,13 +97,13 @@ fn a_server_whose_access_log_nobody_reads_keeps_answering() {
     let dir = std::env::temp_dir().join(format!("awanfs_stalledaccess_{}_{}", std::process::id(), nanos));
     std::fs::create_dir_all(&dir).unwrap();
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let child = Command::new(env!("CARGO_BIN_EXE_s3-server"))
+    let child = Command::new(env!("CARGO_BIN_EXE_awanfs"))
         .args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous", "--access-log", "-"])
         .env("AWANFS_LOG", "off")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn s3-server");
+        .expect("spawn awanfs");
     let _server = Server(child);
 
     let deadline = Instant::now() + Duration::from_secs(30);

@@ -61,8 +61,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
-      - name: Build s3-server
-        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Build awanfs
+        run: cargo build --locked --release --bin awanfs --manifest-path server/Cargo.toml
       - name: Build bare listeners example
         run: cargo build --locked --release --example bare_listeners --manifest-path server/Cargo.toml
       - name: Test bare listeners example
@@ -111,7 +111,7 @@ jobs:
           TEMP: ${{ runner.temp }}
           TMPDIR: ${{ runner.temp }}
         run: |
-          bin=server/target/release/s3-server
+          bin=server/target/release/awanfs
           [ -f "$bin.exe" ] && bin="$bin.exe"
           python -u benchmarks/put_path_probe.py --server-bin "$bin" --report put_path_probe.md
           cat put_path_probe.md >> "$GITHUB_STEP_SUMMARY"
@@ -126,15 +126,15 @@ jobs:
           grep -E '^(Data under|\|)' commit_cost.txt >> "$GITHUB_STEP_SUMMARY"
       - name: Probe self-tests
         run: python benchmarks/test_large_volume_probe.py
-      # #248, #320: loopback connect cost across bare std, bare tokio, s3-server, and MinIO.
-      - name: Loopback connect cost, bare std and tokio against s3-server and MinIO
+      # #248, #320: loopback connect cost across bare std, bare tokio, awanfs, and MinIO.
+      - name: Loopback connect cost, bare std and tokio against awanfs and MinIO
         shell: bash
         env:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
           TMPDIR: ${{ runner.temp }}
         run: |
-          bin=server/target/release/s3-server
+          bin=server/target/release/awanfs
           bare=server/target/release/examples/bare_listeners
           exe=""
           if [ -f "$bin.exe" ]; then bin="$bin.exe"; bare="$bare.exe"; exe=".exe"; fi
@@ -152,7 +152,7 @@ jobs:
           TMPDIR: ${{ runner.temp }}
           FILL_GIB: ${{ inputs.fill_gib || '10' }}
         run: |
-          bin=server/target/release/s3-server
+          bin=server/target/release/awanfs
           [ -f "$bin.exe" ] && bin="$bin.exe"
           python -u benchmarks/large_volume_probe.py --server-bin "$bin" --fill-gib "$FILL_GIB" --report large_volume_probe.md
           cat large_volume_probe.md >> "$GITHUB_STEP_SUMMARY"

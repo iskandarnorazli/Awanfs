@@ -2,7 +2,7 @@
 //!
 //! The ID is returned in `x-amz-request-id` and written into every error body's
 //! `<RequestId>` (through a task-local, so the handlers need not pass it around). Log lines
-//! go to a sink the embedder sets; the `s3-server` binary writes them to stderr.
+//! go to a sink the embedder sets; the `awanfs` binary writes them to stderr.
 //! The issue asked for the `tracing` crate; it is not in the lockfile and this change adds no
 //! dependency, so the line is written directly. Same fields.
 

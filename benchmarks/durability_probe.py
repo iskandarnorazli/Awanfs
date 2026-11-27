@@ -1,6 +1,6 @@
 """Linux strace durability probe and 64 KiB PUT throughput comparison (#334).
 
-    python3 benchmarks/durability_probe.py --server-bin server/target/release/s3-server
+    python3 benchmarks/durability_probe.py --server-bin server/target/release/awanfs
 
 Starts each default server (AwanFS --durability group, MinIO, RustFS at release defaults) on
 Linux and runs three isolated passes:
@@ -230,7 +230,7 @@ def _start_server(
     if spec.kind == "awanfs":
         if not os.path.isfile(server_bin):
             shutil.rmtree(data_dir, ignore_errors=True)
-            raise RuntimeError(f"s3-server binary not found: {server_bin}")
+            raise RuntimeError(f"awanfs binary not found: {server_bin}")
         argv = [server_bin, "--port", str(port), "--data-dir", data_dir, "--allow-anonymous", "--durability", "group"]
         proc = _start_logged(argv, log_path)
         ver = rwb.binary_version(server_bin)
@@ -551,7 +551,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     ap = argparse.ArgumentParser(description="Count sync calls per PUT and compare 64 KiB PUT rates across default S3 servers.")
-    ap.add_argument("--server-bin", default=os.path.join(REPO_ROOT, "server", "target", "release", "s3-server"))
+    ap.add_argument("--server-bin", default=os.path.join(REPO_ROOT, "server", "target", "release", "awanfs"))
     ap.add_argument("--minio-bin", default="")
     ap.add_argument("--mc-bin", default="")
     ap.add_argument("--rustfs-bin", default="")

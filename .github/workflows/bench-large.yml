@@ -44,8 +44,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
-      - name: Build s3-server
-        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Build awanfs
+        run: cargo build --locked --release --bin awanfs --manifest-path server/Cargo.toml
 
       - uses: actions/cache@v4
         id: minio-cache
@@ -96,7 +96,7 @@ jobs:
           for kv in $SERVER_ENV; do
             case "$kv" in AWAN_*=*) export "$kv"; echo "$kv" >> "$GITHUB_STEP_SUMMARY" ;; *) echo "not an AWAN_ setting: $kv"; exit 2 ;; esac
           done
-          python -u benchmarks/large_object_check.py --server-bin server/target/release/s3-server \
+          python -u benchmarks/large_object_check.py --server-bin server/target/release/awanfs \
             --minio-bin .tmp/minio/minio --mc-bin .tmp/minio/mc \
             --sizes "$SIZES" --runs "$RUNS" \
             --report large_report.md
@@ -111,7 +111,7 @@ jobs:
         timeout-minutes: 10
         run: |
           set +e
-          python -u benchmarks/relocation_rss.py --server-bin server/target/release/s3-server \
+          python -u benchmarks/relocation_rss.py --server-bin server/target/release/awanfs \
             --size 64MiB --budget 32MiB --budget-mib 32 --overhead-mib 16 --report relocation_rss.md
           code=$?
           [ -f relocation_rss.md ] && cat relocation_rss.md >> "$GITHUB_STEP_SUMMARY"

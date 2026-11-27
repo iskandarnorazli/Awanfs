@@ -33,7 +33,7 @@ impl Drop for Server {
 fn command(name: &str, extra: &[&str], env: &[(&str, &str)]) -> (Command, PathBuf) {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let dir = temp_dir(name);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-server"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_awanfs"));
     cmd.args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous"])
         .args(extra)
         .env("AWANFS_LOG", "off")
@@ -48,7 +48,7 @@ fn command(name: &str, extra: &[&str], env: &[(&str, &str)]) -> (Command, PathBu
 fn raw_command(name: &str, args_list: &[&str]) -> (Command, PathBuf) {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let dir = temp_dir(name);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-server"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_awanfs"));
     cmd.args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap()])
         .args(args_list)
         .env("AWANFS_LOG", "off")
@@ -60,7 +60,7 @@ fn raw_command(name: &str, args_list: &[&str]) -> (Command, PathBuf) {
 fn startup_lines(spec: (Command, PathBuf), prefix: &str) -> Vec<String> {
     let (mut cmd, dir) = spec;
     let mut child = Server {
-        child: cmd.spawn().expect("spawn s3-server"),
+        child: cmd.spawn().expect("spawn awanfs"),
         dir,
     };
     let out = child.child.stdout.take().unwrap();

@@ -42,9 +42,9 @@ def run(cmd, cwd=None):
 
 
 def build_server() -> str:
-    run(["cargo", "build", "--locked", "--release", "--bin", "s3-server",
+    run(["cargo", "build", "--locked", "--release", "--bin", "awanfs",
          "--manifest-path", os.path.join(ROOT, "server", "Cargo.toml")])
-    path = os.path.join(ROOT, "server", "target", "release", "s3-server" + EXE)
+    path = os.path.join(ROOT, "server", "target", "release", "awanfs" + EXE)
     if not os.path.isfile(path):
         sys.exit(f"build finished but {path} is missing")
     return path

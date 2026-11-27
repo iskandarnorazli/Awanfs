@@ -150,9 +150,9 @@ jobs:
         run: |
           rm -f ci_small_put_latency.md
           exe=""; [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
-          server_bin="server/target/release/s3-server$exe"
+          server_bin="server/target/release/awanfs$exe"
           if [ ! -f "$server_bin" ]; then
-            cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+            cargo build --locked --release --bin awanfs --manifest-path server/Cargo.toml
           fi
           extra_args=()
           [ -x ".tmp/minio/minio$exe" ] && [ -x ".tmp/minio/mc$exe" ] && extra_args+=(--minio-bin ".tmp/minio/minio$exe" --mc-bin ".tmp/minio/mc$exe")

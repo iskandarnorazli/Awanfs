@@ -106,7 +106,7 @@ async fn unsigned_requests_need_the_anonymous_switch() {
 
 #[test]
 fn the_binary_refuses_to_start_without_credentials_or_the_anonymous_switch() {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_s3-server"))
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_awanfs"))
         .args(["--port", "0"])
         .env_remove("AWANFS_ACCESS_KEY")
         .env_remove("AWANFS_SECRET_KEY")

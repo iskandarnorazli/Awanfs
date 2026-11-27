@@ -69,7 +69,7 @@ async fn plain_http_still_works_without_a_certificate() {
 
 #[test]
 fn cert_without_key_stops_the_binary() {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_s3-server"))
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_awanfs"))
         .args(["--port", "0", "--allow-anonymous", "--cert", fixture("cert.pem").to_str().unwrap()])
         .env_remove("AWANFS_TLS_KEY")
         .output()

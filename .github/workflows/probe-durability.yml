@@ -31,8 +31,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
-      - name: Build s3-server (--release)
-        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Build awanfs (--release)
+        run: cargo build --locked --release --bin awanfs --manifest-path server/Cargo.toml
 
       - uses: actions/cache@v4
         id: tools
@@ -99,7 +99,7 @@ jobs:
         run: |
           command -v strace >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y strace)
           strace -V | head -1
-          ./server/target/release/s3-server --version || true
+          ./server/target/release/awanfs --version || true
           .tmp/minio/minio --version | head -1
           .tmp/minio/mc --version | head -1
           .tmp/rustfs/rustfs --version | head -1
@@ -115,7 +115,7 @@ jobs:
         run: |
           rm -f "$RUNNER_TEMP/durability_probe.md"
           sudo -E env "PATH=$PATH" python3 -u benchmarks/durability_probe.py \
-            --server-bin server/target/release/s3-server \
+            --server-bin server/target/release/awanfs \
             --minio-bin .tmp/minio/minio \
             --mc-bin .tmp/minio/mc \
             --rustfs-bin .tmp/rustfs/rustfs \

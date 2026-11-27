@@ -25,8 +25,8 @@ jobs:
           python-version: "3.12"
       - name: Install psutil
         run: python -m pip install --disable-pip-version-check psutil==6.1.1
-      - name: Build s3-server
-        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Build awanfs
+        run: cargo build --locked --release --bin awanfs --manifest-path server/Cargo.toml
       - name: Budget RSS self-tests
         run: python benchmarks/test_budget_rss.py
       - name: Run 128 MiB and 256 MiB edge measurements
@@ -37,7 +37,7 @@ jobs:
             for size in 4KiB 1MiB; do
               report="${{ runner.temp }}/edge-${budget}-${size}.md"
               python -u benchmarks/budget_rss.py \
-                --server-bin server/target/release/s3-server \
+                --server-bin server/target/release/awanfs \
                 --budget "${budget}MiB" \
                 --budget-mib "$budget" \
                 --size "$size" \

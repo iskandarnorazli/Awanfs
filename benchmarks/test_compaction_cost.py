@@ -162,7 +162,7 @@ class ReportTests(unittest.TestCase):
 
     def test_load_ignores_non_json_lines(self):
         sample = make_run("90-10", 0.5)
-        loaded = load(["Compiling s3-server...", "", json.dumps(sample)])
+        loaded = load(["Compiling awanfs...", "", json.dumps(sample)])
         self.assertEqual(len(loaded), 1)
         self.assertEqual(loaded[0]["mix"], "90-10")
 

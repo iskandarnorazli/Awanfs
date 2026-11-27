@@ -176,7 +176,7 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: |
           python -c "import os; os.path.exists('selfhosted_budget.md') and os.remove('selfhosted_budget.md')"
-          python -u benchmarks/budget_rss.py --server-bin server/target/release/s3-server.exe --budget 256MiB --budget-mib 256 --concurrency 64 --size 1MiB --duration 10 --overhead 200 --data-dir "${{ runner.temp }}/budget_rss" --report selfhosted_budget.md
+          python -u benchmarks/budget_rss.py --server-bin server/target/release/awanfs.exe --budget 256MiB --budget-mib 256 --concurrency 64 --size 1MiB --duration 10 --overhead 200 --data-dir "${{ runner.temp }}/budget_rss" --report selfhosted_budget.md
       - name: Market claims benchmark (synced writes, cold reads, 4-dir MinIO, spread)
         if: ${{ !cancelled() && (inputs.mode == 'market_claims' || inputs.mode == 'all') }}
         timeout-minutes: 240
