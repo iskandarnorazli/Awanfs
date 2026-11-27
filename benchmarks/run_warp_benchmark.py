@@ -663,7 +663,7 @@ def format_markdown_report(
         f"- **Client Affinity Pin:** {hw_info.get('affinity_client', 'Cores 4..7 (Mask 0xF0)')}",
         f"- **Live MinIO Binary Status:** {hw_info.get('minio_status', 'not measured')}",
         f"- **Live RustFS Binary Status:** {hw_info.get('rustfs_status', 'not measured')}",
-        "- **Durability per PUT:** `s3-server` runs with its default, group commit (#29): a 200 means the bytes are on stable storage, and concurrent PUTs share one sync. " + minio_durability_note() + " RustFS (1.0.5, release defaults) is durable on Linux (3.09 sync calls/PUT, measurements/2026-11-21-durability-probe.md; Windows sync count is not probed).",
+        "- **Durability per PUT:** `awanfs` runs with its default, group commit (#29): a 200 means the bytes are on stable storage, and concurrent PUTs share one sync. " + minio_durability_note() + " RustFS (1.0.5, release defaults) is durable on Linux (3.09 sync calls/PUT, measurements/2026-11-21-durability-probe.md; Windows sync count is not probed).",
     ]
     if runs > 1:
         lines.append(f"- **Rounds per Server:** {runs} (values are medians; Peak RSS shows median and min..max spread)")
@@ -703,7 +703,7 @@ def format_markdown_report(
 
         a_s1, a_s2 = _format_split_cells(a, split_kind, bold=True)
         lines.append(
-            f"| **{label}** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **{a.mib_per_sec:.1f}** | **{a.ops_per_sec:.1f}** | **{a.p50_ms:.2f}** | **{a.p90_ms:.2f}** | **{a.p99_ms:.2f}** | **{a.p999_ms:.2f}** | **{format_rss_cell(a)}** | {a_s1} | {a_s2} |"
+            f"| **{label}** | **S3 Storage Server** (`awanfs` `--release`, Columnar SoA Index) | **{a.mib_per_sec:.1f}** | **{a.ops_per_sec:.1f}** | **{a.p50_ms:.2f}** | **{a.p90_ms:.2f}** | **{a.p99_ms:.2f}** | **{a.p999_ms:.2f}** | **{format_rss_cell(a)}** | {a_s1} | {a_s2} |"
         )
         if m.measured:
             m_s1, m_s2 = _format_split_cells(m, split_kind)
@@ -759,10 +759,10 @@ def format_markdown_report(
             "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
         ])
         for c in [8, 32, 64, 128]:
-            if "s3-server" in concurrency_data and c in concurrency_data["s3-server"]:
-                m = concurrency_data["s3-server"][c]
+            if "awanfs" in concurrency_data and c in concurrency_data["awanfs"]:
+                m = concurrency_data["awanfs"][c]
                 lines.append(
-                    f"| **C = {c}** | **S3 Storage Server** (`s3-server` `--release`, Columnar SoA Index) | **{m.mib_per_sec:.1f}** | **{m.ops_per_sec:.1f}** | **{m.p50_ms:.2f}** | **{m.p90_ms:.2f}** | **{m.p99_ms:.2f}** | **{m.p999_ms:.2f}** |"
+                    f"| **C = {c}** | **S3 Storage Server** (`awanfs` `--release`, Columnar SoA Index) | **{m.mib_per_sec:.1f}** | **{m.ops_per_sec:.1f}** | **{m.p50_ms:.2f}** | **{m.p90_ms:.2f}** | **{m.p99_ms:.2f}** | **{m.p999_ms:.2f}** |"
                 )
             if "minio" in concurrency_data and c in concurrency_data["minio"]:
                 m = concurrency_data["minio"][c]
@@ -787,9 +787,9 @@ def format_markdown_report(
         "",
         f"## {section_num}. Open-Source S3 Alternatives Reference Comparison",
         "",
-        f"> **Provenance Note (Audit Rule 3):** MinIO ({hw_info.get('minio_status', 'not measured')}) and RustFS ({hw_info.get('rustfs_status', 'not measured')}) ran on this machine ({hw_info.get('os', platform.platform())}) with anonymous access enabled via `mc`, receiving the same persistent HTTP/1.1 keep-alive requests as `s3-server`. Server pinning: {hw_info.get('affinity_server', 'not recorded')}. Peak RSS comes from the OS (`GetProcessMemoryInfo` / `PROCESS_MEMORY_COUNTERS_EX` `private` & `wset` on Windows, `/proc/<pid>/status` `VmHWM`, `RssFile`, `RssAnon` on Linux). Note that for 1 MiB multipart upload with 256 KiB parts, both MinIO and RustFS strictly reject parts smaller than 5 MiB with HTTP 400 `EntityTooSmall` per AWS S3 RFC specification, whereas `s3-server` accepts them, which does not conform to S3. Reference figures for SeaweedFS, Garage and Ceph RGW are not measured here and are left out.",
+        f"> **Provenance Note (Audit Rule 3):** MinIO ({hw_info.get('minio_status', 'not measured')}) and RustFS ({hw_info.get('rustfs_status', 'not measured')}) ran on this machine ({hw_info.get('os', platform.platform())}) with anonymous access enabled via `mc`, receiving the same persistent HTTP/1.1 keep-alive requests as `awanfs`. Server pinning: {hw_info.get('affinity_server', 'not recorded')}. Peak RSS comes from the OS (`GetProcessMemoryInfo` / `PROCESS_MEMORY_COUNTERS_EX` `private` & `wset` on Windows, `/proc/<pid>/status` `VmHWM`, `RssFile`, `RssAnon` on Linux). Note that for 1 MiB multipart upload with 256 KiB parts, both MinIO and RustFS strictly reject parts smaller than 5 MiB with HTTP 400 `EntityTooSmall` per AWS S3 RFC specification, whereas `awanfs` accepts them, which does not conform to S3. Reference figures for SeaweedFS, Garage and Ceph RGW are not measured here and are left out.",
         "",
-        "| Dimension | `s3-server` (Measured Local) | MinIO (Go, Measured Local) | RustFS (Rust, Measured Local) |",
+        "| Dimension | `awanfs` (Measured Local) | MinIO (Go, Measured Local) | RustFS (Rust, Measured Local) |",
         "| :--- | :--- | :--- | :--- |",
         f"| **64 KiB PUT Throughput** | **{put_64k.mib_per_sec:.1f} MiB/s ({put_64k.ops_per_sec:.0f} ops/s)** | {m_put_64k.mib_per_sec:.1f} MiB/s ({m_put_64k.ops_per_sec:.0f} ops/s) | {r_put_64k.mib_per_sec:.1f} MiB/s ({r_put_64k.ops_per_sec:.0f} ops/s) |",
         f"| **64 KiB GET Throughput** | **{get_64k.mib_per_sec:.1f} MiB/s ({get_64k.ops_per_sec:.0f} ops/s)** | {m_get_64k.mib_per_sec:.1f} MiB/s ({m_get_64k.ops_per_sec:.0f} ops/s) | {r_get_64k.mib_per_sec:.1f} MiB/s ({r_get_64k.ops_per_sec:.0f} ops/s) |",
@@ -855,7 +855,7 @@ def build_awanfs_server_argv(
     data_dir: str,
     allow_small_parts: bool = False,
 ) -> List[str]:
-    """Builds CLI arguments for starting `s3-server`; keeps defaults intact unless requested."""
+    """Builds CLI arguments for starting `awanfs`; keeps defaults intact unless requested."""
     argv = [server_bin, "--port", str(port), "--data-dir", data_dir, "--allow-anonymous"]
     if allow_small_parts:
         argv.append("--allow-small-parts")
@@ -1595,7 +1595,7 @@ def run_awanfs_mpu_1m_phase(
     try:
         set_affinity_mask(mpu_proc.pid, srv_mask)
         if not wait_for_port("127.0.0.1", mpu_port):
-            return BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0, measured=False, note="s3-server --allow-small-parts did not become ready")
+            return BenchmarkMetrics(0, 0, 0, 0, 0, 0, 0, measured=False, note="awanfs --allow-small-parts did not become ready")
         conn = http.client.HTTPConnection("127.0.0.1", mpu_port, timeout=5.0)
         try:
             conn.request("PUT", f"/{bucket}")
@@ -2319,14 +2319,14 @@ def main():
     manifest = os.path.abspath(
         (os.path.join(os.path.dirname(__file__), "..", "server", "Cargo.toml") if os.path.exists(os.path.join(os.path.dirname(__file__), "..", "server", "Cargo.toml")) else os.path.join(os.path.dirname(__file__), "..", "..", "awan-storage", "server", "Cargo.toml"))
     )
-    print("Building s3-server (--release)...")
+    print("Building awanfs (--release)...")
     subprocess.run(
-        ["cargo", "build", "--release", "--bin", "s3-server", "--manifest-path", manifest],
+        ["cargo", "build", "--release", "--bin", "awanfs", "--manifest-path", manifest],
         check=True,
     )
 
     server_bin = os.path.abspath(
-        (os.path.join(os.path.dirname(__file__), "..", "server", "target", "release", "s3-server.exe" if sys.platform == "win32" else "s3-server") if os.path.exists(os.path.join(os.path.dirname(__file__), "..", "server", "Cargo.toml")) else os.path.join(os.path.dirname(__file__), "..", "..", "awan-storage", "server", "target", "release", "s3-server.exe" if sys.platform == "win32" else "s3-server"))
+        (os.path.join(os.path.dirname(__file__), "..", "server", "target", "release", "awanfs.exe" if sys.platform == "win32" else "awanfs") if os.path.exists(os.path.join(os.path.dirname(__file__), "..", "server", "Cargo.toml")) else os.path.join(os.path.dirname(__file__), "..", "..", "awan-storage", "server", "target", "release", "awanfs.exe" if sys.platform == "win32" else "awanfs"))
     )
 
     minio_bin, mc_bin = find_minio_binaries()
@@ -2366,7 +2366,7 @@ def main():
     baseline_results = aggregate_rounds(baseline_rounds)
     rustfs_results = aggregate_rounds(rustfs_rounds)
     concurrency_data: Dict[str, Dict[int, BenchmarkMetrics]] = {
-        "s3-server": aggregate_rounds(awan_conc_rounds),
+        "awanfs": aggregate_rounds(awan_conc_rounds),
         "minio": aggregate_rounds(minio_conc_rounds),
         "rustfs": aggregate_rounds(rustfs_conc_rounds),
     }

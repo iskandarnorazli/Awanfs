@@ -59,7 +59,7 @@ class TestRunWarpBenchmark(unittest.TestCase):
         self.assertIn("#29", report)  # AwanFS issue number (was awan-lang #490 before the split)
 
     def test_report_durability_matches_the_server_default(self):
-        # The benchmark starts s3-server without --durability, so it runs with group commit, the
+        # The benchmark starts awanfs without --durability, so it runs with group commit, the
         # default since #29 (ARCHITECTURE.md decision 1): a 200 means the bytes are on stable
         # storage. The report said "no fsync on the write path" until 2026-11-14.
         report = format_markdown_report("cmd", {}, {}, {})
@@ -525,18 +525,18 @@ class SmallPartsFlagForMpu1mTests(unittest.TestCase):
 
     def test_default_server_argv_omits_allow_small_parts(self):
         import run_warp_benchmark as r
-        argv = r.build_awanfs_server_argv("s3-server", 9000, "/tmp/data")
-        self.assertEqual(argv, ["s3-server", "--port", "9000", "--data-dir", "/tmp/data", "--allow-anonymous"])
+        argv = r.build_awanfs_server_argv("awanfs", 9000, "/tmp/data")
+        self.assertEqual(argv, ["awanfs", "--port", "9000", "--data-dir", "/tmp/data", "--allow-anonymous"])
         self.assertNotIn("--allow-small-parts", argv)
         self.assertNotIn("--durability", argv)
 
     def test_mpu_1m_server_argv_adds_allow_small_parts(self):
         import run_warp_benchmark as r
-        argv = r.build_awanfs_server_argv("s3-server", 9001, "/tmp/mpu", allow_small_parts=True)
+        argv = r.build_awanfs_server_argv("awanfs", 9001, "/tmp/mpu", allow_small_parts=True)
         self.assertIn("--allow-small-parts", argv)
         self.assertEqual(
             argv,
-            ["s3-server", "--port", "9001", "--data-dir", "/tmp/mpu", "--allow-anonymous", "--allow-small-parts"],
+            ["awanfs", "--port", "9001", "--data-dir", "/tmp/mpu", "--allow-anonymous", "--allow-small-parts"],
         )
 
     def test_run_awanfs_mpu_1m_phase_launches_server_with_allow_small_parts(self):
@@ -567,7 +567,7 @@ class SmallPartsFlagForMpu1mTests(unittest.TestCase):
              mock.patch.object(r, "set_affinity_mask"), \
              mock.patch.object(r.http.client, "HTTPConnection", FakeConn), \
              mock.patch.object(r, "run_multipart_upload_duration_phase", return_value=expected_metrics) as mock_phase:
-            got = r.run_awanfs_mpu_1m_phase("s3-server", "warp-bench-bucket", 2.0, 0x0F)
+            got = r.run_awanfs_mpu_1m_phase("awanfs", "warp-bench-bucket", 2.0, 0x0F)
 
         self.assertEqual(got, expected_metrics)
         self.assertEqual(len(launched_argvs), 1)
@@ -644,7 +644,7 @@ class MemorySplitParsingTests(unittest.TestCase):
     """#274: parse Linux /proc/<pid>/status and Windows psutil memory_full_info() splits."""
 
     AWANFS_PROC_STATUS = (
-        "Name:\ts3-server\n"
+        "Name:\tawanfs\n"
         "VmHWM:\t 1193984 kB\n"
         "VmRSS:\t 1180000 kB\n"
         "RssAnon:\t   40960 kB\n"

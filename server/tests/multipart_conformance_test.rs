@@ -667,7 +667,7 @@ impl Drop for ChildServer {
 async fn start_binary_server(tag: &str, extra_args: &[&str]) -> (ChildServer, String, std::path::PathBuf) {
     let dir = temp_dir(tag);
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_s3-server"))
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_awanfs"))
         .args([
             "--port",
             &port.to_string(),
@@ -682,7 +682,7 @@ async fn start_binary_server(tag: &str, extra_args: &[&str]) -> (ChildServer, St
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("spawn s3-server");
+        .expect("spawn awanfs");
     let server = ChildServer(child);
     let base = format!("http://127.0.0.1:{}", port);
     let c = reqwest::Client::new();
@@ -695,7 +695,7 @@ async fn start_binary_server(tag: &str, extra_args: &[&str]) -> (ChildServer, St
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    panic!("s3-server binary did not become ready on {}", base);
+    panic!("awanfs binary did not become ready on {}", base);
 }
 
 #[test]
@@ -707,12 +707,12 @@ fn cli_help_documents_allow_small_parts() {
         let out_file = std::fs::File::create(&out_path).unwrap();
         let err_file = std::fs::File::create(&err_path).unwrap();
         let mut child = ChildServer(
-            std::process::Command::new(env!("CARGO_BIN_EXE_s3-server"))
+            std::process::Command::new(env!("CARGO_BIN_EXE_awanfs"))
                 .arg(flag)
                 .stdout(std::process::Stdio::from(out_file))
                 .stderr(std::process::Stdio::from(err_file))
                 .spawn()
-                .expect("spawn s3-server --help"),
+                .expect("spawn awanfs --help"),
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let status = loop {
@@ -721,17 +721,17 @@ fn cli_help_documents_allow_small_parts() {
                 None if std::time::Instant::now() >= deadline => {
                     let _ = child.0.kill();
                     let _ = child.0.wait();
-                    panic!("s3-server {} did not exit immediately", flag);
+                    panic!("awanfs {} did not exit immediately", flag);
                 }
                 None => std::thread::sleep(std::time::Duration::from_millis(25)),
             }
         };
         let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
         let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
-        assert!(status.success(), "s3-server {} exited {:?}: stderr={}", flag, status.code(), stderr);
+        assert!(status.success(), "awanfs {} exited {:?}: stderr={}", flag, status.code(), stderr);
         assert!(
             stdout.contains("--allow-small-parts"),
-            "s3-server {} stdout must document --allow-small-parts; got:\n{}",
+            "awanfs {} stdout must document --allow-small-parts; got:\n{}",
             flag,
             stdout
         );
@@ -744,7 +744,7 @@ async fn cli_default_rejects_small_parts_and_flag_allows_them() {
     let c = reqwest::Client::new();
     let part_body = vec![b'a'; 256 * 1024];
 
-    // 1. Default s3-server (without --allow-small-parts): < 5 MiB non-final part -> 400 EntityTooSmall.
+    // 1. Default awanfs (without --allow-small-parts): < 5 MiB non-final part -> 400 EntityTooSmall.
     let (mut srv_default, base_default, dir_default) = start_binary_server("cli_default_small", &[]).await;
     assert_eq!(c.put(format!("{}/bkt", base_default)).send().await.unwrap().status(), StatusCode::OK);
     let uid = create_upload(&c, &base_default, "bkt", "obj").await;
@@ -771,7 +771,7 @@ async fn cli_default_rejects_small_parts_and_flag_allows_them() {
     drop(srv_default);
     let _ = std::fs::remove_dir_all(&dir_default);
 
-    // 2. s3-server --allow-small-parts: 4 x 256 KiB parts (as in mpu_1m) succeed with 200 OK.
+    // 2. awanfs --allow-small-parts: 4 x 256 KiB parts (as in mpu_1m) succeed with 200 OK.
     let (mut srv_allow, base_allow, dir_allow) =
         start_binary_server("cli_allow_small", &["--allow-small-parts"]).await;
     assert_eq!(c.put(format!("{}/bkt", base_allow)).send().await.unwrap().status(), StatusCode::OK);

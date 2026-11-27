@@ -1,6 +1,6 @@
 name: Release
 
-# Builds real s3-server binaries on GitHub-hosted runners (replaces the Windows-only,
+# Builds real awanfs binaries on GitHub-hosted runners (replaces the Windows-only,
 # self-hosted "build_release_matrix" job of awan-lang's awan-storage-ci.yml).
 # workflow_dispatch: binaries as run artifacts. A pushed tag v*: also a GitHub release.
 
@@ -21,10 +21,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,    bin: s3-server.exe }
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  bin: s3-server }
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-musl, bin: s3-server }
-          - { os: macos-latest,   target: aarch64-apple-darwin,      bin: s3-server }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,    bin: awanfs.exe }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  bin: awanfs }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-musl, bin: awanfs }
+          - { os: macos-latest,   target: aarch64-apple-darwin,      bin: awanfs }
     steps:
       - uses: actions/checkout@v4
       - name: Add target
@@ -37,16 +37,16 @@ jobs:
           workspaces: server
           key: ${{ matrix.target }}
       - name: Build
-        run: cargo build --locked --release --bin s3-server --target ${{ matrix.target }} --manifest-path server/Cargo.toml
+        run: cargo build --locked --release --bin awanfs --target ${{ matrix.target }} --manifest-path server/Cargo.toml
       - name: Package
         shell: bash
         run: |
           mkdir -p out
-          cp "server/target/${{ matrix.target }}/release/${{ matrix.bin }}" "out/s3-server-${{ matrix.target }}${{ endsWith(matrix.bin, '.exe') && '.exe' || '' }}"
+          cp "server/target/${{ matrix.target }}/release/${{ matrix.bin }}" "out/awanfs-${{ matrix.target }}${{ endsWith(matrix.bin, '.exe') && '.exe' || '' }}"
           cd out && for f in *; do (sha256sum "$f" 2>/dev/null || shasum -a 256 "$f") > "$f.sha256"; done; ls -l
       - uses: actions/upload-artifact@v4
         with:
-          name: s3-server-${{ matrix.target }}
+          name: awanfs-${{ matrix.target }}
           path: out/*
 
   release:

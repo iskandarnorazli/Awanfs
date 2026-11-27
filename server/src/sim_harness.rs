@@ -2,7 +2,7 @@
 //!
 //! Extracted from `server/tests/sim_storage_test.rs` so both integration tests and the
 //! `sim_storage` libFuzzer target execute the exact same `VolumeManager<SimFs>` + `SimModel`
-//! harness without linking `libfuzzer-sys` into `s3-server`.
+//! harness without linking `libfuzzer-sys` into `awanfs`.
 
 use crate::clock::{Clock, ManualClock};
 use crate::compute_md5;

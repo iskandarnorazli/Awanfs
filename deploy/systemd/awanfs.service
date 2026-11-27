@@ -1,5 +1,5 @@
 # AwanFS S3 server as a systemd service (#49).
-# Install: copy s3-server to /usr/local/bin, this file to /etc/systemd/system/, and put the keys
+# Install: copy awanfs to /usr/local/bin, this file to /etc/systemd/system/, and put the keys
 # in /etc/awanfs/awanfs.env (mode 0600):
 #   AWANFS_ACCESS_KEY=...
 #   AWANFS_SECRET_KEY=...
@@ -15,7 +15,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/awanfs/awanfs.env
-ExecStart=/usr/local/bin/s3-server --port 9000 --data-dir /var/lib/awanfs
+ExecStart=/usr/local/bin/awanfs --port 9000 --data-dir /var/lib/awanfs
 # SIGTERM starts the graceful shutdown: no new connections, requests in flight finish (up to
 # 30 s), every volume is synced, exit 0.
 KillSignal=SIGTERM

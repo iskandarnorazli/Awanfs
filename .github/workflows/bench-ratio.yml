@@ -31,8 +31,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
-      - name: Build s3-server
-        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Build awanfs
+        run: cargo build --locked --release --bin awanfs --manifest-path server/Cargo.toml
 
       - uses: actions/cache@v4
         id: minio-cache
@@ -78,7 +78,7 @@ jobs:
         id: ratio
         run: |
           set +e
-          python benchmarks/ratio_check.py --server-bin server/target/release/s3-server \
+          python benchmarks/ratio_check.py --server-bin server/target/release/awanfs \
             --minio-bin .tmp/minio/minio --mc-bin .tmp/minio/mc --runs 5 --duration 3 \
             --report ratio_report.md
           code=$?
@@ -96,7 +96,7 @@ jobs:
         timeout-minutes: 15
         run: |
           set +e
-          python -u benchmarks/budget_rss.py --server-bin server/target/release/s3-server \
+          python -u benchmarks/budget_rss.py --server-bin server/target/release/awanfs \
             --budget 256MiB --budget-mib 256 --concurrency 64 --size 1MiB --duration 10 \
             --overhead 200 --report budget_report.md
           code=$?
@@ -111,7 +111,7 @@ jobs:
         timeout-minutes: 15
         run: |
           set +e
-          python -u benchmarks/budget_rss.py --server-bin server/target/release/s3-server \
+          python -u benchmarks/budget_rss.py --server-bin server/target/release/awanfs \
             --budget 256MiB --budget-mib 256 --size 4KiB --unique-keys --concurrency 64 --duration 20 \
             --overhead 200 --report budget_unique_keys_report.md
           code=$?

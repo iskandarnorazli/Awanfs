@@ -29,7 +29,7 @@ impl Drop for Server {
 fn command(name: &str, extra: &[&str], env: &[(&str, &str)]) -> Command {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let dir = temp_dir(name);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-server"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_awanfs"));
     cmd.args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous"])
         .args(extra)
         .stdout(Stdio::piped())
@@ -44,7 +44,7 @@ fn command(name: &str, extra: &[&str], env: &[(&str, &str)]) -> Command {
 /// such line came within 30 s (a running server never closes its stdout, so the read is on a
 /// thread and the server is killed when this returns).
 fn sweep_line(mut cmd: Command) -> Option<String> {
-    let mut child = Server(cmd.spawn().expect("spawn s3-server"));
+    let mut child = Server(cmd.spawn().expect("spawn awanfs"));
     let out = child.0.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {

@@ -202,8 +202,8 @@ def find_server_binary() -> Optional[str]:
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     exe = ".exe" if sys.platform == "win32" else ""
     candidates = [
-        os.path.join(repo_root, "server", "target", "release", f"s3-server{exe}"),
-        shutil.which(f"s3-server{exe}"),
+        os.path.join(repo_root, "server", "target", "release", f"awanfs{exe}"),
+        shutil.which(f"awanfs{exe}"),
     ]
     return next((p for p in candidates if p and os.path.isfile(p)), None)
 
@@ -312,7 +312,7 @@ def start_awanfs(
     if not wait_port(port, timeout=30.0):
         proc.kill()
         proc.wait()
-        raise RuntimeError(f"s3-server ({durability}) did not start")
+        raise RuntimeError(f"awanfs ({durability}) did not start")
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5.0)
     conn.request("PUT", f"/{BUCKET}")
     conn.getresponse().read()
@@ -1435,7 +1435,7 @@ def build_durability_table(
             waits = "Per-write `fsync`/`FlushFileBuffers` of volume + journal before 200 (no batching)"
         else:
             waits = "Acknowledged in memory before flush; background thread syncs every ~1s"
-        lines.append(f"| {label} | `s3-server --durability {flag}` | {waits} | {summary} |")
+        lines.append(f"| {label} | `awanfs --durability {flag}` | {waits} | {summary} |")
 
     minio_setup = f"`minio server dir1..dir{minio_drives}` ({minio_drives}-dir erasure)" if minio_drives > 1 else "`minio server dir` (single-drive)"
     minio_note = minio_durability_note()
@@ -1464,14 +1464,14 @@ def format_market_claims_report(
     ram_gb_label = hw_info.get("ram_gb", "unknown")
     if cold_dataset_exceeds_ram(cold_set_mib, ram_bytes):
         cold_setup_line = (
-            f"- **Cold-Read Setup (`--cache-bytes 0`):** `s3-server` exposes `--memory-budget` "
+            f"- **Cold-Read Setup (`--cache-bytes 0`):** `awanfs` exposes `--memory-budget` "
             f"(minimum `16MiB`, yielding a 6 MiB payload cache) rather than `--cache-bytes 0`; "
             f"cold-read phases start AwanFS with `--memory-budget 16MiB` and sweep a `{cold_set_mib} MiB dataset` "
             f"against {ram_gb_label} GB host RAM (`Dataset exceeds host RAM`)."
         )
     else:
         cold_setup_line = (
-            f"- **Cold-Read Setup (`--cache-bytes 0`):** `s3-server` exposes `--memory-budget` "
+            f"- **Cold-Read Setup (`--cache-bytes 0`):** `awanfs` exposes `--memory-budget` "
             f"(minimum `16MiB`, yielding a 6 MiB payload cache) rather than `--cache-bytes 0`; "
             f"cold-read phases start AwanFS with `--memory-budget 16MiB` and sweep a `{cold_set_mib} MiB dataset` "
             f"on {ram_gb_label} GB host RAM (`warm page cache`: working set fits in OS page cache)."
@@ -1672,8 +1672,8 @@ def run_server_suite(
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Market-claims S3 benchmark harness (#58)")
-    ap.add_argument("--server-bin", help="Path to s3-server binary (auto-detected if omitted)")
-    ap.add_argument("--build", action="store_true", help="Build s3-server (--release) before running")
+    ap.add_argument("--server-bin", help="Path to awanfs binary (auto-detected if omitted)")
+    ap.add_argument("--build", action="store_true", help="Build awanfs (--release) before running")
     ap.add_argument("--minio-bin", help="Path to minio binary")
     ap.add_argument("--mc-bin", help="Path to mc binary")
     ap.add_argument("--rustfs-bin", help="Path to rustfs binary")
@@ -1709,13 +1709,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     if a.build:
         subprocess.run(
-            ["cargo", "build", "--locked", "--release", "--bin", "s3-server",
+            ["cargo", "build", "--locked", "--release", "--bin", "awanfs",
              "--manifest-path", os.path.join(repo_root, "server", "Cargo.toml")],
             check=True,
         )
     server_bin = a.server_bin or find_server_binary()
     if not server_bin or not os.path.isfile(server_bin):
-        print("error: s3-server binary not found (pass --server-bin or --build)", file=sys.stderr)
+        print("error: awanfs binary not found (pass --server-bin or --build)", file=sys.stderr)
         return 2
 
     minio_bin, mc_bin = (a.minio_bin, a.mc_bin) if (a.minio_bin and a.mc_bin) else find_minio_binaries()

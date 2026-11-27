@@ -46,7 +46,7 @@ jobs:
           cmp /tmp/in.txt /tmp/out.txt
           docker logs awanfs 2>&1 | tail -5
       - name: systemd unit
-        run: systemd-analyze verify --man=no deploy/systemd/awanfs.service 2>&1 | grep -v "Command /usr/local/bin/s3-server is not executable" | tee /tmp/verify.txt; ! grep -qiE "error|unknown" /tmp/verify.txt
+        run: systemd-analyze verify --man=no deploy/systemd/awanfs.service 2>&1 | grep -v "Command /usr/local/bin/awanfs is not executable" | tee /tmp/verify.txt; ! grep -qiE "error|unknown" /tmp/verify.txt
       - name: Push to ghcr.io
         if: startsWith(github.ref, 'refs/tags/v')
         run: |

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Starts s3-server for the MinIO Mint conformance suite (#278).
+# Starts awanfs for the MinIO Mint conformance suite (#278).
 # Redirects stdout and stderr to a log file (never an unread pipe; AGENTS.md #135).
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-BIN="${AWANFS_BIN:-$ROOT/server/target/release/s3-server}"
+BIN="${AWANFS_BIN:-$ROOT/server/target/release/awanfs}"
 DATA_DIR="${AWANFS_DATA_DIR:-/tmp/awanfs-mint-data}"
 LOG_FILE="${AWANFS_LOG_FILE:-/tmp/awanfs-mint.log}"
 PID_FILE="${AWANFS_PID_FILE:-/tmp/awanfs-mint.pid}"
@@ -31,6 +31,6 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
-echo "s3-server did not become ready at http://127.0.0.1:${PORT}/_awanfs/health/ready" >&2
+echo "awanfs did not become ready at http://127.0.0.1:${PORT}/_awanfs/health/ready" >&2
 cat "$LOG_FILE" >&2 || true
 exit 1

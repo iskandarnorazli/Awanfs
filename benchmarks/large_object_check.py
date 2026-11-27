@@ -1,6 +1,6 @@
 """How does AwanFS handle objects above 4 MiB, next to MinIO on the same machine?
 
-    python benchmarks/large_object_check.py --server-bin server/target/release/s3-server \
+    python benchmarks/large_object_check.py --server-bin server/target/release/awanfs \
         --minio-bin .tmp/minio/minio --mc-bin .tmp/minio/mc --sizes 16MiB,64MiB,256MiB --runs 3
 
 An experiment, not a gate: it has no baseline and exits 1 only when a phase did not measure

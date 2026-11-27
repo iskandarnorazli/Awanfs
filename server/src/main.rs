@@ -32,9 +32,9 @@ fn fix_mmap_threshold() -> &'static str {
 fn print_help() {
     println!(
         "\
-s3-server — AwanFS S3-compatible object storage server
+awanfs — AwanFS S3-compatible object storage server
 
-Usage: s3-server [OPTIONS]
+Usage: awanfs [OPTIONS]
 
 Options:
   -p, --port <PORT>                Listen port (default: 9000, or S3_PORT / AWAN_S3_PORT)

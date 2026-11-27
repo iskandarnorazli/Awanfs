@@ -1,6 +1,6 @@
 """#210: today's server past its 100,000-object hot set: PUT, GET and boot at 1M objects.
 
-    python benchmarks/hot_set_scale.py --server server/target/release/s3-server \\
+    python benchmarks/hot_set_scale.py --server server/target/release/awanfs \\
         --client server/target/release/examples/hot_set_bench --objects 1000000 \\
         --data-dir <dir> --results hot_set.jsonl --report hot_set.md
 
@@ -137,7 +137,7 @@ def report(recs, title):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--server", help="s3-server binary (to run the measurement)")
+    ap.add_argument("--server", help="awanfs binary (to run the measurement)")
     ap.add_argument("--client", help="hot_set_bench binary")
     ap.add_argument("--data-dir")
     ap.add_argument("--objects", type=int, default=1_000_000)

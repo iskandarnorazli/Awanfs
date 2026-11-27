@@ -3,8 +3,8 @@
 scripts/build_release_matrix.py
 Multi-OS and Multi-Architecture Release Binary Matrix Packaging Script
 Packages a 100% self-contained compiled-binary distribution inside `dist/`
-for the standalone S3 Server (`s3-server`):
-  1. `s3-server-x86_64-windows.exe` (Drop-in S3-compatible server daemon)
+for the standalone S3 Server (`awanfs`):
+  1. `awanfs-x86_64-windows.exe` (Drop-in S3-compatible server daemon)
   2. Multi-target cross-compilation verification (`x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`)
   3. SHA-256 integrity manifest (`SHA256SUMS.txt`)
 """
@@ -38,14 +38,14 @@ def main():
 
     server_manifest = os.path.join(server_dir, "Cargo.toml")
 
-    # 1. Native Windows x86_64 Release Build for s3-server
+    # 1. Native Windows x86_64 Release Build for awanfs
     print("  [1/4] Building S3 Server Windows x86_64 release binary (--release)...")
     subprocess.run(
-        ["cargo", "build", "--release", "--bin", "s3-server", "--manifest-path", server_manifest],
+        ["cargo", "build", "--release", "--bin", "awanfs", "--manifest-path", server_manifest],
         check=True,
     )
-    src_server_win = os.path.join(server_dir, "target", "release", "s3-server.exe")
-    dst_server_win = os.path.join(dist_dir, "s3-server-x86_64-windows.exe")
+    src_server_win = os.path.join(server_dir, "target", "release", "awanfs.exe")
+    dst_server_win = os.path.join(dist_dir, "awanfs-x86_64-windows.exe")
     shutil.copy2(src_server_win, dst_server_win)
 
     # 2. Linux x86_64 (glibc) Cross-Target Verification
@@ -71,7 +71,7 @@ def main():
 
     # Clean up any stale files in dist/
     for fname in os.listdir(dist_dir):
-        if fname not in ("s3-server-x86_64-windows.exe", "SHA256SUMS.txt"):
+        if fname not in ("awanfs-x86_64-windows.exe", "SHA256SUMS.txt"):
             fpath = os.path.join(dist_dir, fname)
             if os.path.isfile(fpath):
                 os.remove(fpath)
@@ -81,7 +81,7 @@ def main():
 
     sha_file = os.path.join(dist_dir, "SHA256SUMS.txt")
     with open(sha_file, "w", encoding="utf-8") as f:
-        f.write(f"{server_sha}  s3-server-x86_64-windows.exe\n")
+        f.write(f"{server_sha}  awanfs-x86_64-windows.exe\n")
 
     report_content = f"""`{producing_cmd}`
 
@@ -90,21 +90,21 @@ def main():
 - **Distribution Directory:** `dist/` (100% self-contained compiled Rust binary; zero external dependencies)
 - **Integrity Manifest:** `dist/SHA256SUMS.txt`
 - **Host Environment:** Windows x86_64 (`x86_64-pc-windows-msvc`)
-- **Release Profile:** Optimized (`--release`), Pure Rust S3 Server (`s3-server`).
+- **Release Profile:** Optimized (`--release`), Pure Rust S3 Server (`awanfs`).
 
 ## 1. Multi-OS & Multi-Architecture Build & Verification Matrix
 
 | Target Artifact | Rust Target Triple | Verification on Host | Binary Size | SHA-256 Fingerprint |
 | :--- | :--- | :--- | :--- | :--- |
-| `s3-server-x86_64-windows.exe` | `x86_64-pc-windows-msvc` | **Compiled (`cargo build --release`) + Smoke-Tested** | {server_kb:.1f} KiB | `{server_sha[:16]}...` |
-| `s3-server-x86_64-linux-gnu` | `x86_64-unknown-linux-gnu` | **`cargo check --target x86_64-unknown-linux-gnu` PASS** | Built in Linux CI | Built in Linux CI |
-| `s3-server-x86_64-linux-musl` | `x86_64-unknown-linux-musl` | **`cargo check --target x86_64-unknown-linux-musl` PASS** | Built in Linux CI | Built in Linux CI |
-| `s3-server-aarch64-linux-gnu` | `aarch64-unknown-linux-gnu` | **`cargo check --target aarch64-unknown-linux-gnu` PASS** | Built in Linux CI | Built in Linux CI |
+| `awanfs-x86_64-windows.exe` | `x86_64-pc-windows-msvc` | **Compiled (`cargo build --release`) + Smoke-Tested** | {server_kb:.1f} KiB | `{server_sha[:16]}...` |
+| `awanfs-x86_64-linux-gnu` | `x86_64-unknown-linux-gnu` | **`cargo check --target x86_64-unknown-linux-gnu` PASS** | Built in Linux CI | Built in Linux CI |
+| `awanfs-x86_64-linux-musl` | `x86_64-unknown-linux-musl` | **`cargo check --target x86_64-unknown-linux-musl` PASS** | Built in Linux CI | Built in Linux CI |
+| `awanfs-aarch64-linux-gnu` | `aarch64-unknown-linux-gnu` | **`cargo check --target aarch64-unknown-linux-gnu` PASS** | Built in Linux CI | Built in Linux CI |
 
 ## 2. Release Binary Smoke Test & Checksum Verification
-- S3 Server binary tested: `dist/s3-server-x86_64-windows.exe --port 9999`
+- S3 Server binary tested: `dist/awanfs-x86_64-windows.exe --port 9999`
 - Full `SHA256SUMS.txt` entry:
-  `{server_sha}  s3-server-x86_64-windows.exe`
+  `{server_sha}  awanfs-x86_64-windows.exe`
 """
 
     local_report = os.path.join(meas_dir, "s3_release_binaries_matrix.md")

@@ -1,11 +1,11 @@
 ---
 name: verify-awanfs
-description: Drive a fresh AwanFS s3-server the way a user does (aws CLI against its HTTP S3 API) and keep the evidence. Use to prove a change to buckets, objects, ranges, multipart, copy, versioning, listing or restart behaviour works end to end, beyond the Rust tests.
+description: Drive a fresh AwanFS awanfs the way a user does (aws CLI against its HTTP S3 API) and keep the evidence. Use to prove a change to buckets, objects, ranges, multipart, copy, versioning, listing or restart behaviour works end to end, beyond the Rust tests.
 ---
 
 # Verify AwanFS by driving it
 
-The surface is the S3 HTTP API of `s3-server` (`server/src/main.rs`). A user reaches it with an S3 client; this skill uses the `aws` CLI.
+The surface is the S3 HTTP API of `awanfs` (`server/src/main.rs`). A user reaches it with an S3 client; this skill uses the `aws` CLI.
 
 ## Launch
 
