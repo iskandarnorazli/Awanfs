@@ -929,14 +929,14 @@ pub fn check_meta_segment(data: &[u8]) {
 
     // Round-trip encoded manifest and verify CRC corruption & truncation return None.
     let n_seg = (byte(2) % 4) as usize;
-    let mut seq = u64_from(4).max(1);
+    let mut seq = u64_from(4).clamp(1, u64::MAX - 2048);
     let mut segs = Vec::with_capacity(n_seg);
     for idx in 0..n_seg {
         segs.push(Live {
             seq,
             level: byte(3 + idx) % (MAX_LEVEL + 1),
         });
-        seq = seq.saturating_add(1 + (byte(7 + idx) as u64));
+        seq += 1 + (byte(7 + idx) as u64);
     }
     let manifest = Manifest {
         generation: u64_from(12),
@@ -1159,7 +1159,13 @@ mod tests {
 
     #[test]
     fn meta_segment_round_trip_and_corpus_seeds() {
-        for sample in [b"".as_slice(), b"bad", &[0u8; 64], &[0u8; BLOCK]] {
+        for sample in [
+            b"".as_slice(),
+            b"bad",
+            &[0u8; 64],
+            &[0u8; BLOCK],
+            &[65, 87, 83, 77, 2, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 1, 0, 0, 0, 1, 97, 0, 0, 0, 0],
+        ] {
             check_meta_segment(sample);
         }
 
