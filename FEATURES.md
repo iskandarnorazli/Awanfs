@@ -177,3 +177,44 @@ A suite test AwanFS cannot run as written (it signs with SigV2) counts by its ow
 - **metadata-index**: no ceph, fuzz
 - **volume-format**: no ceph
 - **operation-table**: no ceph, fuzz
+
+## Settings
+
+Every flag and environment variable the server reads (`[[setting]]` in `features.toml`, checked by `features.py check`, #494). `derives` is what else a setting sets.
+
+| setting | flags | environment | default | feature | derives | doc | test |
+|---|---|---|---|---|---|---|---|
+| port | `--port`, `-p` | `S3_PORT`, `AWAN_S3_PORT` | 9000 | server | - | internal: S3_PORT and AWAN_S3_PORT are older names kept for deployments that set them; README documents --port | `server/tests/auth_test.rs::the_binary_refuses_to_start_without_credentials_or_the_anonymous_switch` |
+| listen | `--listen` | `AWANFS_LISTEN` | 127.0.0.1 | server | - | README.md | `server/tests/profile_test.rs::a_safe_production_server_starts_and_says_so_and_default_says_default` |
+| data-dir | `--data-dir`, `-d` | `S3_DATA_DIR`, `AWAN_S3_DATA_DIR` | none: in-memory, nothing kept | restart | - | internal: S3_DATA_DIR and AWAN_S3_DATA_DIR are older names kept for deployments that set them; README documents --data-dir | `server/tests/graceful_shutdown_test.rs::the_binary_stops_cleanly_on_sigterm` |
+| durability | `--durability` | `AWANFS_DURABILITY` | group | restart | --profile production refuses fast | README.md | `server/tests/durability_test.rs::an_unknown_mode_stops_the_binary` |
+| tls-cert | `--cert` | `AWANFS_TLS_CERT` | none: plain HTTP | tls | certificate reload within 60 s of a file change, or on SIGHUP | README.md | `server/tests/tls_test.rs::cert_without_key_stops_the_binary` |
+| tls-key | `--key` | `AWANFS_TLS_KEY` | none | tls | - | README.md | `server/tests/tls_test.rs::cert_without_key_stops_the_binary` |
+| http-port | `--http-port` | - | none | tls | --profile production refuses it | README.md | `server/tests/tls_test.rs::https_put_and_get_with_a_trusted_certificate_and_refused_otherwise` |
+| compaction-rate | `--compaction-rate` | `AWANFS_COMPACTION_RATE_MB` | 50 MB/s (0 = no limit) | compaction | - | README.md | untested: no test sets the rate; compaction tests run with the default |
+| auto-compaction | `--auto-compaction` | `AWANFS_AUTO_COMPACTION` | on | compaction | - | README.md | untested: no test starts the binary with --auto-compaction off; auto_compaction_test drives the policy directly |
+| scrub-rate | `--scrub-mib-per-sec` | `AWANFS_SCRUB_MIB_PER_SEC` | 10 MiB/s (0 = off) | health | - | README.md | `server/tests/scrub_test.rs::scrub_detects_payload_and_header_corruption_and_reports_via_http` |
+| otlp-endpoint | `--otlp-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | none: no traces | otlp-tracing | - | README.md | `server/tests/otlp_test.rs::a_put_exports_a_request_span_with_write_and_sync_children` |
+| access-log | `--access-log` | `AWANFS_ACCESS_LOG` | off | access-log | - | README.md | `server/tests/stalled_log_test.rs::a_server_whose_access_log_nobody_reads_keeps_answering`<br>`server/tests/access_log_test.rs::put_get_and_a_denied_request_write_three_access_log_lines` |
+| request-log | - | `AWANFS_LOG` | on (one JSON line per request on stderr); off turns it off | request-log | - | README.md | `server/tests/stalled_log_test.rs::a_server_whose_access_log_nobody_reads_keeps_answering` |
+| config | `--config` | `AWANFS_CONFIG` | none | iam | reload within 60 s of a change, or on SIGHUP | README.md | `server/tests/anonymous_with_config_test.rs::users_in_the_config_with_allow_anonymous_is_refused` |
+| root-credentials | - | `AWANFS_ACCESS_KEY`, `AWANFS_SECRET_KEY` | none: the server refuses to start without credentials, users in --config, or --allow-anonymous | sigv4-auth | --profile production refuses a published or short secret key | README.md | `server/tests/auth_test.rs::the_binary_refuses_to_start_without_credentials_or_the_anonymous_switch` |
+| allow-anonymous | `--allow-anonymous` | `AWANFS_ALLOW_ANONYMOUS` | off | anonymous-and-presigned | refused together with users in --config; --profile production refuses it | README.md | `server/tests/anonymous_with_config_test.rs::users_in_the_config_with_allow_anonymous_is_refused` |
+| memory-budget | `--memory-budget` | `AWANFS_MEMORY_BUDGET` | a quarter of RAM, between 128 MiB and 2 GiB | memory-budget | payload cache size (half); in-flight body budget (half); spill index cache | README.md | `server/tests/memory_budget_test.rs::the_flag_sets_the_budget_the_cache_and_the_metrics`<br>`server/tests/memory_budget_test.rs::the_environment_sets_it_and_the_flag_wins_over_the_environment` |
+| allocator | - | `MALLOC_MMAP_THRESHOLD_` | unset: the server fixes glibc's mmap threshold at 128 KiB (Linux, glibc) | memory-budget | - | internal: a glibc variable, documented by glibc; the startup line names what the server did | `server/tests/memory_budget_test.rs::the_startup_line_says_what_was_done_to_the_allocator` |
+| lifecycle-day-seconds | `--lifecycle-day-seconds` | - | 86400 | lifecycle | lifecycle sweep period: 1/24 of a day, 500 ms to 1 h (#486); age at which stale multipart uploads are aborted: 7 days | README.md | `server/tests/lifecycle_conformance_test.rs::lifecycle_filters_date_disabled_header_and_tags` |
+| body-idle-timeout | `--body-idle-timeout` | - | 20s | objects | - | README.md | `server/tests/body_timeout_test.rs::stalled_buffered_put_returns_408_and_releases_key` |
+| region | `--region` | `AWANFS_REGION` | us-east-1 | buckets | - | README.md | `server/tests/s3_details_test.rs::get_bucket_location_and_create_bucket_constraint` |
+| profile | `--profile` | `AWANFS_PROFILE` | default | server | - | README.md | `server/tests/profile_test.rs::production_refuses_anonymous_access_and_names_why`<br>`server/tests/profile_test.rs::an_unknown_profile_stops_the_binary` |
+| verify-payloads-at-boot | `--verify-payloads-at-boot` | `AWANFS_VERIFY_PAYLOADS_AT_BOOT` | off: only payloads the journal does not record are checked | restart | - | README.md | `server/tests/boot_verify_all_flag_test.rs::the_switch_checks_every_payload_even_when_all_are_journaled` |
+| allow-small-parts | `--allow-small-parts` | - | off: non-final multipart parts must be at least 5 MiB | multipart | - | README.md | `server/tests/multipart_conformance_test.rs::cli_default_rejects_small_parts_and_flag_allows_them` |
+| worker-threads | `--worker-threads` | `AWANFS_WORKER_THREADS` | the cores the process may run on (Windows: its affinity mask; Linux: available_parallelism) | server | - | README.md | `server/tests/worker_threads_test.rs::the_flag_and_the_environment_set_the_count`<br>`server/tests/worker_threads_test.rs::a_server_started_on_two_cores_runs_two_workers` |
+| per-bucket-metrics | `--per-bucket-metrics` | `AWANFS_PER_BUCKET_METRICS` | off: awanfs_bucket_* gauges stop above 1000 buckets | metrics | - | README.md | `server/tests/commit_events_and_usage_test.rs::prometheus_bucket_metrics_respect_cardinality_cap_and_flag` |
+| help | `--help`, `-h` | - | - | server | - | README.md | `server/tests/multipart_conformance_test.rs::cli_help_documents_allow_small_parts` |
+| direct-io | - | `AWAN_DIRECT_IO` | off | volume-format | - | internal: a measurement switch, not an operator setting | untested: no test sets it; volume tests run with buffered files |
+| sparse-volume | - | `AWAN_SPARSE_VOLUME` | off: volumes grow in steps | volume-format | - | internal: a measurement switch, not an operator setting | `server/tests/auto_compaction_test.rs::a_lone_volume_is_sealed_and_compacted_only_above_the_minimum_size` |
+| volume-growth-step | - | `AWAN_VOLUME_GROWTH_STEP` | 256 MiB | volume-format | - | internal: a measurement switch, not an operator setting | `server/tests/stepped_growth_test.rs::reading_each_object_right_after_its_write_remaps_once_per_extension` |
+| read-chunk | - | `AWAN_READ_CHUNK` | 1 MiB | ranges | - | internal: a measurement switch, not an operator setting | `server/tests/stream_read_test.rs::no_payload_byte_is_read_before_the_body_is_polled` |
+| read-ahead | - | `AWAN_READ_AHEAD` | 1 (1 to 8) | ranges | - | internal: a measurement switch, not an operator setting | `server/tests/stream_read_budget_test.rs::sixty_four_concurrent_256_mib_gets_hold_bounded_buffers_and_verify_work` |
+| direct-read-min | - | `AWAN_DIRECT_READ_MIN` | never: GETs read through the mapping | ranges | - | internal: a measurement switch, not an operator setting | `server/tests/stream_read_test.rs::a_full_get_and_ranges_of_a_large_object_do_not_use_the_mapping` |
+| sim-trace | - | `AWAN_SIM_TRACE` | off | volume-format | - | internal: test harness output, not a server setting | `server/tests/sim_storage_test.rs::seeded_storage_simulation_matches_model_and_covers_all_fault_points` |

@@ -2163,3 +2163,335 @@ operations = []
 ceph = []
 mint = []
 server_tests = ["server/tests/static_website_test.rs::bucket_website_put_get_and_delete_answer_not_implemented"]
+
+# Server settings (#494, owner 2026-11-27): every command-line flag in server/src/main.rs and every
+# environment variable the server reads, with its default, the feature it belongs to (a feature id,
+# or "server" for server-wide settings), what else it sets (`derives`: behaviour that follows the
+# setting without a setting of its own), where it is documented and the test that pins it.
+# `scripts/features.py check` fails when a flag or variable has no entry, or an entry names one the
+# server no longer reads. `internal` replaces a README mention for settings not meant for operators;
+# `untested` names why no test pins a setting yet.
+
+[[setting]]
+id = "port"
+flags = ["--port", "-p"]
+env = ["S3_PORT", "AWAN_S3_PORT"]
+default = "9000"
+feature = "server"
+what = "TCP port of the S3 listener"
+test = ["server/tests/auth_test.rs::the_binary_refuses_to_start_without_credentials_or_the_anonymous_switch"]
+internal = "S3_PORT and AWAN_S3_PORT are older names kept for deployments that set them; README documents --port"
+
+[[setting]]
+id = "listen"
+flags = ["--listen"]
+env = ["AWANFS_LISTEN"]
+default = "127.0.0.1"
+feature = "server"
+what = "bind address"
+test = ["server/tests/profile_test.rs::a_safe_production_server_starts_and_says_so_and_default_says_default"]
+
+[[setting]]
+id = "data-dir"
+flags = ["--data-dir", "-d"]
+env = ["S3_DATA_DIR", "AWAN_S3_DATA_DIR"]
+default = "none: in-memory, nothing kept"
+feature = "restart"
+what = "directory of the volumes, journals and bucket manifest"
+test = ["server/tests/graceful_shutdown_test.rs::the_binary_stops_cleanly_on_sigterm"]
+internal = "S3_DATA_DIR and AWAN_S3_DATA_DIR are older names kept for deployments that set them; README documents --data-dir"
+
+[[setting]]
+id = "durability"
+flags = ["--durability"]
+env = ["AWANFS_DURABILITY"]
+default = "group"
+feature = "restart"
+what = "when a write is acknowledged: group (shared sync), fast (background sync once a second), strict (sync per write)"
+derives = ["--profile production refuses fast"]
+test = ["server/tests/durability_test.rs::an_unknown_mode_stops_the_binary"]
+
+[[setting]]
+id = "tls-cert"
+flags = ["--cert"]
+env = ["AWANFS_TLS_CERT"]
+default = "none: plain HTTP"
+feature = "tls"
+what = "TLS certificate PEM; with --key the port serves HTTPS only"
+derives = ["certificate reload within 60 s of a file change, or on SIGHUP"]
+test = ["server/tests/tls_test.rs::cert_without_key_stops_the_binary"]
+
+[[setting]]
+id = "tls-key"
+flags = ["--key"]
+env = ["AWANFS_TLS_KEY"]
+default = "none"
+feature = "tls"
+what = "TLS private key PEM; goes with --cert"
+test = ["server/tests/tls_test.rs::cert_without_key_stops_the_binary"]
+
+[[setting]]
+id = "http-port"
+flags = ["--http-port"]
+env = []
+default = "none"
+feature = "tls"
+what = "a plain HTTP listener next to the HTTPS port"
+derives = ["--profile production refuses it"]
+test = ["server/tests/tls_test.rs::https_put_and_get_with_a_trusted_certificate_and_refused_otherwise"]
+
+[[setting]]
+id = "compaction-rate"
+flags = ["--compaction-rate"]
+env = ["AWANFS_COMPACTION_RATE_MB"]
+default = "50 MB/s (0 = no limit)"
+feature = "compaction"
+what = "most bytes per second compaction copies"
+untested = "no test sets the rate; compaction tests run with the default"
+
+[[setting]]
+id = "auto-compaction"
+flags = ["--auto-compaction"]
+env = ["AWANFS_AUTO_COMPACTION"]
+default = "on"
+feature = "compaction"
+what = "background compaction every 10 minutes of volumes with at least 20% dead bytes and 1 GiB"
+untested = "no test starts the binary with --auto-compaction off; auto_compaction_test drives the policy directly"
+
+[[setting]]
+id = "scrub-rate"
+flags = ["--scrub-mib-per-sec"]
+env = ["AWANFS_SCRUB_MIB_PER_SEC"]
+default = "10 MiB/s (0 = off)"
+feature = "health"
+what = "read rate of the background needle scrub, which runs every 10 minutes"
+test = ["server/tests/scrub_test.rs::scrub_detects_payload_and_header_corruption_and_reports_via_http"]
+
+[[setting]]
+id = "otlp-endpoint"
+flags = ["--otlp-endpoint"]
+env = ["OTEL_EXPORTER_OTLP_ENDPOINT"]
+default = "none: no traces"
+feature = "otlp-tracing"
+what = "OTLP/HTTP endpoint that receives a span per request"
+test = ["server/tests/otlp_test.rs::a_put_exports_a_request_span_with_write_and_sync_children"]
+
+[[setting]]
+id = "access-log"
+flags = ["--access-log"]
+env = ["AWANFS_ACCESS_LOG"]
+default = "off"
+feature = "access-log"
+what = "S3 server access log to a file, or - for stdout"
+test = ["server/tests/stalled_log_test.rs::a_server_whose_access_log_nobody_reads_keeps_answering", "server/tests/access_log_test.rs::put_get_and_a_denied_request_write_three_access_log_lines"]
+
+[[setting]]
+id = "request-log"
+flags = []
+env = ["AWANFS_LOG"]
+default = "on (one JSON line per request on stderr); off turns it off"
+feature = "request-log"
+what = "the per-request log on stderr"
+test = ["server/tests/stalled_log_test.rs::a_server_whose_access_log_nobody_reads_keeps_answering"]
+
+[[setting]]
+id = "config"
+flags = ["--config"]
+env = ["AWANFS_CONFIG"]
+default = "none"
+feature = "iam"
+what = "TOML file of users, policies and bucket settings"
+derives = ["reload within 60 s of a change, or on SIGHUP"]
+test = ["server/tests/anonymous_with_config_test.rs::users_in_the_config_with_allow_anonymous_is_refused"]
+
+[[setting]]
+id = "root-credentials"
+flags = []
+env = ["AWANFS_ACCESS_KEY", "AWANFS_SECRET_KEY"]
+default = "none: the server refuses to start without credentials, users in --config, or --allow-anonymous"
+feature = "sigv4-auth"
+what = "the root account's key pair"
+derives = ["--profile production refuses a published or short secret key"]
+test = ["server/tests/auth_test.rs::the_binary_refuses_to_start_without_credentials_or_the_anonymous_switch"]
+
+[[setting]]
+id = "allow-anonymous"
+flags = ["--allow-anonymous"]
+env = ["AWANFS_ALLOW_ANONYMOUS"]
+default = "off"
+feature = "anonymous-and-presigned"
+what = "accept unsigned requests"
+derives = ["refused together with users in --config", "--profile production refuses it"]
+test = ["server/tests/anonymous_with_config_test.rs::users_in_the_config_with_allow_anonymous_is_refused"]
+
+[[setting]]
+id = "memory-budget"
+flags = ["--memory-budget"]
+env = ["AWANFS_MEMORY_BUDGET"]
+default = "a quarter of RAM, between 128 MiB and 2 GiB"
+feature = "memory-budget"
+what = "memory for the payload cache and in-flight request bodies together"
+derives = ["payload cache size (half)", "in-flight body budget (half)", "spill index cache"]
+test = ["server/tests/memory_budget_test.rs::the_flag_sets_the_budget_the_cache_and_the_metrics", "server/tests/memory_budget_test.rs::the_environment_sets_it_and_the_flag_wins_over_the_environment"]
+
+[[setting]]
+id = "allocator"
+flags = []
+env = ["MALLOC_MMAP_THRESHOLD_"]
+default = "unset: the server fixes glibc's mmap threshold at 128 KiB (Linux, glibc)"
+feature = "memory-budget"
+what = "glibc's own variable; when set, the server leaves the threshold as it says"
+test = ["server/tests/memory_budget_test.rs::the_startup_line_says_what_was_done_to_the_allocator"]
+internal = "a glibc variable, documented by glibc; the startup line names what the server did"
+
+[[setting]]
+id = "lifecycle-day-seconds"
+flags = ["--lifecycle-day-seconds"]
+env = []
+default = "86400"
+feature = "lifecycle"
+what = "seconds in a lifecycle day (test use only; the server warns when it is set)"
+derives = ["lifecycle sweep period: 1/24 of a day, 500 ms to 1 h (#486)", "age at which stale multipart uploads are aborted: 7 days"]
+test = ["server/tests/lifecycle_conformance_test.rs::lifecycle_filters_date_disabled_header_and_tags"]
+
+[[setting]]
+id = "body-idle-timeout"
+flags = ["--body-idle-timeout"]
+env = []
+default = "20s"
+feature = "objects"
+what = "longest wait for the next frame of a request body before 408 RequestTimeout"
+test = ["server/tests/body_timeout_test.rs::stalled_buffered_put_returns_408_and_releases_key"]
+
+[[setting]]
+id = "region"
+flags = ["--region"]
+env = ["AWANFS_REGION"]
+default = "us-east-1"
+feature = "buckets"
+what = "the region GetBucketLocation answers and CreateBucket's LocationConstraint must match"
+test = ["server/tests/s3_details_test.rs::get_bucket_location_and_create_bucket_constraint"]
+
+[[setting]]
+id = "profile"
+flags = ["--profile"]
+env = ["AWANFS_PROFILE"]
+default = "default"
+feature = "server"
+what = "production refuses to start with anonymous access, no TLS, plain HTTP next to TLS, a published or short secret key, or --durability fast"
+test = ["server/tests/profile_test.rs::production_refuses_anonymous_access_and_names_why", "server/tests/profile_test.rs::an_unknown_profile_stops_the_binary"]
+
+[[setting]]
+id = "verify-payloads-at-boot"
+flags = ["--verify-payloads-at-boot"]
+env = ["AWANFS_VERIFY_PAYLOADS_AT_BOOT"]
+default = "off: only payloads the journal does not record are checked"
+feature = "restart"
+what = "check every stored payload's CRC at startup"
+test = ["server/tests/boot_verify_all_flag_test.rs::the_switch_checks_every_payload_even_when_all_are_journaled"]
+
+[[setting]]
+id = "allow-small-parts"
+flags = ["--allow-small-parts"]
+env = []
+default = "off: non-final multipart parts must be at least 5 MiB"
+feature = "multipart"
+what = "accept smaller non-final parts (benchmarks)"
+test = ["server/tests/multipart_conformance_test.rs::cli_default_rejects_small_parts_and_flag_allows_them"]
+
+[[setting]]
+id = "worker-threads"
+flags = ["--worker-threads"]
+env = ["AWANFS_WORKER_THREADS"]
+default = "the cores the process may run on (Windows: its affinity mask; Linux: available_parallelism)"
+feature = "server"
+what = "tokio worker threads"
+test = ["server/tests/worker_threads_test.rs::the_flag_and_the_environment_set_the_count", "server/tests/worker_threads_test.rs::a_server_started_on_two_cores_runs_two_workers"]
+
+[[setting]]
+id = "per-bucket-metrics"
+flags = ["--per-bucket-metrics"]
+env = ["AWANFS_PER_BUCKET_METRICS"]
+default = "off: awanfs_bucket_* gauges stop above 1000 buckets"
+feature = "metrics"
+what = "always emit the per-bucket gauges"
+test = ["server/tests/commit_events_and_usage_test.rs::prometheus_bucket_metrics_respect_cardinality_cap_and_flag"]
+
+[[setting]]
+id = "help"
+flags = ["--help", "-h"]
+env = []
+default = "-"
+feature = "server"
+what = "print the options and exit"
+test = ["server/tests/multipart_conformance_test.rs::cli_help_documents_allow_small_parts"]
+
+[[setting]]
+id = "direct-io"
+flags = []
+env = ["AWAN_DIRECT_IO"]
+default = "off"
+feature = "volume-format"
+what = "1 forces O_DIRECT / FILE_FLAG_NO_BUFFERING on volume files"
+untested = "no test sets it; volume tests run with buffered files"
+internal = "a measurement switch, not an operator setting"
+
+[[setting]]
+id = "sparse-volume"
+flags = []
+env = ["AWAN_SPARSE_VOLUME"]
+default = "off: volumes grow in steps"
+feature = "volume-format"
+what = "1 maps each new volume at its full span as a sparse file"
+test = ["server/tests/auto_compaction_test.rs::a_lone_volume_is_sealed_and_compacted_only_above_the_minimum_size"]
+internal = "a measurement switch, not an operator setting"
+
+[[setting]]
+id = "volume-growth-step"
+flags = []
+env = ["AWAN_VOLUME_GROWTH_STEP"]
+default = "256 MiB"
+feature = "volume-format"
+what = "how far a growing volume file is extended at a time"
+test = ["server/tests/stepped_growth_test.rs::reading_each_object_right_after_its_write_remaps_once_per_extension"]
+internal = "a measurement switch, not an operator setting"
+
+[[setting]]
+id = "read-chunk"
+flags = []
+env = ["AWAN_READ_CHUNK"]
+default = "1 MiB"
+feature = "ranges"
+what = "size of one positioned read and one response frame of a streamed GET"
+test = ["server/tests/stream_read_test.rs::no_payload_byte_is_read_before_the_body_is_polled"]
+internal = "a measurement switch, not an operator setting"
+
+[[setting]]
+id = "read-ahead"
+flags = []
+env = ["AWAN_READ_AHEAD"]
+default = "1 (1 to 8)"
+feature = "ranges"
+what = "reads a streamed GET keeps in flight"
+test = ["server/tests/stream_read_budget_test.rs::sixty_four_concurrent_256_mib_gets_hold_bounded_buffers_and_verify_work"]
+internal = "a measurement switch, not an operator setting"
+
+[[setting]]
+id = "direct-read-min"
+flags = []
+env = ["AWAN_DIRECT_READ_MIN"]
+default = "never: GETs read through the mapping"
+feature = "ranges"
+what = "objects at least this size are read with positioned reads, not the mapping"
+test = ["server/tests/stream_read_test.rs::a_full_get_and_ranges_of_a_large_object_do_not_use_the_mapping"]
+internal = "a measurement switch, not an operator setting"
+
+[[setting]]
+id = "sim-trace"
+flags = []
+env = ["AWAN_SIM_TRACE"]
+default = "off"
+feature = "volume-format"
+what = "1 prints the storage simulation's steps (server/src/sim_harness.rs, tests only)"
+test = ["server/tests/sim_storage_test.rs::seeded_storage_simulation_matches_model_and_covers_all_fault_points"]
+internal = "test harness output, not a server setting"
