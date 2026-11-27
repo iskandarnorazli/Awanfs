@@ -1126,7 +1126,6 @@ fuzz = ["sigv4"]
 id = "copy"
 name = "CopyObject (same-bucket, cross-bucket, and versioned copy)"
 status = "done"
-gaps = { fuzz = "#445" }
 issue = "#152"
 area = "copy"
 design_section = "4"
@@ -1163,6 +1162,7 @@ server_tests = [
   "server/tests/test_boto3_compat.py::test_04_copy_object",
 ]
 drive = ["copy"]
+fuzz = ["copy_source"]
 
 [[feature]]
 id = "versioning"

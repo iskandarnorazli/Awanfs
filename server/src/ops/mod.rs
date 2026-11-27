@@ -852,6 +852,34 @@ fn authenticate_form(state: &S3ServiceState, mut c: Classified) -> Result<Authen
     Ok(Authenticated { classified: c, principal, iam })
 }
 
+/// Parsed `x-amz-copy-source` header components (`bucket`, `key`, optional `versionId`) (#152, #445).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCopySource {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Option<String>,
+}
+
+/// Parses an `x-amz-copy-source` header value into bucket, key, and optional `versionId`.
+pub fn parse_copy_source(raw: &str) -> Option<ParsedCopySource> {
+    let (copy_path, copy_query) = raw.split_once('?').unwrap_or((raw, ""));
+    let version_id = copy_query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("versionId="))
+        .map(percent_decode_path);
+    let decoded = percent_decode_path(copy_path);
+    let trimmed = decoded.trim_start_matches('/');
+    let (bucket, key) = trimmed.split_once('/')?;
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some(ParsedCopySource {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        version_id,
+    })
+}
+
 fn lookup_object_owner(
     state: &S3ServiceState,
     b_id: u32,
@@ -943,59 +971,45 @@ pub fn resolve_bucket(state: &S3ServiceState, a: Authenticated) -> Result<Resolv
         a.classified.op,
         Operation::CopyObject | Operation::UploadPartCopy
     ) {
-        if let Some(raw) = a
+        if let Some(src) = a
             .classified
             .parts
             .headers
             .get("x-amz-copy-source")
             .and_then(|v| v.to_str().ok())
+            .and_then(parse_copy_source)
         {
-            let (copy_path, copy_query) = raw.split_once('?').unwrap_or((raw, ""));
-            let src_vid = copy_query
-                .split('&')
-                .find_map(|kv| kv.strip_prefix("versionId="))
-                .map(percent_decode_path);
-            let decoded = percent_decode_path(copy_path);
-            let trimmed = decoded.trim_start_matches('/');
-            if let Some((src_bucket, src_key)) = trimmed.split_once('/') {
-                if !src_bucket.is_empty() && !src_key.is_empty() {
-                    let src_b_id = match state.engine.read().lookup_bucket(src_bucket) {
-                        Ok(id) => id,
-                        Err(_) => {
-                            let xml = s3_error_xml(
-                                "NoSuchBucket",
-                                "Source bucket does not exist",
-                                src_bucket,
-                                "req-cp",
-                            );
-                            return Err(Response::builder()
-                                .status(StatusCode::NOT_FOUND)
-                                .header(CONTENT_TYPE, "application/xml")
-                                .body(full_body(Bytes::from(xml)))
-                                .unwrap());
-                        }
-                    };
-                    let src_cfg = state.bucket_config_reader.load_bucket(src_b_id);
-                    let src_ownership = src_cfg
-                        .as_ref()
-                        .map_or(DEFAULT_BUCKET_OWNERSHIP, |c| c.ownership());
-                    let src_obj_owner = if src_ownership != BucketOwnership::BucketOwnerEnforced {
-                        lookup_object_owner(state, src_b_id, src_key, src_vid.as_deref())
-                    } else {
-                        None
-                    };
-                    Some(CopySourceResolved {
-                        bucket: src_bucket.to_string(),
-                        key: src_key.to_string(),
-                        bucket_cfg: src_cfg,
-                        object_owner: src_obj_owner,
-                    })
-                } else {
-                    None
+            let src_b_id = match state.engine.read().lookup_bucket(&src.bucket) {
+                Ok(id) => id,
+                Err(_) => {
+                    let xml = s3_error_xml(
+                        "NoSuchBucket",
+                        "Source bucket does not exist",
+                        &src.bucket,
+                        "req-cp",
+                    );
+                    return Err(Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .header(CONTENT_TYPE, "application/xml")
+                        .body(full_body(Bytes::from(xml)))
+                        .unwrap());
                 }
+            };
+            let src_cfg = state.bucket_config_reader.load_bucket(src_b_id);
+            let src_ownership = src_cfg
+                .as_ref()
+                .map_or(DEFAULT_BUCKET_OWNERSHIP, |c| c.ownership());
+            let src_obj_owner = if src_ownership != BucketOwnership::BucketOwnerEnforced {
+                lookup_object_owner(state, src_b_id, &src.key, src.version_id.as_deref())
             } else {
                 None
-            }
+            };
+            Some(CopySourceResolved {
+                bucket: src.bucket,
+                key: src.key,
+                bucket_cfg: src_cfg,
+                object_owner: src_obj_owner,
+            })
         } else {
             None
         }

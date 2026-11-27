@@ -1075,7 +1075,7 @@ pub async fn abort_multipart_upload(
     }
 }
 
-fn parse_copy_source_range(raw: &str) -> Result<(u64, u64), ()> {
+pub fn parse_copy_source_range(raw: &str) -> Result<(u64, u64), ()> {
     let rest = raw.trim().strip_prefix("bytes=").ok_or(())?;
     if rest.contains(',') {
         return Err(());
