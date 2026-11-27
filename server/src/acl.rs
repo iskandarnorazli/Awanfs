@@ -93,13 +93,16 @@ impl CannedAcl {
             },
             permission: AclPermission::FullControl,
         };
-        let mut grants = vec![self_grant];
+        let mut grants = Vec::new();
         match self {
-            CannedAcl::Private => {}
-            CannedAcl::PublicRead => grants.push(StoredAclGrant {
-                grantee: StoredGrantee::AllUsers,
-                permission: AclPermission::Read,
-            }),
+            CannedAcl::Private => grants.push(self_grant),
+            CannedAcl::PublicRead => {
+                grants.push(StoredAclGrant {
+                    grantee: StoredGrantee::AllUsers,
+                    permission: AclPermission::Read,
+                });
+                grants.push(self_grant);
+            }
             CannedAcl::PublicReadWrite => {
                 grants.push(StoredAclGrant {
                     grantee: StoredGrantee::AllUsers,
@@ -109,12 +112,17 @@ impl CannedAcl {
                     grantee: StoredGrantee::AllUsers,
                     permission: AclPermission::Write,
                 });
+                grants.push(self_grant);
             }
-            CannedAcl::AuthenticatedRead => grants.push(StoredAclGrant {
-                grantee: StoredGrantee::AuthenticatedUsers,
-                permission: AclPermission::Read,
-            }),
+            CannedAcl::AuthenticatedRead => {
+                grants.push(StoredAclGrant {
+                    grantee: StoredGrantee::AuthenticatedUsers,
+                    permission: AclPermission::Read,
+                });
+                grants.push(self_grant);
+            }
             CannedAcl::BucketOwnerRead => {
+                grants.push(self_grant);
                 if let Some(bo) = bucket_owner {
                     if bo.id != owner.id {
                         grants.push(StoredAclGrant {
@@ -128,6 +136,7 @@ impl CannedAcl {
                 }
             }
             CannedAcl::BucketOwnerFullControl => {
+                grants.push(self_grant);
                 if let Some(bo) = bucket_owner {
                     if bo.id != owner.id {
                         grants.push(StoredAclGrant {
@@ -447,7 +456,16 @@ pub fn render_acl_xml(acp: &AccessControlPolicy) -> String {
     );
     out.push_str(&format!("<ID>{}</ID>\n    ", xml_escape(&acp.owner.id)));
     out.push_str(&format!("<DisplayName>{}</DisplayName>\n  </Owner>\n  <AccessControlList>\n", xml_escape(&acp.owner.display_name)));
-    for g in &acp.grants {
+    let ordered_grants = acp
+        .grants
+        .iter()
+        .filter(|g| !matches!(g.grantee, StoredGrantee::CanonicalUser { .. }))
+        .chain(
+            acp.grants
+                .iter()
+                .filter(|g| matches!(g.grantee, StoredGrantee::CanonicalUser { .. })),
+        );
+    for g in ordered_grants {
         let perm = match g.permission {
             AclPermission::Read => "READ",
             AclPermission::Write => "WRITE",

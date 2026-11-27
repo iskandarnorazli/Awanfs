@@ -21,6 +21,7 @@ AWANFS_LOG="${AWANFS_LOG:-off}" \
     --data-dir "$DATA_DIR" \
     --auto-compaction off \
     --region us-east-1 \
+    --default-bucket-ownership ObjectWriter \
     </dev/null >"$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
 

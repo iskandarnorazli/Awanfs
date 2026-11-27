@@ -1599,6 +1599,7 @@ pub fn authorize(state: &S3ServiceState, r: Resolved) -> Result<Authorized, Resp
         &ctx,
     );
     record_authz_reason(decision.reason().as_str());
+    let mut bypassed_allow_anonymous = false;
     if matches!(decision, Decision::Deny { .. }) {
         // S3 returns 404 NoSuchKey for GetObject/HeadObject on a missing object whenever the caller
         // has `s3:ListBucket` permission matching `s3:prefix = key` (`test_head_object_404_with_policy_prefix`
@@ -1650,12 +1651,21 @@ pub fn authorize(state: &S3ServiceState, r: Resolved) -> Result<Authorized, Resp
                 .is_allowed()
             };
         if !allow_missing_404 {
-            let defer_to_delete_keys = c.op == Operation::DeleteObjects
-                && matches!(decision, Decision::Deny { reason: crate::authz::Reason::DefaultDeny, .. })
-                && (r.bucket_cfg.as_deref().is_some_and(|cfg| cfg.bucket_policy().is_some())
-                    || matches!((&r.auth.principal, r.auth.iam.as_deref(), c.bucket.as_deref()), (Principal::User { name, .. }, Some(iam), Some(b)) if iam.evaluate_user(name, "s3:DeleteObject", &format!("arn:aws:s3:::{}/*", b)) == PolicyMatch::Allow));
-            if !defer_to_delete_keys {
-                return Err(access_denied_response(c.parts.uri.path()));
+            let allow_anon_fallback = matches!(decision, Decision::Deny { reason: crate::authz::Reason::DefaultDeny, .. })
+                && state.auth.allow_anonymous
+                && matches!(r.auth.principal, Principal::Anonymous)
+                && r.auth.iam.as_deref().is_none_or(|i| i.is_empty())
+                && !bucket_target.as_ref().is_some_and(|b| b.public_access_block.restrict_public_buckets);
+            if allow_anon_fallback {
+                record_authz_reason("allow-anonymous");
+                bypassed_allow_anonymous = true;
+            } else {
+                let defer_to_delete_keys = c.op == Operation::DeleteObjects
+                    && matches!(decision, Decision::Deny { reason: crate::authz::Reason::DefaultDeny, .. })
+                    && r.bucket_cfg.as_deref().is_some_and(|cfg| cfg.bucket_policy().is_some());
+                if !defer_to_delete_keys {
+                    return Err(access_denied_response(c.parts.uri.path()));
+                }
             }
         }
     }
@@ -1741,7 +1751,7 @@ pub fn authorize(state: &S3ServiceState, r: Resolved) -> Result<Authorized, Resp
         }
     }
 
-    let bypass_governance = if wants_bypass {
+    let bypass_governance = if wants_bypass && !bypassed_allow_anonymous {
         let bypass_res_arn = match (c.bucket.as_deref(), c.key.as_deref()) {
             (Some(b), Some(k)) => format!("arn:aws:s3:::{}/{}", b, k),
             (Some(b), None) => format!("arn:aws:s3:::{}", b),
@@ -1887,7 +1897,15 @@ fn authorize_key_action(
             identity_policy: id_pol,
             _marker: PhantomData,
         };
-        crate::authz::authorize(principal, Operation::DeleteObject, Some(&b_target), None, &ctx).is_allowed()
+        let dec = crate::authz::authorize(principal, Operation::DeleteObject, Some(&b_target), None, &ctx);
+        if dec.is_allowed() {
+            return true;
+        }
+        matches!(dec, Decision::Deny { reason: crate::authz::Reason::DefaultDeny, .. })
+            && state.auth.allow_anonymous
+            && matches!(principal, Principal::Anonymous)
+            && iam.is_none_or(|i| i.is_empty())
+            && !b_target.public_access_block.restrict_public_buckets
     }
 }
 

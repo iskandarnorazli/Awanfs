@@ -194,7 +194,7 @@ fn call_list_buckets(query_map: &HashMap<String, String>) -> (StatusCode, String
     let rt = list_buckets_runtime();
     let state = Arc::clone(list_buckets_state());
     rt.block_on(async move {
-        let resp = list_buckets(state, query_map, None)
+        let resp = list_buckets(state, query_map, None, false, None)
             .await
             .expect("list_buckets never returns hyper::Error");
         let status = resp.status();

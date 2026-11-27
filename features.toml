@@ -479,7 +479,7 @@ ceph = [
   "test_s3::test_cors_presigned_put_object_tenant_with_acl",
 ]
 mint = [
-  "minio-go: testCors::SetBucketCors(bucketName, cors)",
+  "re:^minio-go: testCors(_|::)",
   "minio-go: testCorsSetGetDelete::SetBucketCors(bucketName, cors)",
   "minio-java::deleteBucketCors()",
   "minio-java::getBucketCors()",
@@ -717,7 +717,7 @@ ceph = [
   "test_s3::test_head_object_404_with_policy_prefix",
 ]
 mint = [
-  "minio-go: testFunctional::GetBucketPolicy(ctx, bucketName)",
+  "re:^minio-go: testFunctional::",
   "minio-java::deleteBucketPolicy()",
   "minio-java::getBucketPolicy()",
   "minio-java::setBucketPolicy()",
