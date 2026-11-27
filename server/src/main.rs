@@ -62,14 +62,39 @@ Options:
                                    not record (or AWANFS_VERIFY_PAYLOADS_AT_BOOT=1); use it for the first start
                                    after upgrading from a build before #412, and after disk trouble
       --allow-small-parts          Allow multipart non-final parts under 5 MiB (off by default; for benchmarks)
+      --worker-threads <n>         Tokio worker threads (or AWANFS_WORKER_THREADS); default: the cores the
+                                   process may run on (its affinity)
       --per-bucket-metrics         Always emit awanfs_bucket_* Prometheus gauges even above 1000 buckets (or AWANFS_PER_BUCKET_METRICS=1)
   -h, --help                       Print this help message and exit"
     );
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let allocator = fix_mmap_threshold();
+    // The runtime is built here, not by #[tokio::main], so its worker count can follow the
+    // process affinity on Windows and --worker-threads (#456).
+    let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let (workers, source) = match s3_server::workers::pick_worker_threads(
+        s3_server::workers::worker_threads_flag(std::env::args().skip(1)).as_deref(),
+        std::env::var("AWANFS_WORKER_THREADS").ok().as_deref(),
+        s3_server::workers::affinity_cores(),
+        available,
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(workers).enable_all().build()?;
+    runtime.block_on(serve(allocator, workers, source))
+}
+
+async fn serve(
+    allocator: &'static str,
+    workers: usize,
+    worker_source: &'static str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut port: u16 = std::env::var("S3_PORT")
         .or_else(|_| std::env::var("AWAN_S3_PORT"))
         .ok()
@@ -184,6 +209,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             allow_small_parts = true;
         } else if arg == "--per-bucket-metrics" {
             per_bucket_metrics = true;
+        } else if arg == "--worker-threads" {
+            // Read before the runtime starts (#456).
+            args.next();
         } else if arg == "--verify-payloads-at-boot" {
             verify_payloads_at_boot = true;
         } else if arg == "--data-dir" || arg == "-d" {
@@ -218,6 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         mib(budget.bodies)
     );
     println!("Allocator: {}", allocator);
+    println!("Worker threads: {} ({})", workers, worker_source);
 
     let auth = AuthConfig::from_env(allow_anonymous);
     // Users and policies (#53): --config <file> or AWANFS_CONFIG.
