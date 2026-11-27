@@ -4,7 +4,6 @@
 use http_body_util::BodyExt;
 use hyper::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use hyper::{Method, StatusCode};
-use s3_server::ops::{classify, ClassifyRefusal, Operation, OPS};
 use s3_server::bucket_config::{
     base64_decode as bucket_base64_decode, base64_encode as bucket_base64_encode,
 };
@@ -12,8 +11,10 @@ use s3_server::checksum::{base64_decode, requested_checksum, ChecksumAlgorithm};
 use s3_server::manifest::{Live, Manifest, ReplayFrom, MAX_LIVE_SEGMENTS};
 use s3_server::meta_index::ObjectMeta;
 use s3_server::ops::bucket::{decode_hex_token, encode_hex_token, parse_list_objects_query};
+use s3_server::ops::multipart::parse_copy_source_range;
 use s3_server::ops::object::{parse_object_attributes_headers, ObjectAttributesQuery};
 use s3_server::ops::service::list_buckets;
+use s3_server::ops::{classify, parse_copy_source, ClassifyRefusal, Operation, OPS};
 use s3_server::segment::{decode_row, encode_segment, parse_block, sort_key, Entry, SegEntry, BLOCK};
 use s3_server::segment_set::MAX_LEVEL;
 use s3_server::{
@@ -955,10 +956,98 @@ pub fn check_meta_segment(data: &[u8]) {
     assert_eq!(Manifest::decode(&enc), None);
 }
 
+fn pct_encode(s: &str, keep_slash: bool) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'_' | b'.' | b'~')
+            || (keep_slash && b == b'/')
+        {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0F) as usize] as char);
+        }
+    }
+    out
+}
+
+fn expected_copy_source_range(raw: &str) -> Result<(u64, u64), ()> {
+    let rest = raw.trim().strip_prefix("bytes=").ok_or(())?;
+    if rest.contains(',') {
+        return Err(());
+    }
+    let (s_str, e_str) = rest.split_once('-').ok_or(())?;
+    if s_str.is_empty()
+        || e_str.is_empty()
+        || !s_str.bytes().all(|b| b.is_ascii_digit())
+        || !e_str.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(());
+    }
+    let start: u64 = s_str.parse().map_err(|_| ())?;
+    let end: u64 = e_str.parse().map_err(|_| ())?;
+    if start > end {
+        return Err(());
+    }
+    Ok((start, end))
+}
+
+/// Oracle for `copy_source` (#152, #445):
+/// - `parse_copy_source` and `parse_copy_source_range` never panic on arbitrary bytes.
+/// - Any parsed `ParsedCopySource` re-encoded (percent-encoding the key, keeping `/`) parses back identically.
+/// - Empty bucket or key inputs are always refused (`None`).
+/// - `parse_copy_source_range` accepts `bytes=first-last` iff both sides are ASCII decimal digits with `first <= last`.
+pub fn check_copy_source(data: &[u8]) {
+    let text = String::from_utf8_lossy(data);
+    if let Some(parsed) = parse_copy_source(&text) {
+        assert!(!parsed.bucket.is_empty());
+        assert!(!parsed.key.is_empty());
+        assert!(!parsed.bucket.contains('/'));
+        let mut reencoded = format!(
+            "{}/{}",
+            pct_encode(&parsed.bucket, false),
+            pct_encode(&parsed.key, true)
+        );
+        if let Some(ref vid) = parsed.version_id {
+            reencoded.push_str("?versionId=");
+            reencoded.push_str(&pct_encode(vid, false));
+        }
+        assert_eq!(
+            parse_copy_source(&reencoded),
+            Some(parsed),
+            "copy source round-trip mismatch for {:?} -> {:?}",
+            text,
+            reencoded
+        );
+    }
+
+    for empty in ["", "/b", "/b/", "b/", "/", "///k"] {
+        assert_eq!(parse_copy_source(empty), None, "must refuse {:?}", empty);
+    }
+
+    let range_got = parse_copy_source_range(&text);
+    let range_want = expected_copy_source_range(&text);
+    assert_eq!(
+        range_got, range_want,
+        "parse_copy_source_range mismatch for {:?}",
+        text
+    );
+    if let Ok((first, last)) = range_got {
+        assert!(first <= last);
+        assert_eq!(
+            parse_copy_source_range(&format!("bytes={}-{}", first, last)),
+            Ok((first, last))
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        check_checksum_headers, check_classify, check_list_buckets_query,
+        check_checksum_headers, check_classify, check_copy_source, check_list_buckets_query,
         check_list_objects_query, check_meta_segment, check_object_attributes_header,
         check_raw_s3_key, crc32c_sw,
     };
@@ -1199,6 +1288,37 @@ mod tests {
         for path in entries {
             let bytes = std::fs::read(&path).expect("read corpus seed");
             check_meta_segment(&bytes);
+        }
+    }
+
+    #[test]
+    fn copy_source_round_trip_and_corpus_seeds() {
+        for sample in [
+            b"/b/k".as_slice(),
+            b"b/k?versionId=null".as_slice(),
+            b"b/%2F%2F".as_slice(),
+            b"b/k?versionId=".as_slice(),
+            b"/b".as_slice(),
+            b"bytes=0-0".as_slice(),
+            b"bytes=5-4".as_slice(),
+            b"bytes=-1".as_slice(),
+            b"bytes=0-18446744073709551616".as_slice(),
+            b"bytes=+0-5".as_slice(),
+            b"b/k%3Ffoo?versionId=v%261".as_slice(),
+        ] {
+            check_copy_source(sample);
+        }
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/copy_source");
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read copy_source corpus dir")
+            .map(|e| e.expect("corpus dir entry").path())
+            .collect();
+        entries.sort();
+        assert!(entries.len() >= 9, "expected at least 9 seeds, got {}", entries.len());
+        for path in entries {
+            let bytes = std::fs::read(&path).expect("read corpus seed");
+            check_copy_source(&bytes);
         }
     }
 }

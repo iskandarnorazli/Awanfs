@@ -165,3 +165,9 @@ name = "meta_segment"
 path = "fuzz_targets/meta_segment.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "copy_source"
+path = "fuzz_targets/copy_source.rs"
+test = false
+doc = false
