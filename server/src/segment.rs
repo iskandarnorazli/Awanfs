@@ -85,7 +85,7 @@ fn encode_row(m: &ObjectMeta, out: &mut Vec<u8>) {
     }
 }
 
-fn decode_row(b: &[u8]) -> ObjectMeta {
+pub fn decode_row(b: &[u8]) -> ObjectMeta {
     let u = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
     ObjectMeta {
         key_hash: u(0),
@@ -443,7 +443,7 @@ fn corrupt(what: impl Into<String>) -> SegmentError {
 }
 
 /// The entries of data block `i`, after its CRC check.
-fn parse_block(b: &[u8], i: u64) -> Result<Vec<SegEntry>, SegmentError> {
+pub fn parse_block(b: &[u8], i: u64) -> Result<Vec<SegEntry>, SegmentError> {
     if crc32c::crc32c(&b[..BLOCK_PAYLOAD]) != u32::from_le_bytes(b[BLOCK_PAYLOAD..BLOCK].try_into().unwrap()) {
         return Err(corrupt(format!("data block {} CRC", i)));
     }

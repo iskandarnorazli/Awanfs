@@ -9,9 +9,13 @@ use s3_server::bucket_config::{
     base64_decode as bucket_base64_decode, base64_encode as bucket_base64_encode,
 };
 use s3_server::checksum::{base64_decode, requested_checksum, ChecksumAlgorithm};
+use s3_server::manifest::{Live, Manifest, ReplayFrom, MAX_LIVE_SEGMENTS};
+use s3_server::meta_index::ObjectMeta;
 use s3_server::ops::bucket::{decode_hex_token, encode_hex_token, parse_list_objects_query};
 use s3_server::ops::object::{parse_object_attributes_headers, ObjectAttributesQuery};
 use s3_server::ops::service::list_buckets;
+use s3_server::segment::{decode_row, encode_segment, parse_block, sort_key, Entry, SegEntry, BLOCK};
+use s3_server::segment_set::MAX_LEVEL;
 use s3_server::{
     base64_encode, parse_s3_target, percent_decode, percent_decode_path_bytes, raw_s3_key,
     ParsedTarget, S3ServiceState,
@@ -821,12 +825,145 @@ pub fn check_object_attributes_header(data: &[u8]) {
     ));
 }
 
+fn crc32c_sw(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0x82F6_3B78 & mask);
+        }
+    }
+    !crc
+}
+
+fn assert_parse_block_contract(block: &[u8]) {
+    assert_eq!(block.len(), BLOCK);
+    let expected_crc = crc32c_sw(&block[..BLOCK - 4]);
+    let stored_crc = u32::from_le_bytes(block[BLOCK - 4..BLOCK].try_into().unwrap());
+    let crc_ok = expected_crc == stored_crc;
+    let count = u16::from_le_bytes([block[0], block[1]]);
+    let res = parse_block(block, 0);
+    if !crc_ok {
+        assert!(res.is_err(), "parse_block must reject bad CRC");
+    } else if count == 0 {
+        assert!(res.is_err(), "parse_block must reject empty block (count=0)");
+    } else if let Ok(entries) = res {
+        assert!(!entries.is_empty());
+        assert_eq!(entries.len(), count as usize);
+    }
+}
+
+/// Oracle for `meta_segment` (#26, #449):
+/// - `parse_block`, `decode_row`, and `Manifest::decode` never panic on arbitrary bytes.
+/// - Bad CRC or empty block is rejected by `parse_block`; damaged manifests return `None`.
+/// - Segments and manifests written by `encode_segment` and `Manifest::encode` round-trip identically.
+pub fn check_meta_segment(data: &[u8]) {
+    if let Some(m) = Manifest::decode(data) {
+        assert!(m.segments.len() <= MAX_LIVE_SEGMENTS);
+        assert!(m.segments.iter().all(|l| l.level <= MAX_LEVEL));
+        assert!(!m.segments.windows(2).any(|w| w[0].seq >= w[1].seq));
+        let reencoded = m.encode().expect("decoded manifest must re-encode");
+        assert_eq!(Manifest::decode(&reencoded), Some(m));
+    }
+
+    if data.len() >= 64 {
+        let row = decode_row(&data[..64]);
+        assert_eq!(row.key_slice, 0);
+    }
+
+    if data.len() == BLOCK {
+        assert_parse_block_contract(data);
+    }
+    let mut padded = [0u8; BLOCK];
+    let ncopy = data.len().min(BLOCK);
+    padded[..ncopy].copy_from_slice(&data[..ncopy]);
+    assert_parse_block_contract(&padded);
+
+    // Round-trip encoded segment data block and verify single-bit CRC corruption fails.
+    let byte = |i: usize| data.get(i).copied().unwrap_or(0);
+    let u64_from = |start: usize| {
+        let mut b = [0u8; 8];
+        for (idx, slot) in b.iter_mut().enumerate() {
+            *slot = byte(start + idx);
+        }
+        u64::from_le_bytes(b)
+    };
+    let k1 = sort_key(1, &[b'a', byte(0)]);
+    let mut k2 = sort_key(1, &[b'b', byte(1)]);
+    if k2 <= k1 {
+        k2.push(0);
+    }
+    let meta = ObjectMeta {
+        key_hash: u64_from(0),
+        bucket_flags: u64_from(8),
+        vol_offset: u64_from(16),
+        size: u64_from(24),
+        etag_hi: u64_from(32),
+        etag_lo: u64_from(40),
+        created_at: u64_from(48),
+        key_slice: 0,
+    };
+    let entries = vec![
+        SegEntry {
+            key: k1,
+            entry: Entry::Row(meta),
+        },
+        SegEntry {
+            key: k2,
+            entry: Entry::Tombstone,
+        },
+    ];
+    let mut seg = encode_segment(u64_from(0).max(1), u64_from(8), &entries)
+        .expect("encode_segment round-trip");
+    let block1 = &seg[BLOCK..2 * BLOCK];
+    assert_eq!(
+        parse_block(block1, 0).expect("encoded block must parse back"),
+        entries
+    );
+    seg[2 * BLOCK - 1] ^= 1;
+    assert!(
+        parse_block(&seg[BLOCK..2 * BLOCK], 0).is_err(),
+        "corrupted CRC must fail parse_block"
+    );
+
+    // Round-trip encoded manifest and verify CRC corruption & truncation return None.
+    let n_seg = (byte(2) % 4) as usize;
+    let mut seq = u64_from(4).max(1);
+    let mut segs = Vec::with_capacity(n_seg);
+    for idx in 0..n_seg {
+        segs.push(Live {
+            seq,
+            level: byte(3 + idx) % (MAX_LEVEL + 1),
+        });
+        seq = seq.saturating_add(1 + (byte(7 + idx) as u64));
+    }
+    let manifest = Manifest {
+        generation: u64_from(12),
+        replay_from: ReplayFrom {
+            volume_id: u32::from(byte(13)),
+            offset: u64_from(14),
+        },
+        next_seq: seq,
+        segments: segs,
+    };
+    let mut enc = manifest.encode().expect("manifest encode");
+    assert_eq!(Manifest::decode(&enc), Some(manifest));
+    let trunc_len = enc.len() - 1;
+    assert_eq!(Manifest::decode(&enc[..trunc_len]), None);
+    enc[trunc_len] ^= 1;
+    assert_eq!(Manifest::decode(&enc), None);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         check_checksum_headers, check_classify, check_list_buckets_query,
-        check_list_objects_query, check_object_attributes_header, check_raw_s3_key,
+        check_list_objects_query, check_meta_segment, check_object_attributes_header,
+        check_raw_s3_key, crc32c_sw,
     };
+    use s3_server::manifest::Manifest;
+    use s3_server::segment::{parse_block, BLOCK};
 
     #[test]
     fn checksum_headers_canonical_vectors_and_invalid_inputs() {
@@ -1017,6 +1154,45 @@ mod tests {
         for path in entries {
             let bytes = std::fs::read(&path).expect("read corpus seed");
             check_object_attributes_header(&bytes);
+        }
+    }
+
+    #[test]
+    fn meta_segment_round_trip_and_corpus_seeds() {
+        for sample in [b"".as_slice(), b"bad", &[0u8; 64], &[0u8; BLOCK]] {
+            check_meta_segment(sample);
+        }
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/meta_segment");
+        let empty = std::fs::read(format!("{}/empty_block", dir)).expect("empty_block");
+        assert_eq!(empty.len(), BLOCK);
+        assert_eq!(
+            crc32c_sw(&empty[..BLOCK - 4]),
+            u32::from_le_bytes(empty[BLOCK - 4..BLOCK].try_into().unwrap())
+        );
+        assert!(parse_block(&empty, 0).is_err());
+
+        let valid_block = std::fs::read(format!("{}/valid_block", dir)).expect("valid_block");
+        assert!(parse_block(&valid_block, 0).is_ok());
+
+        let flipped = std::fs::read(format!("{}/flipped_crc_block", dir)).expect("flipped_crc_block");
+        assert!(parse_block(&flipped, 0).is_err());
+
+        let valid_manifest = std::fs::read(format!("{}/valid_manifest", dir)).expect("valid_manifest");
+        assert!(Manifest::decode(&valid_manifest).is_some());
+
+        let truncated_manifest = std::fs::read(format!("{}/truncated_manifest", dir)).expect("truncated_manifest");
+        assert!(Manifest::decode(&truncated_manifest).is_none());
+
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read meta_segment corpus dir")
+            .map(|e| e.expect("corpus dir entry").path())
+            .collect();
+        entries.sort();
+        assert!(entries.len() >= 5, "expected at least 5 seeds, got {}", entries.len());
+        for path in entries {
+            let bytes = std::fs::read(&path).expect("read corpus seed");
+            check_meta_segment(&bytes);
         }
     }
 }
