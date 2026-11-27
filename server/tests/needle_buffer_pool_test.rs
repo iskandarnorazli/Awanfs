@@ -21,12 +21,13 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 }
 
 #[test]
-fn twenty_one_mib_writes_allocate_one_needle_buffer() {
+fn twenty_writes_of_about_one_mib_allocate_one_needle_buffer() {
     let dir = temp_dir("reuse");
     let vm = VolumeManager::open(&dir, 1).unwrap();
     let before = vm.needle_buffer_allocs();
+    // Every size here needs a buffer of the same 64 KiB step (just under 1 MiB).
     for i in 0..20u8 {
-        let payload = pattern(1024 * 1024 - usize::from(i) * 100, i);
+        let payload = pattern(1_000_000 - usize::from(i) * 100, i);
         let loc = vm.write_needle_with_attrs(1, &format!("k{}", i), &[], &payload, AWAN_FLAG_ACTIVE, 1, 2, None).unwrap();
         assert_eq!(&vm.read_needle_bytes_verified(1, loc.offset).unwrap()[..], &payload[..]);
     }
@@ -38,9 +39,10 @@ fn twenty_one_mib_writes_allocate_one_needle_buffer() {
 fn a_reused_buffer_writes_zeros_after_a_shorter_needle() {
     let dir = temp_dir("padding");
     let vm = VolumeManager::open(&dir, 1).unwrap();
-    let long = vec![0xAAu8; 1024 * 1024];
+    // Both needles fit one buffer size (the 64 KiB step just under 1 MiB).
+    let long = vec![0xAAu8; 1_040_000];
     vm.write_needle_with_attrs(1, "long", &[], &long, AWAN_FLAG_ACTIVE, 1, 2, None).unwrap();
-    let short = pattern(1024 * 1024 - 3000, 7);
+    let short = pattern(1_000_000, 7);
     let loc = vm.write_needle_with_attrs(1, "short", &[], &short, AWAN_FLAG_ACTIVE, 1, 2, None).unwrap();
     vm.sync_now().unwrap();
     assert_eq!(vm.needle_buffer_allocs(), 1, "the second write reused the first one's buffer");
