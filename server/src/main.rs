@@ -183,7 +183,6 @@ async fn serve(
             if let Some(v) = args.next().and_then(|s| s.parse::<u64>().ok()).filter(|&n| n > 0) {
                 lifecycle_day_seconds = v;
             }
-            memory_budget = args.next();
         } else if arg == "--body-idle-timeout" {
             let Some(v) = args.next() else {
                 eprintln!("--body-idle-timeout requires a value such as 20s");
