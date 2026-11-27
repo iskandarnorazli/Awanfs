@@ -1379,7 +1379,7 @@ class _InheritedAffinity:
 
 
 def _spawn_pinned(argv: List[str], n_cores: int, log_path: str, env: Optional[dict] = None) -> subprocess.Popen:
-    cmd = pinning_command(argv, n_cores)
+    cmd = pinning_command(argv, n_cores, sys.platform)
     use_taskset = sys.platform.startswith("linux") and cmd[0] == "taskset" and shutil.which("taskset") is not None
     launch_argv = cmd if use_taskset else argv
     cores = list(range(n_cores))
