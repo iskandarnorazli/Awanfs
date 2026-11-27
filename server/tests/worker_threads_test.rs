@@ -39,17 +39,25 @@ fn command(name: &str, extra: &[&str], env: &[(&str, &str)]) -> Command {
     cmd
 }
 
-/// The `Worker threads: ...` line the server prints, or `None` if its stdout ended first.
+/// The `Worker threads: ...` line the server prints, or `None` if its stdout ended first or no
+/// such line came within 30 s (a running server never closes its stdout, so the read is on a
+/// thread and the server is killed when this returns).
 fn worker_line(mut cmd: Command) -> Option<String> {
     let mut child = Server(cmd.spawn().expect("spawn s3-server"));
     let out = child.0.stdout.take().unwrap();
-    for line in BufReader::new(out).lines() {
-        let line = line.ok()?;
-        if line.starts_with("Worker threads:") {
-            return Some(line);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            if line.starts_with("Worker threads:") {
+                let _ = tx.send(line);
+                return;
+            }
         }
-    }
-    None
+    });
+    let found = rx.recv_timeout(std::time::Duration::from_secs(30)).ok();
+    drop(child);
+    found
 }
 
 #[test]
