@@ -605,6 +605,7 @@ def format_markdown_report(
     duration_sec: float,
     durability_notes: Sequence[str],
     pin_labels: Optional[Tuple[str, str]] = None,
+    mc_version: Optional[str] = None,
 ) -> str:
     lines = [
         f"Command: `{cmd}`",
@@ -617,6 +618,8 @@ def format_markdown_report(
         f"- **Schedule:** {runs} round(s), {duration_sec:.1f}s per phase, alternating server order across rounds (medians reported)",
         f"- **Data directory:** `{hw_info.get('data_dir', tempfile.gettempdir())}`",
     ]
+    if mc_version:
+        lines.append(f"- **mc:** {mc_version}")
     if pin_labels:
         lines.append(f"- **Core pinning:** server `{pin_labels[0]}`, client `{pin_labels[1]}`")
     for note in durability_notes:
@@ -778,6 +781,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         has_rustfs = True
         targets.append(("RustFS", lambda: _start_rustfs(rustfs_bin, mc_bin, data_root, srv_mask)))
 
+    mc_version: Optional[str] = None
+    if (has_minio or has_rustfs) and mc_bin:
+        mc_version = rwb.binary_version(mc_bin)
+        print(f"mc version: {mc_version}", flush=True)
+
     rounds_by_target: Dict[str, List[Dict[str, SmallPutMetrics]]] = {label: [] for label, _ in targets}
     for r_idx in range(a.runs):
         shift = r_idx % len(targets)
@@ -824,6 +832,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         duration_sec=duration_sec,
         durability_notes=_durability_notes(durabilities, has_minio, has_rustfs),
         pin_labels=pin_labels,
+        mc_version=mc_version,
     )
     print(report)
     if a.output:
@@ -841,6 +850,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "hw_info": hw_info,
             "runs": a.runs,
             "duration_sec": duration_sec,
+            **({"mc_version": mc_version} if mc_version else {}),
             "results": {
                 label: {
                     k: {

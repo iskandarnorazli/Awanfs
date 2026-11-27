@@ -57,6 +57,7 @@ jobs:
     timeout-minutes: 30
     env:
       MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+      MC_RELEASE: RELEASE.2025-08-13T08-35-41Z
     steps:
       - uses: actions/cache@v4
         id: tools
@@ -64,7 +65,7 @@ jobs:
           path: |
             .tmp/minio
             .tmp/warp
-          key: selfhosted-tools-Windows-${{ env.MINIO_RELEASE }}-warp-v1
+          key: selfhosted-tools-Windows-${{ env.MINIO_RELEASE }}-mc-${{ env.MC_RELEASE }}-warp-v1
       - uses: actions/setup-go@v5
         if: steps.tools.outputs.cache-hit != 'true'
         with:
@@ -77,10 +78,13 @@ jobs:
           mkdir -p .tmp/minio .tmp/warp
           git clone -q --depth 1 --branch "$MINIO_RELEASE" https://github.com/minio/minio "$RUNNER_TEMP/minio-src"
           (cd "$RUNNER_TEMP/minio-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/minio.exe" .)
-          git clone -q --depth 1 https://github.com/minio/mc "$RUNNER_TEMP/mc-src"
-          (cd "$RUNNER_TEMP/mc-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/mc.exe" .)
+          git clone -q --depth 1 --branch "$MC_RELEASE" https://github.com/minio/mc "$RUNNER_TEMP/mc-src"
+          (cd "$RUNNER_TEMP/mc-src" && commit=$(git rev-parse HEAD) && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/minio/mc/cmd.Version=${MC_RELEASE} -X github.com/minio/mc/cmd.ReleaseTag=${MC_RELEASE} -X github.com/minio/mc/cmd.CommitID=${commit} -X github.com/minio/mc/cmd.ShortCommitID=${commit:0:12}" -o "$GITHUB_WORKSPACE/.tmp/minio/mc.exe" .)
           git clone -q --depth 1 https://github.com/minio/warp "$RUNNER_TEMP/warp-src"
           (cd "$RUNNER_TEMP/warp-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/warp/warp.exe" .)
+      - name: Tool versions
+        shell: bash
+        run: .tmp/minio/minio.exe --version | head -1 && .tmp/minio/mc.exe --version | head -1
       - uses: actions/upload-artifact@v4
         with:
           name: minio-windows

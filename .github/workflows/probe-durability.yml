@@ -16,6 +16,7 @@ permissions:
 
 env:
   MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+  MC_RELEASE: RELEASE.2025-08-13T08-35-41Z
   RUSTFS_TAG: 1.0.5
 
 jobs:
@@ -40,7 +41,7 @@ jobs:
           path: |
             .tmp/minio
             .tmp/rustfs
-          key: bench-tools-${{ runner.os }}-${{ env.MINIO_RELEASE }}-rustfs-${{ env.RUSTFS_TAG }}-v1
+          key: bench-tools-${{ runner.os }}-${{ env.MINIO_RELEASE }}-mc-${{ env.MC_RELEASE }}-rustfs-${{ env.RUSTFS_TAG }}-v1
       - name: Fetch pinned MinIO and mc binaries if missing
         id: fetch-minio
         run: |
@@ -69,8 +70,8 @@ jobs:
             (cd "$RUNNER_TEMP/minio-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/minio" .)
           fi
           if [ ! -x .tmp/minio/mc ]; then
-            git clone -q --depth 1 https://github.com/minio/mc "$RUNNER_TEMP/mc-src"
-            (cd "$RUNNER_TEMP/mc-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/mc" .)
+            git clone -q --depth 1 --branch "$MC_RELEASE" https://github.com/minio/mc "$RUNNER_TEMP/mc-src"
+            (cd "$RUNNER_TEMP/mc-src" && commit=$(git rev-parse HEAD) && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/minio/mc/cmd.Version=${MC_RELEASE} -X github.com/minio/mc/cmd.ReleaseTag=${MC_RELEASE} -X github.com/minio/mc/cmd.CommitID=${commit} -X github.com/minio/mc/cmd.ShortCommitID=${commit:0:12}" -o "$GITHUB_WORKSPACE/.tmp/minio/mc" .)
           fi
       - name: Download RustFS release if missing
         env:
