@@ -300,7 +300,7 @@ fn etag_str_matches(s: &str, target_etag: &str, strong: bool) -> bool {
     false
 }
 
-fn etag_matches(headers: &HeaderMap, name: &str, target_etag: &str, strong: bool) -> bool {
+pub fn etag_matches(headers: &HeaderMap, name: &str, target_etag: &str, strong: bool) -> bool {
     for val in headers.get_all(name) {
         let Ok(s) = val.to_str() else {
             continue;

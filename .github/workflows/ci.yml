@@ -138,7 +138,7 @@ jobs:
           }
           trap cleanup EXIT
           AWANFS_ACCESS_KEY=warpkey AWANFS_SECRET_KEY=warps3secret \
-            ./server/target/release/s3-server --port "$PORT" --data-dir "$DATA" >"$LOG" 2>&1 &
+            ./server/target/release/awanfs --port "$PORT" --data-dir "$DATA" >"$LOG" 2>&1 &
           PID=$!
           for _ in $(seq 1 100); do
             if curl -s -o /dev/null "http://127.0.0.1:$PORT/"; then break; fi

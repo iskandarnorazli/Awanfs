@@ -76,7 +76,7 @@ async fn the_binary_stops_cleanly_on_sigterm() {
     let dir = temp_dir("sigterm");
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let start = || {
-        Command::new(env!("CARGO_BIN_EXE_s3-server"))
+        Command::new(env!("CARGO_BIN_EXE_awanfs"))
             .args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous", "--durability", "fast"])
             .env("AWANFS_LOG", "off")
             .stdout(Stdio::null())

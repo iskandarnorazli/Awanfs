@@ -15,6 +15,10 @@ use s3_server::ops::multipart::parse_copy_source_range;
 use s3_server::ops::object::{parse_object_attributes_headers, ObjectAttributesQuery};
 use s3_server::ops::service::list_buckets;
 use s3_server::ops::{classify, parse_copy_source, ClassifyRefusal, Operation, OPS};
+use s3_server::precondition::{
+    etag_matches, format_http_date, parse_http_date, parse_http_date_or_iso, precondition,
+    ObjectFacts, PreconditionOutcome,
+};
 use s3_server::segment::{decode_row, encode_segment, parse_block, sort_key, Entry, SegEntry, BLOCK};
 use s3_server::segment_set::MAX_LEVEL;
 use s3_server::{
@@ -1044,12 +1048,113 @@ pub fn check_copy_source(data: &[u8]) {
     }
 }
 
+/// Oracle for `precondition_headers` (#181, #446):
+/// - `parse_http_date`, `parse_http_date_or_iso`, and `etag_matches` never panic on arbitrary bytes.
+/// - `parse_http_date` accepts everything `format_http_date` produces by round-trip (`parse(format(t)) == Some(t)`).
+/// - `etag_matches` matches a target ETag appearing quoted anywhere in a comma-separated list, and `*` for existing objects.
+pub fn check_precondition_headers(data: &[u8]) {
+    let text = String::from_utf8_lossy(data);
+    if let Some(secs) = parse_http_date(&text) {
+        let formatted = format_http_date(secs);
+        assert_eq!(
+            parse_http_date(&formatted),
+            Some(secs),
+            "parse_http_date round-trip failed for {:?} -> {:?}",
+            text,
+            formatted
+        );
+    }
+    let _ = parse_http_date_or_iso(&text);
+
+    let mut ts_bytes = [0u8; 8];
+    for (i, &b) in data.iter().take(8).enumerate() {
+        ts_bytes[i] = b;
+    }
+    let derived_ts = u64::from_le_bytes(ts_bytes);
+    for ts in [derived_ts, 0u64, u64::MAX] {
+        let formatted = format_http_date(ts);
+        assert_eq!(parse_http_date(&formatted), Some(ts));
+        assert_eq!(parse_http_date_or_iso(&formatted), Some(ts));
+    }
+
+    if let Ok(hv) = HeaderValue::from_bytes(data) {
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("if-match", hv.clone());
+        hdrs.insert("if-none-match", hv.clone());
+        let _ = etag_matches(&hdrs, "if-match", "\"abc\"", true);
+        let _ = etag_matches(&hdrs, "if-none-match", "\"abc\"", false);
+
+        if let Ok(hv_str) = hv.to_str() {
+            for item in hv_str.split(',') {
+                let trimmed = item.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.starts_with("W/")
+                    && !trimmed.starts_with("w/")
+                    && trimmed != "*"
+                {
+                    let unquoted = trimmed.trim_matches('"');
+                    if !unquoted.is_empty() && unquoted.trim() == unquoted && !unquoted.contains('"')
+                    {
+                        assert!(
+                            etag_matches(&hdrs, "if-match", unquoted, true),
+                            "expected unquoted {:?} to match list {:?}",
+                            unquoted,
+                            hv_str
+                        );
+                        assert!(
+                            etag_matches(&hdrs, "if-match", &format!("\"{}\"", unquoted), true),
+                            "expected quoted {:?} to match list {:?}",
+                            unquoted,
+                            hv_str
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let tok = if data.is_empty() {
+        "abc123".to_string()
+    } else {
+        data.iter()
+            .take(4)
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    };
+    let quoted = format!("\"{}\"", tok);
+    let facts = ObjectFacts {
+        etag: quoted.clone(),
+        last_modified_secs: 1_794_268_800,
+    };
+    for list in [
+        format!("\"other\", {}", quoted),
+        format!("{}, \"other\"", quoted),
+        format!("\"x\", \"y\", {}, \"z\"", quoted),
+        "*".to_string(),
+    ] {
+        let hv = HeaderValue::from_str(&list).unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("if-match", hv.clone());
+        h.insert("if-none-match", hv);
+        assert!(etag_matches(&h, "if-match", &quoted, true));
+        assert!(etag_matches(&h, "if-none-match", &quoted, false));
+    }
+
+    let mut star = HeaderMap::new();
+    star.insert("if-match", HeaderValue::from_static("*"));
+    assert_eq!(precondition(&star, Some(&facts), false), PreconditionOutcome::Proceed);
+    assert_eq!(
+        precondition(&star, None, false),
+        PreconditionOutcome::PreconditionFailed
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         check_checksum_headers, check_classify, check_copy_source, check_list_buckets_query,
         check_list_objects_query, check_meta_segment, check_object_attributes_header,
-        check_raw_s3_key, crc32c_sw,
+        check_precondition_headers, check_raw_s3_key, crc32c_sw,
     };
     use s3_server::manifest::Manifest;
     use s3_server::segment::{parse_block, BLOCK};
@@ -1319,6 +1424,35 @@ mod tests {
         for path in entries {
             let bytes = std::fs::read(&path).expect("read corpus seed");
             check_copy_source(&bytes);
+        }
+    }
+
+    #[test]
+    fn precondition_headers_round_trip_and_corpus_seeds() {
+        for sample in [
+            b"*".as_slice(),
+            b"\"a\", \"b\"".as_slice(),
+            b"W/\"a\"".as_slice(),
+            b"\"a\",,\"b\"".as_slice(),
+            b"Sun, 06 Nov 1994 08:49:37 GMT".as_slice(),
+            b"Sunday, 06-Nov-94 08:49:37 GMT".as_slice(),
+            b"Feb 30 2026".as_slice(),
+            b"\"a\", \"b\", \"c\"".as_slice(),
+            &[195, 42],
+        ] {
+            check_precondition_headers(sample);
+        }
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/precondition_headers");
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read precondition_headers corpus dir")
+            .map(|e| e.expect("corpus dir entry").path())
+            .collect();
+        entries.sort();
+        assert!(entries.len() >= 8, "expected at least 8 seeds, got {}", entries.len());
+        for path in entries {
+            let bytes = std::fs::read(&path).expect("read corpus seed");
+            check_precondition_headers(&bytes);
         }
     }
 }

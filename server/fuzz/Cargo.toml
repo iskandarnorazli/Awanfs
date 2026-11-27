@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-s3-server = { path = ".." }
+s3_server = { package = "awanfs", path = ".." }
 hyper = "1"
 http-body-util = "0.1"
 tokio = { version = "1", features = ["rt"] }
@@ -169,5 +169,17 @@ doc = false
 [[bin]]
 name = "copy_source"
 path = "fuzz_targets/copy_source.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "precondition_headers"
+path = "fuzz_targets/precondition_headers.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sim_storage"
+path = "fuzz_targets/sim_storage.rs"
 test = false
 doc = false

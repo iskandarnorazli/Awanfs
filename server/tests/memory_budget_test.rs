@@ -30,7 +30,7 @@ impl Drop for Server {
 /// answers, plus everything it wrote to stdout by then.
 fn start(dir: &Path, extra: &[&str], env: &[(&str, &str)]) -> (Server, String, String) {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-server"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_awanfs"));
     cmd.args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous"])
         .args(extra)
         .stdout(Stdio::piped())
@@ -38,7 +38,7 @@ fn start(dir: &Path, extra: &[&str], env: &[(&str, &str)]) -> (Server, String, S
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().expect("spawn s3-server");
+    let mut child = cmd.spawn().expect("spawn awanfs");
     let mut out = child.stdout.take().expect("piped stdout");
     let url = format!("http://127.0.0.1:{}", port);
     let server = Server(child);
@@ -71,7 +71,7 @@ fn start(dir: &Path, extra: &[&str], env: &[(&str, &str)]) -> (Server, String, S
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("s3-server did not answer on {}. stdout so far:\n{}", url, text);
+    panic!("awanfs did not answer on {}. stdout so far:\n{}", url, text);
 }
 
 /// A GET with the standard library, so this test needs no async runtime.
@@ -163,13 +163,13 @@ fn a_budget_that_cannot_work_stops_the_server_with_a_message() {
     let dir = temp_dir("bad");
     for bad in ["plenty", "4MiB", "0"] {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_s3-server"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_awanfs"))
             .args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous"])
             .args(["--memory-budget", bad])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn s3-server");
+            .expect("spawn awanfs");
         // It must exit on its own. Waiting forever here would hang CI, so poll and kill.
         let deadline = Instant::now() + Duration::from_secs(20);
         let status = loop {

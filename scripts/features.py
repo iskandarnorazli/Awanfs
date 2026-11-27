@@ -559,6 +559,91 @@ def _check_suite_coverage(
     return problems
 
 
+FLAG_RE = re.compile(r'arg == "(-{1,2}[A-Za-z0-9-]+)"')
+ENV_RE = re.compile(r'env::var(?:_os)?\(\s*"([A-Z0-9_]+)"\s*\)')
+SERVER_WIDE = "server"
+
+
+def server_flags(root: Path) -> Set[str]:
+    """Flags `server/src/main.rs` compares its arguments with (#494)."""
+    main = root / "server" / "src" / "main.rs"
+    return set(FLAG_RE.findall(main.read_text(encoding="utf-8"))) if main.is_file() else set()
+
+
+def server_env_vars(root: Path) -> Set[str]:
+    """Environment variables read with `std::env::var` or `var_os` in `server/src` (#494)."""
+    found: Set[str] = set()
+    src = root / "server" / "src"
+    if src.is_dir():
+        for path in sorted(src.rglob("*.rs")):
+            found.update(ENV_RE.findall(path.read_text(encoding="utf-8")))
+    return found
+
+
+def check_settings(root: Path, settings: List[dict], feats: List[dict]) -> List[str]:
+    """Every flag and environment variable the server reads has one `[[setting]]`, each entry
+    names only what the server reads, a feature id (or "server"), a README mention or an
+    `internal` reason, and existing tests or an `untested` reason (#494)."""
+    problems: List[str] = []
+    flags, env_vars = server_flags(root), server_env_vars(root)
+    if not flags and not env_vars:
+        return problems
+    feature_ids = {f.get("id") for f in feats}
+    readme = root / "README.md"
+    readme_text = readme.read_text(encoding="utf-8") if readme.is_file() else ""
+    fns_cache: Dict[Path, Dict[str, List[str]]] = {}
+    owner: Dict[str, str] = {}
+    for st in settings:
+        sid = st.get("id")
+        if not isinstance(sid, str) or not sid:
+            problems.append(f"setting without an id: {st!r}")
+            continue
+        names = list(st.get("flags", [])) + list(st.get("env", []))
+        if not names:
+            problems.append(f"setting {sid}: names no flag and no environment variable")
+        for key in ("default", "what", "feature"):
+            if not isinstance(st.get(key), str) or not st.get(key):
+                problems.append(f"setting {sid}: missing {key}")
+        for name in names:
+            if name in owner:
+                problems.append(f"setting {sid}: {name} is also in setting {owner[name]}")
+            owner[name] = sid
+            if name not in (flags if name.startswith("-") else env_vars):
+                problems.append(f"setting {sid}: {name} is not read by the server (server/src)")
+        feat = st.get("feature")
+        if isinstance(feat, str) and feat and feat != SERVER_WIDE and feat not in feature_ids:
+            problems.append(f"setting {sid}: feature {feat!r} is not a feature id or {SERVER_WIDE!r}")
+        if not st.get("internal"):
+            has_long = any(n.startswith("--") for n in names)
+            for name in names:
+                if has_long and name.startswith("-") and not name.startswith("--"):
+                    continue  # a short alias of a documented long flag
+                if not re.search(r"(?<![A-Za-z0-9_-])" + re.escape(name) + r"(?![A-Za-z0-9_-])", readme_text):
+                    problems.append(f"setting {sid}: {name} is not in README.md and has no internal reason")
+        tests = st.get("test", [])
+        if not tests and not st.get("untested"):
+            problems.append(f"setting {sid}: no test and no untested reason")
+        for t in tests:
+            path_s, _, fn = t.partition("::")
+            path = root / path_s
+            if not path.is_file():
+                problems.append(f"setting {sid}: test file {path_s} does not exist")
+                continue
+            fns = fns_cache.setdefault(path, test_fns(path))
+            if fn not in fns:
+                problems.append(f"setting {sid}: no test fn {fn} in {path_s}")
+    for name in sorted(flags | env_vars):
+        if name not in owner:
+            problems.append(f"{name}: read by the server but has no [[setting]] in features.toml")
+    return problems
+
+
+def load_settings(path: Path) -> List[dict]:
+    with open(path, "rb") as fh:
+        data = tomllib.load(fh)
+    return data.get("setting", [])
+
+
 def check_registry(
     root: Path = DEFAULT_ROOT,
     registry_path: Optional[Path] = None,
@@ -625,6 +710,7 @@ def check_registry(
         problems.extend(_check_suite_coverage("ceph", feats, "ceph", ceph_tests, verify_ceph_literals))
 
     problems.extend(_check_coverage(root, feats))
+    problems.extend(check_settings(root, load_settings(reg_path), feats))
 
     passing_now = set(parse_passing_file(passing_path, default_prefix="test_s3::")) if passing_path.is_file() else set()
     problems.extend(_check_ported(root, feats, ceph_tests, passing_now))
@@ -850,8 +936,32 @@ def build_report(
     else:
         lines.append("- None.")
 
+    lines += settings_md_lines(load_settings(reg_path))
     lines.append("")
     return "\n".join(lines)
+
+
+def settings_md_lines(settings: List[dict]) -> List[str]:
+    """The Settings table of FEATURES.md (#494)."""
+    def cell(v: object) -> str:
+        return str(v).replace("|", "/").replace("\n", " ")
+
+    def codes(items: Sequence[str]) -> str:
+        return ", ".join(f"`{i}`" for i in items) or "-"
+
+    out = ["", "## Settings", ""]
+    out.append("Every flag and environment variable the server reads (`[[setting]]` in `features.toml`, checked by `features.py check`, #494). `derives` is what else a setting sets.")
+    out.append("")
+    out += ["| setting | flags | environment | default | feature | derives | doc | test |", "|---|---|---|---|---|---|---|---|"]
+    for st in settings:
+        doc = f"internal: {cell(st['internal'])}" if st.get("internal") else "README.md"
+        tests = "<br>".join(f"`{t}`" for t in st.get("test", [])) or f"untested: {cell(st.get('untested', ''))}"
+        derives = "; ".join(cell(d) for d in st.get("derives", [])) or "-"
+        out.append(
+            f"| {st['id']} | {codes(st.get('flags', []))} | {codes(st.get('env', []))} | {cell(st.get('default', ''))} | "
+            f"{st.get('feature', '')} | {derives} | {doc} | {tests} |"
+        )
+    return out
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

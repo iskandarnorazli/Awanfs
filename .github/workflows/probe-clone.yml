@@ -1,0 +1,130 @@
+name: Compaction clone probe
+
+# #104 (owner decision 2026-11-27): measures whether FICLONERANGE on XFS (-m reflink=1)
+# makes compacting the 50% live extents of a 32 GiB sparse source file at least 2x faster
+# or cheaper in bytes written than read+write across small, large, and mixed extents.
+
+on:
+  workflow_dispatch:
+    inputs:
+      total_bytes:
+        description: "Source logical size in bytes (default: 32 GiB)"
+        default: "34359738368"
+        required: false
+      runs:
+        description: "Number of runs per mix"
+        default: "3"
+        required: false
+      mixes:
+        description: "Comma-separated extent mixes (small,large,mixed)"
+        default: "small,large,mixed"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Clone probe (XFS FICLONERANGE)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      - name: Check disk space and pick XFS image directory (>= 50 GiB free)
+        id: disk
+        run: |
+          set -euo pipefail
+          df -h
+          avail_gib() { df -BG --output=avail "$1" | tail -1 | tr -dc '0-9'; }
+          target=""
+          for cand in /mnt "$RUNNER_TEMP"; do
+            if [ -d "$cand" ] && [ "$(avail_gib "$cand")" -ge 50 ]; then
+              target="$cand"
+              break
+            fi
+          done
+          if [ -z "$target" ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+            df -h
+            for cand in /mnt "$RUNNER_TEMP"; do
+              if [ -d "$cand" ] && [ "$(avail_gib "$cand")" -ge 50 ]; then
+                target="$cand"
+                break
+              fi
+            done
+          fi
+          if [ -z "$target" ]; then
+            echo "::error::Need at least 50 GiB free for 75 GiB sparse XFS loop probe"
+            exit 1
+          fi
+          echo "img_dir=$target" >> "$GITHUB_OUTPUT"
+          echo "Using img_dir=$target ($(avail_gib "$target") GiB free)"
+
+      - name: Install xfsprogs
+        run: sudo apt-get update && sudo apt-get install -y xfsprogs
+
+      - name: Test and build clone_probe (--release)
+        run: |
+          cargo test --locked --example clone_probe --manifest-path server/Cargo.toml
+          cargo build --locked --release --example clone_probe --manifest-path server/Cargo.toml
+
+      - name: Run XFS FICLONERANGE probe (75 GiB loop image, 32 GiB sparse source)
+        env:
+          IMG_DIR: ${{ steps.disk.outputs.img_dir }}
+        run: |
+          set -euo pipefail
+          IMG="$IMG_DIR/awanfs_xfs_probe.img"
+          MNT="$RUNNER_TEMP/xfs_probe_mnt"
+          LOOP=""
+          cleanup() {
+            set +e
+            if mountpoint -q "$MNT"; then
+              df -h "$MNT" || true
+              sudo umount "$MNT"
+            fi
+            if [ -n "$LOOP" ]; then
+              sudo losetup -d "$LOOP"
+            fi
+            sudo rm -f "$IMG"
+            rmdir "$MNT" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          sudo mkdir -p "$MNT"
+          sudo rm -f "$IMG"
+          sudo truncate -s 75G "$IMG"
+          sudo mkfs.xfs -m reflink=1 -f "$IMG"
+          LOOP=$(sudo losetup --find --show "$IMG")
+          sudo mount "$LOOP" "$MNT"
+          df -h "$MNT"
+          xfs_info "$MNT"
+
+          DEV_NAME=$(basename "$LOOP")
+          sudo ./server/target/release/examples/clone_probe \
+            --dir "$MNT" \
+            --total-bytes "${{ inputs.total_bytes || '34359738368' }}" \
+            --runs "${{ inputs.runs || '3' }}" \
+            --mixes "${{ inputs.mixes || 'small,large,mixed' }}" \
+            --drop-caches \
+            --block-stat "/sys/block/$DEV_NAME/stat" \
+            --output "$RUNNER_TEMP/clone_probe.md"
+
+      - name: Write job summary
+        if: always()
+        run: |
+          if [ -s "$RUNNER_TEMP/clone_probe.md" ]; then
+            cat "$RUNNER_TEMP/clone_probe.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "clone_probe produced no report." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: clone-probe
+          path: ${{ runner.temp }}/clone_probe.md
+          if-no-files-found: warn

@@ -1,4 +1,4 @@
-//! Gate of AwanFS #12: start the real `s3-server` binary, PUT 50 small and 5 large objects,
+//! Gate of AwanFS #12: start the real `awanfs` binary, PUT 50 small and 5 large objects,
 //! kill the process (no shutdown), start it again on the same data directory, and read every
 //! object back with its length and ETag.
 //!
@@ -25,12 +25,12 @@ fn free_port() -> u16 {
 
 async fn start(dir: &Path) -> (Child, String) {
     let port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_s3-server"))
+    let child = Command::new(env!("CARGO_BIN_EXE_awanfs"))
         .args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn s3-server");
+        .expect("spawn awanfs");
     let url = format!("http://127.0.0.1:{}", port);
     let c = reqwest::Client::new();
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -40,7 +40,7 @@ async fn start(dir: &Path) -> (Child, String) {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("s3-server did not start on port {}", port);
+    panic!("awanfs did not start on port {}", port);
 }
 
 fn pattern(len: usize, seed: u32) -> Vec<u8> {
@@ -63,7 +63,7 @@ async fn objects_survive_a_killed_server_process() {
         let etag = res.headers().get(ETAG).unwrap().to_str().unwrap().to_string();
         objects.push((key, data, etag));
     }
-    child.kill().expect("kill s3-server");
+    child.kill().expect("kill awanfs");
     child.wait().unwrap();
 
     let (mut child, url) = start(&dir).await;

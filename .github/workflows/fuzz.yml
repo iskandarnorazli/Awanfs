@@ -27,10 +27,16 @@ on:
       - "server/src/attrs.rs"
       - "server/src/form_upload.rs"
       - "server/src/post_object.rs"
+      - "server/src/precondition.rs"
       - "server/src/s3_api.rs"
       - "server/src/segment.rs"
+      - "server/src/sim.rs"
+      - "server/src/sim_gen.rs"
+      - "server/src/sim_harness.rs"
+      - "server/src/sim_model.rs"
       - "server/src/trace.rs"
       - "server/src/versions.rs"
+      - "server/src/volume.rs"
       - "server/src/memory.rs"
       - "server/fuzz/**"
       - ".github/workflows/fuzz.yml"
@@ -49,7 +55,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, attrs_values, form_upload, post_policy, cors_xml, object_lock_xml, request_xml, lifecycle_config_xml, tagging_xml, s3_target, iso8601, traceparent, version_id, parse_size, checksum_headers, list_buckets_query, raw_s3_key, classify, list_objects_query, object_attributes_header, meta_segment, copy_source ]
+        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, attrs_values, form_upload, post_policy, cors_xml, object_lock_xml, request_xml, lifecycle_config_xml, tagging_xml, s3_target, iso8601, traceparent, version_id, parse_size, checksum_headers, list_buckets_query, raw_s3_key, classify, list_objects_query, object_attributes_header, meta_segment, copy_source, precondition_headers, sim_storage ]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

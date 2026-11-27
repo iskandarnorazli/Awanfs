@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use crate::clock::{Clock, SystemClock};
 use bytes::Bytes;
@@ -85,6 +85,50 @@ impl From<io::Error> for VolumeError {
     fn from(err: io::Error) -> Self {
         VolumeError::Io(err)
     }
+}
+
+/// Needle flags that require volume format >= 2 (`FORMAT.md`).
+pub(crate) const FORMAT_2_FLAGS: u16 = crate::meta_index::FLAG_COMPRESSED
+    | crate::meta_index::FLAG_VERSIONED
+    | crate::meta_index::FLAG_NULL_ID
+    | crate::meta_index::FLAG_VERSION_DELETE;
+
+/// Oldest volume format that may hold a needle with `flags` and optional attributes block.
+pub(crate) fn needed_format_for_flags(flags: u16, has_attrs: bool) -> u32 {
+    if has_attrs || flags & (crate::meta_index::FLAG_ATTRS | crate::meta_index::FLAG_ATTR_UPDATE) != 0 {
+        3
+    } else if flags & FORMAT_2_FLAGS != 0 {
+        2
+    } else {
+        1
+    }
+}
+
+fn is_reflink_permanent_unsupported(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        #[allow(unreachable_patterns)]
+        if matches!(e.raw_os_error(), Some(libc::EOPNOTSUPP | libc::ENOTSUP | libc::EXDEV)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_reflink_per_call_fallback(e: &io::Error) -> bool {
+    if matches!(e.kind(), io::ErrorKind::StorageFull | io::ErrorKind::InvalidInput) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        if matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::EINVAL | libc::EBUSY)) {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,6 +484,8 @@ pub struct ScannedNeedle {
     /// Verified payload bytes for `FLAG_ATTR_UPDATE` needles, read directly from the
     /// streaming scan window without faulting the volume memory map at boot (#203).
     pub attr_update_payload: Option<Vec<u8>>,
+    /// Decoded 64-byte header from the needle sector (#524).
+    pub header: NeedleHeader,
 }
 
 /// 64-byte Header of a Needle on disk.
@@ -845,6 +891,9 @@ pub struct VolumeManager<Fs: VolFs = DiskFs> {
     /// Tests: the next journal append fails, after the needle is on disk (#184).
     fail_next_index: std::sync::atomic::AtomicBool,
     fail_next_sync: std::sync::atomic::AtomicBool,
+    /// Whether `VolFile::clone_range_from` (`ioctl(FICLONERANGE)`) may still work on this volume;
+    /// flipped to `false` on permanent `Unsupported`/`EOPNOTSUPP`/`ENOTSUP`/`EXDEV` (#524).
+    reflink_supported: AtomicBool,
     /// Journal records not yet written, numbered in the order their needles were written. A
     /// record is written only by a sync, after the volume sync that covers its needle (#412),
     /// so every record on disk names a needle whose bytes are on disk.
@@ -1076,6 +1125,7 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
             fail_next_index: std::sync::atomic::AtomicBool::new(false),
             fail_next_sync: std::sync::atomic::AtomicBool::new(false),
+            reflink_supported: AtomicBool::new(true),
             pending_journal: Mutex::new(Vec::new()),
             journal_pushed: AtomicU64::new(0),
             payload_verified_at_open,
@@ -1556,6 +1606,135 @@ impl<Fs: VolFs> VolumeManager<Fs> {
         }
     }
 
+    /// Relocates an intact needle at `src_offset` from `src` into this volume, using
+    /// copy-on-write cloning (`VolFile::clone_range_from`) when supported and falling back
+    /// automatically in-place at the same reserved offset on unsupported filesystems or
+    /// per-call errors without leaving gaps (#524).
+    ///
+    /// Tail sectors `[SECTOR_SIZE..total_len)` always land before sector 0 (header) so a crash
+    /// never leaves a valid header pointing at unwritten payload sectors. Returns `(loc, cloned)`.
+    pub fn copy_needle_from(
+        &self,
+        src: &VolumeManager<Fs>,
+        src_offset: u64,
+        hdr: &NeedleHeader,
+    ) -> Result<(NeedleLocation, bool), VolumeError> {
+        let total_len = hdr.total_len();
+        if hdr.magic != NEEDLE_MAGIC || total_len == 0 || total_len % SECTOR_SIZE as u64 != 0 {
+            return Err(VolumeError::CorruptIndex);
+        }
+        if needed_format_for_flags(hdr.flags, hdr.attrs_len > 0) > self.format {
+            return Err(VolumeError::VolumeFull {
+                offset: self.current_offset.load(Ordering::SeqCst),
+                len: total_len,
+            });
+        }
+
+        // Counted from before the reservation to the end of this function (#167).
+        let _in_flight = self.enter_write(total_len)?;
+        let offset = self.current_offset.fetch_add(total_len, Ordering::SeqCst);
+        if offset + total_len > self.max_span() {
+            return Err(VolumeError::VolumeFull { offset, len: total_len });
+        }
+
+        let cloned = if self.reflink_supported.load(Ordering::Relaxed) {
+            let clone_res = if total_len > SECTOR_SIZE as u64 {
+                self.file
+                    .clone_range_from(
+                        &src.file,
+                        src_offset + SECTOR_SIZE as u64,
+                        total_len - SECTOR_SIZE as u64,
+                        offset + SECTOR_SIZE as u64,
+                    )
+                    .and_then(|()| {
+                        self.file.clone_range_from(&src.file, src_offset, SECTOR_SIZE as u64, offset)
+                    })
+            } else {
+                self.file.clone_range_from(&src.file, src_offset, total_len, offset)
+            };
+            match clone_res {
+                Ok(()) => {
+                    self.allocated.fetch_max(offset + total_len, Ordering::SeqCst);
+                    true
+                }
+                Err(ref e) if is_reflink_permanent_unsupported(e) => {
+                    self.reflink_supported.store(false, Ordering::Relaxed);
+                    false
+                }
+                Err(ref e) if is_reflink_per_call_fallback(e) => false,
+                Err(e) => {
+                    self.gaps.lock().insert(offset, total_len);
+                    return Err(VolumeError::Io(e));
+                }
+            }
+        } else {
+            false
+        };
+
+        if !cloned {
+            if let Err(e) = self.copy_aligned_tail_then_header(src, src_offset, offset, total_len) {
+                self.gaps.lock().insert(offset, total_len);
+                return Err(e);
+            }
+            self.work.disk_write(total_len);
+        }
+
+        let journaled = self.append_index(
+            hdr.key_hash,
+            offset,
+            total_len,
+            hdr.payload_size,
+            hdr.flags,
+            hdr.payload_crc32c,
+        );
+        let seq = self.written_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let loc = NeedleLocation {
+            volume_id: self.volume_id,
+            offset,
+            total_len,
+            payload_size: hdr.payload_size,
+            payload_crc32c: hdr.payload_crc32c,
+            seq,
+        };
+        match journaled {
+            Ok(()) => Ok((loc, cloned)),
+            Err(e) => Err(VolumeError::AfterRecord { loc, flags: hdr.flags, cause: format!("{:?}", e) }),
+        }
+    }
+
+    fn copy_aligned_tail_then_header(
+        &self,
+        src: &VolumeManager<Fs>,
+        src_offset: u64,
+        dst_offset: u64,
+        total_len: u64,
+    ) -> Result<(), VolumeError> {
+        if self.fail_next_write.swap(false, Ordering::SeqCst) {
+            return Err(VolumeError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                "injected write failure",
+            )));
+        }
+        self.ensure_allocated(dst_offset + total_len)?;
+        let mut head = AlignedBuffer::new(SECTOR_SIZE);
+        src.read_aligned(src_offset, &mut head)?;
+        if total_len > SECTOR_SIZE as u64 {
+            const COPY_CHUNK: usize = 1024 * 1024;
+            let buf_len = ((total_len - SECTOR_SIZE as u64) as usize).min(COPY_CHUNK);
+            let mut chunk = AlignedBuffer::new(buf_len);
+            let mut pos = SECTOR_SIZE as u64;
+            while pos < total_len {
+                let len = ((total_len - pos) as usize).min(buf_len);
+                src.read_aligned(src_offset + pos, &mut chunk[..len])?;
+                self.file.write_aligned_at(dst_offset + pos, &chunk[..len])?;
+                pos += len as u64;
+            }
+        }
+        self.file.write_aligned_at(dst_offset, &head)?;
+        self.allocated.fetch_max(dst_offset + total_len, Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Starts a needle whose payload arrives in pieces (#36). The space is reserved now; the
     /// payload is written in `STREAM_CHUNK` pieces as it arrives, and the first sector, which
     /// holds the header with the payload CRC, is written last by `NeedleWriter::finish`.
@@ -1943,6 +2122,9 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 .or_else(|| self.open_gaps.get(&scan_offset).copied())
             {
                 if len > 0 {
+                    if len > SCAN_BATCH_BYTES as u64 {
+                        window.cap_next_refill(SKIP_REFILL_BYTES);
+                    }
                     scan_offset += len;
                     continue;
                 }
@@ -1954,6 +2136,9 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 Ok(h) => h,
                 Err(_) => match self.jump_gap_after(scan_offset) {
                     Some(next) => {
+                        if next.saturating_sub(scan_offset) > SCAN_BATCH_BYTES as u64 {
+                            window.cap_next_refill(SKIP_REFILL_BYTES);
+                        }
                         scan_offset = next;
                         continue;
                     }
@@ -1966,6 +2151,9 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             if scan_offset.checked_add(total_len).is_none_or(|end| end > file_len) {
                 match self.jump_gap_after(scan_offset) {
                     Some(next) => {
+                        if next.saturating_sub(scan_offset) > SCAN_BATCH_BYTES as u64 {
+                            window.cap_next_refill(SKIP_REFILL_BYTES);
+                        }
                         scan_offset = next;
                         continue;
                     }
@@ -2016,10 +2204,14 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 payload_crc32c: hdr.payload_crc32c,
                 created_at_ns: hdr.created_at_ns,
                 attr_update_payload,
+                header: hdr.clone(),
             }) {
                 return Ok(Err(e));
             }
 
+            if total_len > SCAN_BATCH_BYTES as u64 {
+                window.cap_next_refill(SKIP_REFILL_BYTES);
+            }
             scan_offset += total_len;
         }
 

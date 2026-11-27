@@ -1,6 +1,6 @@
 """Does a volume that grows cost anything once it is large? AwanFS only.
 
-    python benchmarks/large_volume_probe.py --server-bin server/target/release/s3-server --fill-gib 10
+    python benchmarks/large_volume_probe.py --server-bin server/target/release/awanfs --fill-gib 10
 
 A new volume grows as it is written and its read mapping is redone when a read reaches past
 it (decision 52); before, the first volume was a 32 GiB sparse file mapped once. The remap
@@ -33,8 +33,8 @@ SMALL = 64 * 1024
 # Every server at its defaults (owner, 2026-11-20); the sparse row was measured once (decision 52).
 CONFIGS = [("growing (default)", {})]
 TWO_LISTENERS = ("AwanFS", "MinIO")
-FOUR_LISTENERS = ("bare std", "bare tokio", "s3-server", "MinIO")
-FOUR_ONLY_LISTENERS = ("bare std", "bare tokio", "s3-server")
+FOUR_LISTENERS = ("bare std", "bare tokio", "awanfs", "MinIO")
+FOUR_ONLY_LISTENERS = ("bare std", "bare tokio", "awanfs")
 
 
 def volume_bytes(data_dir: str) -> int:
@@ -257,7 +257,7 @@ def run_connect_comparison(
         starters = [
             ("bare std", lambda: start_bare_listener(bare_bin, "std")),
             ("bare tokio", lambda: start_bare_listener(bare_bin, "tokio")),
-            ("s3-server", lambda: start_awanfs(server_bin)),
+            ("awanfs", lambda: start_awanfs(server_bin)),
         ]
         n_rounds = 3 if connect_rounds is None else connect_rounds
     else:
@@ -329,8 +329,8 @@ def summarize_connect(results) -> dict:
     if four_mode:
         summary["ratios"] = {
             "bare_tokio_vs_bare_std": _ratio_or_none(summary.get("bare tokio"), summary.get("bare std")),
-            "s3_server_vs_bare_tokio": _ratio_or_none(summary.get("s3-server"), summary.get("bare tokio")),
-            "s3_server_vs_minio": _ratio_or_none(summary.get("s3-server"), summary.get("MinIO")),
+            "s3_server_vs_bare_tokio": _ratio_or_none(summary.get("awanfs"), summary.get("bare tokio")),
+            "s3_server_vs_minio": _ratio_or_none(summary.get("awanfs"), summary.get("MinIO")),
         }
     else:
         summary["ratio"] = _ratio_or_none(summary.get("AwanFS"), summary.get("MinIO"))
@@ -351,7 +351,7 @@ def _render_four_listener_connect(results, rounds: int, cmd: str, summary: dict)
     lines = [
         f"Command: `{cmd}`",
         "",
-        f"# Loopback connect cost: bare std, bare tokio, s3-server, and MinIO ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
+        f"# Loopback connect cost: bare std, bare tokio, awanfs, and MinIO ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
         "",
         f"Machine: {platform.node()} ({platform.platform()}, {os.cpu_count()} CPUs). Data under {tempfile.gettempdir()}. "
         f"{rounds} fresh connections per round, {len(round_nums)} rounds in alternating order ({order_desc}).",
@@ -387,8 +387,8 @@ def _render_four_listener_connect(results, rounds: int, cmd: str, summary: dict)
     lines.append("")
     for key, label in (
         ("bare_tokio_vs_bare_std", "bare tokio / bare std connect P50 ratio"),
-        ("s3_server_vs_bare_tokio", "s3-server / bare tokio connect P50 ratio"),
-        ("s3_server_vs_minio", "s3-server / MinIO connect P50 ratio"),
+        ("s3_server_vs_bare_tokio", "awanfs / bare tokio connect P50 ratio"),
+        ("s3_server_vs_minio", "awanfs / MinIO connect P50 ratio"),
     ):
         val = ratios.get(key)
         lines.append(f"{label}: {val:.2f}x" if val is not None else f"{label}: not measured")
@@ -462,7 +462,7 @@ def parse_connect_summary(text: str) -> dict:
         "ratio": None,
         "bare std": None,
         "bare tokio": None,
-        "s3-server": None,
+        "awanfs": None,
         "ratios": {
             "bare_tokio_vs_bare_std": None,
             "s3_server_vs_bare_tokio": None,
@@ -472,8 +472,8 @@ def parse_connect_summary(text: str) -> dict:
     known = set(TWO_LISTENERS) | set(FOUR_LISTENERS)
     ratio_prefixes = {
         "bare tokio / bare std connect P50 ratio:": "bare_tokio_vs_bare_std",
-        "s3-server / bare tokio connect P50 ratio:": "s3_server_vs_bare_tokio",
-        "s3-server / MinIO connect P50 ratio:": "s3_server_vs_minio",
+        "awanfs / bare tokio connect P50 ratio:": "s3_server_vs_bare_tokio",
+        "awanfs / MinIO connect P50 ratio:": "s3_server_vs_minio",
     }
     for line in text.splitlines():
         s = line.strip()
