@@ -2247,7 +2247,7 @@ env = ["AWANFS_COMPACTION_RATE_MB"]
 default = "50 MB/s (0 = no limit)"
 feature = "compaction"
 what = "most bytes per second compaction copies"
-untested = "no test sets the rate; compaction tests run with the default"
+test = ["server/tests/compaction_settings_test.rs::compaction_defaults_are_auto_on_and_50_mb_per_sec", "server/tests/compaction_settings_test.rs::compaction_rate_flag_and_env_override_default"]
 
 [[setting]]
 id = "auto-compaction"
@@ -2256,7 +2256,7 @@ env = ["AWANFS_AUTO_COMPACTION"]
 default = "on"
 feature = "compaction"
 what = "background compaction every 10 minutes of volumes with at least 20% dead bytes and 1 GiB"
-untested = "no test starts the binary with --auto-compaction off; auto_compaction_test drives the policy directly"
+test = ["server/tests/compaction_settings_test.rs::compaction_defaults_are_auto_on_and_50_mb_per_sec", "server/tests/compaction_settings_test.rs::auto_compaction_flag_and_env_toggle_background_task"]
 
 [[setting]]
 id = "scrub-rate"
