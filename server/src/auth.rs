@@ -200,7 +200,11 @@ pub fn authenticate(
     headers: &HeaderMap,
     now_sec: u64,
 ) -> Result<(), &'static str> {
-    authenticate_with(cfg, None, cache, method, raw_path, raw_query, headers, now_sec).map(|_| ())
+    let p = authenticate_with(cfg, None, cache, method, raw_path, raw_query, headers, now_sec)?;
+    if matches!(p, Principal::Anonymous) && !cfg.allow_anonymous {
+        return Err("AccessDenied");
+    }
+    Ok(())
 }
 
 /// The secret for an access key, and who it belongs to: the root pair, or a config user.

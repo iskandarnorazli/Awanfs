@@ -339,4 +339,18 @@ fn non_utf8_authorization_and_partial_presigned_query_are_rejected() {
         authenticate(&cfg, &SigV4KeyCache::new(), "GET", "/b/k", "X-Amz-Signature=00", &h2, 1_794_441_600),
         Err("AuthorizationQueryParametersError")
     );
+    // Fuzz sigv4 regression: control bytes (0x07) fail HeaderValue::from_str so no auth header is attached;
+    // authenticate() must reject unsigned requests when allow_anonymous is false.
+    assert_eq!(
+        authenticate(&cfg, &SigV4KeyCache::new(), "GET", "/b/k", "", &h2, 1_794_441_600),
+        Err("AccessDenied")
+    );
+    let open_cfg = AuthConfig {
+        credentials: cfg.credentials.clone(),
+        allow_anonymous: true,
+    };
+    assert_eq!(
+        authenticate(&open_cfg, &SigV4KeyCache::new(), "GET", "/b/k", "", &h2, 1_794_441_600),
+        Ok(())
+    );
 }
