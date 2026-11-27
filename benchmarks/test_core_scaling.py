@@ -276,6 +276,82 @@ class PinningTests(unittest.TestCase):
         self.assertEqual(cs.client_cores_for(4, 4), ([0, 1, 2, 3], True))
 
 
+class PinAtStartTests(unittest.TestCase):
+    """#474: on Windows a server starts already pinned: the parent takes the server's cores just
+    for the spawn, so the child inherits them, as `taskset` gives on Linux."""
+
+    def _fake_psutil(self, events, start=(0, 1, 2, 3)):
+        state = {"aff": list(start)}
+
+        class FakeSelf:
+            def cpu_affinity(self, cores=None):
+                if cores is None:
+                    return list(state["aff"])
+                events.append(("set", list(cores)))
+                state["aff"] = list(cores)
+
+        return types.SimpleNamespace(Process=lambda pid=None: FakeSelf())
+
+    def test_windows_spawn_happens_inside_the_server_cores_then_restores(self):
+        events = []
+        fake = self._fake_psutil(events)
+
+        class FakeProc:
+            pid = 4242
+
+        def fake_popen(argv, **kw):
+            events.append(("popen", list(argv)))
+            return FakeProc()
+
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(sys.modules, {"psutil": fake}), \
+                mock.patch.object(cs.sys, "platform", "win32"), \
+                mock.patch.object(cs.subprocess, "Popen", side_effect=fake_popen), \
+                mock.patch.object(cs, "pin_process", return_value=True):
+            cs._spawn_pinned(["s3-server.exe", "--port", "9000"], 2, os.path.join(d, "log"))
+        self.assertEqual(events, [("set", [0, 1]), ("popen", ["s3-server.exe", "--port", "9000"]), ("set", [0, 1, 2, 3])])
+
+    def test_linux_spawn_uses_taskset_and_leaves_the_parent_alone(self):
+        events = []
+        fake = self._fake_psutil(events)
+
+        class FakeProc:
+            pid = 4242
+
+        def fake_popen(argv, **kw):
+            events.append(("popen", list(argv)))
+            return FakeProc()
+
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(sys.modules, {"psutil": fake}), \
+                mock.patch.object(cs.sys, "platform", "linux"), \
+                mock.patch.object(cs.shutil, "which", return_value="/usr/bin/taskset"), \
+                mock.patch.object(cs.subprocess, "Popen", side_effect=fake_popen), \
+                mock.patch.object(cs, "pin_process", return_value=True):
+            cs._spawn_pinned(["s3-server", "--port", "9000"], 2, os.path.join(d, "log"))
+        self.assertEqual(events, [("popen", ["taskset", "-c", "0-1", "s3-server", "--port", "9000"])])
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows only")
+    def test_a_real_child_sees_its_cores_as_its_first_act(self):
+        try:
+            import psutil  # noqa: F401
+        except ImportError:
+            self.skipTest("psutil not installed")
+        if (os.cpu_count() or 1) < 2:
+            self.skipTest("fewer than two CPUs")
+        before = psutil.Process().cpu_affinity()
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "out.txt")
+            log = os.path.join(d, "log")
+            child = [sys.executable, "-c", f"import psutil; open({out!r}, 'w').write(repr(psutil.Process().cpu_affinity()))"]
+            with mock.patch.object(cs, "pin_process", return_value=True):
+                proc = cs._spawn_pinned(child, 1, log)
+            proc.wait(timeout=60)
+            with open(out) as f:
+                self.assertEqual(f.read(), "[0]")
+        self.assertEqual(psutil.Process().cpu_affinity(), before, "the parent's affinity is restored")
+
+
 class ScalingAndCpuTests(unittest.TestCase):
     def test_scaling_is_largest_n_over_1_core(self):
         pts = {
