@@ -234,12 +234,19 @@ pub fn authenticate_with(
     headers: &HeaderMap,
     now_sec: u64,
 ) -> Result<Principal, &'static str> {
-    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+    let has_auth_header = headers.contains_key("authorization");
+    let auth_header = match headers.get("authorization") {
+        Some(v) => Some(v.to_str().map_err(|_| "AuthorizationHeaderMalformed")?),
+        None => None,
+    };
     let pairs = query_pairs(raw_query);
     let q = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
-    let presigned = q("X-Amz-Algorithm").is_some();
+    let presigned = q("X-Amz-Algorithm").is_some()
+        || q("X-Amz-Signature").is_some()
+        || q("X-Amz-Credential").is_some()
+        || raw_query.contains("X-Amz-Signature");
 
-    if auth_header.is_none() && !presigned {
+    if !has_auth_header && !presigned {
         return Ok(Principal::Anonymous);
     }
     if cfg.credentials.is_none() && iam.is_none_or(|i| i.is_empty()) {

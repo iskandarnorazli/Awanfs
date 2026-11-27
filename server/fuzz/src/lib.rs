@@ -447,6 +447,20 @@ fn canonical_operation_cases() -> &'static [(
         (Operation::PutObjectRetention, Method::PUT, Some("bkt"), Some("obj"), "retention", None),
         (Operation::GetObjectLegalHold, Method::GET, Some("bkt"), Some("obj"), "legal-hold", None),
         (Operation::PutObjectLegalHold, Method::PUT, Some("bkt"), Some("obj"), "legal-hold", None),
+        (Operation::GetBucketPolicy, Method::GET, Some("bkt"), None, "policy", None),
+        (Operation::PutBucketPolicy, Method::PUT, Some("bkt"), None, "policy", None),
+        (Operation::DeleteBucketPolicy, Method::DELETE, Some("bkt"), None, "policy", None),
+        (Operation::GetBucketPolicyStatus, Method::GET, Some("bkt"), None, "policyStatus", None),
+        (Operation::GetBucketAcl, Method::GET, Some("bkt"), None, "acl", None),
+        (Operation::PutBucketAcl, Method::PUT, Some("bkt"), None, "acl", None),
+        (Operation::GetObjectAcl, Method::GET, Some("bkt"), Some("obj"), "acl", None),
+        (Operation::PutObjectAcl, Method::PUT, Some("bkt"), Some("obj"), "acl", None),
+        (Operation::GetBucketOwnershipControls, Method::GET, Some("bkt"), None, "ownershipControls", None),
+        (Operation::PutBucketOwnershipControls, Method::PUT, Some("bkt"), None, "ownershipControls", None),
+        (Operation::DeleteBucketOwnershipControls, Method::DELETE, Some("bkt"), None, "ownershipControls", None),
+        (Operation::GetPublicAccessBlock, Method::GET, Some("bkt"), None, "publicAccessBlock", None),
+        (Operation::PutPublicAccessBlock, Method::PUT, Some("bkt"), None, "publicAccessBlock", None),
+        (Operation::DeletePublicAccessBlock, Method::DELETE, Some("bkt"), None, "publicAccessBlock", None),
     ]
 }
 

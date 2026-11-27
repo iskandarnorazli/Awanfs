@@ -314,3 +314,29 @@ fn x_amz_date_wins_over_the_date_header() {
     let h = date_get_headers(Some("Fri, 24 May 2013 01:00:00 GMT"), Some("20130524T000000Z"), signed, &sig);
     assert_eq!(authenticate(&keys(SK), &SigV4KeyCache::new(), "GET", "/bucket/k", "", &h, now()), Ok(()));
 }
+
+#[test]
+fn non_utf8_authorization_and_partial_presigned_query_are_rejected() {
+    let cfg = AuthConfig {
+        credentials: Some(("AKIAFUZZ".into(), "fuzz-secret".into())),
+        allow_anonymous: false,
+    };
+    let mut h = HeaderMap::new();
+    h.insert("host", HeaderValue::from_static("localhost"));
+    h.insert(
+        "authorization",
+        HeaderValue::from_bytes(b"AWS4-HMAC-SHA256 Credential=AK\x89AFUZZ/20261112/us-east-0/s3/aws4_request,SignedHeaders=host;x-amz-date,Signature=00").unwrap(),
+    );
+    h.insert("x-amz-date", HeaderValue::from_static("20261112T000000Z"));
+    assert_eq!(
+        authenticate(&cfg, &SigV4KeyCache::new(), "GET", "/b/k", "", &h, 1_794_441_600),
+        Err("AuthorizationHeaderMalformed")
+    );
+
+    let mut h2 = HeaderMap::new();
+    h2.insert("host", HeaderValue::from_static("localhost"));
+    assert_eq!(
+        authenticate(&cfg, &SigV4KeyCache::new(), "GET", "/b/k", "X-Amz-Signature=00", &h2, 1_794_441_600),
+        Err("AuthorizationQueryParametersError")
+    );
+}

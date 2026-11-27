@@ -654,22 +654,12 @@ fuzz = ["tagging_xml"]
 
 # Its other ceph tests pass; these fail only because each each calls PutBucketPolicy first (owner, 2026-11-21).
 [feature.waits_on]
-"test_s3::test_get_tags_acl_public" = "policy"
-"test_s3::test_put_tags_acl_public" = "policy"
-"test_s3::test_delete_tags_obj_public" = "policy"
-"test_s3::test_bucket_policy_get_obj_existing_tag" = "policy"
-"test_s3::test_bucket_policy_get_obj_tagging_existing_tag" = "policy"
-"test_s3::test_bucket_policy_put_obj_tagging_existing_tag" = "policy"
-"test_s3::test_bucket_policy_put_obj_copy_source" = "policy"
-"test_s3::test_bucket_policy_put_obj_copy_source_meta" = "policy"
-"test_s3::test_bucket_policy_put_obj_acl" = "policy"
 "test_s3::test_bucket_policy_put_obj_request_obj_tag" = "policy"
-"test_s3::test_bucket_policy_get_obj_acl_existing_tag" = "policy"
 
 [[feature]]
 id = "policy"
 name = "Bucket policies, policy status, and Public Access Block"
-status = "planned"
+status = "partial"
 issue = "#122"
 area = "policy"
 design_section = "5"
@@ -1285,10 +1275,6 @@ server_tests = [
 drive = ["versioning"]
 fuzz = ["version_id", "request_xml"]
 
-# Its other ceph tests pass; these fail only because each calls GetObjectAcl (owner, 2026-11-21).
-[feature.waits_on]
-"test_s3::test_bucket_list_return_data_versioning" = "acl-ownership"
-
 [[feature]]
 id = "listing"
 name = "Bucket listing (ListObjects, ListObjectsV2, paginated ListBuckets)"
@@ -1428,10 +1414,6 @@ server_tests = [
 drive = ["listing"]
 fuzz = ["list_objects_query"]
 
-# Its other ceph tests pass; these fail only because each calls GetObjectAcl (owner, 2026-11-21).
-[feature.waits_on]
-"test_s3::test_bucket_list_return_data" = "acl-ownership"
-
 [[feature]]
 id = "buckets"
 name = "Bucket operations (CreateBucket, ListBuckets, HeadBucket, DeleteBucket, GetBucketLocation)"
@@ -1532,10 +1514,6 @@ fuzz = ["s3_target"]
 moved = [
   { test = "test_s3::test_object_delete_key_bucket_gone", to = "anonymous-bucket-gone", decision = "https://github.com/iskandarnorazli/Awanfs/issues/140#issuecomment-6998945944" },
 ]
-
-# Its other ceph tests pass; these fail only because each calls PutObjectAcl (owner, 2026-11-21).
-[feature.waits_on]
-"test_s3::test_bucket_create_special_key_names" = "acl-ownership"
 
 [[feature]]
 id = "ranges"
@@ -1721,10 +1699,6 @@ server_tests = [
 ]
 drive = ["objects"]
 fuzz = ["request_xml", "s3_target"]
-
-# Its other ceph tests pass; these fail only because each calls PutBucketAcl (owner, 2026-11-21).
-[feature.waits_on]
-"test_s3::test_100_continue" = "acl-ownership"
 
 [[feature]]
 id = "restart"
