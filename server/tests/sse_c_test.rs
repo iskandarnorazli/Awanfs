@@ -46,6 +46,11 @@ async fn spawn(dir: &Path) -> (String, ServerHandle, Arc<S3ServiceState>) {
 async fn spawn_compressed(dir: &Path) -> (String, ServerHandle, Arc<S3ServiceState>) {
     let cfg = dir.join("awanfs.toml");
     std::fs::write(&cfg, "[[buckets]]\nname = \"comp-sse\"\ncompression = \"zstd\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let iam = ReloadingIam::open(&cfg).unwrap();
     let st = Arc::new(S3ServiceState::with_data_dir(dir));
     *st.iam.write() = Some(iam);
