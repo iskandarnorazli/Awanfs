@@ -52,6 +52,8 @@ Options:
       --config <PATH>              TOML config for users/policies/buckets (or AWANFS_CONFIG)
       --memory-budget <SIZE>       Total cache + in-flight body memory budget (or AWANFS_MEMORY_BUDGET)
       --lifecycle-day-seconds <N>  Seconds per lifecycle day (default: 86400; test use only)
+      --lifecycle-sweep-interval <d> How often expired objects are removed, e.g. 30m or 2h (or
+                                   AWANFS_LIFECYCLE_SWEEP_INTERVAL; default: 1h)
       --body-idle-timeout <DUR>    Idle timeout between request body frames (default: 20s)
       --region <NAME>              Server region (default: us-east-1, or AWANFS_REGION)
       --allow-anonymous            Allow unsigned requests (or AWANFS_ALLOW_ANONYMOUS=1)
@@ -123,6 +125,7 @@ async fn serve(
     let mut durability = std::env::var("AWANFS_DURABILITY").unwrap_or_else(|_| "group".to_string());
     let mut memory_budget: Option<String> = None;
     let mut lifecycle_day_seconds: u64 = 86_400;
+    let mut lifecycle_sweep_flag: Option<String> = None;
     let mut body_idle_timeout = s3_server::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT;
     let mut region = std::env::var("AWANFS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let mut allow_small_parts = false;
@@ -178,6 +181,8 @@ async fn serve(
             config_path = args.next().map(PathBuf::from);
         } else if arg == "--memory-budget" {
             memory_budget = args.next();
+        } else if arg == "--lifecycle-sweep-interval" {
+            lifecycle_sweep_flag = Some(args.next().unwrap_or_default());
         } else if arg == "--lifecycle-day-seconds" {
             if let Some(v) = args.next().and_then(|s| s.parse::<u64>().ok()).filter(|&n| n > 0) {
                 lifecycle_day_seconds = v;
@@ -310,6 +315,18 @@ async fn serve(
     // Compaction copies at most this many MB/s (#28, decision 24); 0 = no limit.
     state.compaction_rate.store(compaction_mb.unwrap_or(50) * 1_000_000, std::sync::atomic::Ordering::Relaxed);
     state.lifecycle_day_seconds.store(lifecycle_day_seconds, std::sync::atomic::Ordering::Relaxed);
+    let lifecycle_period = match s3_server::lifecycle::sweep_interval(
+        lifecycle_sweep_flag.as_deref(),
+        std::env::var("AWANFS_LIFECYCLE_SWEEP_INTERVAL").ok().as_deref(),
+        lifecycle_day_seconds,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }
+    };
+    println!("Lifecycle sweep every {:?}", lifecycle_period);
     state.set_per_bucket_metrics(per_bucket_metrics);
     if lifecycle_day_seconds != 86_400 {
         eprintln!("WARNING: --lifecycle-day-seconds {} is set (default 86400); for test use only", lifecycle_day_seconds);
@@ -361,11 +378,6 @@ async fn serve(
         state.start_auto_compaction(std::time::Duration::from_secs(600), 0.20, 1 << 30);
     }
     state.start_multipart_cleanup(std::time::Duration::from_secs(600), 7 * lifecycle_day_seconds * 1000);
-    let lifecycle_period = if lifecycle_day_seconds < 60 {
-        std::time::Duration::from_millis(500)
-    } else {
-        std::time::Duration::from_secs(60)
-    };
     state.start_lifecycle_sweep(lifecycle_period);
     state.start_scrub(std::time::Duration::from_secs(600), scrub_mib_per_sec);
 
