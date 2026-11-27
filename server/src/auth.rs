@@ -240,7 +240,7 @@ pub fn authenticate_with(
     let presigned = q("X-Amz-Algorithm").is_some();
 
     if auth_header.is_none() && !presigned {
-        return if cfg.allow_anonymous { Ok(Principal::Anonymous) } else { Err("AccessDenied") };
+        return Ok(Principal::Anonymous);
     }
     if cfg.credentials.is_none() && iam.is_none_or(|i| i.is_empty()) {
         return if cfg.allow_anonymous { Ok(Principal::Anonymous) } else { Err("InvalidAccessKeyId") };
@@ -288,7 +288,7 @@ pub fn authenticate_with(
         let amz_date = q("X-Amz-Date").ok_or("AuthorizationQueryParametersError")?.to_string();
         let req_epoch = parse_iso8601_epoch(&amz_date).ok_or("AuthorizationQueryParametersError")?;
         let expires: u64 = q("X-Amz-Expires").and_then(|v| v.parse().ok()).ok_or("AuthorizationQueryParametersError")?;
-        if expires > 604_800 {
+        if expires == 0 || expires > 604_800 {
             return Err("AuthorizationQueryParametersError");
         }
         if now_sec > req_epoch + expires {

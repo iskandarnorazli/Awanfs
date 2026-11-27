@@ -330,6 +330,95 @@ pub(super) fn apply_owner_attr(attrs: &mut crate::attrs::Attrs, writer_account: 
     }
 }
 
+/// Validates request ACL headers (`x-amz-acl`, `x-amz-grant-*`) against bucket ownership and
+/// PublicAccessBlock rules, and writes `TAG_OWNER` and `TAG_ACL` onto `attrs` (#122). Returns the
+/// effective object owner account on success.
+pub(super) fn apply_object_ownership_and_acl(
+    state: &S3ServiceState,
+    b_id: u32,
+    key: &str,
+    headers: &HeaderMap,
+    writer_account: &str,
+    bucket_owner: &str,
+    iam: Option<&crate::iam::Iam>,
+    attrs: &mut crate::attrs::Attrs,
+) -> Result<String, Response<ResponseBody>> {
+    let cfg = state.bucket_config_reader.load_bucket(b_id);
+    let ownership = cfg
+        .as_deref()
+        .map_or(state.default_bucket_ownership, |c| c.ownership_or(state.default_bucket_ownership));
+    let eff_bucket = if bucket_owner.is_empty() { crate::iam::ROOT_ACCOUNT } else { bucket_owner };
+    let eff_writer = if writer_account.is_empty() { crate::iam::ROOT_ACCOUNT } else { writer_account };
+    let canned_raw = match headers.get("x-amz-acl") {
+        None => None,
+        Some(v) => match v.to_str() {
+            Ok(s) => Some(s),
+            Err(_) => return Err(bad_request("InvalidArgument", "Invalid x-amz-acl header value", key)),
+        },
+    };
+    let has_grants = crate::acl::has_grant_headers(headers);
+    if ownership == crate::acl::BucketOwnership::BucketOwnerEnforced {
+        let unsupported = match canned_raw {
+            Some(c) if c.trim() != "bucket-owner-full-control" => true,
+            _ => has_grants,
+        };
+        if unsupported {
+            return Err(bad_request(
+                "AccessControlListNotSupported",
+                "The bucket does not allow ACLs",
+                key,
+            ));
+        }
+        apply_owner_attr(attrs, eff_bucket, eff_bucket);
+        attrs.remove(crate::attrs::TAG_ACL);
+        return Ok(eff_bucket.to_string());
+    }
+
+    let canned = match canned_raw {
+        Some(c) => match crate::acl::parse_canned_acl(c) {
+            Ok(parsed) => Some(parsed),
+            Err(r) => return Err(bad_request(r.code, r.why, key)),
+        },
+        None => None,
+    };
+    let eff_obj_acct = match ownership {
+        crate::acl::BucketOwnership::BucketOwnerEnforced => eff_bucket,
+        crate::acl::BucketOwnership::BucketOwnerPreferred
+            if canned == Some(crate::acl::CannedAcl::BucketOwnerFullControl) =>
+        {
+            eff_bucket
+        }
+        crate::acl::BucketOwnership::BucketOwnerPreferred
+        | crate::acl::BucketOwnership::ObjectWriter => eff_writer,
+    };
+    apply_owner_attr(attrs, eff_obj_acct, eff_bucket);
+
+    let obj_owner = crate::acl::owner_for_account(eff_obj_acct, iam);
+    let b_owner = crate::acl::owner_for_account(eff_bucket, iam);
+    let acp = match crate::acl::acl_from_headers(headers, &obj_owner, Some(&b_owner), iam) {
+        Ok(Some(a)) => Some(a),
+        Ok(None) => None,
+        Err(r) => return Err(bad_request(r.code, r.why, key)),
+    };
+    if let Some(acp) = acp {
+        let pab = cfg
+            .as_deref()
+            .map_or(Default::default(), |c| c.public_access_block());
+        if pab.block_public_acls && acp.is_public() {
+            let xml = s3_error_xml("AccessDenied", "Access Denied", key, "req-pab");
+            return Err(Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(full_body(Bytes::from(xml)))
+                .unwrap());
+        }
+        attrs.set_acl_xml(&crate::acl::render_acl_xml(&acp));
+    } else {
+        attrs.remove(crate::attrs::TAG_ACL);
+    }
+    Ok(eff_obj_acct.to_string())
+}
+
 fn request_attrs_with_checksum(
     headers: &HeaderMap,
     key: &str,
@@ -982,6 +1071,7 @@ pub async fn copy_object(
     headers: &HeaderMap,
     writer_account: &str,
     bucket_owner: &str,
+    iam: Option<&crate::iam::Iam>,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let copy_source = headers.get("x-amz-copy-source").expect("CopyObject requires x-amz-copy-source");
     let copy_source_raw = copy_source.to_str().unwrap_or("");
@@ -1161,7 +1251,10 @@ pub async fn copy_object(
     if let Err(resp) = apply_lock_headers_and_default(&state, b_id, key, headers, &mut copy_attrs_obj, true, false) {
         return Ok(resp);
     }
-    apply_owner_attr(&mut copy_attrs_obj, writer_account, bucket_owner);
+    copy_attrs_obj.remove(crate::attrs::TAG_ACL);
+    if let Err(resp) = apply_object_ownership_and_acl(&state, b_id, key, headers, writer_account, bucket_owner, iam, &mut copy_attrs_obj) {
+        return Ok(resp);
+    }
     let copy_attrs = match copy_attrs_obj.encode() {
         Ok(a) => a,
         Err(_) => return Ok(bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key)),
@@ -1421,6 +1514,7 @@ pub async fn put_object<B>(
     headers: &HeaderMap,
     writer_account: &str,
     bucket_owner: &str,
+    iam: Option<&crate::iam::Iam>,
     mut chunk_verifier: Option<crate::auth::ChunkVerifier>,
     body: B,
 ) -> Result<Response<ResponseBody>, hyper::Error>
@@ -1485,7 +1579,9 @@ where
     if let Err(resp) = apply_lock_headers_and_default(&state, b_id, key, &signed_headers, &mut put_attrs_map, true, true) {
         return Ok(resp);
     }
-    apply_owner_attr(&mut put_attrs_map, writer_account, bucket_owner);
+    if let Err(resp) = apply_object_ownership_and_acl(&state, b_id, key, &signed_headers, writer_account, bucket_owner, iam, &mut put_attrs_map) {
+        return Ok(resp);
+    }
     let put_attrs = match put_attrs_map.encode() {
         Ok(a) => a,
         Err(_) => return Ok(bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key)),
@@ -2015,7 +2111,9 @@ where
     if let Err(resp) = apply_lock_headers_and_default(&state, b_id, key, &signed_headers, &mut buf_attrs_map, true, true) {
         return Ok(resp);
     }
-    apply_owner_attr(&mut buf_attrs_map, writer_account, bucket_owner);
+    if let Err(resp) = apply_object_ownership_and_acl(&state, b_id, key, &signed_headers, writer_account, bucket_owner, iam, &mut buf_attrs_map) {
+        return Ok(resp);
+    }
     let buf_attrs = match buf_attrs_map.encode() {
         Ok(a) => a,
         Err(_) => return Ok(bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key)),

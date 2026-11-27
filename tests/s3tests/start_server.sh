@@ -21,6 +21,7 @@ AWANFS_LOG=off \
     --data-dir "$DATA_DIR" \
     --auto-compaction off \
     --region default \
+    --default-bucket-ownership ObjectWriter \
     --config "$USERS_FILE" \
     --lifecycle-day-seconds 2 \
     </dev/null >"$LOG_FILE" 2>&1 &

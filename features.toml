@@ -145,6 +145,7 @@ ceph = [
   "test_s3::test_cors_presigned_get_object_tenant",
   "test_s3::test_cors_presigned_put_object_tenant",
   "test_s3::test_bucket_policy_different_tenant",
+  "test_s3::test_bucket_policy_tenanted_bucket",
   "test_s3::test_get_object_torrent",
 ]
 
@@ -689,7 +690,6 @@ ceph = [
   "test_s3::test_bucket_policy_acl",
   "test_s3::test_bucketv2_policy_acl",
   "test_s3::test_bucket_policy_multipart",
-  "test_s3::test_bucket_policy_tenanted_bucket",
   "test_s3::test_bucket_policy_another_bucket",
   "test_s3::test_bucketv2_policy_another_bucket",
   "test_s3::test_bucket_policy_set_condition_operator_end_with_IfExists",
@@ -724,6 +724,19 @@ mint = [
   "minio-js::getBucketPolicy(bucketName, cb)",
   "minio-js::setBucketPolicy(bucketName, bucketPolicy, cb)",
 ]
+server_tests = [
+  "server/tests/access_control_test.rs::bucket_policy_crud_exact_bytes_and_validation",
+  "server/tests/access_control_test.rs::policy_conditions_operators_and_keys",
+  "server/tests/access_control_test.rs::ownership_controls_pab_expected_owner_anonymous_and_100_continue",
+  "server/tests/access_control_test.rs::policy_and_acl_live_update_and_restart_round_trip",
+  "server/tests/access_ported_test.rs::test_bucket_policy_set_condition_operator_end_with_if_exists",
+  "server/tests/policy_differential_test.rs::differential_100k_policy_and_authz_against_reference",
+]
+drive = ["access"]
+fuzz = ["bucket_policy"]
+
+[feature.ported]
+"test_s3::test_bucket_policy_set_condition_operator_end_with_IfExists" = "server/tests/access_ported_test.rs::test_bucket_policy_set_condition_operator_end_with_if_exists"
 
 [[feature]]
 id = "acl-ownership"
@@ -819,6 +832,13 @@ mint = [
   "minio-go: testGetObjectACLContext::GetObjectACL(ctx, bucketName, objectName)",
   "minio-java::getObjectAcl()",
 ]
+server_tests = [
+  "server/tests/access_control_test.rs::acl_canned_headers_xml_email_and_mtime",
+  "server/tests/access_control_test.rs::ownership_controls_pab_expected_owner_anonymous_and_100_continue",
+  "server/tests/access_control_test.rs::policy_and_acl_live_update_and_restart_round_trip",
+]
+drive = ["access"]
+fuzz = ["acl_xml"]
 
 [[feature]]
 id = "conditional"
@@ -1119,8 +1139,17 @@ mint = [
 ]
 server_tests = [
   "server/tests/multipart_sigv4_test.rs::test_sigv4_presigned_url_and_skew_checks",
+  "server/tests/access_control_test.rs::ownership_controls_pab_expected_owner_anonymous_and_100_continue",
+  "server/tests/access_ported_test.rs::test_object_raw_get_x_amz_expires_out_range_and_put_expired_port",
 ]
+drive = ["access"]
 fuzz = ["sigv4"]
+
+[feature.ported]
+"test_s3::test_object_raw_get_x_amz_expires_out_range_zero" = "server/tests/access_ported_test.rs::test_object_raw_get_x_amz_expires_out_range_and_put_expired_port"
+"test_s3::test_object_raw_get_x_amz_expires_out_max_range" = "server/tests/access_ported_test.rs::test_object_raw_get_x_amz_expires_out_range_and_put_expired_port"
+"test_s3::test_object_raw_get_x_amz_expires_out_positive_range" = "server/tests/access_ported_test.rs::test_object_raw_get_x_amz_expires_out_range_and_put_expired_port"
+"test_s3::test_object_raw_put_authenticated_expired" = "server/tests/access_ported_test.rs::test_object_raw_get_x_amz_expires_out_range_and_put_expired_port"
 
 [[feature]]
 id = "copy"
@@ -2495,3 +2524,12 @@ feature = "volume-format"
 what = "1 prints the storage simulation's steps (server/src/sim_harness.rs, tests only)"
 test = ["server/tests/sim_storage_test.rs::seeded_storage_simulation_matches_model_and_covers_all_fault_points"]
 internal = "test harness output, not a server setting"
+
+[[setting]]
+id = "default-bucket-ownership"
+flags = ["--default-bucket-ownership"]
+env = ["AWANFS_DEFAULT_BUCKET_OWNERSHIP"]
+default = "BucketOwnerEnforced"
+feature = "acl-ownership"
+what = "default ObjectOwnership for newly created buckets without x-amz-object-ownership (BucketOwnerEnforced, BucketOwnerPreferred, or ObjectWriter)"
+test = ["server/tests/access_control_test.rs::cli_default_bucket_ownership_flag_accepts_valid_and_rejects_invalid"]

@@ -310,6 +310,23 @@ impl Iam {
         self.users.is_empty()
     }
 
+    pub fn user_by_id(&self, id: &str) -> Option<&User> {
+        self.users.values().find(|u| u.id == id)
+    }
+
+    pub fn user_by_email(&self, email: &str) -> Option<&User> {
+        self.users
+            .values()
+            .find(|u| u.email.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(email)))
+    }
+
+    pub fn user_by_account(&self, account: &str) -> Option<&User> {
+        self.users
+            .values()
+            .filter(|u| u.account == account)
+            .min_by(|a, b| a.id.cmp(&b.id))
+    }
+
     /// Evaluates the identity policy for user `name` on `(action, resource)`.
     pub fn evaluate_user(&self, name: &str, action: &str, resource: &str) -> crate::authz::PolicyMatch {
         let Some(u) = self.user_by_name(name) else {
@@ -467,6 +484,18 @@ pub fn requirements(method: &str, bucket: Option<&str>, key: Option<&str>, query
                 "GET" if has("lifecycle") => "s3:GetLifecycleConfiguration",
                 "GET" if has("object-lock") => "s3:GetBucketObjectLockConfiguration",
                 "PUT" if has("object-lock") => "s3:PutBucketObjectLockConfiguration",
+                "GET" if has("policy") => "s3:GetBucketPolicy",
+                "PUT" if has("policy") => "s3:PutBucketPolicy",
+                "DELETE" if has("policy") => "s3:DeleteBucketPolicy",
+                "GET" if has("policyStatus") => "s3:GetBucketPolicyStatus",
+                "GET" if has("acl") => "s3:GetBucketAcl",
+                "PUT" if has("acl") => "s3:PutBucketAcl",
+                "GET" if has("ownershipControls") => "s3:GetBucketOwnershipControls",
+                "PUT" if has("ownershipControls") => "s3:PutBucketOwnershipControls",
+                "DELETE" if has("ownershipControls") => "s3:DeleteBucketOwnershipControls",
+                "GET" if has("publicAccessBlock") => "s3:GetBucketPublicAccessBlock",
+                "PUT" if has("publicAccessBlock") => "s3:PutBucketPublicAccessBlock",
+                "DELETE" if has("publicAccessBlock") => "s3:DeleteBucketPublicAccessBlock",
                 "GET" if has("uploads") => "s3:ListBucketMultipartUploads",
                 "POST" if has("delete") => return vec![],
                 "PUT" => "s3:CreateBucket",
@@ -487,6 +516,8 @@ pub fn requirements(method: &str, bucket: Option<&str>, key: Option<&str>, query
                 "PUT" if has("retention") => "s3:PutObjectRetention",
                 "GET" if has("legal-hold") => "s3:GetObjectLegalHold",
                 "PUT" if has("legal-hold") => "s3:PutObjectLegalHold",
+                "GET" if has("acl") => "s3:GetObjectAcl",
+                "PUT" if has("acl") => "s3:PutObjectAcl",
                 "PUT" | "POST" => "s3:PutObject",
                 "GET" | "HEAD" => "s3:GetObject",
                 "DELETE" => "s3:DeleteObject",

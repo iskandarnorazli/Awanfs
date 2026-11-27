@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Drives a fresh s3-server the way a user does (aws CLI) and keeps the evidence.
-#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle (default: all)
+#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle access (default: all)
 # Needs: a built server (cargo build --release --manifest-path server/Cargo.toml), the aws CLI, curl.
 # Evidence: verification/evidence/<UTC timestamp>/ (kept after cleanup). Exit 0 only if every journey passed.
 set -uo pipefail
@@ -27,8 +27,8 @@ check() { # name, command...
   if "$@" >>"$EVID/$name.txt" 2>&1; then echo "ok    $name"; pass=$((pass+1)); else echo "FAIL  $name (see $EVID/$name.txt)"; tail -n 15 "$EVID/$name.txt" | sed "s/^/      /"; fail=$((fail+1)); fi; }
 same() { cmp -s "$1" "$2"; }
 
-# Up, refusing unsigned requests (403), and answering the aws CLI's signed ones.
-doctor() { curl -s -o /dev/null -w '%{http_code}\n' "$URL/" | grep -q 403 && S3 list-buckets >/dev/null &&
+# Up, refusing unsigned write requests (403), and answering the aws CLI's signed ones.
+doctor() { curl -s -o /dev/null -w '%{http_code}\n' -X PUT "$URL/doctor-unsigned" | grep -q 403 && S3 list-buckets >/dev/null &&
   echo "server up on $PORT, pid $PID, data $DATA; unsigned 403, signed 200"; }
 
 # A journey declares its locals before its && chain: `A && local x; x=... && B` is two lists, and
@@ -385,6 +385,25 @@ j_lifecycle() { local lc_data lc_port lc_url lc_pid="";
     done
     [ "$expired" -eq 1 ]
   ); }
+j_access() { local code;
+  S3 create-bucket --bucket verify-access &&
+  echo "public-via-policy" >"$EVID/access.bin" &&
+  S3 put-object --bucket verify-access --key pub.txt --body "$EVID/access.bin" >/dev/null &&
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/verify-access/pub.txt") && [ "$code" = "403" ] &&
+  S3 put-bucket-policy --bucket verify-access --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::verify-access/*"}]}' &&
+  S3 get-bucket-policy-status --bucket verify-access --query 'PolicyStatus.IsPublic' --output text | grep -qi true &&
+  curl -sf "$URL/verify-access/pub.txt" | grep -qx "public-via-policy" &&
+  S3 put-public-access-block --bucket verify-access --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true &&
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/verify-access/pub.txt") && [ "$code" = "403" ] &&
+  S3 delete-public-access-block --bucket verify-access &&
+  S3 delete-bucket-policy --bucket verify-access &&
+  S3 create-bucket --bucket verify-acl-own --object-ownership ObjectWriter >/dev/null &&
+  S3 put-bucket-ownership-controls --bucket verify-acl-own --ownership-controls 'Rules=[{ObjectOwnership=ObjectWriter}]' &&
+  S3 get-bucket-ownership-controls --bucket verify-acl-own --query 'OwnershipControls.Rules[0].ObjectOwnership' --output text | grep -qx ObjectWriter &&
+  S3 put-bucket-acl --bucket verify-acl-own --acl public-read &&
+  S3 get-bucket-acl --bucket verify-acl-own --query 'Grants[?Grantee.URI!=null].Permission' --output text | grep -q READ &&
+  S3 put-bucket-acl --bucket verify-acl-own --acl private &&
+  S3 delete-bucket-ownership-controls --bucket verify-acl-own; }
 
 # Refuse to run a journey whose && chain is split by a `local x;` (see the note above md5q).
 masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:]]+local [^;]*;|&& *local ' || true)
@@ -392,7 +411,7 @@ masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:
 
 start || exit 1
 check doctor doctor
-features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle)
+features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle access)
 [[ " ${features[*]} " == *" buckets "* ]] || check buckets j_buckets
 for f in "${features[@]}"; do check "$f" "j_$f"; done
 ls -la "$DATA" >"$EVID/data-dir.txt" 2>&1

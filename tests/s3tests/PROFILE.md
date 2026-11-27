@@ -12,6 +12,7 @@ This document states the exact `s3-server` and client configuration that `tests/
 | `--data-dir` | `/tmp/awanfs-data` (`$AWANFS_DATA_DIR`) | `S3_DATA_DIR` / temp | All (fresh storage directory per suite run) | Yes (use persistent storage) |
 | `--auto-compaction` | `off` | `on` | All (avoids background compaction during short suite runs) | No (keep `on` in production to reclaim dead space) |
 | `--region` | `default` | `us-east-1` | `test_bucket_get_location` (`api_name = default` in `s3tests.conf`) | Yes (set to deployment region) |
+| `--default-bucket-ownership` | `ObjectWriter` | `BucketOwnerEnforced` | ACL tests assuming ACLs enabled on new buckets (`#122`, D5) | Optional (production recommendation: `BucketOwnerEnforced`) |
 | `--config` | `/tmp/awanfs-users.toml` (copied from `tests/s3tests/users.toml` with mode `0600`) | none | Multi-user and policy tests (`alt`, `tenant`) | Yes (with real keys and scoped policies) |
 | `--lifecycle-day-seconds` | `2` | `86400` | Lifecycle expiration tests (`lc_debug_interval = 2` in `s3tests.conf`) | No (keep `86400` in production; test-only flag emits startup warning) |
 | `AWANFS_ACCESS_KEY` | `AWANFSMAINKEY0000000` | none | All (`[s3 main]` in `s3tests.conf`) | No (public test credential) |
@@ -40,7 +41,7 @@ Skipped tests in `tests/s3tests/CONFORMANCE_MAP.md` are skipped by `pytest` beca
 Area issues that add new profile settings update `start_server.sh` and the **Settings** table above in the same PR:
 
 - `#118`: implemented: `--lifecycle-day-seconds 2` (test-only flag with startup warning) matching `lc_debug_interval = 2` in `s3tests.conf`
-- `#122`: default object ownership (`D5`, ACLs enabled on new buckets for the suite)
+- `#122`: implemented: `--default-bucket-ownership ObjectWriter` (production default stays `BucketOwnerEnforced`), `[s3 main]` uses `user_id = root` and `display_name = root` matching `ROOT_ACCOUNT = "root"`, and unsigned requests without `--allow-anonymous` authenticate as `Principal::Anonymous` checked by `authorize()`
 - `#121`: `--sse-master-key-file` and `kms_keyid` in `s3tests.conf`
 - `#140`: `--region` matching `api_name`
 - `#151`: implemented: `users.toml` sets `account`, `id`, `display_name`, and `email` matching `s3tests.conf`, with explicit self-account S3 actions instead of `s3:*`

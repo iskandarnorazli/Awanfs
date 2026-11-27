@@ -66,6 +66,7 @@ Options:
       --worker-threads <n>         Tokio worker threads (or AWANFS_WORKER_THREADS); default: the cores the
                                    process may run on (its affinity)
       --per-bucket-metrics         Always emit awanfs_bucket_* Prometheus gauges even above 1000 buckets (or AWANFS_PER_BUCKET_METRICS=1)
+      --default-bucket-ownership <MODE>  Default ownership for new buckets: BucketOwnerEnforced (default), BucketOwnerPreferred, or ObjectWriter (or AWANFS_DEFAULT_BUCKET_OWNERSHIP)
   -h, --help                       Print this help message and exit"
     );
 }
@@ -129,6 +130,8 @@ async fn serve(
     let mut allow_small_parts = false;
     let mut per_bucket_metrics = std::env::var("AWANFS_PER_BUCKET_METRICS").ok().as_deref() == Some("1");
     let mut verify_payloads_at_boot = std::env::var("AWANFS_VERIFY_PAYLOADS_AT_BOOT").ok().as_deref() == Some("1");
+    let mut default_ownership_raw = std::env::var("AWANFS_DEFAULT_BUCKET_OWNERSHIP")
+        .unwrap_or_else(|_| "BucketOwnerEnforced".to_string());
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -214,6 +217,12 @@ async fn serve(
             args.next();
         } else if arg == "--verify-payloads-at-boot" {
             verify_payloads_at_boot = true;
+        } else if arg == "--default-bucket-ownership" {
+            let Some(v) = args.next() else {
+                eprintln!("--default-bucket-ownership requires BucketOwnerEnforced, BucketOwnerPreferred, or ObjectWriter");
+                std::process::exit(2);
+            };
+            default_ownership_raw = v;
         } else if arg == "--data-dir" || arg == "-d" {
             if let Some(d_str) = args.next() {
                 data_dir = Some(PathBuf::from(d_str));
@@ -298,7 +307,18 @@ async fn serve(
         },
         None => S3ServiceState::new(),
     };
+    let default_bucket_ownership = match s3_server::acl::parse_ownership_str(&default_ownership_raw) {
+        Some(o) => o,
+        None => {
+            eprintln!(
+                "--default-bucket-ownership must be BucketOwnerEnforced, BucketOwnerPreferred, or ObjectWriter, not {:?}",
+                default_ownership_raw
+            );
+            std::process::exit(2);
+        }
+    };
     state.auth = auth;
+    state.default_bucket_ownership = default_bucket_ownership;
     state.region = region;
     if let Some(r) = iam {
         r.watch(std::time::Duration::from_secs(60));
@@ -362,16 +382,6 @@ async fn serve(
         });
         *state.access_log.write() = Some(sink);
     }
-    let state = Arc::new(state);
-    let state_for_stop = Arc::clone(&state);
-    // Automatic compaction (owner decision 15): on unless --auto-compaction off.
-    if auto_compaction {
-        state.start_auto_compaction(std::time::Duration::from_secs(600), 0.20, 1 << 30);
-    }
-    state.start_multipart_cleanup(std::time::Duration::from_secs(600), 7 * lifecycle_day_seconds * 1000);
-    state.start_lifecycle_sweep(lifecycle_period);
-    state.start_scrub(std::time::Duration::from_secs(600), scrub_mib_per_sec);
-
     // TLS (#30, owner decision 18): with --cert and --key the port serves HTTPS only; plain
     // HTTP needs --http-port.
     let tls = match (&tls_cert, &tls_key) {
@@ -392,6 +402,16 @@ async fn serve(
         }
     };
     let https = tls.is_some();
+    state.is_https = https;
+    let state = Arc::new(state);
+    let state_for_stop = Arc::clone(&state);
+    // Automatic compaction (owner decision 15): on unless --auto-compaction off.
+    if auto_compaction {
+        state.start_auto_compaction(std::time::Duration::from_secs(600), 0.20, 1 << 30);
+    }
+    state.start_multipart_cleanup(std::time::Duration::from_secs(600), 7 * lifecycle_day_seconds * 1000);
+    state.start_lifecycle_sweep(lifecycle_period);
+    state.start_scrub(std::time::Duration::from_secs(600), scrub_mib_per_sec);
     // #358: --profile production refuses an unsafe configuration, one line per reason.
     let profile = match s3_server::profile::Profile::parse(&profile_name) {
         Some(p) => p,

@@ -353,7 +353,7 @@ impl BucketState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BucketEvent {
-    Create { caller_id: u32, is_us_east_1: bool },
+    Create { caller_id: u32, is_us_east_1: bool, acl_matches: bool },
     Delete { empty: bool },
     PutConfig(ConfigKind),
     DeleteConfig(ConfigKind),
@@ -362,8 +362,9 @@ pub enum BucketEvent {
 /// Bucket and per-kind configuration transitions (#149).
 ///
 /// - `Absent -> Active` on `Create`, `Active -> Deleted` on `Delete { empty: true }`.
-/// - `Create` on `Active` by owner in `us-east-1` is idempotent (`Ok`), else 409
-///   `BucketAlreadyOwnedByYou`; by another account is 409 `BucketAlreadyExists`.
+/// - `Create` on `Active` by owner in `us-east-1` is idempotent (`Ok`) when `acl_matches`,
+///   else 409 `BucketAlreadyExists` (on ACL mismatch) or 409 `BucketAlreadyOwnedByYou`
+///   (non-us-east-1); by another account is always 409 `BucketAlreadyExists`.
 /// - `Delete` on non-empty `Active` is 409 `BucketNotEmpty`; on empty `Active` drops all configs.
 /// - `PutConfig(kind)` sets `kind` (`Unset -> Set`); `DeleteConfig(kind)` clears `kind` (`Set -> Unset`).
 /// - Any `Delete` or config event on `Absent` or `Deleted` is 404 `NoSuchBucket`.
@@ -374,9 +375,11 @@ pub fn bucket_step(state: BucketState, event: BucketEvent) -> Result<BucketState
             owner_id: caller_id,
             configs: 0,
         }),
-        (BucketStatus::Active, BucketEvent::Create { caller_id, is_us_east_1 }) => {
+        (BucketStatus::Active, BucketEvent::Create { caller_id, is_us_east_1, acl_matches }) => {
             if caller_id == state.owner_id {
-                if is_us_east_1 {
+                if !acl_matches {
+                    Err(BUCKET_ALREADY_EXISTS)
+                } else if is_us_east_1 {
                     Ok(state)
                 } else {
                     Err(BUCKET_ALREADY_OWNED_BY_YOU)
@@ -762,9 +765,10 @@ mod tests {
             BucketState { status: BucketStatus::Deleted, owner_id: 1, configs: 0 },
         ];
         let events = [
-            BucketEvent::Create { caller_id: 1, is_us_east_1: true },
-            BucketEvent::Create { caller_id: 1, is_us_east_1: false },
-            BucketEvent::Create { caller_id: 2, is_us_east_1: true },
+            BucketEvent::Create { caller_id: 1, is_us_east_1: true, acl_matches: true },
+            BucketEvent::Create { caller_id: 1, is_us_east_1: true, acl_matches: false },
+            BucketEvent::Create { caller_id: 1, is_us_east_1: false, acl_matches: true },
+            BucketEvent::Create { caller_id: 2, is_us_east_1: true, acl_matches: true },
             BucketEvent::Delete { empty: false },
             BucketEvent::Delete { empty: true },
             BucketEvent::PutConfig(kind),
@@ -778,10 +782,10 @@ mod tests {
                     (BucketStatus::Absent, BucketEvent::Create { caller_id, .. }) => {
                         assert_eq!(res, Ok(BucketState { status: BucketStatus::Active, owner_id: caller_id, configs: 0 }));
                     }
-                    (BucketStatus::Active, BucketEvent::Create { caller_id: 1, is_us_east_1: true }) => {
+                    (BucketStatus::Active, BucketEvent::Create { caller_id: 1, is_us_east_1: true, acl_matches: true }) => {
                         assert_eq!(res, Ok(s));
                     }
-                    (BucketStatus::Active, BucketEvent::Create { caller_id: 1, is_us_east_1: false }) => {
+                    (BucketStatus::Active, BucketEvent::Create { caller_id: 1, is_us_east_1: false, acl_matches: true }) => {
                         assert_eq!(res, Err(BUCKET_ALREADY_OWNED_BY_YOU));
                     }
                     (BucketStatus::Active, BucketEvent::Create { .. }) => {
@@ -819,7 +823,7 @@ mod tests {
     #[test]
     fn bucket_deleted_drops_configs_and_stays_deleted() {
         let mut st = BucketState::absent();
-        st = bucket_step(st, BucketEvent::Create { caller_id: 7, is_us_east_1: true }).unwrap();
+        st = bucket_step(st, BucketEvent::Create { caller_id: 7, is_us_east_1: true, acl_matches: true }).unwrap();
         for &k in ConfigKind::ALL {
             st = bucket_step(st, BucketEvent::PutConfig(k)).unwrap();
             assert_eq!(st.config_status(k), ConfigStatus::Set);

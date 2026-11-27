@@ -155,6 +155,7 @@ pub async fn create_bucket(
     path: &str,
     headers: &hyper::HeaderMap,
     caller_owner: &str,
+    iam: Option<&crate::iam::Iam>,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     if let Err(refusal) = crate::names::validate_bucket_name(bucket) {
@@ -170,6 +171,34 @@ pub async fn create_bucket(
         Ok(b) => b,
         Err(refusal) => return Ok(refusal_response(refusal, bucket)),
     };
+
+    let explicit_ownership = match headers.get("x-amz-object-ownership").and_then(|v| v.to_str().ok()) {
+        Some(raw) => match crate::acl::parse_ownership_str(raw) {
+            Some(o) => Some(o),
+            None => return Ok(bad_request("InvalidArgument", "Invalid x-amz-object-ownership header", bucket)),
+        },
+        None => None,
+    };
+    let eff_ownership = explicit_ownership.unwrap_or(state.default_bucket_ownership);
+    let eff_caller = if caller_owner.is_empty() { crate::iam::ROOT_ACCOUNT } else { caller_owner };
+    let caller_acl_owner = crate::acl::owner_for_account(eff_caller, iam);
+    let req_acl = match crate::acl::acl_from_headers(headers, &caller_acl_owner, None, iam) {
+        Ok(a) => a,
+        Err(r) => return Ok(refusal_response(r, bucket)),
+    };
+    if eff_ownership == crate::acl::BucketOwnership::BucketOwnerEnforced {
+        let disallowed = match headers.get("x-amz-acl").and_then(|v| v.to_str().ok()) {
+            Some(c) if c.trim() != "bucket-owner-full-control" && c.trim() != "private" => true,
+            _ => crate::acl::has_grant_headers(headers),
+        };
+        if disallowed {
+            return Ok(bad_request(
+                "InvalidBucketAclWithObjectOwnership",
+                "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting.",
+                bucket,
+            ));
+        }
+    }
 
     let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, &state.work, body, MAX_XML_BODY, None, state.body_idle_timeout(), path).await? {
         Ok(b) => b,
@@ -195,13 +224,20 @@ pub async fn create_bucket(
 
     let mut engine = state.engine.write();
     if let Ok(existing_id) = engine.lookup_bucket(bucket) {
-        let existing_owner = state
-            .bucket_config_reader
-            .load_bucket(existing_id)
+        let existing_cfg = state.bucket_config_reader.load_bucket(existing_id);
+        let existing_owner = existing_cfg
+            .as_deref()
             .map(|c| c.effective_owner().to_string())
             .unwrap_or_else(|| "root".to_string());
-        let eff_caller = if caller_owner.is_empty() { "root" } else { caller_owner };
         let same_owner = existing_owner == eff_caller;
+        let existing_acp = existing_cfg
+            .as_deref()
+            .and_then(|c| c.acl())
+            .unwrap_or_else(|| Arc::new(crate::acl::CannedAcl::Private.expand(&caller_acl_owner, None)));
+        let want_acp = req_acl
+            .clone()
+            .unwrap_or_else(|| crate::acl::CannedAcl::Private.expand(&caller_acl_owner, None));
+        let acl_matches = existing_acp.grants == want_acp.grants;
         let step = crate::fsm::bucket_step(
             crate::fsm::BucketState {
                 status: crate::fsm::BucketStatus::Active,
@@ -211,6 +247,7 @@ pub async fn create_bucket(
             crate::fsm::BucketEvent::Create {
                 caller_id: if same_owner { 0 } else { 1 },
                 is_us_east_1: state.region == "us-east-1" || state.region == "default",
+                acl_matches,
             },
         );
         return match step {
@@ -240,6 +277,22 @@ pub async fn create_bucket(
             let created_ns = state.clock.now_ns();
             state.bucket_created_ns.write().insert(id, created_ns);
             let _ = state.bucket_configs.lock().apply_bucket_create(id, bucket, created_ns, caller_owner, "");
+            if let Some(own) = explicit_ownership {
+                let own_xml = crate::acl::render_ownership_xml(own);
+                let _ = state.bucket_configs.lock().put_config(
+                    id,
+                    crate::bucket_config::ConfigKind::Ownership,
+                    own_xml.as_bytes(),
+                );
+            }
+            if let Some(acp) = req_acl {
+                let acl_xml = crate::acl::render_acl_xml(&acp);
+                let _ = state.bucket_configs.lock().put_config(
+                    id,
+                    crate::bucket_config::ConfigKind::Acl,
+                    acl_xml.as_bytes(),
+                );
+            }
             if lock_requested {
                 let _ = state.set_versioning(id, crate::versions::Versioning::Enabled);
                 let default_lock_xml = crate::object_lock::lock_configuration_xml(&crate::object_lock::LockConfiguration {
@@ -466,12 +519,38 @@ pub fn parse_list_objects_query<'a>(
     })
 }
 
+fn listing_object_owner(
+    state: &S3ServiceState,
+    b_id: u32,
+    key: &[u8],
+    target_vid: u64,
+    vol_offset: u64,
+    flags: u16,
+    b_owner_acct: &str,
+    ownership: crate::acl::BucketOwnership,
+    iam: Option<&crate::iam::Iam>,
+) -> crate::acl::AclOwner {
+    let eff_acct = if ownership != crate::acl::BucketOwnership::BucketOwnerEnforced
+        && (flags & crate::meta_index::FLAG_ATTRS != 0 || state.attr_updates.has_updates())
+    {
+        let key_str = String::from_utf8_lossy(key);
+        state
+            .object_view_for(b_id, &key_str, target_vid, vol_offset, flags)
+            .ok()
+            .and_then(|v| v.attrs.owner().map(str::to_string))
+    } else {
+        None
+    };
+    crate::acl::owner_for_account(eff_acct.as_deref().unwrap_or(b_owner_acct), iam)
+}
+
 pub async fn list_objects(
     state: Arc<S3ServiceState>,
     b_id: u32,
     bucket: &str,
     query_map: &HashMap<String, String>,
     v2: bool,
+    iam: Option<&crate::iam::Iam>,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let parsed = match parse_list_objects_query(query_map, v2) {
         Ok(p) => p,
@@ -494,11 +573,28 @@ pub async fn list_objects(
     );
     let q = |k: &str| query_map.get(k).map(|s| s.as_str()).unwrap_or("");
     let page = list_page(&state, b_id, prefix.as_bytes(), delimiter.as_bytes(), &start, max_keys);
+    let cfg = state.bucket_config_reader.load_bucket(b_id);
+    let b_owner_acct = cfg.as_deref().map_or(crate::iam::ROOT_ACCOUNT, |c| c.effective_owner());
+    let ownership = cfg
+        .as_deref()
+        .map_or(state.default_bucket_ownership, |c| c.ownership_or(state.default_bucket_ownership));
     let enc = |s: &str| if url_encode { s3_url_encode(s) } else { s.to_string() };
     let key_strings: Vec<String> = page.objects.iter().map(|(k, _)| enc(&String::from_utf8_lossy(k))).collect();
     let etag_strings: Vec<String> = page.objects.iter().map(|(_, m)| md5_to_etag_hex(m.etag_hi, m.etag_lo)).collect();
     let prefix_strings: Vec<String> = page.prefixes.iter().map(|p| enc(&String::from_utf8_lossy(p))).collect();
     let lm_strings: Vec<String> = page.objects.iter().map(|(_, m)| crate::versions::iso8601(m.created_at.saturating_mul(1_000_000))).collect();
+    let owners: Vec<crate::acl::AclOwner> = page
+        .objects
+        .iter()
+        .map(|(k, m)| {
+            let flags = crate::ffi_bridge::unpack_flags(m.bucket_flags);
+            let target_vid = {
+                let key_s = String::from_utf8_lossy(k);
+                state.versions.read().current(b_id, &key_s).map_or(0, |v| v.id())
+            };
+            listing_object_owner(&state, b_id, k, target_vid, m.vol_offset, flags, b_owner_acct, ownership, iam)
+        })
+        .collect();
     let contents: Vec<S3ObjectEntry> = page
         .objects
         .iter()
@@ -508,6 +604,8 @@ pub async fn list_objects(
             last_modified: &lm_strings[i],
             etag: &etag_strings[i],
             size: m.size,
+            owner_id: &owners[i].id,
+            owner_display_name: &owners[i].display_name,
         })
         .collect();
     let cps: Vec<&str> = prefix_strings.iter().map(|s| s.as_str()).collect();
@@ -558,6 +656,7 @@ pub async fn list_object_versions(
     b_id: u32,
     bucket: &str,
     query_map: &HashMap<String, String>,
+    iam: Option<&crate::iam::Iam>,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let q = |k: &str| query_map.get(k).map(|s| s.as_str()).unwrap_or("");
     let prefix = q("prefix");
@@ -717,12 +816,29 @@ pub async fn list_object_versions(
             0
         };
 
+        let cfg = state.bucket_config_reader.load_bucket(b_id);
+        let b_owner_acct = cfg.as_deref().map_or(crate::iam::ROOT_ACCOUNT, |c| c.effective_owner());
+        let ownership = cfg
+            .as_deref()
+            .map_or(state.default_bucket_ownership, |c| c.ownership_or(state.default_bucket_ownership));
+
         for (orig_idx, v) in versions.iter().enumerate().skip(start_idx) {
             if entries.len() + common_prefixes.len() >= max_keys {
                 truncated = true;
                 break 'outer;
             }
             let vid = v.id_string();
+            let v_owner = listing_object_owner(
+                &state,
+                b_id,
+                k.as_bytes(),
+                v.id(),
+                v.vol_offset,
+                v.flags,
+                b_owner_acct,
+                ownership,
+                iam,
+            );
             entries.push(VersionListing {
                 key: enc(&k),
                 version_id: vid.clone(),
@@ -731,6 +847,8 @@ pub async fn list_object_versions(
                 last_modified: crate::versions::iso8601(v.modified),
                 etag: version_etag(v).trim_matches('"').to_string(),
                 size: v.size,
+                owner_id: v_owner.id,
+                owner_display_name: v_owner.display_name,
             });
             last_key_raw = Some(k.clone());
             last_vid = Some(vid);
@@ -773,8 +891,8 @@ pub async fn delete_objects(
     b_id: u32,
     bucket: &str,
     path: &str,
-    may_delete: impl Fn(&str) -> bool,
-    may_bypass: impl Fn(&str) -> bool,
+    may_delete: impl Fn(&str, Option<&str>) -> bool,
+    may_bypass: impl Fn(&str, Option<&str>) -> bool,
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, &state.work, body, MAX_XML_BODY, None, state.body_idle_timeout(), path).await? {
@@ -798,7 +916,7 @@ pub async fn delete_objects(
     for obj in &req.objects {
         let k = &obj.key;
         let vid = obj.version_id.as_deref();
-        if !may_delete(k) {
+        if !may_delete(k, vid) {
             failed.push((k.clone(), vid.map(str::to_string), "AccessDenied", "Access Denied".to_string()));
             continue;
         }
@@ -810,7 +928,7 @@ pub async fn delete_objects(
         };
         match vid {
             Some(v) => match crate::versions::parse_id(v) {
-                Some(id) => match state.delete_version_conditional(b_id, k, id, &conds, may_bypass(k)).await {
+                Some(id) => match state.delete_version_conditional(b_id, k, id, &conds, may_bypass(k, vid)).await {
                     Ok(removed) => {
                         let is_dm = removed.is_some_and(|ver| ver.marker);
                         ok_keys.push(DeletedOutcome {

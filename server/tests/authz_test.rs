@@ -53,7 +53,15 @@ fn op_class(op: Operation) -> OpClass {
         | Operation::GetObjectTagging
         | Operation::GetObjectLockConfiguration
         | Operation::GetObjectRetention
-        | Operation::GetObjectLegalHold => OpClass::Read,
+        | Operation::GetObjectLegalHold
+        | Operation::GetBucketPolicy
+        | Operation::GetBucketPolicyStatus
+        | Operation::GetBucketOwnershipControls
+        | Operation::GetPublicAccessBlock => OpClass::Read,
+        Operation::GetBucketAcl
+        | Operation::GetObjectAcl => OpClass::ReadAcl,
+        Operation::PutBucketAcl
+        | Operation::PutObjectAcl => OpClass::WriteAcl,
         Operation::PutObject
         | Operation::PostObject
         | Operation::CopyObject
@@ -77,7 +85,13 @@ fn op_class(op: Operation) -> OpClass {
         | Operation::DeleteBucketCors
         | Operation::PutBucketTagging
         | Operation::DeleteBucketTagging
-        | Operation::PutObjectLockConfiguration => OpClass::BucketAdmin,
+        | Operation::PutObjectLockConfiguration
+        | Operation::PutBucketPolicy
+        | Operation::DeleteBucketPolicy
+        | Operation::PutBucketOwnershipControls
+        | Operation::DeleteBucketOwnershipControls
+        | Operation::PutPublicAccessBlock
+        | Operation::DeletePublicAccessBlock => OpClass::BucketAdmin,
     }
 }
 
