@@ -602,6 +602,9 @@ async fn sweep_unversioned_or_null_key_locked(
 
 /// Runs one rate-limited lifecycle sweep tick using [`fsm::expiry_step`]. Returns `true` if
 /// the work budget was exhausted and another tick should run promptly.
+/// Keys the sweep lists from the engine at a time (#475).
+const SWEEP_PAGE: usize = 1024;
+
 pub async fn run_lifecycle_sweep_async(
     state: &S3ServiceState,
     now_epoch_ms: u64,
@@ -644,24 +647,34 @@ pub async fn run_lifecycle_sweep_async(
             continue;
         }
 
-        // Collect candidate keys from `versions` and `engine` without holding both locks together
-        // to preserve strict lock ordering (`engine` before `versions` elsewhere in `s3_api.rs`).
+        // Versioned keys first, then every current object in key order, a page at a time:
+        // `list_keys` merges the in-memory rows with the spill index, where rows past the hot
+        // set live (#475). `engine` and `versions` are never held together (lock order
+        // elsewhere in `s3_api.rs` is `engine` before `versions`), and neither while sweeping.
         let v_keys = state.versions.read().keys_of(b_id, "");
-        let mut seen_keys: HashSet<String> = v_keys.iter().cloned().collect();
-        let mut candidate_keys: Vec<String> = v_keys.into_iter().collect();
-        {
-            let engine = state.engine.read();
-            if let Some(bucket) = engine.buckets.get(&b_id) {
-                for key_bytes in bucket.key_index.keys() {
-                    let key_str = String::from_utf8_lossy(key_bytes).into_owned();
-                    if seen_keys.insert(key_str.clone()) {
-                        candidate_keys.push(key_str);
+        let versioned: HashSet<String> = v_keys.iter().cloned().collect();
+        let mut pending: std::collections::VecDeque<String> = v_keys.into_iter().collect();
+        let mut after: Vec<u8> = Vec::new();
+        let mut listed_all = false;
+        loop {
+            if pending.is_empty() {
+                if listed_all {
+                    break;
+                }
+                let page = state.engine.read().list_keys(b_id, b"", &after, SWEEP_PAGE);
+                listed_all = page.len() < SWEEP_PAGE;
+                if let Some((last, _)) = page.last() {
+                    after = last.clone();
+                }
+                for (k, _) in page {
+                    let key_str = String::from_utf8_lossy(&k).into_owned();
+                    if !versioned.contains(&key_str) {
+                        pending.push_back(key_str);
                     }
                 }
+                continue;
             }
-        }
-
-        for key_str in candidate_keys {
+            let key_str = pending.pop_front().expect("pending is not empty");
             if actions_done >= budget {
                 return true;
             }
