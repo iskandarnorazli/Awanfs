@@ -602,6 +602,19 @@ async fn sweep_unversioned_or_null_key_locked(
 
 /// Runs one rate-limited lifecycle sweep tick using [`fsm::expiry_step`]. Returns `true` if
 /// the work budget was exhausted and another tick should run promptly.
+/// The lifecycle sweep runs every 1/24 of a lifecycle day, kept between these bounds (#486,
+/// owner decision 2026-11-27): hourly at the default day of 86,400 s, every 500 ms under the
+/// suite's 2-second day. A pass over 1M objects cost 2.8 s of CPU
+/// (`measurements/2026-11-27-lifecycle-sweep-cost.md`), and rules count in days.
+pub const MIN_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+pub const MAX_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How often to sweep for a lifecycle day of `day_seconds` (`--lifecycle-day-seconds`).
+pub fn sweep_interval(day_seconds: u64) -> std::time::Duration {
+    let ms = day_seconds.max(1).saturating_mul(1000) / 24;
+    std::time::Duration::from_millis(ms).clamp(MIN_SWEEP_INTERVAL, MAX_SWEEP_INTERVAL)
+}
+
 /// Keys the sweep lists from the engine at a time (#475).
 const SWEEP_PAGE: usize = 1024;
 
@@ -777,5 +790,21 @@ pub fn run_lifecycle_sweep(
         let _ = std::thread::scope(|s| s.spawn(exec).join());
     } else {
         let _ = exec();
+    }
+}
+
+#[cfg(test)]
+mod sweep_interval_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn the_sweep_runs_every_twenty_fourth_of_a_day_within_bounds() {
+        assert_eq!(sweep_interval(86_400), Duration::from_secs(3600));
+        assert_eq!(sweep_interval(2_400), Duration::from_secs(100));
+        assert_eq!(sweep_interval(2), Duration::from_millis(500));
+        assert_eq!(sweep_interval(0), Duration::from_millis(500));
+        assert_eq!(sweep_interval(30 * 86_400), Duration::from_secs(3600));
+        assert_eq!(sweep_interval(u64::MAX), Duration::from_secs(3600));
     }
 }

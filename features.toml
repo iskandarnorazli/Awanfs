@@ -2352,7 +2352,7 @@ default = "86400"
 feature = "lifecycle"
 what = "seconds in a lifecycle day (test use only; the server warns when it is set)"
 derives = ["lifecycle sweep period: 1/24 of a day, 500 ms to 1 h (#486)", "age at which stale multipart uploads are aborted: 7 days"]
-test = ["server/tests/lifecycle_conformance_test.rs::lifecycle_filters_date_disabled_header_and_tags"]
+test = ["server/tests/lifecycle_sweep_interval_test.rs::the_period_follows_the_lifecycle_day", "server/tests/lifecycle_conformance_test.rs::lifecycle_filters_date_disabled_header_and_tags"]
 
 [[setting]]
 id = "body-idle-timeout"
