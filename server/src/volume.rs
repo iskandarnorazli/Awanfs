@@ -440,6 +440,8 @@ pub struct ScannedNeedle {
     /// Verified payload bytes for `FLAG_ATTR_UPDATE` needles, read directly from the
     /// streaming scan window without faulting the volume memory map at boot (#203).
     pub attr_update_payload: Option<Vec<u8>>,
+    /// Plaintext byte size read from `TAG_SSE` (`0x0050`) when the needle is encrypted (#121).
+    pub sse_plaintext_size: Option<u64>,
 }
 
 /// 64-byte Header of a Needle on disk.
@@ -1973,6 +1975,23 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 }
             }
 
+            let fast_sse_plaintext_size = if hdr.attrs_len > 0
+                && hdr.flags
+                    & (crate::meta_index::FLAG_MULTIPART
+                        | crate::meta_index::FLAG_ATTR_UPDATE
+                        | crate::meta_index::FLAG_TOMBSTONE
+                        | crate::meta_index::FLAG_VERSION_DELETE)
+                    == 0
+                && hdr.payload_start() <= SECTOR_SIZE
+            {
+                let a_start = hdr.attrs_start();
+                let p_start = hdr.payload_start();
+                crate::attrs::Attrs::raw_tag_value(&sector[a_start..p_start], crate::attrs::TAG_SSE)
+                    .and_then(crate::sse::SseAttr::plaintext_size_from_raw)
+            } else {
+                None
+            };
+
             let key_end = 64 + hdr.key_len as usize;
             let key_str = if key_end <= SECTOR_SIZE {
                 String::from_utf8_lossy(&sector[64..key_end]).to_string()
@@ -2003,6 +2022,28 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 None
             };
 
+            let sse_plaintext_size = if fast_sse_plaintext_size.is_some() {
+                fast_sse_plaintext_size
+            } else if hdr.attrs_len > 0
+                && hdr.flags
+                    & (crate::meta_index::FLAG_MULTIPART
+                        | crate::meta_index::FLAG_ATTR_UPDATE
+                        | crate::meta_index::FLAG_TOMBSTONE
+                        | crate::meta_index::FLAG_VERSION_DELETE)
+                    == 0
+                && hdr.payload_start() > SECTOR_SIZE
+            {
+                let a_start = hdr.attrs_start();
+                let p_start = hdr.payload_start();
+                let need_bytes = p_start.div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
+                window.read_at(scan_offset, need_bytes)?.and_then(|slice| {
+                    crate::attrs::Attrs::raw_tag_value(&slice[a_start..p_start], crate::attrs::TAG_SSE)
+                        .and_then(crate::sse::SseAttr::plaintext_size_from_raw)
+                })
+            } else {
+                None
+            };
+
             if let Err(e) = visitor(ScannedNeedle {
                 bucket_id: hdr.bucket_id,
                 key: key_str,
@@ -2016,6 +2057,7 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 payload_crc32c: hdr.payload_crc32c,
                 created_at_ns: hdr.created_at_ns,
                 attr_update_payload,
+                sse_plaintext_size,
             }) {
                 return Ok(Err(e));
             }

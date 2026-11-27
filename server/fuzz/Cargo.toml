@@ -183,3 +183,15 @@ name = "sim_storage"
 path = "fuzz_targets/sim_storage.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "sse_headers"
+path = "fuzz_targets/sse_headers.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sse_payload"
+path = "fuzz_targets/sse_payload.rs"
+test = false
+doc = false
