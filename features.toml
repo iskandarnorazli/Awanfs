@@ -552,7 +552,6 @@ fuzz = ["attrs_values"]
 id = "object-attributes-api"
 name = "GetObjectAttributes API (ETag, Checksum, ObjectParts, StorageClass, ObjectSize)"
 status = "done"
-gaps = { fuzz = "#447" }
 issue = "#117"
 area = "object-attributes-api"
 design_section = "7.1"
@@ -575,6 +574,7 @@ server_tests = [
   "server/tests/checksum_test.rs::multipart_checksum_and_get_object_attributes_parts",
 ]
 drive = ["checksums"]
+fuzz = ["object_attributes_header"]
 
 [[feature]]
 id = "tagging"
@@ -1264,7 +1264,6 @@ fuzz = ["version_id", "request_xml"]
 id = "listing"
 name = "Bucket listing (ListObjects, ListObjectsV2, paginated ListBuckets)"
 status = "done"
-gaps = { fuzz = "#444" }
 issue = "#114"
 area = "listing"
 design_section = "6.6"
@@ -1398,6 +1397,7 @@ server_tests = [
   "server/tests/listing_props_test.rs::prop_list_objects_thousand_batch_boundary",
 ]
 drive = ["listing"]
+fuzz = ["list_objects_query"]
 
 # Its other ceph tests pass; these fail only because each calls GetObjectAcl (owner, 2026-11-21).
 [feature.waits_on]
@@ -2046,13 +2046,13 @@ fuzz = ["attrs_block", "attrs_values"]
 id = "operation-table"
 name = "Central S3 operation table, 501 handling, and bucket config manifest"
 status = "done"
-gaps = { fuzz = "#448" }
 issue = "#148"
 user_visible = false
 server_tests = [
   "server/tests/operation_table_test.rs::unknown_subresources_answer_501_and_store_nothing",
   "server/tests/operation_table_test.rs::error_precedence_follows_pipeline_order",
 ]
+fuzz = ["classify"]
 
 [[feature]]
 id = "erasure-coding"

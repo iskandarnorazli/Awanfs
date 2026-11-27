@@ -1,8 +1,9 @@
 #![no_main]
 //! ISO 8601 basic date (`YYYYMMDDTHHMMSSZ`): never panics, and agrees with a formatter on
-//! every value it accepts.
+//! every value it accepts. The SigV4 time read from an HTTP `Date` header (#457) parses back
+//! to the same instant.
 use libfuzzer_sys::fuzz_target;
-use s3_server::parse_iso8601_epoch;
+use s3_server::{format_iso8601_basic, parse_iso8601_epoch, sigv4_time_from_http_date};
 
 fn format_iso8601_epoch(epoch: u64) -> Option<String> {
     let days = (epoch / 86_400) as i64;
@@ -38,10 +39,16 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(parse_iso8601_epoch(&formatted), Some(epoch));
     }
 
+    if let Some((iso, epoch)) = sigv4_time_from_http_date(&s) {
+        assert_eq!(parse_iso8601_epoch(&iso), Some(epoch), "Date header {:?} gave {}", s, iso);
+        assert_eq!(format_iso8601_basic(epoch).as_deref(), Some(iso.as_str()));
+    }
+
     if data.len() >= 8 {
         // 9999-12-31T23:59:59Z = 253402300799
         let epoch = u64::from_le_bytes(data[..8].try_into().unwrap()) % 253_402_300_800;
         let formatted = format_iso8601_epoch(epoch).unwrap();
         assert_eq!(parse_iso8601_epoch(&formatted), Some(epoch));
+        assert_eq!(format_iso8601_basic(epoch), Some(formatted));
     }
 });

@@ -2,12 +2,15 @@
 //! `list_buckets_query`, `raw_s3_key`), called by both `fuzz_targets/*.rs` and unit tests.
 
 use http_body_util::BodyExt;
-use hyper::header::{HeaderMap, HeaderValue};
-use hyper::StatusCode;
+use hyper::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use hyper::{Method, StatusCode};
+use s3_server::ops::{classify, ClassifyRefusal, Operation, OPS};
 use s3_server::bucket_config::{
     base64_decode as bucket_base64_decode, base64_encode as bucket_base64_encode,
 };
 use s3_server::checksum::{base64_decode, requested_checksum, ChecksumAlgorithm};
+use s3_server::ops::bucket::{decode_hex_token, encode_hex_token, parse_list_objects_query};
+use s3_server::ops::object::{parse_object_attributes_headers, ObjectAttributesQuery};
 use s3_server::ops::service::list_buckets;
 use s3_server::{
     base64_encode, parse_s3_target, percent_decode, percent_decode_path_bytes, raw_s3_key,
@@ -382,9 +385,448 @@ pub fn check_raw_s3_key(data: &[u8]) {
     }
 }
 
+fn canonical_operation_cases() -> &'static [(
+    Operation,
+    Method,
+    Option<&'static str>,
+    Option<&'static str>,
+    &'static str,
+    Option<&'static str>,
+)] {
+    &[
+        (Operation::ListBuckets, Method::GET, None, None, "", None),
+        (Operation::CreateBucket, Method::PUT, Some("bkt"), None, "", None),
+        (Operation::DeleteBucket, Method::DELETE, Some("bkt"), None, "", None),
+        (Operation::HeadBucket, Method::HEAD, Some("bkt"), None, "", None),
+        (Operation::ListObjects, Method::GET, Some("bkt"), None, "", None),
+        (Operation::ListObjectsV2, Method::GET, Some("bkt"), None, "list-type=2", None),
+        (Operation::ListObjectVersions, Method::GET, Some("bkt"), None, "versions", None),
+        (Operation::GetBucketLocation, Method::GET, Some("bkt"), None, "location", None),
+        (Operation::GetBucketVersioning, Method::GET, Some("bkt"), None, "versioning", None),
+        (Operation::PutBucketVersioning, Method::PUT, Some("bkt"), None, "versioning", None),
+        (Operation::GetBucketLifecycle, Method::GET, Some("bkt"), None, "lifecycle", None),
+        (Operation::PutBucketLifecycle, Method::PUT, Some("bkt"), None, "lifecycle", None),
+        (Operation::DeleteBucketLifecycle, Method::DELETE, Some("bkt"), None, "lifecycle", None),
+        (Operation::GetBucketCors, Method::GET, Some("bkt"), None, "cors", None),
+        (Operation::PutBucketCors, Method::PUT, Some("bkt"), None, "cors", None),
+        (Operation::DeleteBucketCors, Method::DELETE, Some("bkt"), None, "cors", None),
+        (Operation::GetBucketTagging, Method::GET, Some("bkt"), None, "tagging", None),
+        (Operation::PutBucketTagging, Method::PUT, Some("bkt"), None, "tagging", None),
+        (Operation::DeleteBucketTagging, Method::DELETE, Some("bkt"), None, "tagging", None),
+        (Operation::CorsPreflight, Method::OPTIONS, Some("bkt"), None, "", None),
+        (Operation::ListMultipartUploads, Method::GET, Some("bkt"), None, "uploads", None),
+        (Operation::DeleteObjects, Method::POST, Some("bkt"), None, "delete", None),
+        (Operation::PutObject, Method::PUT, Some("bkt"), Some("obj"), "", None),
+        (Operation::PostObject, Method::POST, Some("bkt"), None, "", None),
+        (Operation::CopyObject, Method::PUT, Some("bkt"), Some("obj"), "", Some("/src/key")),
+        (Operation::GetObject, Method::GET, Some("bkt"), Some("obj"), "", None),
+        (Operation::GetObjectAttributes, Method::GET, Some("bkt"), Some("obj"), "attributes", None),
+        (Operation::HeadObject, Method::HEAD, Some("bkt"), Some("obj"), "", None),
+        (Operation::DeleteObject, Method::DELETE, Some("bkt"), Some("obj"), "", None),
+        (Operation::CreateMultipartUpload, Method::POST, Some("bkt"), Some("obj"), "uploads", None),
+        (Operation::UploadPart, Method::PUT, Some("bkt"), Some("obj"), "partNumber=1&uploadId=u1", None),
+        (Operation::UploadPartCopy, Method::PUT, Some("bkt"), Some("obj"), "partNumber=1&uploadId=u1", Some("/src/key")),
+        (Operation::CompleteMultipartUpload, Method::POST, Some("bkt"), Some("obj"), "uploadId=u1", None),
+        (Operation::AbortMultipartUpload, Method::DELETE, Some("bkt"), Some("obj"), "uploadId=u1", None),
+        (Operation::ListParts, Method::GET, Some("bkt"), Some("obj"), "uploadId=u1", None),
+        (Operation::GetObjectTagging, Method::GET, Some("bkt"), Some("obj"), "tagging", None),
+        (Operation::PutObjectTagging, Method::PUT, Some("bkt"), Some("obj"), "tagging", None),
+        (Operation::DeleteObjectTagging, Method::DELETE, Some("bkt"), Some("obj"), "tagging", None),
+        (Operation::GetObjectLockConfiguration, Method::GET, Some("bkt"), None, "object-lock", None),
+        (Operation::PutObjectLockConfiguration, Method::PUT, Some("bkt"), None, "object-lock", None),
+        (Operation::GetObjectRetention, Method::GET, Some("bkt"), Some("obj"), "retention", None),
+        (Operation::PutObjectRetention, Method::PUT, Some("bkt"), Some("obj"), "retention", None),
+        (Operation::GetObjectLegalHold, Method::GET, Some("bkt"), Some("obj"), "legal-hold", None),
+        (Operation::PutObjectLegalHold, Method::PUT, Some("bkt"), Some("obj"), "legal-hold", None),
+    ]
+}
+
+fn reorder_query(query: &str, sort_pairs: bool) -> String {
+    let mut parts: Vec<&str> = query.split('&').filter(|p| !p.is_empty()).collect();
+    if sort_pairs {
+        parts.sort_unstable();
+    } else {
+        parts.reverse();
+    }
+    parts.join("&")
+}
+
+fn check_classify_one(method: &Method, bucket: Option<&str>, key: Option<&str>, query: &str, hdrs: &HeaderMap) {
+    let r1 = classify(method, bucket, key, query, hdrs);
+    let rev_q = reorder_query(query, false);
+    let sort_q = reorder_query(query, true);
+    let r2 = classify(method, bucket, key, &rev_q, hdrs);
+    let r3 = classify(method, bucket, key, &sort_q, hdrs);
+    assert_eq!(
+        r1, r2,
+        "classify depended on query parameter order for {} {:?}/{:?} ?{:?} vs ?{:?}",
+        method, bucket, key, query, rev_q
+    );
+    assert_eq!(
+        r1, r3,
+        "classify depended on query parameter sort order for {} {:?}/{:?} ?{:?} vs ?{:?}",
+        method, bucket, key, query, sort_q
+    );
+}
+
+/// Oracle for `classify` (#148, #448):
+/// - Every input yields an `Operation` or `ClassifyRefusal` without panicking.
+/// - Reordering/sorting query parameters produces the identical classification.
+/// - Every `Operation` in `OPS` round-trips from its canonical request.
+pub fn check_classify(data: &[u8]) {
+    static CANONICAL_OK: OnceLock<()> = OnceLock::new();
+    CANONICAL_OK.get_or_init(|| {
+        let mut seen = Vec::new();
+        for (expected, method, bucket, key, query, copy) in canonical_operation_cases() {
+            let mut hdrs = HeaderMap::new();
+            if let Some(c) = copy {
+                hdrs.insert("x-amz-copy-source", HeaderValue::from_static(c));
+            }
+            if *expected == Operation::PostObject {
+                hdrs.insert(CONTENT_TYPE, HeaderValue::from_static("multipart/form-data; boundary=x"));
+            }
+            let got = classify(method, *bucket, *key, query, &hdrs)
+                .unwrap_or_else(|e| panic!("canonical {:?} refused: {:?}", expected, e));
+            assert_eq!(got, *expected, "canonical mismatch for {:?}", expected);
+            check_classify_one(method, *bucket, *key, query, &hdrs);
+            if !seen.contains(&got) {
+                seen.push(got);
+            }
+        }
+        assert_eq!(seen.len(), OPS.len(), "every Operation variant in OPS must be covered");
+    });
+
+    let text = String::from_utf8_lossy(data);
+    // Support structured multi-field seeds (`METHOD\nbucket\nkey\nheaders\nquery`) AND raw query strings.
+    let raw_query = if let Some(rest) = text.strip_prefix("REQ:") {
+        let mut lines = rest.splitn(5, '\n');
+        let m_str = lines.next().unwrap_or("GET");
+        let b_str = lines.next().unwrap_or("");
+        let k_str = lines.next().unwrap_or("");
+        let h_flags = lines.next().unwrap_or("");
+        let q = lines.next().unwrap_or("");
+        let method = Method::from_bytes(m_str.as_bytes()).unwrap_or(Method::GET);
+        let bucket = (!b_str.is_empty()).then_some(b_str);
+        let key = (!k_str.is_empty()).then_some(k_str);
+        let mut hdrs = HeaderMap::new();
+        if h_flags.contains('C') {
+            hdrs.insert("x-amz-copy-source", HeaderValue::from_static("/src/key"));
+        }
+        if h_flags.contains('F') {
+            hdrs.insert(CONTENT_TYPE, HeaderValue::from_static("multipart/form-data; boundary=x"));
+        }
+        check_classify_one(&method, bucket, key, q, &hdrs);
+        q
+    } else {
+        text.as_ref()
+    };
+
+    let methods = [Method::GET, Method::PUT, Method::POST, Method::DELETE, Method::HEAD, Method::OPTIONS];
+    let selector = data.first().copied().unwrap_or(0) as usize;
+    let bucket_opts = [None, Some("bkt"), Some("")];
+    let key_opts = [None, Some("obj"), Some("")];
+    let b = bucket_opts[(selector >> 3) % bucket_opts.len()];
+    let k = key_opts[(selector >> 5) % key_opts.len()];
+    let mut hdrs = HeaderMap::new();
+    if selector & 0x40 != 0 {
+        hdrs.insert("x-amz-copy-source", HeaderValue::from_static("/src/k"));
+    }
+    if selector & 0x80 != 0 {
+        hdrs.insert(CONTENT_TYPE, HeaderValue::from_static("multipart/form-data; boundary=x"));
+    }
+    for m in &methods {
+        check_classify_one(m, b, k, raw_query, &hdrs);
+    }
+    // Also exercise explicit arbitrary-order queries with PUT object + headers so sub-resource order bugs fail fast.
+    let mut empty_hdrs = HeaderMap::new();
+    check_classify_one(&Method::PUT, Some("bkt"), Some("obj"), raw_query, &empty_hdrs);
+    empty_hdrs.insert("x-amz-copy-source", HeaderValue::from_static("/src/k"));
+    check_classify_one(&Method::PUT, Some("bkt"), Some("obj"), raw_query, &empty_hdrs);
+    let _: Result<Operation, ClassifyRefusal> = classify(&Method::GET, Some("bkt"), None, raw_query, &HeaderMap::new());
+}
+
+fn assert_list_objects_oracle(query_map: &HashMap<String, String>, v2: bool) {
+    let res = parse_list_objects_query(query_map, v2);
+    assert_eq!(res, parse_list_objects_query(query_map, v2));
+
+    let bad_enc = query_map
+        .get("encoding-type")
+        .is_some_and(|et| !et.is_empty() && et != "url");
+    if bad_enc {
+        assert!(
+            matches!(res, Err(("InvalidArgument", _))),
+            "encoding-type={:?} must return InvalidArgument, got {:?}",
+            query_map.get("encoding-type"),
+            res
+        );
+        return;
+    }
+
+    let bad_max_keys = query_map
+        .get("max-keys")
+        .is_some_and(|s| s.parse::<i32>().ok().filter(|&n| n >= 0).is_none());
+    if bad_max_keys {
+        assert!(
+            matches!(res, Err(("InvalidArgument", _))),
+            "max-keys={:?} must return InvalidArgument, got {:?}",
+            query_map.get("max-keys"),
+            res
+        );
+        return;
+    }
+
+    let bad_tok = v2
+        && query_map
+            .get("continuation-token")
+            .is_some_and(|t| decode_hex_token(t).is_none());
+    if bad_tok {
+        assert!(
+            matches!(res, Err(("InvalidArgument", _))),
+            "continuation-token={:?} must return InvalidArgument, got {:?}",
+            query_map.get("continuation-token"),
+            res
+        );
+        return;
+    }
+
+    let parsed = res.unwrap_or_else(|e| panic!("valid ListObjects query {:?} failed: {:?}", query_map, e));
+    assert!(parsed.max_keys <= 1000);
+    if let Some(mk) = query_map.get("max-keys") {
+        let want = (mk.parse::<i32>().unwrap() as usize).min(1000);
+        assert_eq!(parsed.max_keys, want);
+    } else {
+        assert_eq!(parsed.max_keys, 1000);
+    }
+    assert_eq!(
+        parsed.url_encode,
+        query_map.get("encoding-type").is_some_and(|et| et == "url")
+    );
+    assert_eq!(
+        parsed.fetch_owner,
+        v2 && query_map
+            .get("fetch-owner")
+            .is_some_and(|f| f.eq_ignore_ascii_case("true"))
+    );
+    assert_eq!(parsed.prefix, query_map.get("prefix").map(String::as_str).unwrap_or(""));
+    assert_eq!(parsed.delimiter, query_map.get("delimiter").map(String::as_str).unwrap_or(""));
+    if v2 {
+        if let Some(t) = query_map.get("continuation-token") {
+            assert_eq!(parsed.start, decode_hex_token(t).unwrap());
+        } else {
+            assert_eq!(
+                parsed.start,
+                query_map.get("start-after").map(String::as_bytes).unwrap_or(&[])
+            );
+        }
+    } else {
+        assert_eq!(
+            parsed.start,
+            query_map.get("marker").map(String::as_bytes).unwrap_or(&[])
+        );
+    }
+}
+
+/// Oracle for `list_objects_query` (#114, #444):
+/// - `parse_list_objects_query` never panics for v1 or v2.
+/// - Every invalid `encoding-type`, `max-keys`, or v2 `continuation-token` returns `InvalidArgument`.
+/// - Server-issued hex tokens (`encode_hex_token`) always round-trip back to original bytes.
+pub fn check_list_objects_query(data: &[u8]) {
+    let text = String::from_utf8_lossy(data);
+    let mut query_map = HashMap::new();
+    for pair in text.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            query_map.insert(percent_decode(k), percent_decode(v));
+        }
+    }
+    for v2 in [false, true] {
+        assert_list_objects_oracle(&query_map, v2);
+    }
+
+    if !text.contains('=') {
+        for key in ["max-keys", "continuation-token", "encoding-type", "prefix", "delimiter"] {
+            let mut single = HashMap::new();
+            single.insert(key.to_string(), text.as_ref().to_string());
+            assert_list_objects_oracle(&single, false);
+            assert_list_objects_oracle(&single, true);
+        }
+    }
+
+    // Any token encoded by the server must decode back identically under v2.
+    let mut tok_map = HashMap::new();
+    tok_map.insert("continuation-token".to_string(), encode_hex_token(data));
+    let parsed = parse_list_objects_query(&tok_map, true).expect("server token must parse back");
+    assert_eq!(parsed.start.as_slice(), data);
+}
+
+fn expected_object_attributes(
+    headers: &HeaderMap,
+) -> Result<ObjectAttributesQuery, &'static str> {
+    let mut out = ObjectAttributesQuery {
+        want_etag: false,
+        want_checksum: false,
+        want_parts: false,
+        want_storage_class: false,
+        want_size: false,
+        max_parts: 1000,
+        part_marker: 0,
+    };
+    let mut any_attr = false;
+    for val in headers.get_all("x-amz-object-attributes") {
+        let Ok(raw) = val.to_str() else {
+            return Err("InvalidArgument");
+        };
+        for tok in raw.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
+            any_attr = true;
+            match tok {
+                "ETag" => out.want_etag = true,
+                "Checksum" => out.want_checksum = true,
+                "ObjectParts" => out.want_parts = true,
+                "StorageClass" => out.want_storage_class = true,
+                "ObjectSize" => out.want_size = true,
+                _ => return Err("InvalidArgument"),
+            }
+        }
+    }
+    if !any_attr {
+        return Err("InvalidArgument");
+    }
+    if let Some(s) = headers.get("x-amz-max-parts").and_then(|v| v.to_str().ok()) {
+        match s.trim().parse::<usize>() {
+            Ok(n) if n > 0 => out.max_parts = n.min(1000),
+            _ => return Err("InvalidArgument"),
+        }
+    }
+    if let Some(s) = headers
+        .get("x-amz-part-number-marker")
+        .and_then(|v| v.to_str().ok())
+    {
+        match s.trim().parse::<usize>() {
+            Ok(n) => out.part_marker = n,
+            Err(_) => return Err("InvalidArgument"),
+        }
+    }
+    Ok(out)
+}
+
+fn assert_object_attributes_oracle(headers: &HeaderMap) {
+    let got = parse_object_attributes_headers(headers);
+    let want = expected_object_attributes(headers);
+    match want {
+        Ok(expected) => assert_eq!(
+            got,
+            Ok(expected),
+            "parse_object_attributes_headers mismatch for {:?}",
+            headers
+        ),
+        Err(code) => assert!(
+            matches!(got, Err((c, _)) if c == code),
+            "expected Err(({:?}, _)) for {:?}, got {:?}",
+            code,
+            headers,
+            got
+        ),
+    }
+}
+
+/// Oracle for `object_attributes_header` (#117, #447):
+/// - Case-sensitive trimmed matching of `ETag`, `Checksum`, `ObjectParts`, `StorageClass`, `ObjectSize`.
+/// - Unknown/empty attributes and invalid `x-amz-max-parts` / `x-amz-part-number-marker` return `InvalidArgument`.
+/// - Splitting attributes across multiple `x-amz-object-attributes` header lines gives the same result as one comma-joined header.
+pub fn check_object_attributes_header(data: &[u8]) {
+    if let Ok(hv) = HeaderValue::from_bytes(data) {
+        let mut raw_attr = HeaderMap::new();
+        raw_attr.insert("x-amz-object-attributes", hv.clone());
+        assert_object_attributes_oracle(&raw_attr);
+
+        let mut raw_max = HeaderMap::new();
+        raw_max.insert("x-amz-object-attributes", HeaderValue::from_static("ObjectParts"));
+        raw_max.insert("x-amz-max-parts", hv);
+        assert_object_attributes_oracle(&raw_max);
+    }
+
+    let text = String::from_utf8_lossy(data);
+    let mut headers = HeaderMap::new();
+    let mut combined_attr_vals: Vec<String> = Vec::new();
+    let mut split_tokens: Vec<String> = Vec::new();
+    let mut opt_max_parts: Option<HeaderValue> = None;
+    let mut opt_part_marker: Option<HeaderValue> = None;
+
+    for line in text.split('\n') {
+        if let Some(v) = line.strip_prefix("x-amz-max-parts:") {
+            if let Ok(hv) = HeaderValue::from_str(v) {
+                headers.insert("x-amz-max-parts", hv.clone());
+                opt_max_parts = Some(hv);
+            }
+        } else if let Some(v) = line.strip_prefix("x-amz-part-number-marker:") {
+            if let Ok(hv) = HeaderValue::from_str(v) {
+                headers.insert("x-amz-part-number-marker", hv.clone());
+                opt_part_marker = Some(hv);
+            }
+        } else if let Ok(hv) = HeaderValue::from_str(line) {
+            headers.append("x-amz-object-attributes", hv);
+            combined_attr_vals.push(line.to_string());
+            for tok in line.split(',') {
+                split_tokens.push(tok.to_string());
+            }
+        }
+    }
+
+    assert_object_attributes_oracle(&headers);
+
+    if !combined_attr_vals.is_empty() {
+        let mut single = HeaderMap::new();
+        if let Ok(hv) = HeaderValue::from_str(&combined_attr_vals.join(",")) {
+            single.insert("x-amz-object-attributes", hv);
+            if let Some(ref mp) = opt_max_parts {
+                single.insert("x-amz-max-parts", mp.clone());
+            }
+            if let Some(ref pm) = opt_part_marker {
+                single.insert("x-amz-part-number-marker", pm.clone());
+            }
+            assert_object_attributes_oracle(&single);
+
+            let mut split = HeaderMap::new();
+            for tok in &split_tokens {
+                if let Ok(hv) = HeaderValue::from_str(tok) {
+                    split.append("x-amz-object-attributes", hv);
+                }
+            }
+            if let Some(ref mp) = opt_max_parts {
+                split.insert("x-amz-max-parts", mp.clone());
+            }
+            if let Some(ref pm) = opt_part_marker {
+                split.insert("x-amz-part-number-marker", pm.clone());
+            }
+            assert_object_attributes_oracle(&split);
+            match (
+                parse_object_attributes_headers(&single),
+                parse_object_attributes_headers(&split),
+            ) {
+                (Ok(a), Ok(b)) => assert_eq!(
+                    a, b,
+                    "multi-header split disagreed with single comma header for {:?}",
+                    combined_attr_vals
+                ),
+                (Err((ca, _)), Err((cb, _))) => assert_eq!(ca, cb),
+                (a, b) => panic!("multi-header equivalence mismatch: {:?} vs {:?}", a, b),
+            }
+        }
+    }
+
+    // Absent x-amz-object-attributes header must always return InvalidArgument.
+    let empty_hdrs = HeaderMap::new();
+    assert!(matches!(
+        parse_object_attributes_headers(&empty_hdrs),
+        Err(("InvalidArgument", _))
+    ));
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{check_checksum_headers, check_list_buckets_query, check_raw_s3_key};
+    use super::{
+        check_checksum_headers, check_classify, check_list_buckets_query,
+        check_list_objects_query, check_object_attributes_header, check_raw_s3_key,
+    };
 
     #[test]
     fn checksum_headers_canonical_vectors_and_invalid_inputs() {
@@ -494,6 +936,87 @@ mod tests {
                 }
             }
             check_raw_s3_key(&buf);
+        }
+    }
+
+    #[test]
+    fn classify_canonical_operations_and_corpus_seeds() {
+        for sample in [
+            b"acl&versioning".as_slice(),
+            b"=%ZZ".as_slice(),
+            b"uploadId=1&partNumber=0".as_slice(),
+            b"list-type=3".as_slice(),
+            b"REQ:PUT\nbkt\nobj\n\nuploadId=1&partNumber=0".as_slice(),
+        ] {
+            check_classify(sample);
+        }
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/classify");
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read classify corpus dir")
+            .map(|e| e.expect("corpus dir entry").path())
+            .collect();
+        entries.sort();
+        assert!(entries.len() >= 48, "expected canonical + regression seeds, got {}", entries.len());
+        for path in entries {
+            let bytes = std::fs::read(&path).expect("read corpus seed");
+            check_classify(&bytes);
+        }
+    }
+
+    #[test]
+    fn list_objects_query_bounds_and_corpus_seeds() {
+        for sample in [
+            b"max-keys=-1".as_slice(),
+            b"max-keys=99999999999999999999".as_slice(),
+            b"continuation-token=%ZZ".as_slice(),
+            b"encoding-type=URL".as_slice(),
+            b"delimiter=".as_slice(),
+            b"list-type=2&prefix=a/&delimiter=/&max-keys=500&encoding-type=url&fetch-owner=true".as_slice(),
+        ] {
+            check_list_objects_query(sample);
+        }
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/list_objects_query");
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read list_objects_query corpus dir")
+            .map(|e| e.expect("corpus dir entry").path())
+            .collect();
+        entries.sort();
+        assert!(entries.len() >= 6, "expected at least 6 named seeds, got {}", entries.len());
+        for path in entries {
+            let bytes = std::fs::read(&path).expect("read corpus seed");
+            check_list_objects_query(&bytes);
+        }
+    }
+
+    #[test]
+    fn object_attributes_header_bounds_and_corpus_seeds() {
+        for sample in [
+            b"ETag".as_slice(),
+            b"ETag,ObjectSize".as_slice(),
+            b" ETag , Checksum".as_slice(),
+            b"etag".as_slice(),
+            b"ETag,,".as_slice(),
+            b"".as_slice(),
+            b"ObjectParts\nx-amz-max-parts: -1".as_slice(),
+            b"ETag\nStorageClass\nChecksum\nObjectParts\nObjectSize\nx-amz-max-parts: 2000\nx-amz-part-number-marker: 7".as_slice(),
+            b"ObjectParts\nx-amz-max-parts: 0".as_slice(),
+            b"ObjectParts\nx-amz-part-number-marker: nope".as_slice(),
+        ] {
+            check_object_attributes_header(sample);
+        }
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/object_attributes_header");
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read object_attributes_header corpus dir")
+            .map(|e| e.expect("corpus dir entry").path())
+            .collect();
+        entries.sort();
+        assert!(entries.len() >= 7, "expected at least 7 named seeds, got {}", entries.len());
+        for path in entries {
+            let bytes = std::fs::read(&path).expect("read corpus seed");
+            check_object_attributes_header(&bytes);
         }
     }
 }

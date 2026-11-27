@@ -2548,14 +2548,22 @@ pub async fn delete_object(
 }
 
 
-pub async fn get_object_attributes(
-    state: Arc<S3ServiceState>,
-    b_id: u32,
-    _bucket: &str,
-    key: &str,
-    query_map: &HashMap<String, String>,
+/// Parsed `GetObjectAttributes` selection and pagination headers (#117, #447).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectAttributesQuery {
+    pub want_etag: bool,
+    pub want_checksum: bool,
+    pub want_parts: bool,
+    pub want_storage_class: bool,
+    pub want_size: bool,
+    pub max_parts: usize,
+    pub part_marker: usize,
+}
+
+/// Parses `x-amz-object-attributes`, `x-amz-max-parts`, and `x-amz-part-number-marker` headers.
+pub fn parse_object_attributes_headers(
     headers: &HeaderMap,
-) -> Result<Response<ResponseBody>, hyper::Error> {
+) -> Result<ObjectAttributesQuery, (&'static str, &'static str)> {
     let mut want_etag = false;
     let mut want_checksum = false;
     let mut want_parts = false;
@@ -2565,7 +2573,7 @@ pub async fn get_object_attributes(
 
     for hdr_val in headers.get_all("x-amz-object-attributes") {
         let Ok(raw) = hdr_val.to_str() else {
-            return Ok(bad_request("InvalidArgument", "Invalid x-amz-object-attributes header.", key));
+            return Err(("InvalidArgument", "Invalid x-amz-object-attributes header."));
         };
         for token in raw.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
             any_attr = true;
@@ -2575,27 +2583,59 @@ pub async fn get_object_attributes(
                 "ObjectParts" => want_parts = true,
                 "StorageClass" => want_storage_class = true,
                 "ObjectSize" => want_size = true,
-                _ => return Ok(bad_request("InvalidArgument", "Unsupported x-amz-object-attributes value.", key)),
+                _ => return Err(("InvalidArgument", "Unsupported x-amz-object-attributes value.")),
             }
         }
     }
     if !any_attr {
-        return Ok(bad_request("InvalidArgument", "Missing required x-amz-object-attributes header.", key));
+        return Err(("InvalidArgument", "Missing required x-amz-object-attributes header."));
     }
 
     let max_parts: usize = match headers.get("x-amz-max-parts").and_then(|v| v.to_str().ok()) {
         Some(s) => match s.trim().parse::<usize>() {
             Ok(n) if n > 0 => n.min(1000),
-            _ => return Ok(bad_request("InvalidArgument", "Invalid x-amz-max-parts header.", key)),
+            _ => return Err(("InvalidArgument", "Invalid x-amz-max-parts header.")),
         },
         None => 1000,
     };
     let part_marker: usize = match headers.get("x-amz-part-number-marker").and_then(|v| v.to_str().ok()) {
         Some(s) => match s.trim().parse::<usize>() {
             Ok(n) => n,
-            Err(_) => return Ok(bad_request("InvalidArgument", "Invalid x-amz-part-number-marker header.", key)),
+            Err(_) => return Err(("InvalidArgument", "Invalid x-amz-part-number-marker header.")),
         },
         None => 0,
+    };
+
+    Ok(ObjectAttributesQuery {
+        want_etag,
+        want_checksum,
+        want_parts,
+        want_storage_class,
+        want_size,
+        max_parts,
+        part_marker,
+    })
+}
+
+pub async fn get_object_attributes(
+    state: Arc<S3ServiceState>,
+    b_id: u32,
+    _bucket: &str,
+    key: &str,
+    query_map: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Result<Response<ResponseBody>, hyper::Error> {
+    let ObjectAttributesQuery {
+        want_etag,
+        want_checksum,
+        want_parts,
+        want_storage_class,
+        want_size,
+        max_parts,
+        part_marker,
+    } = match parse_object_attributes_headers(headers) {
+        Ok(q) => q,
+        Err((code, msg)) => return Ok(bad_request(code, msg, key)),
     };
 
     let vid = query_map.get("versionId").map(|s| s.as_str());
