@@ -986,3 +986,133 @@ async fn test_encryption_sse_c_post_object_authenticated_request() {
     let _ = (SseAttr::plaintext_size_from_raw, Sha256::new());
     handle.shutdown();
 }
+
+#[tokio::test]
+async fn ssec_preconditions_never_bypass_key_authorization() {
+    let dir = temp_dir("precond");
+    let _guard = DirGuard(dir.clone());
+    let (base, handle, _st) = spawn(&dir).await;
+    let c = reqwest::Client::new();
+
+    // Unversioned SSE-C object
+    assert_eq!(c.put(format!("{}/ssec-precond", base)).send().await.unwrap().status(), StatusCode::OK);
+    let put = with_ssec(c.put(format!("{}/ssec-precond/obj.bin", base)), KEY_A_B64, MD5_A_B64)
+        .body("secret-payload")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    let etag = put.headers().get("etag").unwrap().to_str().unwrap().to_string();
+
+    for (hdr, val) in [("if-none-match", "*"), ("if-match", "\"bogus\"")] {
+        // Missing key: GET and HEAD must return 400 InvalidRequest without ETag header (never 304/412).
+        let r_get = c.get(format!("{}/ssec-precond/obj.bin", base)).header(hdr, val).send().await.unwrap();
+        assert_eq!(r_get.status(), StatusCode::BAD_REQUEST, "unversioned GET {} missing key", hdr);
+        assert!(r_get.headers().get("etag").is_none());
+        let body = r_get.text().await.unwrap();
+        assert!(body.contains("InvalidRequest"), "got: {}", body);
+
+        let r_head = c.head(format!("{}/ssec-precond/obj.bin", base)).header(hdr, val).send().await.unwrap();
+        assert_eq!(r_head.status(), StatusCode::BAD_REQUEST, "unversioned HEAD {} missing key", hdr);
+        assert!(r_head.headers().get("etag").is_none());
+
+        // Wrong key: GET and HEAD must return 400 InvalidArgument without ETag header (never 304/412).
+        let r_bad = with_ssec(c.get(format!("{}/ssec-precond/obj.bin", base)), KEY_B_B64, MD5_B_B64)
+            .header(hdr, val)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_bad.status(), StatusCode::BAD_REQUEST, "unversioned GET {} wrong key", hdr);
+        assert!(r_bad.headers().get("etag").is_none());
+        let bad_body = r_bad.text().await.unwrap();
+        assert!(bad_body.contains("InvalidArgument"), "got: {}", bad_body);
+    }
+
+    // Correct key with matching If-None-Match still returns 304.
+    let r_304 = with_ssec(c.get(format!("{}/ssec-precond/obj.bin", base)), KEY_A_B64, MD5_A_B64)
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_304.status(), StatusCode::NOT_MODIFIED);
+
+    // Versioned SSE-C object
+    assert_eq!(c.put(format!("{}/ssec-precond-v", base)).send().await.unwrap().status(), StatusCode::OK);
+    let ver_xml = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    assert_eq!(
+        c.put(format!("{}/ssec-precond-v?versioning", base))
+            .body(ver_xml)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let vput = with_ssec(c.put(format!("{}/ssec-precond-v/obj.bin", base)), KEY_A_B64, MD5_A_B64)
+        .body("versioned-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(vput.status(), StatusCode::OK);
+    let vid = vput.headers().get("x-amz-version-id").unwrap().to_str().unwrap().to_string();
+
+    for url in [
+        format!("{}/ssec-precond-v/obj.bin", base),
+        format!("{}/ssec-precond-v/obj.bin?versionId={}", base, vid),
+    ] {
+        let g_miss = c.get(&url).header("if-none-match", "*").send().await.unwrap();
+        assert_eq!(g_miss.status(), StatusCode::BAD_REQUEST, "versioned GET missing key {}", url);
+        assert!(g_miss.headers().get("etag").is_none());
+
+        let h_miss = c.head(&url).header("if-none-match", "*").send().await.unwrap();
+        assert_eq!(h_miss.status(), StatusCode::BAD_REQUEST, "versioned HEAD missing key {}", url);
+
+        let g_wrong = with_ssec(c.get(&url), KEY_B_B64, MD5_B_B64)
+            .header("if-none-match", "*")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(g_wrong.status(), StatusCode::BAD_REQUEST, "versioned GET wrong key {}", url);
+        assert!(g_wrong.headers().get("etag").is_none());
+
+        let g_ok = with_ssec(c.get(&url), KEY_A_B64, MD5_A_B64)
+            .header("if-none-match", "*")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(g_ok.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    // CopyObject preconditions with SSE-C source (unversioned and explicit ?versionId=)
+    for src in [
+        "/ssec-precond/obj.bin".to_string(),
+        format!("/ssec-precond-v/obj.bin?versionId={}", vid),
+    ] {
+        let cp_miss = c
+            .put(format!("{}/ssec-precond/copied.bin", base))
+            .header("x-amz-copy-source", &src)
+            .header("x-amz-copy-source-if-match", "\"bogus\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cp_miss.status(), StatusCode::BAD_REQUEST, "copy missing key {}", src);
+
+        let cp_wrong = with_copy_ssec(c.put(format!("{}/ssec-precond/copied.bin", base)), KEY_B_B64, MD5_B_B64)
+            .header("x-amz-copy-source", &src)
+            .header("x-amz-copy-source-if-match", "\"bogus\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cp_wrong.status(), StatusCode::BAD_REQUEST, "copy wrong key {}", src);
+
+        let cp_precond = with_copy_ssec(c.put(format!("{}/ssec-precond/copied.bin", base)), KEY_A_B64, MD5_A_B64)
+            .header("x-amz-copy-source", &src)
+            .header("x-amz-copy-source-if-match", "\"bogus\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cp_precond.status(), StatusCode::PRECONDITION_FAILED, "copy right key precondition {}", src);
+    }
+
+    handle.shutdown();
+}

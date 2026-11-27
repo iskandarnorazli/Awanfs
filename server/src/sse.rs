@@ -271,7 +271,7 @@ impl SseAttr {
         let expected_mac = compute_ssec_verifier(key, key_salt);
         let md5_ok = ct_eq(key_md5, &key.key_md5);
         let mac_ok = ct_eq(verifier_mac, &expected_mac);
-        md5_ok && mac_ok
+        md5_ok & mac_ok
     }
 
     pub fn derive_dek(&self, key: &SseCKey) -> Result<SseDek, SseError> {
@@ -474,6 +474,9 @@ pub fn stored_range_for_plaintext(
     if total_plaintext_len == 0 {
         return Ok((0, AWE1_HEADER_LEN as u64, AWE1_TAG_LEN as u64));
     }
+    if len == 0 {
+        return Ok((0, AWE1_HEADER_LEN as u64, 0));
+    }
     let first_chunk = (start / AWE1_CHUNK_PLAIN as u64) as u32;
     let last_chunk = if len == 0 {
         first_chunk
@@ -586,6 +589,12 @@ pub struct Awe1EncryptWriter {
     seen_nonces: HashSet<[u8; 12]>,
 }
 
+impl Drop for Awe1EncryptWriter {
+    fn drop(&mut self) {
+        zeroize(&mut self.buf);
+    }
+}
+
 impl Awe1EncryptWriter {
     pub fn new(
         dek: &SseDek,
@@ -686,7 +695,7 @@ impl Awe1EncryptWriter {
             self.flush_chunk(true, &mut emit)?;
         }
         debug_assert_eq!(self.next_chunk_idx, self.total_chunks);
-        let raw_md5: [u8; 16] = self.md5.finalize().into();
+        let raw_md5: [u8; 16] = std::mem::take(&mut self.md5).finalize().into();
         Ok(raw_md5)
     }
 }
@@ -1203,5 +1212,31 @@ mod tests {
         let mut buf = [0x5Au8; 32];
         zeroize(&mut buf);
         assert_eq!(buf, [0u8; 32]);
+    }
+
+    #[test]
+    fn zero_len_range_at_chunk_boundary() {
+        assert_eq!(
+            stored_range_for_plaintext(AWE1_CHUNK_PLAIN as u64, AWE1_CHUNK_PLAIN as u64, 0),
+            Ok((0, AWE1_HEADER_LEN as u64, 0))
+        );
+        assert_eq!(
+            stored_range_for_plaintext(0, 0, 0),
+            Ok((0, AWE1_HEADER_LEN as u64, AWE1_TAG_LEN as u64))
+        );
+        let dek = SseDek::from_raw([0x33u8; 32]);
+        let prefix = [1, 2, 3, 4];
+        let _ = encrypt_full(&dek, prefix, 0, &vec![0xAB; AWE1_CHUNK_PLAIN]).unwrap();
+        let out = decrypt_range_from_chunks(
+            &dek,
+            prefix,
+            0,
+            AWE1_CHUNK_PLAIN as u64,
+            AWE1_CHUNK_PLAIN as u64,
+            0,
+            0,
+            &[],
+        );
+        assert_eq!(out, Ok(Vec::new()));
     }
 }

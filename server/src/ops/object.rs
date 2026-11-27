@@ -815,10 +815,6 @@ fn version_get_response(
         etag: etag_val.clone(),
         last_modified_secs: lm_secs,
     };
-    match precondition(headers, Some(&facts), false) {
-        PreconditionOutcome::Proceed => {}
-        outcome => return precondition_failure_response(outcome, Some(&facts), key, head),
-    }
     let view = match state.object_view_for(b_id, key, v.id(), v.vol_offset, v.flags) {
         Ok(view) => view,
         Err(e) => return internal_error_response(key, &format!("could not read the version's attributes: {:?}", e)),
@@ -827,14 +823,7 @@ fn version_get_response(
         Ok(s) => s,
         Err(e) => return internal_error_response(key, &format!("could not read encryption metadata: {:?}", e)),
     };
-    let is_current = id.is_none() || state.versions.read().current(b_id, key).is_some_and(|c| c.id() == v.id());
-    let exp_hdr = if is_current {
-        crate::lifecycle::expiration_header_for_attrs(state, b_id, key, v.size, &view.attrs, v.modified)
-    } else {
-        None
-    };
-    let resp = (|| -> Response<ResponseBody> {
-    if let Some(pn) = part_num {
+    let mp_part_extents = if let Some(pn) = part_num {
         if v.flags & AWAN_FLAG_MULTIPART != 0 {
             let extents = match state
                 .manifest_extents(b_id, v.vol_offset)
@@ -856,63 +845,7 @@ fn version_get_response(
                     .body(body)
                     .unwrap();
             }
-            let sse_dek = match crate::sse::authorize_read_ssec(stored_sse.as_ref(), read_sse.as_ref()) {
-                Ok(d) => d,
-                Err(e) => return sse_error_response(e, key, head),
-            };
-            let ext = &extents[(pn - 1) as usize];
-            let actual_pn = crate::sse::part_number_from_staged_path(ext.staged_path.as_deref(), pn);
-            let body = if head {
-                empty_body()
-            } else if let Some(dek) = sse_dek {
-                if v.size > VERIFY_WHILE_SENDING_MIN {
-                    match state.encrypted_part_body(b_id, format!("{}/{} part {}", bucket, key, pn), ext, actual_pn, dek) {
-                        Ok(b) => b.boxed(),
-                        Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
-                    }
-                } else {
-                    match state.read_encrypted_part_bytes(b_id, key, ext, actual_pn, &dek) {
-                        Ok(b) => full_body(b),
-                        Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
-                    }
-                }
-            } else if v.size > VERIFY_WHILE_SENDING_MIN {
-                match state.multipart_body(
-                    b_id,
-                    format!("{}/{} part {}", bucket, key, pn),
-                    &extents,
-                    ext.cumulative_end - ext.part_size,
-                    ext.part_size,
-                    true,
-                ) {
-                    Ok(b) => b.boxed(),
-                    Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
-                }
-            } else {
-                let b = match state.part_bytes(b_id, ext) {
-                    Ok(b) => b,
-                    Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
-                };
-                full_body(b.slice(..(ext.part_size as usize).min(b.len())))
-            };
-            return with_sse_headers(
-                with_part_checksum_headers(
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, view.content_type())
-                        .header(ETAG, etag_val)
-                        .header(ACCEPT_RANGES, "bytes")
-                        .header("x-amz-mp-parts-count", parts_count.to_string())
-                        .header("x-amz-version-id", v.id_string())
-                        .header(CONTENT_LENGTH, ext.part_size.to_string())
-                        .header(LAST_MODIFIED, crate::clock::format_http_date(v.modified)),
-                    &view.attrs,
-                    ext.checksum.as_ref(),
-                ),
-                stored_sse.as_ref(),
-            )
-            .body(body)
-            .unwrap();
+            Some(extents)
         } else if pn > 1 {
             let body = if head {
                 empty_body()
@@ -924,12 +857,83 @@ fn version_get_response(
                 .header(CONTENT_TYPE, "application/xml")
                 .body(body)
                 .unwrap();
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
     let sse_dek = match crate::sse::authorize_read_ssec(stored_sse.as_ref(), read_sse.as_ref()) {
         Ok(d) => d,
         Err(e) => return sse_error_response(e, key, head),
     };
+    match precondition(headers, Some(&facts), false) {
+        PreconditionOutcome::Proceed => {}
+        outcome => return precondition_failure_response(outcome, Some(&facts), key, head),
+    }
+    let is_current = id.is_none() || state.versions.read().current(b_id, key).is_some_and(|c| c.id() == v.id());
+    let exp_hdr = if is_current {
+        crate::lifecycle::expiration_header_for_attrs(state, b_id, key, v.size, &view.attrs, v.modified)
+    } else {
+        None
+    };
+    let resp = (|| -> Response<ResponseBody> {
+    if let (Some(pn), Some(extents)) = (part_num, mp_part_extents) {
+        let parts_count = extents.len();
+        let ext = &extents[(pn - 1) as usize];
+        let actual_pn = crate::sse::part_number_from_staged_path(ext.staged_path.as_deref(), pn);
+        let body = if head {
+            empty_body()
+        } else if let Some(dek) = sse_dek {
+            if v.size > VERIFY_WHILE_SENDING_MIN {
+                match state.encrypted_part_body(b_id, format!("{}/{} part {}", bucket, key, pn), ext, actual_pn, dek) {
+                    Ok(b) => b.boxed(),
+                    Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
+                }
+            } else {
+                match state.read_encrypted_part_bytes(b_id, key, ext, actual_pn, &dek) {
+                    Ok(b) => full_body(b),
+                    Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
+                }
+            }
+        } else if v.size > VERIFY_WHILE_SENDING_MIN {
+            match state.multipart_body(
+                b_id,
+                format!("{}/{} part {}", bucket, key, pn),
+                &extents,
+                ext.cumulative_end - ext.part_size,
+                ext.part_size,
+                true,
+            ) {
+                Ok(b) => b.boxed(),
+                Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
+            }
+        } else {
+            let b = match state.part_bytes(b_id, ext) {
+                Ok(b) => b,
+                Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
+            };
+            full_body(b.slice(..(ext.part_size as usize).min(b.len())))
+        };
+        return with_sse_headers(
+            with_part_checksum_headers(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, view.content_type())
+                    .header(ETAG, etag_val)
+                    .header(ACCEPT_RANGES, "bytes")
+                    .header("x-amz-mp-parts-count", parts_count.to_string())
+                    .header("x-amz-version-id", v.id_string())
+                    .header(CONTENT_LENGTH, ext.part_size.to_string())
+                    .header(LAST_MODIFIED, crate::clock::format_http_date(v.modified)),
+                &view.attrs,
+                ext.checksum.as_ref(),
+            ),
+            stored_sse.as_ref(),
+        )
+        .body(body)
+        .unwrap();
+    }
     let tag_count = view.attrs.tag_count();
     let cksum_mode = checksum_mode_enabled(headers);
     let is_compressed = v.flags & crate::meta_index::FLAG_COMPRESSED != 0;
@@ -1220,7 +1224,7 @@ pub async fn copy_object(
     };
 
     let src_view: Result<crate::attrs::Attrs, VolumeError>;
-    let (src_vol_offset, src_flags, src_size, src_etag_hi, src_etag_lo, copied_vid, version_opt) = match (&src_vid, &src_meta) {
+    let (src_vol_offset, src_flags, src_size, src_etag_hi, src_etag_lo, copied_vid, version_opt, src_facts) = match (&src_vid, &src_meta) {
         (Some(vid), _) => {
             let Some(id) = crate::versions::parse_id(vid) else {
                 return Ok(no_such_version(src_key, false));
@@ -1245,14 +1249,11 @@ pub async fn copy_object(
                 etag: version_etag(&v),
                 last_modified_secs: last_modified_secs_from_ns(v.modified),
             };
-            if precondition(headers, Some(&src_facts), true) != PreconditionOutcome::Proceed {
-                return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
-            }
             src_view = state
                 .object_view_for(src_b_id, src_key, v.id(), v.vol_offset, v.flags)
                 .map(|view| view.attrs);
             let vid_s = v.id_string();
-            (v.vol_offset, v.flags, v.size, v.etag_hi, v.etag_lo, Some(vid_s), Some(v))
+            (v.vol_offset, v.flags, v.size, v.etag_hi, v.etag_lo, Some(vid_s), Some(v), src_facts)
         }
         (None, Some(m)) => {
             let flags = unpack_flags(m.bucket_flags);
@@ -1261,9 +1262,6 @@ pub async fn copy_object(
                 etag: format_object_etag(m.etag_hi, m.etag_lo, is_mp, unpack_part_count(m.bucket_flags)),
                 last_modified_secs: last_modified_secs_from_ms(m.created_at),
             };
-            if precondition(headers, Some(&src_facts), true) != PreconditionOutcome::Proceed {
-                return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
-            }
             let target_vid = state
                 .versions
                 .read()
@@ -1272,7 +1270,7 @@ pub async fn copy_object(
             src_view = state
                 .object_view_for(src_b_id, src_key, target_vid, m.vol_offset, flags)
                 .map(|view| view.attrs);
-            (m.vol_offset, flags, m.size, m.etag_hi, m.etag_lo, None, None)
+            (m.vol_offset, flags, m.size, m.etag_hi, m.etag_lo, None, None, src_facts)
         }
         (None, None) => unreachable!("src_meta is read whenever no version is named"),
     };
@@ -1288,6 +1286,9 @@ pub async fn copy_object(
         Ok(d) => d,
         Err(e) => return Ok(sse_error_response(e, key, false)),
     };
+    if precondition(headers, Some(&src_facts), true) != PreconditionOutcome::Proceed {
+        return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
+    }
     let replace = match headers.get("x-amz-metadata-directive").and_then(|v| v.to_str().ok()) {
         None => false,
         Some(v) if v.eq_ignore_ascii_case("COPY") => false,
@@ -2520,25 +2521,11 @@ pub async fn get_or_head_object(
         etag: etag_val.clone(),
         last_modified_secs: lm_secs,
     };
-    match precondition(headers, Some(&facts), false) {
-        PreconditionOutcome::Proceed => {}
-        outcome => return Ok(precondition_failure_response(outcome, Some(&facts), key, is_head)),
-    }
-    let exp_hdr = crate::lifecycle::expiration_header_for_attrs(
-        &state,
-        b_id,
-        key,
-        meta.size,
-        &view.attrs,
-        meta.created_at.saturating_mul(1_000_000),
-    );
-
     let stored_sse = match view.attrs.sse() {
         Ok(s) => s,
         Err(e) => return Ok(internal_error_response(key, &format!("could not decode SSE attribute: {:?}", e))),
     };
-
-    if let Some(pn) = part_num {
+    let mp_part_extents = if let Some(pn) = part_num {
         if is_multipart {
             let extents = match state.multipart.get_completed_extents(b_id, key) {
                 Some(e) => e,
@@ -2557,55 +2544,7 @@ pub async fn get_or_head_object(
                     .body(body)
                     .unwrap());
             }
-            let part_dek = match crate::sse::authorize_read_ssec(stored_sse.as_ref(), read_sse_key.as_ref()) {
-                Ok(d) => d,
-                Err(e) => return Ok(sse_error_response(e, key, is_head)),
-            };
-            let ext = &extents[(pn - 1) as usize];
-            let actual_pn = crate::sse::part_number_from_staged_path(ext.staged_path.as_deref(), pn);
-            let body = if is_head {
-                empty_body()
-            } else if let Some(dek) = part_dek {
-                if meta.size > VERIFY_WHILE_SENDING_MIN {
-                    match state.encrypted_part_body(b_id, format!("{}/{} part {}", bucket, key, pn), ext, actual_pn, dek) {
-                        Ok(b) => b.boxed(),
-                        Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
-                    }
-                } else {
-                    let b = match state.read_encrypted_part_bytes(b_id, key, ext, actual_pn, &dek) {
-                        Ok(b) => b,
-                        Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
-                    };
-                    full_body(b.slice(..(ext.part_size as usize).min(b.len())))
-                }
-            } else if meta.size > VERIFY_WHILE_SENDING_MIN {
-                // A part of a large object is read from its file, not its mapping (#155
-                // requirement 5), whatever the part's own size.
-                match state.multipart_body(b_id, format!("{}/{} part {}", bucket, key, pn), &extents, ext.cumulative_end - ext.part_size, ext.part_size, true) {
-                    Ok(b) => b.boxed(),
-                    Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
-                }
-            } else {
-                let b = match state.part_bytes(b_id, ext) {
-                    Ok(b) => b,
-                    Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
-                };
-                full_body(b.slice(..(ext.part_size as usize).min(b.len())))
-            };
-            return Ok(with_sse_headers(with_expiration_header(with_part_checksum_headers(
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, view.content_type())
-                    .header(ETAG, etag_val)
-                    .header(ACCEPT_RANGES, "bytes")
-                    .header("x-amz-mp-parts-count", parts_count.to_string())
-                    .header(CONTENT_LENGTH, ext.part_size.to_string())
-                    .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)),
-                &view.attrs,
-                ext.checksum.as_ref(),
-            ), exp_hdr.as_deref()), stored_sse.as_ref())
-            .body(body)
-            .unwrap());
+            Some(extents)
         } else if pn > 1 {
             let body = if is_head {
                 empty_body()
@@ -2617,13 +2556,79 @@ pub async fn get_or_head_object(
                 .header(CONTENT_TYPE, "application/xml")
                 .body(body)
                 .unwrap());
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
 
     let sse_dek = match crate::sse::authorize_read_ssec(stored_sse.as_ref(), read_sse_key.as_ref()) {
         Ok(d) => d,
         Err(e) => return Ok(sse_error_response(e, key, is_head)),
     };
+
+    match precondition(headers, Some(&facts), false) {
+        PreconditionOutcome::Proceed => {}
+        outcome => return Ok(precondition_failure_response(outcome, Some(&facts), key, is_head)),
+    }
+    let exp_hdr = crate::lifecycle::expiration_header_for_attrs(
+        &state,
+        b_id,
+        key,
+        meta.size,
+        &view.attrs,
+        meta.created_at.saturating_mul(1_000_000),
+    );
+
+    if let (Some(pn), Some(extents)) = (part_num, mp_part_extents) {
+        let parts_count = extents.len();
+        let ext = &extents[(pn - 1) as usize];
+        let actual_pn = crate::sse::part_number_from_staged_path(ext.staged_path.as_deref(), pn);
+        let body = if is_head {
+            empty_body()
+        } else if let Some(dek) = sse_dek {
+            if meta.size > VERIFY_WHILE_SENDING_MIN {
+                match state.encrypted_part_body(b_id, format!("{}/{} part {}", bucket, key, pn), ext, actual_pn, dek) {
+                    Ok(b) => b.boxed(),
+                    Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
+                }
+            } else {
+                let b = match state.read_encrypted_part_bytes(b_id, key, ext, actual_pn, &dek) {
+                    Ok(b) => b,
+                    Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
+                };
+                full_body(b.slice(..(ext.part_size as usize).min(b.len())))
+            }
+        } else if meta.size > VERIFY_WHILE_SENDING_MIN {
+            // A part of a large object is read from its file, not its mapping (#155
+            // requirement 5), whatever the part's own size.
+            match state.multipart_body(b_id, format!("{}/{} part {}", bucket, key, pn), &extents, ext.cumulative_end - ext.part_size, ext.part_size, true) {
+                Ok(b) => b.boxed(),
+                Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
+            }
+        } else {
+            let b = match state.part_bytes(b_id, ext) {
+                Ok(b) => b,
+                Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
+            };
+            full_body(b.slice(..(ext.part_size as usize).min(b.len())))
+        };
+        return Ok(with_sse_headers(with_expiration_header(with_part_checksum_headers(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, view.content_type())
+                .header(ETAG, etag_val)
+                .header(ACCEPT_RANGES, "bytes")
+                .header("x-amz-mp-parts-count", parts_count.to_string())
+                .header(CONTENT_LENGTH, ext.part_size.to_string())
+                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)),
+            &view.attrs,
+            ext.checksum.as_ref(),
+        ), exp_hdr.as_deref()), stored_sse.as_ref())
+        .body(body)
+        .unwrap());
+    }
 
     let range_hdr = headers.get("Range").and_then(|v| v.to_str().ok());
     let range_res = range_hdr.map(|h| parse_range_header(h, meta.size));
