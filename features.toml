@@ -1701,8 +1701,9 @@ fuzz = ["request_xml", "s3_target"]
 id = "restart"
 name = "Crash durability, restart recovery, and volume persistence"
 status = "done"
-gaps = { fuzz = "#407", ceph = "not needed: the suites never restart the server; restart is checked by the TLA+ model, its Rust replays and the restart tests" }
+gaps = { ceph = "not needed: the suites never restart the server; restart is checked by the TLA+ model, its Rust replays and the restart tests" }
 issue = "#29"
+fuzz = ["sim_storage"]
 operations = ["Server restart recovery", "Durability modes (group, strict, fast)"]
 server_tests = [
   "server/tests/durability_test.rs::group_mode_covers_a_batch_of_writes_with_one_sync_of_volume_and_journal",
