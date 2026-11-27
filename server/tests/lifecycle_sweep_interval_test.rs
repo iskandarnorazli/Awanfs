@@ -17,48 +17,80 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-struct Server(Child);
+struct Server {
+    child: Child,
+    dir: PathBuf,
+}
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
-fn command(name: &str, extra: &[&str], env: &[(&str, &str)]) -> Command {
+fn command(name: &str, extra: &[&str], env: &[(&str, &str)]) -> (Command, PathBuf) {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let dir = temp_dir(name);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_awanfs"));
     cmd.args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous"])
         .args(extra)
+        .env("AWANFS_LOG", "off")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::null());
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd
+    (cmd, dir)
+}
+
+fn raw_command(name: &str, args_list: &[&str]) -> (Command, PathBuf) {
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let dir = temp_dir(name);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_awanfs"));
+    cmd.args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap()])
+        .args(args_list)
+        .env("AWANFS_LOG", "off")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    (cmd, dir)
+}
+
+fn startup_lines(spec: (Command, PathBuf), prefix: &str) -> Vec<String> {
+    let (mut cmd, dir) = spec;
+    let mut child = Server {
+        child: cmd.spawn().expect("spawn awanfs"),
+        dir,
+    };
+    let out = child.child.stdout.take().unwrap();
+    let prefix = prefix.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = Vec::new();
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            let done = line.starts_with(&prefix);
+            lines.push(line);
+            if done {
+                let _ = tx.send(lines);
+                return;
+            }
+        }
+        let _ = tx.send(lines);
+    });
+    let found = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap_or_default();
+    drop(child);
+    found
 }
 
 /// The `Lifecycle sweep every ...` line the server prints, or `None` if its stdout ended first or no
 /// such line came within 30 s (a running server never closes its stdout, so the read is on a
 /// thread and the server is killed when this returns).
-fn sweep_line(mut cmd: Command) -> Option<String> {
-    let mut child = Server(cmd.spawn().expect("spawn awanfs"));
-    let out = child.0.stdout.take().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(out).lines() {
-            let Ok(line) = line else { break };
-            if line.starts_with("Lifecycle sweep every") {
-                let _ = tx.send(line);
-                return;
-            }
-        }
-    });
-    let found = rx.recv_timeout(std::time::Duration::from_secs(30)).ok();
-    drop(child);
-    found
+fn sweep_line(spec: (Command, PathBuf)) -> Option<String> {
+    startup_lines(spec, "Lifecycle sweep every")
+        .into_iter()
+        .find(|l| l.starts_with("Lifecycle sweep every"))
 }
 
 #[test]
@@ -76,5 +108,38 @@ fn the_period_follows_the_lifecycle_day() {
     assert_eq!(
         sweep_line(command("day-2", &["--lifecycle-day-seconds", "2"], &[])).as_deref(),
         Some("Lifecycle sweep every 500ms")
+    );
+}
+
+#[test]
+fn lifecycle_day_seconds_does_not_consume_following_flag() {
+    assert_eq!(
+        sweep_line(raw_command(
+            "before-allow-anon",
+            &["--lifecycle-day-seconds", "2400", "--allow-anonymous"],
+        ))
+        .as_deref(),
+        Some("Lifecycle sweep every 100s")
+    );
+}
+
+#[test]
+fn lifecycle_day_seconds_does_not_clear_prior_memory_budget() {
+    let lines = startup_lines(
+        raw_command(
+            "preserve-budget",
+            &["--memory-budget", "256MiB", "--lifecycle-day-seconds", "2400", "--allow-anonymous"],
+        ),
+        "Lifecycle sweep every",
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("Memory budget 256 MiB (flag)")),
+        "expected Memory budget 256 MiB (flag) in startup lines: {:?}",
+        lines
+    );
+    assert!(
+        lines.iter().any(|l| l == "Lifecycle sweep every 100s"),
+        "expected Lifecycle sweep every 100s in startup lines: {:?}",
+        lines
     );
 }
