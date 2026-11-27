@@ -1080,31 +1080,34 @@ pub fn check_precondition_headers(data: &[u8]) {
     if let Ok(hv) = HeaderValue::from_bytes(data) {
         let mut hdrs = HeaderMap::new();
         hdrs.insert("if-match", hv.clone());
-        hdrs.insert("if-none-match", hv);
+        hdrs.insert("if-none-match", hv.clone());
         let _ = etag_matches(&hdrs, "if-match", "\"abc\"", true);
         let _ = etag_matches(&hdrs, "if-none-match", "\"abc\"", false);
 
-        for item in text.split(',') {
-            let trimmed = item.trim();
-            if !trimmed.is_empty()
-                && !trimmed.starts_with("W/")
-                && !trimmed.starts_with("w/")
-                && trimmed != "*"
-            {
-                let unquoted = trimmed.trim_matches('"');
-                if !unquoted.is_empty() && unquoted.trim() == unquoted && !unquoted.contains('"') {
-                    assert!(
-                        etag_matches(&hdrs, "if-match", unquoted, true),
-                        "expected unquoted {:?} to match list {:?}",
-                        unquoted,
-                        text
-                    );
-                    assert!(
-                        etag_matches(&hdrs, "if-match", &format!("\"{}\"", unquoted), true),
-                        "expected quoted {:?} to match list {:?}",
-                        unquoted,
-                        text
-                    );
+        if let Ok(hv_str) = hv.to_str() {
+            for item in hv_str.split(',') {
+                let trimmed = item.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.starts_with("W/")
+                    && !trimmed.starts_with("w/")
+                    && trimmed != "*"
+                {
+                    let unquoted = trimmed.trim_matches('"');
+                    if !unquoted.is_empty() && unquoted.trim() == unquoted && !unquoted.contains('"')
+                    {
+                        assert!(
+                            etag_matches(&hdrs, "if-match", unquoted, true),
+                            "expected unquoted {:?} to match list {:?}",
+                            unquoted,
+                            hv_str
+                        );
+                        assert!(
+                            etag_matches(&hdrs, "if-match", &format!("\"{}\"", unquoted), true),
+                            "expected quoted {:?} to match list {:?}",
+                            unquoted,
+                            hv_str
+                        );
+                    }
                 }
             }
         }
@@ -1435,6 +1438,7 @@ mod tests {
             b"Sunday, 06-Nov-94 08:49:37 GMT".as_slice(),
             b"Feb 30 2026".as_slice(),
             b"\"a\", \"b\", \"c\"".as_slice(),
+            &[195, 42],
         ] {
             check_precondition_headers(sample);
         }
