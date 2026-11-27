@@ -93,6 +93,27 @@ pub enum FaultPoint {
     MultipartManifestRecovered,
     VolumeRollover,
     JournalRetryFlushed,
+    SegmentWriteEio,
+    SegmentWriteNoSpace,
+    SegmentReadEio,
+    SegmentReadNoSpace,
+    SegmentSetLenEio,
+    SegmentSetLenNoSpace,
+    SegmentSyncEio,
+    SegmentSyncNoSpace,
+    ManifestWriteEio,
+    ManifestWriteNoSpace,
+    ManifestReadEio,
+    ManifestReadNoSpace,
+    ManifestSetLenEio,
+    ManifestSetLenNoSpace,
+    ManifestSyncEio,
+    ManifestSyncNoSpace,
+    MetaFlushCommitted,
+    MetaManifestSlotSwitch,
+    MetaCompactL0ToL1,
+    MetaCompactDeeperLevel,
+    MetaManifestTornFallback,
 }
 
 impl FaultPoint {
@@ -131,6 +152,58 @@ impl FaultPoint {
         FaultPoint::JournalRetryFlushed,
     ];
 
+    /// Named fault and scenario points tracked in the joint VolumeManager + MetaStore simulation (#408).
+    pub const JOINT_ALL: &'static [FaultPoint] = &[
+        FaultPoint::DataWriteEio,
+        FaultPoint::DataWriteNoSpace,
+        FaultPoint::DataReadEio,
+        FaultPoint::DataReadNoSpace,
+        FaultPoint::DataSetLenEio,
+        FaultPoint::DataSetLenNoSpace,
+        FaultPoint::DataSyncEio,
+        FaultPoint::DataSyncNoSpace,
+        FaultPoint::JournalWriteEio,
+        FaultPoint::JournalWriteNoSpace,
+        FaultPoint::JournalReadEio,
+        FaultPoint::JournalReadNoSpace,
+        FaultPoint::JournalSetLenEio,
+        FaultPoint::JournalSetLenNoSpace,
+        FaultPoint::JournalSyncEio,
+        FaultPoint::JournalSyncNoSpace,
+        FaultPoint::SegmentWriteEio,
+        FaultPoint::SegmentWriteNoSpace,
+        FaultPoint::SegmentReadEio,
+        FaultPoint::SegmentReadNoSpace,
+        FaultPoint::SegmentSetLenEio,
+        FaultPoint::SegmentSetLenNoSpace,
+        FaultPoint::SegmentSyncEio,
+        FaultPoint::SegmentSyncNoSpace,
+        FaultPoint::ManifestWriteEio,
+        FaultPoint::ManifestWriteNoSpace,
+        FaultPoint::ManifestReadEio,
+        FaultPoint::ManifestReadNoSpace,
+        FaultPoint::ManifestSetLenEio,
+        FaultPoint::ManifestSetLenNoSpace,
+        FaultPoint::ManifestSyncEio,
+        FaultPoint::ManifestSyncNoSpace,
+        FaultPoint::CrashDropUnsynced,
+        FaultPoint::CrashSeededPrefix,
+        FaultPoint::CrashTornWrite,
+        FaultPoint::CrashTorn4kBlock,
+        FaultPoint::CrashBeforeSync,
+        FaultPoint::CrashAfterSync,
+        FaultPoint::LateFailJournalAfterRecord,
+        FaultPoint::LateFailSyncAfterRecord,
+        FaultPoint::JournalRetryFlushed,
+        FaultPoint::VolumeRollover,
+        FaultPoint::CompactionMovedLive,
+        FaultPoint::MetaFlushCommitted,
+        FaultPoint::MetaManifestSlotSwitch,
+        FaultPoint::MetaCompactL0ToL1,
+        FaultPoint::MetaCompactDeeperLevel,
+        FaultPoint::MetaManifestTornFallback,
+    ];
+
     pub const fn name(self) -> &'static str {
         match self {
             FaultPoint::DataWriteEio => "data.write.eio",
@@ -165,6 +238,27 @@ impl FaultPoint {
             FaultPoint::MultipartManifestRecovered => "multipart.manifest_recovered",
             FaultPoint::VolumeRollover => "volume.rollover",
             FaultPoint::JournalRetryFlushed => "journal.retry_flushed",
+            FaultPoint::SegmentWriteEio => "segment.write.eio",
+            FaultPoint::SegmentWriteNoSpace => "segment.write.nospace",
+            FaultPoint::SegmentReadEio => "segment.read.eio",
+            FaultPoint::SegmentReadNoSpace => "segment.read.nospace",
+            FaultPoint::SegmentSetLenEio => "segment.set_len.eio",
+            FaultPoint::SegmentSetLenNoSpace => "segment.set_len.nospace",
+            FaultPoint::SegmentSyncEio => "segment.sync.eio",
+            FaultPoint::SegmentSyncNoSpace => "segment.sync.nospace",
+            FaultPoint::ManifestWriteEio => "manifest.write.eio",
+            FaultPoint::ManifestWriteNoSpace => "manifest.write.nospace",
+            FaultPoint::ManifestReadEio => "manifest.read.eio",
+            FaultPoint::ManifestReadNoSpace => "manifest.read.nospace",
+            FaultPoint::ManifestSetLenEio => "manifest.set_len.eio",
+            FaultPoint::ManifestSetLenNoSpace => "manifest.set_len.nospace",
+            FaultPoint::ManifestSyncEio => "manifest.sync.eio",
+            FaultPoint::ManifestSyncNoSpace => "manifest.sync.nospace",
+            FaultPoint::MetaFlushCommitted => "meta.flush_committed",
+            FaultPoint::MetaManifestSlotSwitch => "meta.manifest_slot_switch",
+            FaultPoint::MetaCompactL0ToL1 => "meta.compact_l0_to_l1",
+            FaultPoint::MetaCompactDeeperLevel => "meta.compact_deeper_level",
+            FaultPoint::MetaManifestTornFallback => "meta.manifest_torn_fallback",
         }
     }
 
@@ -187,6 +281,58 @@ impl FaultPoint {
             (FileKind::Journal, SimOp::Sync, SimFault::Eio) => Some(FaultPoint::JournalSyncEio),
             (FileKind::Journal, SimOp::Sync, SimFault::NoSpace) => Some(FaultPoint::JournalSyncNoSpace),
             (FileKind::Segment, _, _) => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SimFileRole {
+    Data,
+    Journal,
+    Segment,
+    Manifest,
+    Other,
+}
+
+impl SimFileRole {
+    fn from_path_kind(path: &Path, kind: FileKind) -> Self {
+        match kind {
+            FileKind::Data => SimFileRole::Data,
+            FileKind::Journal => SimFileRole::Journal,
+            FileKind::Segment => {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with("manifest.") {
+                    SimFileRole::Manifest
+                } else if name.starts_with("seg_") && name.ends_with(".seg") {
+                    SimFileRole::Segment
+                } else {
+                    SimFileRole::Other
+                }
+            }
+        }
+    }
+
+    const fn fault_point(self, op: SimOp, fault: SimFault) -> Option<FaultPoint> {
+        match (self, op, fault) {
+            (SimFileRole::Data, _, _) => FaultPoint::from_file_op(FileKind::Data, op, fault),
+            (SimFileRole::Journal, _, _) => FaultPoint::from_file_op(FileKind::Journal, op, fault),
+            (SimFileRole::Segment, SimOp::Write, SimFault::Eio) => Some(FaultPoint::SegmentWriteEio),
+            (SimFileRole::Segment, SimOp::Write, SimFault::NoSpace) => Some(FaultPoint::SegmentWriteNoSpace),
+            (SimFileRole::Segment, SimOp::Read, SimFault::Eio) => Some(FaultPoint::SegmentReadEio),
+            (SimFileRole::Segment, SimOp::Read, SimFault::NoSpace) => Some(FaultPoint::SegmentReadNoSpace),
+            (SimFileRole::Segment, SimOp::SetLen, SimFault::Eio) => Some(FaultPoint::SegmentSetLenEio),
+            (SimFileRole::Segment, SimOp::SetLen, SimFault::NoSpace) => Some(FaultPoint::SegmentSetLenNoSpace),
+            (SimFileRole::Segment, SimOp::Sync, SimFault::Eio) => Some(FaultPoint::SegmentSyncEio),
+            (SimFileRole::Segment, SimOp::Sync, SimFault::NoSpace) => Some(FaultPoint::SegmentSyncNoSpace),
+            (SimFileRole::Manifest, SimOp::Write, SimFault::Eio) => Some(FaultPoint::ManifestWriteEio),
+            (SimFileRole::Manifest, SimOp::Write, SimFault::NoSpace) => Some(FaultPoint::ManifestWriteNoSpace),
+            (SimFileRole::Manifest, SimOp::Read, SimFault::Eio) => Some(FaultPoint::ManifestReadEio),
+            (SimFileRole::Manifest, SimOp::Read, SimFault::NoSpace) => Some(FaultPoint::ManifestReadNoSpace),
+            (SimFileRole::Manifest, SimOp::SetLen, SimFault::Eio) => Some(FaultPoint::ManifestSetLenEio),
+            (SimFileRole::Manifest, SimOp::SetLen, SimFault::NoSpace) => Some(FaultPoint::ManifestSetLenNoSpace),
+            (SimFileRole::Manifest, SimOp::Sync, SimFault::Eio) => Some(FaultPoint::ManifestSyncEio),
+            (SimFileRole::Manifest, SimOp::Sync, SimFault::NoSpace) => Some(FaultPoint::ManifestSyncNoSpace),
+            (SimFileRole::Other, _, _) => None,
         }
     }
 }
@@ -257,7 +403,7 @@ fn apply(image: &mut Vec<u8>, op: &Pending) {
 
 #[derive(Debug)]
 struct SimState {
-    kind: FileKind,
+    role: SimFileRole,
     tracker: Option<Arc<FaultTracker>>,
     /// What survives a crash.
     durable: Vec<u8>,
@@ -269,18 +415,24 @@ struct SimState {
     faults: HashMap<SimOp, Vec<SimFault>>,
     /// How many times each operation ran (fired faults included).
     calls: HashMap<SimOp, u64>,
+    /// Total bytes succeeded on write calls.
+    bytes_written: u64,
+    /// Total bytes succeeded on read calls.
+    bytes_read: u64,
 }
 
 impl Default for SimState {
     fn default() -> Self {
         Self {
-            kind: FileKind::Data,
+            role: SimFileRole::Data,
             tracker: None,
             durable: Vec::new(),
             current: Vec::new(),
             pending: Vec::new(),
             faults: HashMap::new(),
             calls: HashMap::new(),
+            bytes_written: 0,
+            bytes_read: 0,
         }
     }
 }
@@ -292,7 +444,7 @@ impl SimState {
             if !list.is_empty() {
                 let fault = list.remove(0);
                 if let Some(tracker) = &self.tracker {
-                    if let Some(point) = FaultPoint::from_file_op(self.kind, op, fault) {
+                    if let Some(point) = self.role.fault_point(op, fault) {
                         tracker.record(point);
                     }
                 }
@@ -327,14 +479,14 @@ impl SimFile {
         Self::default()
     }
 
-    fn new_with(kind: FileKind, tracker: Option<Arc<FaultTracker>>) -> Self {
-        SimFile { state: Mutex::new(SimState { kind, tracker, ..Default::default() }) }
+    fn new_with(role: SimFileRole, tracker: Option<Arc<FaultTracker>>) -> Self {
+        SimFile { state: Mutex::new(SimState { role, tracker, ..Default::default() }) }
     }
 
-    fn with_bytes(bytes: Vec<u8>, kind: FileKind, tracker: Option<Arc<FaultTracker>>) -> Self {
+    fn with_bytes(bytes: Vec<u8>, role: SimFileRole, tracker: Option<Arc<FaultTracker>>) -> Self {
         SimFile {
             state: Mutex::new(SimState {
-                kind,
+                role,
                 tracker,
                 current: bytes.clone(),
                 durable: bytes,
@@ -351,6 +503,16 @@ impl SimFile {
     /// How many times `op` ran on this file.
     pub fn calls(&self, op: SimOp) -> u64 {
         self.state.lock().calls.get(&op).copied().unwrap_or(0)
+    }
+
+    /// Total bytes written through this file handle.
+    pub fn bytes_written(&self) -> u64 {
+        self.state.lock().bytes_written
+    }
+
+    /// Total bytes read through this file handle.
+    pub fn bytes_read(&self) -> u64 {
+        self.state.lock().bytes_read
     }
 
     /// The bytes a read sees now.
@@ -392,7 +554,7 @@ impl SimFile {
                 }
             }
         }
-        (SimFile::with_bytes(image, st.kind, st.tracker.clone()), stats)
+        (SimFile::with_bytes(image, st.role, st.tracker.clone()), stats)
     }
 
     /// The file as it is after a crash now: a new file, so the old handle's later writes
@@ -409,6 +571,7 @@ impl VolFile for SimFile {
         let op = Pending::Write { offset, data: buf.to_vec() };
         apply(&mut st.current, &op);
         st.pending.push(op);
+        st.bytes_written += buf.len() as u64;
         Ok(())
     }
 
@@ -420,6 +583,7 @@ impl VolFile for SimFile {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "read past the end of a simulated file"));
         }
         buf.copy_from_slice(&st.current[offset as usize..end]);
+        st.bytes_read += buf.len() as u64;
         Ok(())
     }
 
@@ -465,6 +629,7 @@ impl VolFile for SimFile {
 #[derive(Debug, Default)]
 pub struct SimFs {
     files: Mutex<HashMap<PathBuf, Arc<SimFile>>>,
+    pending_faults: Mutex<HashMap<PathBuf, Vec<(SimOp, SimFault)>>>,
     tracker: Arc<FaultTracker>,
 }
 
@@ -492,6 +657,45 @@ impl SimFs {
         }
     }
 
+    /// Arms a fault immediately if `path` exists, or attaches it when `path` is next opened.
+    pub fn arm_on_open(&self, path: &Path, op: SimOp, fault: SimFault) {
+        if let Some(f) = self.file(path) {
+            f.arm(op, fault);
+        } else {
+            self.pending_faults.lock().entry(path.to_path_buf()).or_default().push((op, fault));
+        }
+    }
+
+    /// Sums `file.calls(op)` over every existing file whose path matches `pred`.
+    pub fn total_calls(&self, op: SimOp, mut pred: impl FnMut(&Path) -> bool) -> u64 {
+        self.files
+            .lock()
+            .iter()
+            .filter(|(p, _)| pred(p))
+            .map(|(_, f)| f.calls(op))
+            .sum()
+    }
+
+    /// Sums `file.bytes_written()` over every existing file whose path matches `pred`.
+    pub fn total_bytes_written(&self, mut pred: impl FnMut(&Path) -> bool) -> u64 {
+        self.files
+            .lock()
+            .iter()
+            .filter(|(p, _)| pred(p))
+            .map(|(_, f)| f.bytes_written())
+            .sum()
+    }
+
+    /// Sums `file.bytes_read()` over every existing file whose path matches `pred`.
+    pub fn total_bytes_read(&self, mut pred: impl FnMut(&Path) -> bool) -> u64 {
+        self.files
+            .lock()
+            .iter()
+            .filter(|(p, _)| pred(p))
+            .map(|(_, f)| f.bytes_read())
+            .sum()
+    }
+
     /// Every file as it is after a crash now, in path order so the seed decides the same
     /// way for the same files, with crash drop/tear statistics.
     pub fn crashed_with_stats(&self, mode: CrashMode, rng: &mut SimRng) -> (SimFs, CrashStats) {
@@ -507,7 +711,14 @@ impl SimFs {
             total.torn_4k_blocks += stats.torn_4k_blocks;
             out.insert(p.clone(), Arc::new(f));
         }
-        (SimFs { files: Mutex::new(out), tracker: Arc::clone(&self.tracker) }, total)
+        (
+            SimFs {
+                files: Mutex::new(out),
+                pending_faults: Mutex::new(HashMap::new()),
+                tracker: Arc::clone(&self.tracker),
+            },
+            total,
+        )
     }
 
     /// Every file as it is after a crash now, in path order so the seed decides the same
@@ -523,12 +734,23 @@ impl VolFs for SimFs {
     fn open(&self, path: &Path, kind: FileKind, create: bool) -> io::Result<Arc<SimFile>> {
         let mut files = self.files.lock();
         if let Some(f) = files.get(path) {
+            if let Some(queued) = self.pending_faults.lock().remove(path) {
+                for (op, fault) in queued {
+                    f.arm(op, fault);
+                }
+            }
             return Ok(Arc::clone(f));
         }
         if !create {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("{} does not exist", path.display())));
         }
-        let f = Arc::new(SimFile::new_with(kind, Some(Arc::clone(&self.tracker))));
+        let role = SimFileRole::from_path_kind(path, kind);
+        let f = Arc::new(SimFile::new_with(role, Some(Arc::clone(&self.tracker))));
+        if let Some(queued) = self.pending_faults.lock().remove(path) {
+            for (op, fault) in queued {
+                f.arm(op, fault);
+            }
+        }
         files.insert(path.to_path_buf(), Arc::clone(&f));
         Ok(f)
     }
@@ -694,5 +916,33 @@ mod tests {
             }
         }
         assert!(saw_torn_4k, "seeded crash must observe at least one torn 4 KiB block");
+    }
+
+    #[test]
+    fn arm_on_open_and_segment_manifest_fault_points_and_io_byte_counters() {
+        let fs = SimFs::new();
+        let seg = Path::new("data/meta/seg_0000000000000001.seg");
+        let man = Path::new("data/meta/manifest.0");
+        fs.arm_on_open(seg, SimOp::SetLen, SimFault::NoSpace);
+        fs.arm_on_open(man, SimOp::Sync, SimFault::Eio);
+
+        let sf = fs.open(seg, FileKind::Segment, true).unwrap();
+        assert!(sf.set_len(0).is_err());
+        sf.write_at(0, &[1u8; 64]).unwrap();
+        let mut buf = [0u8; 32];
+        sf.read_at(0, &mut buf).unwrap();
+        assert_eq!(sf.bytes_written(), 64);
+        assert_eq!(sf.bytes_read(), 32);
+
+        let mf = fs.open(man, FileKind::Segment, true).unwrap();
+        mf.write_at(0, &[2u8; 44]).unwrap();
+        assert!(mf.sync_data().is_err());
+
+        let tracker = fs.fault_tracker();
+        assert_eq!(tracker.count(FaultPoint::SegmentSetLenNoSpace), 1);
+        assert_eq!(tracker.count(FaultPoint::ManifestSyncEio), 1);
+        assert_eq!(fs.total_bytes_written(|p| p.extension().is_some_and(|e| e == "seg")), 64);
+        assert_eq!(fs.total_bytes_read(|p| p.extension().is_some_and(|e| e == "seg")), 32);
+        assert_eq!(fs.total_calls(SimOp::Write, |_| true), 2);
     }
 }
