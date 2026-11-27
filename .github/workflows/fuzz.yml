@@ -15,6 +15,7 @@ on:
       - "server/src/ops/mod.rs"
       - "server/src/ops/object.rs"
       - "server/src/sigv4.rs"
+      - "server/src/precondition.rs"
       - "server/src/aws_chunked.rs"
       - "server/src/lifecycle.rs"
       - "server/src/lifecycle_config.rs"
