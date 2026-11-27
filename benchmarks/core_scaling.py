@@ -413,8 +413,81 @@ WORK_COUNTERS: Tuple[str, ...] = (
     "awanfs_disk_syncs_total",
     "awanfs_disk_write_bytes_total",
     "awanfs_disk_writes_total",
+    "awanfs_disk_reads_total",
+    "awanfs_payload_cache_hits_total",
+    "awanfs_payload_cache_misses_total",
+    "awanfs_payload_cache_bytes",
+    "awanfs_volume_used_bytes",
+    "awanfs_payload_copies_total",
+    "awanfs_payload_copy_bytes_total",
     "awanfs_peak_inflight_bytes",
 )
+
+
+def parse_proc_meminfo(text: str) -> Dict[str, int]:
+    """Parses Linux `/proc/meminfo` fields (such as `Cached` and `Dirty`) into bytes."""
+    out: Dict[str, int] = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, rest = line.split(":", 1)
+        parts = rest.strip().split()
+        if not parts:
+            continue
+        try:
+            val = int(parts[0])
+        except ValueError:
+            continue
+        unit = parts[1].lower() if len(parts) > 1 else "b"
+        if unit == "kb":
+            val *= KIB
+        elif unit == "mb":
+            val *= MIB
+        out[key.strip()] = val
+    return out
+
+
+def parse_proc_io(text: str) -> Dict[str, int]:
+    """Parses Linux `/proc/<pid>/io` `key: value` lines into integers."""
+    out: Dict[str, int] = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, rest = line.split(":", 1)
+        try:
+            out[key.strip()] = int(rest.strip())
+        except ValueError:
+            continue
+    return out
+
+
+def read_proc_meminfo() -> Optional[Dict[str, int]]:
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            return parse_proc_meminfo(fh.read())
+    except OSError:
+        return None
+
+
+def read_proc_io(pid: Optional[int]) -> Optional[Dict[str, int]]:
+    if pid is None or not sys.platform.startswith("linux"):
+        return None
+    path = f"/proc/{pid}/io"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return parse_proc_io(fh.read())
+    except PermissionError:
+        try:
+            r = subprocess.run(["sudo", "-n", "cat", path], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                return parse_proc_io(r.stdout)
+        except Exception:
+            pass
+        return None
+    except OSError:
+        return None
 
 
 def parse_awanfs_metrics(text: str) -> Dict[str, float]:
@@ -1378,7 +1451,22 @@ class _InheritedAffinity:
         return False
 
 
+_LAUNCHES: Dict[int, Tuple[List[str], int, str, Optional[dict]]] = {}
+
+
+def _restart_same(proc: subprocess.Popen) -> subprocess.Popen:
+    """Starts the same server again with the argv, cores, log and env it was launched with (#452/#460)."""
+    argv, n_cores, log_path, env = _LAUNCHES[proc.pid]
+    return _spawn_pinned(argv, n_cores, log_path + ".restart", env=env)
+
+
 def _spawn_pinned(argv: List[str], n_cores: int, log_path: str, env: Optional[dict] = None) -> subprocess.Popen:
+    proc = _spawn_pinned_inner(argv, n_cores, log_path, env=env)
+    _LAUNCHES[proc.pid] = (list(argv), n_cores, log_path, env)
+    return proc
+
+
+def _spawn_pinned_inner(argv: List[str], n_cores: int, log_path: str, env: Optional[dict] = None) -> subprocess.Popen:
     cmd = pinning_command(argv, n_cores, sys.platform)
     use_taskset = sys.platform.startswith("linux") and cmd[0] == "taskset" and shutil.which("taskset") is not None
     launch_argv = cmd if use_taskset else argv
@@ -4175,6 +4263,233 @@ def _resolve_profile_config(
     return durability, profile_cores, compare_fast
 
 
+def drop_page_cache() -> Optional[str]:
+    """`sync`, then drop Linux's page cache. Returns an error string, or None."""
+    if not sys.platform.startswith("linux"):
+        return "page cache drop needs Linux"
+    try:
+        subprocess.run(["sync"], check=True, timeout=120)
+        r = subprocess.run(["sudo", "-n", "tee", "/proc/sys/vm/drop_caches"], input=b"3\n",
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+        if r.returncode != 0:
+            return "could not drop the page cache: " + r.stderr.decode(errors="replace").strip()[:200]
+    except Exception as e:
+        return f"could not drop the page cache: {e}"
+    return None
+
+
+def _cold_pass(host: str, port: int, keys: List[str], size: int, concurrency: int,
+               method: str, auth: Optional[S3Auth]) -> Tuple[Optional[str], float, List[float]]:
+    """Sends `method` once per key with `concurrency` threads. Returns (error, wall s, latencies ms)."""
+    signer = SigV4Signer(auth) if auth is not None else None
+    host_hdr = f"{host}:{port}"
+    payload = deterministic_bytes(size, DEFAULT_SEED) if method == "PUT" else b""
+    lock = threading.Lock()
+    todo = list(keys)
+    lat: List[float] = []
+    errors: List[str] = []
+
+    def worker() -> None:
+        conn = http.client.HTTPConnection(host, port, timeout=120.0)
+        while True:
+            with lock:
+                if not todo or errors:
+                    break
+                key = todo.pop()
+            path = f"/{BUCKET}/{key}"
+            base = {"Connection": "keep-alive"}
+            if method == "PUT":
+                base["Content-Length"] = str(size)
+            hdrs = _make_headers(signer, method, path, host_hdr, base)
+            t0 = time.perf_counter()
+            try:
+                conn.request(method, path, body=payload if method == "PUT" else None, headers=hdrs)
+                resp = conn.getresponse()
+                body = resp.read()
+            except Exception as e:
+                with lock:
+                    errors.append(f"{method} {key}: {e}")
+                break
+            dt = (time.perf_counter() - t0) * 1000.0
+            if resp.status != 200 or (method == "GET" and len(body) != size):
+                with lock:
+                    errors.append(f"{method} {key}: HTTP {resp.status}, {len(body)} bytes")
+                break
+            with lock:
+                lat.append(dt)
+        conn.close()
+
+    t0 = time.perf_counter()
+    threads = [threading.Thread(target=worker) for _ in range(concurrency)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return (errors[0] if errors else None), time.perf_counter() - t0, lat
+
+
+def _pct(vals: List[float], q: float) -> float:
+    v = sorted(vals)
+    return v[min(len(v) - 1, int(q * len(v)))] if v else float("nan")
+
+
+def capture_cold_snapshot(
+    size_label: str,
+    step_name: str,
+    pid: Optional[int],
+    port: Optional[int],
+    running: bool,
+) -> Dict[str, str]:
+    """Records kernel page cache (`/proc/meminfo`), `/proc/<pid>/io`, and `/_awanfs/metrics` for #460."""
+    mem = read_proc_meminfo() or {}
+    cached_mib = f"{mem['Cached'] / MIB:,.1f} MiB ({mem['Cached']:,})" if "Cached" in mem else "-"
+    dirty_mib = f"{mem['Dirty'] / MIB:,.1f} MiB ({mem['Dirty']:,})" if "Dirty" in mem else "-"
+    pio = read_proc_io(pid) if (running and pid is not None) else None
+    read_bytes = (
+        f"{pio['read_bytes'] / MIB:,.1f} MiB ({pio['read_bytes']:,})"
+        if (pio and "read_bytes" in pio) else "-"
+    )
+    rchar = f"{pio['rchar'] / MIB:,.1f} MiB ({pio['rchar']:,})" if (pio and "rchar" in pio) else "-"
+    syscr = f"{pio['syscr']:,}" if (pio and "syscr" in pio) else "-"
+    metrics = scrape_awanfs_metrics("127.0.0.1", port) if (running and port is not None) else None
+
+    def _m(key: str) -> str:
+        if not metrics or key not in metrics:
+            return "-"
+        return f"{int(metrics[key]):,}"
+
+    return {
+        "size": size_label,
+        "step": step_name,
+        "cached": cached_mib,
+        "dirty": dirty_mib,
+        "proc_read_bytes": read_bytes,
+        "proc_rchar": rchar,
+        "proc_syscr": syscr,
+        "disk_reads": _m("awanfs_disk_reads_total"),
+        "cache_hits": _m("awanfs_payload_cache_hits_total"),
+        "cache_misses": _m("awanfs_payload_cache_misses_total"),
+        "cache_bytes": _m("awanfs_payload_cache_bytes"),
+        "volume_used": _m("awanfs_volume_used_bytes"),
+        "payload_copies": _m("awanfs_payload_copies_total"),
+        "payload_copy_bytes": _m("awanfs_payload_copy_bytes_total"),
+    }
+
+
+def format_cold_step_row(snap: Dict[str, str]) -> str:
+    return (
+        f"| {snap['size']} | {snap['step']} | {snap['cached']} | {snap['dirty']} "
+        f"| {snap['proc_read_bytes']} | {snap['proc_rchar']} | {snap['proc_syscr']} "
+        f"| {snap['disk_reads']} | {snap['cache_hits']} | {snap['cache_misses']} "
+        f"| {snap['cache_bytes']} | {snap['volume_used']} | {snap['payload_copies']} "
+        f"| {snap['payload_copy_bytes']} |"
+    )
+
+
+def _run_cold_mode(a: argparse.Namespace, cmd: str, total_cores: int, data_root: str, make_starter) -> int:
+    """Cold GET instrumentation (#460): records `/proc/meminfo`, `/proc/<pid>/io`, and `/_awanfs/metrics`
+    after write, after page cache drop, after restart before GET, and after cold pass."""
+    sizes = [parse_size(x) for x in (a.sizes or "1MiB").split(",") if x.strip()]
+    servers = parse_servers(getattr(a, "servers", "") or "")
+    n = a.cold_cores
+    cli_cores, shares = client_cores_for(n, total_cores)
+    set_bytes = parse_size(a.cold_set)
+    conc = a.cold_concurrency
+    rows: List[str] = []
+    step_rows: List[str] = []
+    log_notes: List[str] = []
+    for sz in sizes:
+        sz_label = format_size(sz)
+        count = max(1, set_bytes // sz)
+        keys = [f"cold/{sz}/{i:06d}" for i in range(count)]
+        for srv in servers:
+            label = f"| {srv} | {sz_label} | {count} |"
+            print(f"[cold] {srv} {sz_label} x {count} (server cores={n}, client cores={cli_cores}, c={conc})...", flush=True)
+            try:
+                proc, port, data_dir, log_path, auth = _unpack_starter_result(make_starter(srv, n)())
+            except Exception as e:
+                rows.append(f"{label} not measured ({str(e).strip()[:160]}) | | | | | |")
+                continue
+            pin_process(os.getpid(), cli_cores)
+            try:
+                err, put_wall, _ = _cold_pass("127.0.0.1", port, keys, sz, conc, "PUT", auth)
+                if err:
+                    rows.append(f"{label} not measured (write: {err[:160]}) | | | | | |")
+                    continue
+                if srv == "AwanFS":
+                    step_rows.append(format_cold_step_row(
+                        capture_cold_snapshot(sz_label, "1. after_write", proc.pid, port, running=True)
+                    ))
+                _stop_proc(proc)
+                err = drop_page_cache()
+                if err:
+                    rows.append(f"{label} not measured ({err}) | | | | | |")
+                    continue
+                if srv == "AwanFS":
+                    step_rows.append(format_cold_step_row(
+                        capture_cold_snapshot(sz_label, "2. after_drop", None, None, running=False)
+                    ))
+                proc = _restart_same(proc)
+                err = _wait_port(proc, port, timeout=60.0)
+                if err:
+                    rows.append(f"{label} not measured (restart: {err}: {_tail_log(log_path + '.restart')}) | | | | | |")
+                    continue
+                if srv == "AwanFS":
+                    step_rows.append(format_cold_step_row(
+                        capture_cold_snapshot(sz_label, "3. after_restart_before_get", proc.pid, port, running=True)
+                    ))
+                    log_notes.append(f"### {sz_label} restart log tail (`{os.path.basename(log_path)}.restart`)\n\n```\n{_tail_log(log_path + '.restart')}\n```")
+                cells = []
+                for pass_name in ("cold", "warm"):
+                    err, wall, lat = _cold_pass("127.0.0.1", port, keys, sz, conc, "GET", auth)
+                    if srv == "AwanFS" and pass_name == "cold":
+                        step_rows.append(format_cold_step_row(
+                            capture_cold_snapshot(sz_label, "4. after_cold_pass", proc.pid, port, running=True)
+                        ))
+                    if err:
+                        cells.append(f"not measured ({err[:120]})")
+                        cells.append("")
+                        continue
+                    ops = count / wall
+                    cells.append(f"{ops:,.0f} ops/s, {ops * sz / MIB:,.1f} MiB/s")
+                    cells.append(f"{_pct(lat, 0.5):.2f} / {_pct(lat, 0.99):.2f}")
+                put_ops = count / put_wall
+                rows.append(f"{label} {put_ops:,.0f} ops/s, {put_ops * sz / MIB:,.1f} MiB/s | {cells[0]} | {cells[1]} | {cells[2]} | {cells[3]} |")
+            finally:
+                _stop_proc(proc)
+                shutil.rmtree(data_dir, ignore_errors=True)
+    report_lines = [
+        f"Command: `{cmd}`",
+        "",
+        f"# Cold GET probe (#460, {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})",
+        "",
+        f"- **Machine:** {platform.node()} ({platform.platform()}, {total_cores} logical cores, {rwb.host_ram_gb()} GB RAM, CPU: {rwb.cpu_model()})",
+        f"- **Method:** per size, {format_size(set_bytes)} of objects is written with {conc} connections, the server is stopped, `sync` and `echo 3 > /proc/sys/vm/drop_caches` drop the page cache, and the server restarts on the same data before reading every object once cold and once warm. Server pinned to {n} cores, client to {cli_cores} (shares cores: {shares}).",
+        "",
+        "## Cold and warm GET throughput",
+        "",
+        "| Server | Size | Objects | PUT (writing the set) | Cold GET | Cold P50 / P99 ms | Warm GET | Warm P50 / P99 ms |",
+        "|---|---|---|---|---|---|---|---|",
+        *rows,
+        "",
+        "## Per-step counters (`AwanFS`)",
+        "",
+        "| Size | Step | `/proc/meminfo` Cached | `/proc/meminfo` Dirty | `/proc/<pid>/io` read_bytes | `/proc/<pid>/io` rchar | `/proc/<pid>/io` syscr | `awanfs_disk_reads_total` | `awanfs_payload_cache_hits_total` | `awanfs_payload_cache_misses_total` | `awanfs_payload_cache_bytes` | `awanfs_volume_used_bytes` | `awanfs_payload_copies_total` | `awanfs_payload_copy_bytes_total` |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        *step_rows,
+        "",
+        *log_notes,
+        "",
+    ]
+    report = "\n".join(report_lines)
+    out_abs = os.path.abspath(a.output)
+    os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+    with open(out_abs, "w", encoding="utf-8") as fh:
+        fh.write(report)
+    print(report)
+    return 0
+
+
 def _starter_for(
     srv: str,
     n: int,
@@ -4423,6 +4738,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--profile-threads-cores", default="",
                     help="Comma-separated core counts where AwanFS per-thread CPU is sampled during PUT 4 KiB (default: 4,8 on 16+ core split-client runs)")
     ap.add_argument("--no-fetch-minio", action="store_true", help="Do not auto-fetch missing MinIO/mc binaries from GitHub Releases")
+    ap.add_argument("--cold-get", action="store_true", help="Cold and warm GET after a page cache drop and restart (#452/#460, Linux)")
+    ap.add_argument("--cold-set", default="1GiB", help="Bytes of objects written per server and size for --cold-get")
+    ap.add_argument("--cold-concurrency", type=int, default=16, help="Connections for --cold-get")
+    ap.add_argument("--cold-cores", type=int, default=2, help="Server cores for --cold-get")
     ap.add_argument("--server-bin", default="", help="Path to AwanFS release s3-server binary")
     ap.add_argument("--minio-bin", default="", help="Path to MinIO binary")
     ap.add_argument("--mc-bin", default="", help="Path to MinIO mc binary")
@@ -4489,6 +4808,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rustfs_bin = a.rustfs_bin or rwb.find_rustfs_binary()
     garage_bin = a.garage_bin or find_garage_binary()
     seaweedfs_bin = a.seaweedfs_bin or find_seaweedfs_binary()
+
+    if getattr(a, "cold_get", False):
+        return _run_cold_mode(
+            a, cmd, total_cores, data_root,
+            lambda srv, n: _starter_for(srv, n, data_root, awanfs_bin, minio_bin, mc_bin, rustfs_bin,
+                                        garage_bin, seaweedfs_bin, memory_budget=a.memory_budget, durability="group"),
+        )
 
     if a.matrix or a.pattern or a.sizes or a.concurrencies:
         return _run_matrix_mode(
