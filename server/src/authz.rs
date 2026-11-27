@@ -214,7 +214,7 @@ pub fn authorize_bypass_governance(
     authorize_for(
         principal,
         TargetKind::Object,
-        AclPermission::Write,
+        Some(AclPermission::Write),
         false,
         bucket,
         object,
@@ -225,7 +225,7 @@ pub fn authorize_bypass_governance(
 fn authorize_for(
     principal: &Principal,
     target_kind: TargetKind,
-    acl_permission: AclPermission,
+    acl_permission: Option<AclPermission>,
     create_new_bucket: bool,
     bucket: Option<&BucketTarget<'_>>,
     object: Option<&ObjectTarget<'_>>,
@@ -308,8 +308,10 @@ fn authorize_for(
                 TargetKind::Object => object.map(|o| o.acl).unwrap_or(b.acl),
                 TargetKind::Service | TargetKind::Bucket => b.acl,
             };
-            if acl_grants_permission(acl, principal, acl_permission, pab.ignore_public_acls) {
-                return Decision::Allow(Reason::Acl);
+            if let Some(req_perm) = acl_permission {
+                if acl_grants_permission(acl, principal, req_perm, pab.ignore_public_acls) {
+                    return Decision::Allow(Reason::Acl);
+                }
             }
         }
     }
