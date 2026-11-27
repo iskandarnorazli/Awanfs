@@ -68,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, windows-latest ]
+        os: [ ubuntu-latest ]
     defaults:
       run:
         shell: bash
@@ -80,62 +80,10 @@ jobs:
       - name: Build s3-server (--release)
         run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
 
-      - uses: actions/cache@v4
-        id: tools
-        with:
-          path: |
-            .tmp/minio
-            .tmp/rustfs
-            .tmp/garage
-            .tmp/seaweedfs
-          key: bench-tools-${{ runner.os }}-${{ env.MINIO_RELEASE }}-rustfs-${{ env.RUSTFS_TAG }}-garage-${{ env.GARAGE_TAG }}-seaweedfs-${{ env.SEAWEEDFS_TAG }}-v1
-      - uses: actions/setup-go@v5
-        if: steps.tools.outputs.cache-hit != 'true'
-        with:
-          go-version: stable
-          cache: false
-      - name: Build MinIO and mc from source (pinned release)
-        if: steps.tools.outputs.cache-hit != 'true'
-        continue-on-error: true
+      - name: Prepare /mnt/bench (#460)
         run: |
-          exe=""; [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
-          mkdir -p .tmp/minio
-          git clone -q --depth 1 --branch "$MINIO_RELEASE" https://github.com/minio/minio "$RUNNER_TEMP/minio-src"
-          (cd "$RUNNER_TEMP/minio-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/minio$exe" .)
-          git clone -q --depth 1 https://github.com/minio/mc "$RUNNER_TEMP/mc-src"
-          (cd "$RUNNER_TEMP/mc-src" && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/mc$exe" .)
-      - name: Download RustFS release
-        if: steps.tools.outputs.cache-hit != 'true'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p .tmp/rustfs "$RUNNER_TEMP/rustfs-dl"
-          if [ "$RUNNER_OS" = "Windows" ]; then want='windows.*(x86_64|amd64).*\.zip$'; bin=rustfs.exe; else want='linux.*(x86_64|amd64).*\.zip$'; bin=rustfs; fi
-          tag=""
-          for t in "$RUSTFS_TAG" "v$RUSTFS_TAG"; do
-            if gh release view "$t" -R rustfs/rustfs >/dev/null 2>&1; then tag="$t"; break; fi
-          done
-          if [ -z "$tag" ]; then echo "::warning::RustFS release $RUSTFS_TAG not found"; exit 0; fi
-          asset=$(gh release view "$tag" -R rustfs/rustfs --json assets --jq '.assets[].name' | grep -Ei "$want" | grep -vi musl | head -1)
-          [ -z "$asset" ] && asset=$(gh release view "$tag" -R rustfs/rustfs --json assets --jq '.assets[].name' | grep -Ei "$want" | head -1)
-          if [ -z "$asset" ]; then echo "::warning::no RustFS asset for $RUNNER_OS in $tag"; exit 0; fi
-          gh release download "$tag" -R rustfs/rustfs -p "$asset" -D "$RUNNER_TEMP/rustfs-dl"
-          (cd "$RUNNER_TEMP/rustfs-dl" && unzip -q -o "$asset")
-          found=$(find "$RUNNER_TEMP/rustfs-dl" -type f -name "$bin" | head -1)
-          if [ -z "$found" ]; then echo "::warning::$bin not in $asset"; exit 0; fi
-          cp "$found" ".tmp/rustfs/$bin"
-          chmod +x ".tmp/rustfs/$bin" || true
-      - name: Download Garage release (Linux)
-        if: steps.tools.outputs.cache-hit != 'true' && runner.os == 'Linux'
-        continue-on-error: true
-        run: python benchmarks/fetch_garage.py --tag "$GARAGE_TAG"
-      - name: Download SeaweedFS release
-        if: steps.tools.outputs.cache-hit != 'true'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python benchmarks/fetch_seaweedfs.py --tag "$SEAWEEDFS_TAG"
+          sudo mkdir -p /mnt/bench && sudo chown "$(id -u):$(id -g)" /mnt/bench
+          df -h / /mnt | tee -a "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-python@v5
         with:
@@ -143,76 +91,43 @@ jobs:
       - name: Install Python benchmark dependencies
         run: python -m pip install -q psutil matplotlib
 
-      - name: Run core scaling and fetch self-tests
-        run: |
-          python benchmarks/test_core_scaling.py
-          python benchmarks/test_fetch_garage.py
-          python benchmarks/test_fetch_seaweedfs.py
+      - name: Run core scaling self-tests
+        run: python benchmarks/test_core_scaling.py
 
-      - name: Run core scaling benchmark
-        timeout-minutes: 105
+      - name: Cold GET probe (#460, AwanFS only, 1MiB and 8MiB)
+        timeout-minutes: 60
         env:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
           TMPDIR: ${{ runner.temp }}
         run: |
           mkdir -p "$RUNNER_TEMP/core_scaling"
-          cores_arg="${{ inputs.cores }}"
-          if [ -z "$cores_arg" ]; then cores_arg="1,2,4"; fi
-          extra_args=()
-          if [ "${{ github.event_name }}" = "pull_request" ] || [ "${{ inputs.matrix }}" = "true" ]; then
-            extra_args+=(
-              --matrix
-              --pattern "${{ inputs.patterns || 'seq-write,rand-write,seq-read,rand-read' }}"
-              --sizes "${{ inputs.sizes || '4KiB,1MiB' }}"
-              --concurrencies "${{ inputs.concurrencies || '1,4,16,64,256' }}"
-              --seed "${{ inputs.seed || '42' }}"
-            )
-          fi
           python -u benchmarks/core_scaling.py \
-            --cores "$cores_arg" \
-            --runs "${{ inputs.runs || '2' }}" \
-            --duration "${{ inputs.duration || '2' }}" \
-            --client-procs "${{ inputs.client_procs || '4' }}" \
-            --data-dir "$RUNNER_TEMP" \
-            --output $RUNNER_TEMP/core_scaling/report.md \
+            --cold-get \
+            --no-fetch-minio \
             --compare-fast \
-            "${extra_args[@]}"
-
-      - name: Run client ceiling probe (local HTTP)
-        env:
-          TMP: ${{ runner.temp }}
-          TEMP: ${{ runner.temp }}
-          TMPDIR: ${{ runner.temp }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/core_scaling"
-          python -u benchmarks/core_scaling.py \
-            --ceiling-probe \
-            --runs "${{ inputs.runs || '2' }}" \
-            --duration "${{ inputs.duration || '2' }}" \
-            --data-dir "$RUNNER_TEMP" \
-            --output $RUNNER_TEMP/core_scaling/client_ceiling.md
+            --sizes "1MiB,8MiB" \
+            --servers "AwanFS" \
+            --cold-set 1GiB \
+            --cold-concurrency 16 \
+            --cold-cores 2 \
+            --data-dir /mnt/bench \
+            --output "$RUNNER_TEMP/core_scaling/cold_get.md"
 
       - name: Report to the job summary
         if: always()
         run: |
-          wrote=0
-          for f in "$RUNNER_TEMP/core_scaling/report.md" "$RUNNER_TEMP/core_scaling/client_ceiling.md"; do
-            if [ -s "$f" ]; then
-              cat "$f" >> "$GITHUB_STEP_SUMMARY"
-              printf "\n" >> "$GITHUB_STEP_SUMMARY"
-              wrote=1
-            fi
-          done
-          if [ "$wrote" -eq 0 ]; then
-            echo "This run produced no core scaling report." | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -s "$RUNNER_TEMP/core_scaling/cold_get.md" ]; then
+            cat "$RUNNER_TEMP/core_scaling/cold_get.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "This run produced no cold GET probe report." | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: core-scaling-${{ matrix.os }}
-          path: ${{ runner.temp }}/core_scaling
+          name: cold-get-460
+          path: ${{ runner.temp }}/core_scaling/cold_get.md
           if-no-files-found: warn
 
   scaling-selfhosted:

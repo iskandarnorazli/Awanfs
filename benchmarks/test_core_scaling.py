@@ -2281,5 +2281,44 @@ class PostMortemMatrixTests(unittest.TestCase):
         self.assertNotIn("| RustFS | seq-write |", md)
 
 
+class ColdProbeParserTests(unittest.TestCase):
+    """#460: parsing `/proc/meminfo`, `/proc/<pid>/io`, and `/_awanfs/metrics` read counters."""
+
+    def test_parse_proc_meminfo_extracts_cached_and_dirty_in_bytes(self):
+        raw = "MemTotal:       16384000 kB\nCached:          1048576 kB\nDirty:             16384 kB\n"
+        got = cs.parse_proc_meminfo(raw)
+        self.assertEqual(got["Cached"], 1048576 * 1024)
+        self.assertEqual(got["Dirty"], 16384 * 1024)
+
+    def test_parse_proc_io_extracts_read_bytes_and_syscalls(self):
+        raw = "rchar: 123456\nwchar: 654321\nsyscr: 78\nread_bytes: 1073741824\nwrite_bytes: 0\n"
+        got = cs.parse_proc_io(raw)
+        self.assertEqual(got["rchar"], 123456)
+        self.assertEqual(got["syscr"], 78)
+        self.assertEqual(got["read_bytes"], 1073741824)
+        self.assertEqual(got["write_bytes"], 0)
+
+    def test_parse_awanfs_metrics_includes_disk_read_and_cache_counters(self):
+        raw = "\n".join([
+            SAMPLE_METRICS,
+            "awanfs_disk_reads_total 2048",
+            "awanfs_payload_cache_hits_total 1024",
+            "awanfs_payload_cache_misses_total 12",
+            "awanfs_payload_cache_bytes 536870912",
+            "awanfs_volume_used_bytes 1073741824",
+            "awanfs_payload_copies_total 10",
+            "awanfs_payload_copy_bytes_total 10485760",
+        ])
+        got = cs.parse_awanfs_metrics(raw)
+        self.assertEqual(got["awanfs_disk_reads_total"], 2048.0)
+        self.assertEqual(got["awanfs_payload_cache_hits_total"], 1024.0)
+        self.assertEqual(got["awanfs_payload_cache_misses_total"], 12.0)
+        self.assertEqual(got["awanfs_payload_cache_bytes"], 536870912.0)
+        self.assertEqual(got["awanfs_volume_used_bytes"], 1073741824.0)
+        self.assertEqual(got["awanfs_payload_copies_total"], 10.0)
+        self.assertEqual(got["awanfs_payload_copy_bytes_total"], 10485760.0)
+        self.assertNotIn("awanfs_requests_total", got)
+
+
 if __name__ == "__main__":
     unittest.main()
