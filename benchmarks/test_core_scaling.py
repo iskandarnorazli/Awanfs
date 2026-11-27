@@ -246,13 +246,13 @@ def _sample_results():
 
 class PinningTests(unittest.TestCase):
     def test_linux_pinning_command_uses_taskset(self):
-        self.assertEqual(cs.pinning_command(["s3-server", "--port", "9000"], 1, "linux"),
-                         ["taskset", "-c", "0", "s3-server", "--port", "9000"])
-        self.assertEqual(cs.pinning_command(["s3-server", "--port", "9000"], 4, "linux"),
-                         ["taskset", "-c", "0-3", "s3-server", "--port", "9000"])
+        self.assertEqual(cs.pinning_command(["awanfs", "--port", "9000"], 1, "linux"),
+                         ["taskset", "-c", "0", "awanfs", "--port", "9000"])
+        self.assertEqual(cs.pinning_command(["awanfs", "--port", "9000"], 4, "linux"),
+                         ["taskset", "-c", "0-3", "awanfs", "--port", "9000"])
 
     def test_windows_pinning_leaves_argv_and_pins_via_psutil(self):
-        argv = ["s3-server.exe", "--port", "9000"]
+        argv = ["awanfs.exe", "--port", "9000"]
         self.assertEqual(cs.pinning_command(argv, 4, "win32"), argv)
 
         calls = []
@@ -308,8 +308,8 @@ class PinAtStartTests(unittest.TestCase):
                 mock.patch.object(cs.sys, "platform", "win32"), \
                 mock.patch.object(cs.subprocess, "Popen", side_effect=fake_popen), \
                 mock.patch.object(cs, "pin_process", return_value=True):
-            cs._spawn_pinned(["s3-server.exe", "--port", "9000"], 2, os.path.join(d, "log"))
-        self.assertEqual(events, [("set", [0, 1]), ("popen", ["s3-server.exe", "--port", "9000"]), ("set", [0, 1, 2, 3])])
+            cs._spawn_pinned(["awanfs.exe", "--port", "9000"], 2, os.path.join(d, "log"))
+        self.assertEqual(events, [("set", [0, 1]), ("popen", ["awanfs.exe", "--port", "9000"]), ("set", [0, 1, 2, 3])])
 
     def test_linux_spawn_uses_taskset_and_leaves_the_parent_alone(self):
         events = []
@@ -328,8 +328,8 @@ class PinAtStartTests(unittest.TestCase):
                 mock.patch.object(cs.shutil, "which", return_value="/usr/bin/taskset"), \
                 mock.patch.object(cs.subprocess, "Popen", side_effect=fake_popen), \
                 mock.patch.object(cs, "pin_process", return_value=True):
-            cs._spawn_pinned(["s3-server", "--port", "9000"], 2, os.path.join(d, "log"))
-        self.assertEqual(events, [("popen", ["taskset", "-c", "0-1", "s3-server", "--port", "9000"])])
+            cs._spawn_pinned(["awanfs", "--port", "9000"], 2, os.path.join(d, "log"))
+        self.assertEqual(events, [("popen", ["taskset", "-c", "0-1", "awanfs", "--port", "9000"])])
 
     @unittest.skipUnless(sys.platform == "win32", "Windows only")
     def test_a_real_child_sees_its_cores_as_its_first_act(self):
@@ -1417,7 +1417,7 @@ class DurabilityAndAutoProfileTests(unittest.TestCase):
                 pass
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = os.path.join(tmpdir, "s3-server")
+            fake_bin = os.path.join(tmpdir, "awanfs")
             with open(fake_bin, "wb") as fh:
                 fh.write(b"bin")
             with mock.patch.object(cs, "_spawn_pinned", side_effect=lambda argv, n, lp: spawned_argvs.append(list(argv)) or FakeProc()), \

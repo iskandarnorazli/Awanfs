@@ -17,7 +17,7 @@ Both servers sync before acknowledging a PUT: AwanFS in its default `group` dura
 must be re-recorded for the PUT rows.
 
 Usage:
-  python benchmarks/ratio_check.py --server-bin server/target/release/s3-server \\
+  python benchmarks/ratio_check.py --server-bin server/target/release/awanfs \\
       --minio-bin .tmp/minio/minio --mc-bin .tmp/minio/mc [--runs 5] [--duration 3] \\
       [--baseline benchmarks/ratio_baseline.json] [--report ratio_report.md]
 
@@ -260,7 +260,7 @@ def start_awanfs(server_bin: str) -> Tuple[subprocess.Popen, int, str]:
         set_affinity_mask(proc.pid, srv_mask)
     if not wait_port(port):
         proc.kill()
-        raise RuntimeError("s3-server did not start")
+        raise RuntimeError("awanfs did not start")
     import http.client
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5.0)
     conn.request("PUT", f"/{BUCKET}")

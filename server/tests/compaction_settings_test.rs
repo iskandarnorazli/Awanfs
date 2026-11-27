@@ -1,5 +1,5 @@
 //! #509 (follow-up from #494): pin `--compaction-rate` / `AWANFS_COMPACTION_RATE_MB` and
-//! `--auto-compaction` / `AWANFS_AUTO_COMPACTION` directly on the `s3-server` binary.
+//! `--auto-compaction` / `AWANFS_AUTO_COMPACTION` directly on the `awanfs` binary.
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
@@ -30,7 +30,7 @@ impl Drop for Server {
 fn command(name: &str, extra: &[&str], env: &[(&str, &str)]) -> (Command, PathBuf) {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let dir = temp_dir(name);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-server"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_awanfs"));
     cmd.args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous"])
         .args(extra)
         .env("AWANFS_LOG", "off")
@@ -44,11 +44,11 @@ fn command(name: &str, extra: &[&str], env: &[(&str, &str)]) -> (Command, PathBu
     (cmd, dir)
 }
 
-/// Returns the `Compaction: ...` startup line printed by `s3-server`, or `None` if stdout ended or timed out.
+/// Returns the `Compaction: ...` startup line printed by `awanfs`, or `None` if stdout ended or timed out.
 fn compaction_line(spec: (Command, PathBuf)) -> Option<String> {
     let (mut cmd, dir) = spec;
     let mut child = Server {
-        child: cmd.spawn().expect("spawn s3-server"),
+        child: cmd.spawn().expect("spawn awanfs"),
         dir,
     };
     let out = child.child.stdout.take().unwrap();

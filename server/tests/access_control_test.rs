@@ -449,7 +449,7 @@ async fn policy_and_acl_live_update_and_restart_round_trip() {
 
 #[test]
 fn cli_default_bucket_ownership_flag_accepts_valid_and_rejects_invalid() {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_s3-server"))
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_awanfs"))
         .args(["--port", "0", "--allow-anonymous", "--default-bucket-ownership", "InvalidMode"])
         .output()
         .unwrap();

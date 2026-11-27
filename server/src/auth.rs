@@ -21,7 +21,7 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    /// The library default, used by tests and embedders: anyone may call. The `s3-server`
+    /// The library default, used by tests and embedders: anyone may call. The `awanfs`
     /// binary never uses it unless `--allow-anonymous` is given.
     pub fn open() -> Self {
         AuthConfig { credentials: None, allow_anonymous: true }

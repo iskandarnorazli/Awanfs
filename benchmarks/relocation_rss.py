@@ -5,7 +5,7 @@ the log before it is indexed (decision 51). The copy used to read the object thr
 mapping, which left every page of it resident: RSS grew by up to the object's size, outside
 --memory-budget. This drives that case against a server binary and reports its peak RSS.
 
-    python benchmarks/relocation_rss.py --server-bin server/target/release/s3-server \
+    python benchmarks/relocation_rss.py --server-bin server/target/release/awanfs \
         --size 64MiB --budget 32MiB --overhead-mib 16 --report relocation_rss.md
 
 Exit 0: peak RSS at or under the budget plus the overhead. 1: over it. 2: not measured (the

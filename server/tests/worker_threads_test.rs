@@ -27,7 +27,7 @@ impl Drop for Server {
 fn command(name: &str, extra: &[&str], env: &[(&str, &str)]) -> Command {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let dir = temp_dir(name);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-server"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_awanfs"));
     cmd.args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous"])
         .args(extra)
         .env_remove("AWANFS_WORKER_THREADS")
@@ -43,7 +43,7 @@ fn command(name: &str, extra: &[&str], env: &[(&str, &str)]) -> Command {
 /// such line came within 30 s (a running server never closes its stdout, so the read is on a
 /// thread and the server is killed when this returns).
 fn worker_line(mut cmd: Command) -> Option<String> {
-    let mut child = Server(cmd.spawn().expect("spawn s3-server"));
+    let mut child = Server(cmd.spawn().expect("spawn awanfs"));
     let out = child.0.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -83,7 +83,7 @@ fn an_invalid_count_stops_the_server_with_its_source() {
         (&["--worker-threads", "many"][..], &[][..], "--worker-threads"),
         (&[][..], &[("AWANFS_WORKER_THREADS", "-3")][..], "AWANFS_WORKER_THREADS"),
     ] {
-        let mut child = Server(command("bad", extra, env).spawn().expect("spawn s3-server"));
+        let mut child = Server(command("bad", extra, env).spawn().expect("spawn awanfs"));
         let status = child.0.wait().expect("wait");
         let mut err = String::new();
         child.0.stderr.take().unwrap().read_to_string(&mut err).unwrap();

@@ -39,12 +39,12 @@ impl Server {
 
 async fn start_binary(dir: &Path) -> (Server, String) {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let child = Command::new(env!("CARGO_BIN_EXE_s3-server"))
+    let child = Command::new(env!("CARGO_BIN_EXE_awanfs"))
         .args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous", "--auto-compaction", "off"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn s3-server");
+        .expect("spawn awanfs");
     let url = format!("http://127.0.0.1:{}", port);
     let child = Server(child);
     let c = reqwest::Client::new();
@@ -55,7 +55,7 @@ async fn start_binary(dir: &Path) -> (Server, String) {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("s3-server did not start on port {}", port);
+    panic!("awanfs did not start on port {}", port);
 }
 
 async fn set_versioning(c: &reqwest::Client, url: &str, bucket: &str, status: &str) {

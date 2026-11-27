@@ -110,7 +110,7 @@ class TestDurabilityAndSetup(unittest.TestCase):
         self.assertEqual((canon, flag), ("none", "fast"))
         self.assertIn("NO-SYNC", label)
 
-        args = mc.build_awanfs_server_args("s3-server", "/tmp/d", 9000, durability="none", memory_budget="16MiB")
+        args = mc.build_awanfs_server_args("awanfs", "/tmp/d", 9000, durability="none", memory_budget="16MiB")
         self.assertIn("--durability", args)
         self.assertEqual(args[args.index("--durability") + 1], "fast")
         self.assertIn("--memory-budget", args)

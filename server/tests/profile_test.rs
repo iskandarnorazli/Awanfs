@@ -13,7 +13,7 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn server(args: &[&str]) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_s3-server"));
+    let mut c = Command::new(env!("CARGO_BIN_EXE_awanfs"));
     c.args(args)
         .env_remove("AWANFS_ALLOW_ANONYMOUS")
         .env_remove("AWANFS_PROFILE")

@@ -3,7 +3,7 @@
 Starts the server with one budget, drives `--concurrency` clients doing PUTs and then GETs of
 one object size, and reports its peak RSS against the budget plus a stated overhead.
 
-    python benchmarks/budget_rss.py --server-bin server/target/release/s3-server \
+    python benchmarks/budget_rss.py --server-bin server/target/release/awanfs \
         --budget 256MiB --concurrency 64 --size 1MiB --duration 10
 
 Exit codes: 0 under the ceiling, 1 over it or not measured (a phase that moved no bytes),

@@ -1422,7 +1422,7 @@ def _start_awanfs(
     if durability not in DURABILITIES:
         raise ValueError(f"invalid durability {durability!r}; expected one of {', '.join(DURABILITIES)}")
     if not server_bin or not os.path.isfile(server_bin):
-        raise RuntimeError("s3-server binary not found")
+        raise RuntimeError("awanfs binary not found")
     data = tempfile.mkdtemp(prefix="scaling_awanfs_", dir=data_root)
     port = rwb.get_free_port()
     log_path = os.path.join(data_root, f"scaling_awanfs_{port}.log")
@@ -1441,7 +1441,7 @@ def _start_awanfs(
         _stop_proc(proc)
         tail = _tail_log(log_path)
         shutil.rmtree(data, ignore_errors=True)
-        raise RuntimeError(f"s3-server {err}" + (f": {tail}" if tail else ""))
+        raise RuntimeError(f"awanfs {err}" + (f": {tail}" if tail else ""))
     try:
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5.0)
         conn.request("PUT", f"/{BUCKET}")
@@ -1453,7 +1453,7 @@ def _start_awanfs(
     except Exception as e:
         _stop_proc(proc)
         shutil.rmtree(data, ignore_errors=True)
-        raise RuntimeError(f"s3-server bucket setup failed: {e}") from e
+        raise RuntimeError(f"awanfs bucket setup failed: {e}") from e
     return proc, port, data, log_path
 
 
@@ -4150,7 +4150,7 @@ def render_ceiling_report(
 
 def _default_awanfs_bin() -> Optional[str]:
     exe = ".exe" if sys.platform == "win32" else ""
-    p = os.path.join(REPO_ROOT, "server", "target", "release", f"s3-server{exe}")
+    p = os.path.join(REPO_ROOT, "server", "target", "release", f"awanfs{exe}")
     return p if os.path.isfile(p) else None
 
 
@@ -4423,7 +4423,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--profile-threads-cores", default="",
                     help="Comma-separated core counts where AwanFS per-thread CPU is sampled during PUT 4 KiB (default: 4,8 on 16+ core split-client runs)")
     ap.add_argument("--no-fetch-minio", action="store_true", help="Do not auto-fetch missing MinIO/mc binaries from GitHub Releases")
-    ap.add_argument("--server-bin", default="", help="Path to AwanFS release s3-server binary")
+    ap.add_argument("--server-bin", default="", help="Path to AwanFS release awanfs binary")
     ap.add_argument("--minio-bin", default="", help="Path to MinIO binary")
     ap.add_argument("--mc-bin", default="", help="Path to MinIO mc binary")
     ap.add_argument("--rustfs-bin", default="", help="Path to RustFS binary")

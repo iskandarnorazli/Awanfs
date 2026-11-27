@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Drives a fresh s3-server the way a user does (aws CLI) and keeps the evidence.
+# Drives a fresh awanfs the way a user does (aws CLI) and keeps the evidence.
 #   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle access (default: all)
 # Needs: a built server (cargo build --release --manifest-path server/Cargo.toml), the aws CLI, curl.
 # Evidence: verification/evidence/<UTC timestamp>/ (kept after cleanup). Exit 0 only if every journey passed.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="${AWANFS_BIN:-$ROOT/server/target/release/s3-server}"
+BIN="${AWANFS_BIN:-$ROOT/server/target/release/awanfs}"
 [ -x "$BIN" ] || [ -x "$BIN.exe" ] || { echo "no server binary at $BIN: run cargo build --release --manifest-path server/Cargo.toml"; exit 2; }
 command -v aws >/dev/null || { echo "the aws CLI is not installed"; exit 2; }
 EVID="$ROOT/verification/evidence/$(date -u +%Y%m%dT%H%M%SZ)"
@@ -259,13 +259,13 @@ j_restart() { local id e1 e2 a; echo "survives" >"$EVID/s.bin" && S3 put-object 
   S3 get-bucket-versioning --bucket verify-rv --query Status --output text | grep -qx Enabled &&
   S3 get-object --bucket verify-rv --key k --version-id "$a" "$EVID/srv.out" >/dev/null && same "$EVID/s.bin" "$EVID/srv.out" &&
   S3 head-bucket --bucket verify-bkt; }
-j_quickstart() { local qd qpid; qd="$EVID/qs" && mkdir -p "$qd/server/target/release" && ln -sfn "$BIN" "$qd/server/target/release/s3-server" && (
+j_quickstart() { local qd qpid; qd="$EVID/qs" && mkdir -p "$qd/server/target/release" && ln -sfn "$BIN" "$qd/server/target/release/awanfs" && (
   cd "$qd" || exit 1
   qpid=""
   cleanup_qs() { [ -n "${qpid:-}" ] && kill "$qpid" 2>/dev/null || true; [ -n "${qpid:-}" ] && wait "$qpid" 2>/dev/null || true; }
   trap cleanup_qs EXIT
   AWANFS_ACCESS_KEY=s3admin AWANFS_SECRET_KEY=s3secret \
-    ./server/target/release/s3-server --port 9000 --data-dir ./s3-data >"$EVID/quickstart-server.log" 2>&1 &
+    ./server/target/release/awanfs --port 9000 --data-dir ./s3-data >"$EVID/quickstart-server.log" 2>&1 &
   qpid=$!
   for _ in $(seq 1 100); do curl -sf http://127.0.0.1:9000/_awanfs/health/ready >/dev/null && break; sleep 0.1; done
   curl -sf http://127.0.0.1:9000/_awanfs/health/ready >/dev/null || exit 1
