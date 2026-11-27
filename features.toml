@@ -824,7 +824,6 @@ mint = [
 id = "conditional"
 name = "Conditional GET, HEAD, PUT, CopyObject, and DELETE (If-Match, If-None-Match, dates)"
 status = "done"
-gaps = { fuzz = "#446" }
 issue = "#112"
 area = "conditional"
 design_section = "6.3"
@@ -911,6 +910,7 @@ server_tests = [
   "server/tests/conditional_writes_test.rs::copy_object_destination_preconditions_evaluated_under_key_lock",
 ]
 drive = ["objects", "conditional"]
+fuzz = ["precondition_headers"]
 
 [[feature]]
 id = "multipart"

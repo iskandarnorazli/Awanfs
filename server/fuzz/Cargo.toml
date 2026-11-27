@@ -171,3 +171,9 @@ name = "copy_source"
 path = "fuzz_targets/copy_source.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "precondition_headers"
+path = "fuzz_targets/precondition_headers.rs"
+test = false
+doc = false
