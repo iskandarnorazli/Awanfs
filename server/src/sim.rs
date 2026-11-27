@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// SplitMix64: small, fast and fully determined by its seed.
@@ -405,6 +406,8 @@ fn apply(image: &mut Vec<u8>, op: &Pending) {
 struct SimState {
     role: SimFileRole,
     tracker: Option<Arc<FaultTracker>>,
+    /// Whether reflink copy-on-write cloning (`clone_range_from`) is enabled on this file (#524).
+    reflink_supported: bool,
     /// What survives a crash.
     durable: Vec<u8>,
     /// What reads see: `durable` with `pending` applied.
@@ -413,12 +416,18 @@ struct SimState {
     pending: Vec<Pending>,
     /// Faults armed per operation, fired in order.
     faults: HashMap<SimOp, Vec<SimFault>>,
+    /// Clone errors armed explicitly, fired in order (#524).
+    clone_errors: Vec<io::ErrorKind>,
     /// How many times each operation ran (fired faults included).
     calls: HashMap<SimOp, u64>,
     /// Total bytes succeeded on write calls.
     bytes_written: u64,
     /// Total bytes succeeded on read calls.
     bytes_read: u64,
+    /// How many times `clone_range_from` ran on this file (#524).
+    clone_calls: u64,
+    /// Total bytes succeeded on clone calls (#524).
+    bytes_cloned: u64,
 }
 
 impl Default for SimState {
@@ -426,13 +435,17 @@ impl Default for SimState {
         Self {
             role: SimFileRole::Data,
             tracker: None,
+            reflink_supported: false,
             durable: Vec::new(),
             current: Vec::new(),
             pending: Vec::new(),
             faults: HashMap::new(),
+            clone_errors: Vec::new(),
             calls: HashMap::new(),
             bytes_written: 0,
             bytes_read: 0,
+            clone_calls: 0,
+            bytes_cloned: 0,
         }
     }
 }
@@ -495,6 +508,16 @@ impl SimFile {
         }
     }
 
+    /// Enables or disables reflink cloning (`clone_range_from`) on this simulated file (#524).
+    pub fn set_reflink_supported(&self, enabled: bool) {
+        self.state.lock().reflink_supported = enabled;
+    }
+
+    /// Arms an `io::ErrorKind` on the next `clone_range_from` call (FIFO) (#524).
+    pub fn arm_clone_error(&self, kind: io::ErrorKind) {
+        self.state.lock().clone_errors.push(kind);
+    }
+
     /// Arms `fault` on the next run of `op` (several arms fire in order).
     pub fn arm(&self, op: SimOp, fault: SimFault) {
         self.state.lock().faults.entry(op).or_default().push(fault);
@@ -513,6 +536,16 @@ impl SimFile {
     /// Total bytes read through this file handle.
     pub fn bytes_read(&self) -> u64 {
         self.state.lock().bytes_read
+    }
+
+    /// How many times `clone_range_from` ran on this file (#524).
+    pub fn clone_calls(&self) -> u64 {
+        self.state.lock().clone_calls
+    }
+
+    /// Total bytes cloned into this file via `clone_range_from` (#524).
+    pub fn bytes_cloned(&self) -> u64 {
+        self.state.lock().bytes_cloned
     }
 
     /// The bytes a read sees now.
@@ -554,7 +587,9 @@ impl SimFile {
                 }
             }
         }
-        (SimFile::with_bytes(image, st.role, st.tracker.clone()), stats)
+        let crashed_file = SimFile::with_bytes(image, st.role, st.tracker.clone());
+        crashed_file.state.lock().reflink_supported = st.reflink_supported;
+        (crashed_file, stats)
     }
 
     /// The file as it is after a crash now: a new file, so the old handle's later writes
@@ -623,6 +658,54 @@ impl VolFile for SimFile {
     fn map(&self) -> io::Result<Option<Mmap>> {
         Ok(None)
     }
+
+    fn clone_range_from(&self, src: &Self, src_offset: u64, len: u64, dest_offset: u64) -> io::Result<()> {
+        let align = crate::direct_io::SECTOR_SIZE as u64;
+        if src_offset % align != 0 || dest_offset % align != 0 || len % align != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "FICLONERANGE requires 4096-byte aligned offset and length",
+            ));
+        }
+        {
+            let mut st = self.state.lock();
+            st.clone_calls += 1;
+            if !st.reflink_supported {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "simulated reflink unsupported",
+                ));
+            }
+            if !st.clone_errors.is_empty() {
+                let kind = st.clone_errors.remove(0);
+                return Err(io::Error::new(kind, format!("simulated clone error: {:?}", kind)));
+            }
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let data = if std::ptr::eq(self, src) {
+            let st = self.state.lock();
+            let end = src_offset as usize + len as usize;
+            if end > st.current.len() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "clone past end of simulated file"));
+            }
+            st.current[src_offset as usize..end].to_vec()
+        } else {
+            let src_st = src.state.lock();
+            let end = src_offset as usize + len as usize;
+            if end > src_st.current.len() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "clone past end of simulated file"));
+            }
+            src_st.current[src_offset as usize..end].to_vec()
+        };
+        let mut st = self.state.lock();
+        let op = Pending::Write { offset: dest_offset, data };
+        apply(&mut st.current, &op);
+        st.pending.push(op);
+        st.bytes_cloned += len;
+        Ok(())
+    }
 }
 
 /// A set of simulated files, keyed by path.
@@ -631,11 +714,20 @@ pub struct SimFs {
     files: Mutex<HashMap<PathBuf, Arc<SimFile>>>,
     pending_faults: Mutex<HashMap<PathBuf, Vec<(SimOp, SimFault)>>>,
     tracker: Arc<FaultTracker>,
+    reflink_supported: AtomicBool,
 }
 
 impl SimFs {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Enables or disables reflink cloning across all files in this simulated filesystem (#524).
+    pub fn set_reflink_supported(&self, enabled: bool) {
+        self.reflink_supported.store(enabled, Ordering::Relaxed);
+        for f in self.files.lock().values() {
+            f.set_reflink_supported(enabled);
+        }
     }
 
     pub fn fault_tracker(&self) -> Arc<FaultTracker> {
@@ -716,6 +808,7 @@ impl SimFs {
                 files: Mutex::new(out),
                 pending_faults: Mutex::new(HashMap::new()),
                 tracker: Arc::clone(&self.tracker),
+                reflink_supported: AtomicBool::new(self.reflink_supported.load(Ordering::Relaxed)),
             },
             total,
         )
@@ -746,6 +839,9 @@ impl VolFs for SimFs {
         }
         let role = SimFileRole::from_path_kind(path, kind);
         let f = Arc::new(SimFile::new_with(role, Some(Arc::clone(&self.tracker))));
+        if self.reflink_supported.load(Ordering::Relaxed) {
+            f.set_reflink_supported(true);
+        }
         if let Some(queued) = self.pending_faults.lock().remove(path) {
             for (op, fault) in queued {
                 f.arm(op, fault);

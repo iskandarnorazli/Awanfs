@@ -45,7 +45,7 @@ Owner decisions after the 2026-11-12 unattended run (#64-#83), each the recommen
 | 21 | **Versioning** after #50 and #53. | #31 |
 | 22 | **Compression:** zstd level 1, enabled per bucket in the TOML config. | #51 |
 | 23 | **Metadata scale:** close #13 if the redb spill meets its gate; #26 waits as `unmeasured` until a deployment needs over 100M objects. Superseded by decision 59: #207 measured it (go, owner 2026-11-16), and #26 is built to replace the redb spill. | #13, #26, #207 |
-| 24 | **Compaction I/O:** token-bucket limit (50 MB/s, configurable); copy-on-write cloning only after a measurement. | #28 |
+| 24 | **Compaction I/O:** token-bucket limit (50 MB/s, configurable); copy-on-write cloning only after a measurement (#104 measured Linux XFS `FICLONERANGE` at 2.51×–1485× faster, and #524 adds the `FICLONERANGE` fast path with automatic read+write fallback; stored bytes in `FORMAT.md` unchanged). | #28, #104, #524 |
 | 25 | **Multi-node:** #15 closed as a duplicate of #27; the #52 design note after Phase 2; no code yet. The note is approved (decision 64); cluster code starts after #26. | #15, #27, #52 |
 | 26 | **Benchmark hardware:** the owner's machine as a self-hosted runner (`benchmarks/RUNNER.md`); paid runners only for published numbers. | #58 |
 | 27 | **Invalid ranges** (`bytes=5-3`): whatever ceph s3-tests expects, once #47 runs. | #47 |
