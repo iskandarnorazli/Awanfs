@@ -106,6 +106,103 @@ def cors_waits_on(other):
     )
 
 
+MAIN_RS = """
+fn main() {
+    while let Some(arg) = args.next() {
+        if arg == "--port" || arg == "-p" {
+        } else if arg == "--quiet" {
+        }
+    }
+    let _ = std::env::var("AWANFS_PORT");
+}
+"""
+
+SETTINGS_TOML = """
+[[setting]]
+id = "port"
+flags = ["--port", "-p"]
+env = ["AWANFS_PORT"]
+default = "9000"
+feature = "server"
+what = "listen port"
+test = ["server/tests/health_test.rs::test_live"]
+
+[[setting]]
+id = "quiet"
+flags = ["--quiet"]
+env = []
+default = "off"
+feature = "health"
+what = "no startup lines"
+untested = "fixture"
+internal = "fixture"
+"""
+
+
+class SettingsTest(unittest.TestCase):
+    """#494: every flag in main.rs and every environment variable in server/src has a
+    [[setting]] entry, with a known feature, a doc and a test."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "server" / "src").mkdir(parents=True)
+        (self.root / "server" / "tests").mkdir(parents=True)
+        (self.root / "server" / "src" / "main.rs").write_text(MAIN_RS, encoding="utf-8")
+        (self.root / "server" / "tests" / "health_test.rs").write_text("#[test]\nfn test_live() {}\n", encoding="utf-8")
+        (self.root / "README.md").write_text("Run with `--port 9000` (or `AWANFS_PORT`).\n", encoding="utf-8")
+        self.feats = [{"id": "health"}]
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _probs(self, text):
+        import tomllib
+        return features.check_settings(self.root, tomllib.loads(text).get("setting", []), self.feats)
+
+    def test_a_complete_registry_passes(self):
+        self.assertEqual(self._probs(SETTINGS_TOML), [])
+
+    def test_a_flag_with_no_entry_fails(self):
+        (self.root / "server" / "src" / "main.rs").write_text(MAIN_RS.replace('"--quiet"', '"--quiet" || arg == "--loud"'), encoding="utf-8")
+        self.assertTrue(any("--loud" in p and "no [[setting]]" in p for p in self._probs(SETTINGS_TOML)), self._probs(SETTINGS_TOML))
+
+    def test_an_entry_the_server_no_longer_reads_fails(self):
+        text = SETTINGS_TOML.replace('flags = ["--quiet"]', 'flags = ["--quiet", "--gone"]')
+        self.assertTrue(any("--gone" in p and "not read" in p for p in self._probs(text)), self._probs(text))
+
+    def test_a_variable_with_no_entry_fails(self):
+        (self.root / "server" / "src" / "x.rs").write_text('fn f() { std::env::var_os("AWAN_NEW_KNOB"); }\n', encoding="utf-8")
+        self.assertTrue(any("AWAN_NEW_KNOB" in p and "no [[setting]]" in p for p in self._probs(SETTINGS_TOML)))
+
+    def test_an_unknown_feature_fails(self):
+        text = SETTINGS_TOML.replace('feature = "health"', 'feature = "nope"')
+        self.assertTrue(any("quiet" in p and "nope" in p for p in self._probs(text)), self._probs(text))
+
+    def test_no_readme_mention_and_no_internal_reason_fails(self):
+        text = SETTINGS_TOML.replace('internal = "fixture"\n', "")
+        self.assertTrue(any("quiet" in p and "README" in p for p in self._probs(text)), self._probs(text))
+
+    def test_a_missing_test_fails(self):
+        text = SETTINGS_TOML.replace("health_test.rs::test_live", "health_test.rs::test_gone")
+        self.assertTrue(any("port" in p and "test_gone" in p for p in self._probs(text)), self._probs(text))
+        text = SETTINGS_TOML.replace('untested = "fixture"\n', "")
+        self.assertTrue(any("quiet" in p and "untested" in p for p in self._probs(text)), self._probs(text))
+
+    def test_the_report_has_a_settings_table(self):
+        import tomllib
+        lines = features.settings_md_lines(tomllib.loads(SETTINGS_TOML)["setting"])
+        self.assertIn("## Settings", lines)
+        self.assertIn("| port | `--port`, `-p` | `AWANFS_PORT` | 9000 | server | - | README.md | `server/tests/health_test.rs::test_live` |", lines)
+        self.assertIn("| quiet | `--quiet` | - | off | health | - | internal: fixture | untested: fixture |", lines)
+
+    def test_the_real_registry_passes(self):
+        import tomllib
+        with open(features.DEFAULT_ROOT / "features.toml", "rb") as fh:
+            data = tomllib.load(fh)
+        self.assertEqual(features.check_settings(features.DEFAULT_ROOT, data.get("setting", []), data["feature"]), [])
+
+
 class FeaturesTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
