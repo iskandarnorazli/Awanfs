@@ -1943,6 +1943,9 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 .or_else(|| self.open_gaps.get(&scan_offset).copied())
             {
                 if len > 0 {
+                    if len > SCAN_BATCH_BYTES as u64 {
+                        window.cap_next_refill(SKIP_REFILL_BYTES);
+                    }
                     scan_offset += len;
                     continue;
                 }
@@ -1954,6 +1957,9 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 Ok(h) => h,
                 Err(_) => match self.jump_gap_after(scan_offset) {
                     Some(next) => {
+                        if next.saturating_sub(scan_offset) > SCAN_BATCH_BYTES as u64 {
+                            window.cap_next_refill(SKIP_REFILL_BYTES);
+                        }
                         scan_offset = next;
                         continue;
                     }
@@ -1966,6 +1972,9 @@ impl<Fs: VolFs> VolumeManager<Fs> {
             if scan_offset.checked_add(total_len).is_none_or(|end| end > file_len) {
                 match self.jump_gap_after(scan_offset) {
                     Some(next) => {
+                        if next.saturating_sub(scan_offset) > SCAN_BATCH_BYTES as u64 {
+                            window.cap_next_refill(SKIP_REFILL_BYTES);
+                        }
                         scan_offset = next;
                         continue;
                     }
@@ -2020,6 +2029,9 @@ impl<Fs: VolFs> VolumeManager<Fs> {
                 return Ok(Err(e));
             }
 
+            if total_len > SCAN_BATCH_BYTES as u64 {
+                window.cap_next_refill(SKIP_REFILL_BYTES);
+            }
             scan_offset += total_len;
         }
 
