@@ -240,11 +240,16 @@ fn reference_authorize(
 ) -> bool {
     let sp = spec(op);
 
-    // Step 1: Explicit Deny in bucket policy or caller's identity policy.
+    // Step 1: Explicit Deny in bucket policy or caller's identity policy (root policy recovery excepted, #544).
     if matches!(principal, Principal::User { .. }) && identity_policy == PolicyMatch::ExplicitDeny {
         return false;
     }
-    if bucket.is_some_and(|b| b.policy.explicit_deny) {
+    let recovering = matches!(principal, Principal::Root)
+        && matches!(
+            op,
+            Operation::GetBucketPolicy | Operation::PutBucketPolicy | Operation::DeleteBucketPolicy
+        );
+    if !recovering && bucket.is_some_and(|b| b.policy.explicit_deny) {
         return false;
     }
 
@@ -794,7 +799,14 @@ fn monotonicity_adding_deny_or_removing_allow_never_turns_deny_into_allow() {
         bkt_deny.policy.explicit_deny = true;
         let b_deny = authorize(&principal, op, (sp.target != TargetKind::Service).then_some(&bkt_deny), None, &AuthzContext { identity_policy: id_pol, _marker: PhantomData });
         assert!(!(b_deny.is_allowed() && !base.is_allowed()), "bucket deny flipped Deny->Allow");
-        if sp.target != TargetKind::Service {
+        let recovering = matches!(principal, Principal::Root)
+            && matches!(
+                op,
+                Operation::GetBucketPolicy
+                    | Operation::PutBucketPolicy
+                    | Operation::DeleteBucketPolicy
+            );
+        if sp.target != TargetKind::Service && !recovering {
             assert!(!b_deny.is_allowed(), "bucket explicit deny must deny bucket/object op");
         }
         // Removing allows must satisfy tightened <= base across both Allow and Deny bases.
@@ -1378,5 +1390,70 @@ fn cross_account_bucket_policy_requires_identity_policy_allow() {
             },
         ),
         Decision::Allow(Reason::BucketPolicy)
+    );
+}
+
+/// #544 (#122 review, owner decision Option A): a bucket policy that denies everything does not
+/// lock the root account out of reading, replacing, or deleting that policy.
+#[test]
+fn a_deny_all_bucket_policy_cannot_lock_root_out_of_the_policy() {
+    let acl = AclGrants { grants: vec![] };
+    let deny_all = BucketPolicyDecision {
+        explicit_deny: true,
+        allow: false,
+        is_public: false,
+        conditions_hold: true,
+    };
+    let b = BucketTarget {
+        name: "locked-bkt",
+        owner_account: "",
+        ownership: BucketOwnership::BucketOwnerEnforced,
+        public_access_block: PublicAccessBlock::default(),
+        policy: deny_all,
+        acl: &acl,
+    };
+    let ctx = AuthzContext {
+        identity_policy: PolicyMatch::Allow,
+        _marker: PhantomData,
+    };
+    for op in [
+        Operation::GetBucketPolicy,
+        Operation::PutBucketPolicy,
+        Operation::DeleteBucketPolicy,
+    ] {
+        assert!(
+            matches!(authorize(&Principal::Root, op, Some(&b), None, &ctx), Decision::Allow(_)),
+            "{:?}: root must be able to recover from a deny-all policy",
+            op
+        );
+    }
+    for op in [
+        Operation::GetObject,
+        Operation::PutObject,
+        Operation::DeleteBucket,
+        Operation::PutBucketAcl,
+    ] {
+        assert_eq!(
+            authorize(&Principal::Root, op, Some(&b), None, &ctx),
+            Decision::Deny {
+                code: "AccessDenied",
+                reason: Reason::BucketPolicyDeny,
+            },
+            "{:?}: the deny still applies to root outside the policy itself",
+            op
+        );
+    }
+    let user = Principal::User {
+        account: "".to_string(),
+        name: "u".to_string(),
+        id: "id-u".to_string(),
+    };
+    assert_eq!(
+        authorize(&user, Operation::DeleteBucketPolicy, Some(&b), None, &ctx),
+        Decision::Deny {
+            code: "AccessDenied",
+            reason: Reason::BucketPolicyDeny,
+        },
+        "the exception is for root only"
     );
 }

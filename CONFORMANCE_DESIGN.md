@@ -218,7 +218,9 @@ decision-table test, a default-deny property test and a review by someone who di
 `authorize(principal, operation, bucket, object, context) -> Allow | Deny(code)` is the only
 place access is decided. Handlers do not check access themselves. In order:
 
-1. An explicit `Deny` in the bucket policy or the caller's identity policy: deny.
+1. An explicit `Deny` in the bucket policy or the caller's identity policy: deny (except
+   `Principal::Root` on `GetBucketPolicy`, `PutBucketPolicy`, and `DeleteBucketPolicy`, which ignore
+   a bucket-policy deny for lockout recovery).
 2. Public access block (per bucket): with `IgnorePublicAcls`, grants to AllUsers and
    AuthenticatedUsers do not count; with `RestrictPublicBuckets`, a public policy only
    applies to the owner's account.
