@@ -6,7 +6,7 @@
 
 ## 1. Scope & Client Compatibility
 
-AwanFS (`s3-server`) implements the subset of the **Amazon S3 REST API (`2006-03-01`)** routed in [`server/src/ops/mod.rs`](server/src/ops/mod.rs) and tracked in [`features.toml`](features.toml) ([`operation-table`](features.toml#L1153)).
+AwanFS (`awanfs`) implements the subset of the **Amazon S3 REST API (`2006-03-01`)** routed in [`server/src/ops/mod.rs`](server/src/ops/mod.rs) and tracked in [`features.toml`](features.toml) ([`operation-table`](features.toml#L1153)).
 
 - **Tested S3 clients:** AWS CLI (`scripts/verify_drive.sh`, `server/tests/test_aws_cli.py`), Python `boto3` (`server/tests/test_boto3_compat.py` and the `ceph/s3-tests` suite in `tests/s3tests/`), Rust `reqwest` (`server/tests/`), and MinIO `warp put` (`.github/workflows/ci.yml`).
 - **Unimplemented sub-resources and verbs:** Requests carrying an unimplemented sub-resource (such as `?acl`, `?policy`, `?encryption`, `?object-lock`, `?retention`, `?legal-hold`, `?logging`, `?website`, `?notification`, `?replication`, `?select`, `?parts`) answer `501 NotImplemented` per [`ARCHITECTURE.md`](ARCHITECTURE.md) Decision 61 (`server/src/ops/mod.rs:413-465`). Unsupported HTTP verbs on a known resource answer `405 MethodNotAllowed`.

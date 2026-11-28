@@ -300,7 +300,7 @@ fn etag_str_matches(s: &str, target_etag: &str, strong: bool) -> bool {
     false
 }
 
-fn etag_matches(headers: &HeaderMap, name: &str, target_etag: &str, strong: bool) -> bool {
+pub fn etag_matches(headers: &HeaderMap, name: &str, target_etag: &str, strong: bool) -> bool {
     for val in headers.get_all(name) {
         let Ok(s) = val.to_str() else {
             continue;
@@ -359,7 +359,7 @@ pub fn parse_http_date(raw: &str) -> Option<u64> {
             let day: u32 = dmy.next()?.parse().ok()?;
             let month = parse_month(dmy.next()?)?;
             let yy: i64 = dmy.next()?.parse().ok()?;
-            if dmy.next().is_some() {
+            if dmy.next().is_some() || !(0..=99).contains(&yy) {
                 return None;
             }
             let year = if yy >= 70 { 1900 + yy } else { 2000 + yy };
@@ -441,8 +441,8 @@ fn to_unix_secs(year: i64, month: u32, day: u32, hh: u32, mm: u32, ss: u32) -> O
     if days < 0 {
         return None;
     }
-    let total = (days as u64) * 86_400 + (hh as u64) * 3600 + (mm as u64) * 60 + (ss as u64);
-    Some(total)
+    let total = (days as u128) * 86_400 + (hh as u128) * 3600 + (mm as u128) * 60 + (ss as u128);
+    u64::try_from(total).ok()
 }
 
 /// Howard Hinnant's civil-from-days algorithm (1970-01-01 = day 0).
@@ -460,12 +460,12 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 /// Howard Hinnant's days-from-civil algorithm (1970-01-01 = day 0).
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
+fn days_from_civil(y: i64, m: u32, d: u32) -> i128 {
+    let y = (y as i128) - if m <= 2 { 1 } else { 0 };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
-    let m = m as i64;
-    let d = d as i64;
+    let m = m as i128;
+    let d = d as i128;
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
@@ -870,5 +870,23 @@ mod tests {
         let mut bad_dt = HeaderMap::new();
         bad_dt.insert("x-amz-if-match-last-modified-time", HeaderValue::from_static("bad-date"));
         assert!(parse_delete_conditions(&bad_dt).is_err());
+    }
+
+    #[test]
+    fn extreme_year_and_u64_bounds_never_overflow() {
+        for bad in [
+            "Mkn, 05 Jan 19096502402290235 0:00:00 GMT",
+            "Sun, 06 Nov 9999999999999999 08:49:37 GMT",
+            "Sun, 06 Nov 999999999999999999 08:49:37 GMT",
+            "Sunday, 06-Nov-9223372036854775807 08:49:37 GMT",
+        ] {
+            assert_eq!(parse_http_date(bad), None, "parse_http_date({:?})", bad);
+            assert_eq!(parse_http_date_or_iso(bad), None, "parse_http_date_or_iso({:?})", bad);
+        }
+        assert_eq!(parse_http_date_or_iso("9999999999999999-01-01T00:00:00Z"), None);
+        for ts in [0u64, 1_794_355_200, u64::MAX] {
+            let formatted = format_http_date(ts);
+            assert_eq!(parse_http_date(&formatted), Some(ts), "round-trip {}", formatted);
+        }
     }
 }

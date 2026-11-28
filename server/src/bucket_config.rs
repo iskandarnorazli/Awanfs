@@ -297,6 +297,82 @@ impl ValidatorRegistry {
                 ))
             }),
         );
+        reg.register(
+            ConfigKind::Policy,
+            Arc::new(|bytes: &[u8]| {
+                let text = std::str::from_utf8(bytes).map_err(|_| ConfigError::Rejected {
+                    status: 400,
+                    code: "MalformedPolicy",
+                    message: "Bucket policy is not valid UTF-8".to_string(),
+                })?;
+                let pol = crate::policy::parse_bucket_policy(text).map_err(|r| ConfigError::Rejected {
+                    status: r.status,
+                    code: r.code,
+                    message: r.why.to_string(),
+                })?;
+                Ok(ParsedConfig::with_parsed(
+                    Bytes::copy_from_slice(bytes),
+                    Arc::new(pol),
+                ))
+            }),
+        );
+        reg.register(
+            ConfigKind::Ownership,
+            Arc::new(|bytes: &[u8]| {
+                let xml_str = std::str::from_utf8(bytes).map_err(|_| ConfigError::Rejected {
+                    status: 400,
+                    code: "MalformedXML",
+                    message: "Ownership configuration is not valid UTF-8".to_string(),
+                })?;
+                let own = crate::acl::parse_ownership_xml(xml_str).map_err(|r| ConfigError::Rejected {
+                    status: r.status,
+                    code: r.code,
+                    message: r.why.to_string(),
+                })?;
+                Ok(ParsedConfig::with_parsed(
+                    Bytes::copy_from_slice(bytes),
+                    Arc::new(own),
+                ))
+            }),
+        );
+        reg.register(
+            ConfigKind::PublicAccessBlock,
+            Arc::new(|bytes: &[u8]| {
+                let xml_str = std::str::from_utf8(bytes).map_err(|_| ConfigError::Rejected {
+                    status: 400,
+                    code: "MalformedXML",
+                    message: "PublicAccessBlock configuration is not valid UTF-8".to_string(),
+                })?;
+                let pab = crate::acl::parse_pab_xml(xml_str).map_err(|r| ConfigError::Rejected {
+                    status: r.status,
+                    code: r.code,
+                    message: r.why.to_string(),
+                })?;
+                Ok(ParsedConfig::with_parsed(
+                    Bytes::copy_from_slice(bytes),
+                    Arc::new(pab),
+                ))
+            }),
+        );
+        reg.register(
+            ConfigKind::Acl,
+            Arc::new(|bytes: &[u8]| {
+                let xml_str = std::str::from_utf8(bytes).map_err(|_| ConfigError::Rejected {
+                    status: 400,
+                    code: "MalformedACLError",
+                    message: "ACL configuration is not valid UTF-8".to_string(),
+                })?;
+                let acp = crate::acl::parse_acl_xml_structural(xml_str).map_err(|r| ConfigError::Rejected {
+                    status: r.status,
+                    code: r.code,
+                    message: r.why.to_string(),
+                })?;
+                Ok(ParsedConfig::with_parsed(
+                    Bytes::copy_from_slice(bytes),
+                    Arc::new(acp),
+                ))
+            }),
+        );
         reg
     }
 
@@ -365,16 +441,50 @@ impl BucketConfig {
         }
     }
 
+    pub fn explicit_ownership(&self) -> Option<crate::authz::BucketOwnership> {
+        self.get(ConfigKind::Ownership)
+            .and_then(|p| p.parsed.as_ref())
+            .and_then(|a| a.downcast_ref::<crate::authz::BucketOwnership>())
+            .copied()
+    }
+
+    pub fn ownership_or(&self, default: crate::authz::BucketOwnership) -> crate::authz::BucketOwnership {
+        self.explicit_ownership().unwrap_or(default)
+    }
+
     pub fn ownership(&self) -> crate::authz::BucketOwnership {
-        crate::authz::DEFAULT_BUCKET_OWNERSHIP
+        self.ownership_or(crate::authz::DEFAULT_BUCKET_OWNERSHIP)
     }
 
     pub fn public_access_block(&self) -> crate::authz::PublicAccessBlock {
-        crate::authz::PublicAccessBlock::default()
+        self.get(ConfigKind::PublicAccessBlock)
+            .and_then(|p| p.parsed.as_ref())
+            .and_then(|a| a.downcast_ref::<crate::authz::PublicAccessBlock>())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn bucket_policy(&self) -> Option<Arc<crate::policy::BucketPolicy>> {
+        self.get(ConfigKind::Policy)
+            .and_then(|p| p.parsed.as_ref())
+            .and_then(|a| Arc::clone(a).downcast::<crate::policy::BucketPolicy>().ok())
+    }
+
+    pub fn acl(&self) -> Option<Arc<crate::acl::AccessControlPolicy>> {
+        self.get(ConfigKind::Acl)
+            .and_then(|p| p.parsed.as_ref())
+            .and_then(|a| Arc::clone(a).downcast::<crate::acl::AccessControlPolicy>().ok())
     }
 
     pub fn policy_decision(&self) -> crate::authz::BucketPolicyDecision {
-        crate::authz::BucketPolicyDecision::none()
+        self.bucket_policy()
+            .map(|p| crate::authz::BucketPolicyDecision {
+                explicit_deny: false,
+                allow: false,
+                is_public: p.is_public,
+                conditions_hold: false,
+            })
+            .unwrap_or_else(crate::authz::BucketPolicyDecision::none)
     }
 
     pub fn lifecycle(&self) -> Option<Arc<crate::lifecycle_config::LifecycleConfig>> {
@@ -725,7 +835,7 @@ impl BucketConfigStore {
             match rec {
                 ManifestRecord::Plus { id, name, created_ns, owner, namespace } => {
                     let prev = store.fsm_states.get(&id).copied().unwrap_or_else(BucketState::absent);
-                    let next = bucket_step(prev, BucketEvent::Create { caller_id: 0, is_us_east_1: true })
+                    let next = bucket_step(prev, BucketEvent::Create { caller_id: 0, is_us_east_1: true, acl_matches: true })
                         .map_err(|r| format!("buckets.manifest replay error on +{}:{}: {}", id, name, r.code))?;
                     store.fsm_states.insert(id, next);
                     map.insert(
@@ -849,7 +959,7 @@ impl BucketConfigStore {
         namespace: &str,
     ) -> Result<(), ConfigError> {
         let prev = self.fsm_state(id);
-        let next = bucket_step(prev, BucketEvent::Create { caller_id: 0, is_us_east_1: true })
+        let next = bucket_step(prev, BucketEvent::Create { caller_id: 0, is_us_east_1: true, acl_matches: true })
             .map_err(ConfigError::Fsm)?;
         if prev.status == BucketStatus::Active {
             return Ok(());

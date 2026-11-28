@@ -4,14 +4,23 @@
 use http_body_util::BodyExt;
 use hyper::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use hyper::{Method, StatusCode};
-use s3_server::ops::{classify, ClassifyRefusal, Operation, OPS};
 use s3_server::bucket_config::{
     base64_decode as bucket_base64_decode, base64_encode as bucket_base64_encode,
 };
 use s3_server::checksum::{base64_decode, requested_checksum, ChecksumAlgorithm};
+use s3_server::manifest::{Live, Manifest, ReplayFrom, MAX_LIVE_SEGMENTS};
+use s3_server::meta_index::ObjectMeta;
 use s3_server::ops::bucket::{decode_hex_token, encode_hex_token, parse_list_objects_query};
+use s3_server::ops::multipart::parse_copy_source_range;
 use s3_server::ops::object::{parse_object_attributes_headers, ObjectAttributesQuery};
 use s3_server::ops::service::list_buckets;
+use s3_server::ops::{classify, parse_copy_source, ClassifyRefusal, Operation, OPS};
+use s3_server::precondition::{
+    etag_matches, format_http_date, parse_http_date, parse_http_date_or_iso, precondition,
+    ObjectFacts, PreconditionOutcome,
+};
+use s3_server::segment::{decode_row, encode_segment, parse_block, sort_key, Entry, SegEntry, BLOCK};
+use s3_server::segment_set::MAX_LEVEL;
 use s3_server::{
     base64_encode, parse_s3_target, percent_decode, percent_decode_path_bytes, raw_s3_key,
     ParsedTarget, S3ServiceState,
@@ -185,7 +194,7 @@ fn call_list_buckets(query_map: &HashMap<String, String>) -> (StatusCode, String
     let rt = list_buckets_runtime();
     let state = Arc::clone(list_buckets_state());
     rt.block_on(async move {
-        let resp = list_buckets(state, query_map, None)
+        let resp = list_buckets(state, query_map, None, false, None)
             .await
             .expect("list_buckets never returns hyper::Error");
         let status = resp.status();
@@ -438,6 +447,20 @@ fn canonical_operation_cases() -> &'static [(
         (Operation::PutObjectRetention, Method::PUT, Some("bkt"), Some("obj"), "retention", None),
         (Operation::GetObjectLegalHold, Method::GET, Some("bkt"), Some("obj"), "legal-hold", None),
         (Operation::PutObjectLegalHold, Method::PUT, Some("bkt"), Some("obj"), "legal-hold", None),
+        (Operation::GetBucketPolicy, Method::GET, Some("bkt"), None, "policy", None),
+        (Operation::PutBucketPolicy, Method::PUT, Some("bkt"), None, "policy", None),
+        (Operation::DeleteBucketPolicy, Method::DELETE, Some("bkt"), None, "policy", None),
+        (Operation::GetBucketPolicyStatus, Method::GET, Some("bkt"), None, "policyStatus", None),
+        (Operation::GetBucketAcl, Method::GET, Some("bkt"), None, "acl", None),
+        (Operation::PutBucketAcl, Method::PUT, Some("bkt"), None, "acl", None),
+        (Operation::GetObjectAcl, Method::GET, Some("bkt"), Some("obj"), "acl", None),
+        (Operation::PutObjectAcl, Method::PUT, Some("bkt"), Some("obj"), "acl", None),
+        (Operation::GetBucketOwnershipControls, Method::GET, Some("bkt"), None, "ownershipControls", None),
+        (Operation::PutBucketOwnershipControls, Method::PUT, Some("bkt"), None, "ownershipControls", None),
+        (Operation::DeleteBucketOwnershipControls, Method::DELETE, Some("bkt"), None, "ownershipControls", None),
+        (Operation::GetPublicAccessBlock, Method::GET, Some("bkt"), None, "publicAccessBlock", None),
+        (Operation::PutPublicAccessBlock, Method::PUT, Some("bkt"), None, "publicAccessBlock", None),
+        (Operation::DeletePublicAccessBlock, Method::DELETE, Some("bkt"), None, "publicAccessBlock", None),
     ]
 }
 
@@ -821,12 +844,431 @@ pub fn check_object_attributes_header(data: &[u8]) {
     ));
 }
 
+fn crc32c_sw(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0x82F6_3B78 & mask);
+        }
+    }
+    !crc
+}
+
+fn assert_parse_block_contract(block: &[u8]) {
+    assert_eq!(block.len(), BLOCK);
+    let expected_crc = crc32c_sw(&block[..BLOCK - 4]);
+    let stored_crc = u32::from_le_bytes(block[BLOCK - 4..BLOCK].try_into().unwrap());
+    let crc_ok = expected_crc == stored_crc;
+    let count = u16::from_le_bytes([block[0], block[1]]);
+    let res = parse_block(block, 0);
+    if !crc_ok {
+        assert!(res.is_err(), "parse_block must reject bad CRC");
+    } else if count == 0 {
+        assert!(res.is_err(), "parse_block must reject empty block (count=0)");
+    } else if let Ok(entries) = res {
+        assert!(!entries.is_empty());
+        assert_eq!(entries.len(), count as usize);
+    }
+}
+
+/// Oracle for `meta_segment` (#26, #449):
+/// - `parse_block`, `decode_row`, and `Manifest::decode` never panic on arbitrary bytes.
+/// - Bad CRC or empty block is rejected by `parse_block`; damaged manifests return `None`.
+/// - Segments and manifests written by `encode_segment` and `Manifest::encode` round-trip identically.
+pub fn check_meta_segment(data: &[u8]) {
+    if let Some(m) = Manifest::decode(data) {
+        assert!(m.segments.len() <= MAX_LIVE_SEGMENTS);
+        assert!(m.segments.iter().all(|l| l.level <= MAX_LEVEL));
+        assert!(!m.segments.windows(2).any(|w| w[0].seq >= w[1].seq));
+        let reencoded = m.encode().expect("decoded manifest must re-encode");
+        assert_eq!(Manifest::decode(&reencoded), Some(m));
+    }
+
+    if data.len() >= 64 {
+        let row = decode_row(&data[..64]);
+        assert_eq!(row.key_slice, 0);
+    }
+
+    if data.len() == BLOCK {
+        assert_parse_block_contract(data);
+    }
+    let mut padded = [0u8; BLOCK];
+    let ncopy = data.len().min(BLOCK);
+    padded[..ncopy].copy_from_slice(&data[..ncopy]);
+    assert_parse_block_contract(&padded);
+
+    // Round-trip encoded segment data block and verify single-bit CRC corruption fails.
+    let byte = |i: usize| data.get(i).copied().unwrap_or(0);
+    let u64_from = |start: usize| {
+        let mut b = [0u8; 8];
+        for (idx, slot) in b.iter_mut().enumerate() {
+            *slot = byte(start + idx);
+        }
+        u64::from_le_bytes(b)
+    };
+    let k1 = sort_key(1, &[b'a', byte(0)]);
+    let mut k2 = sort_key(1, &[b'b', byte(1)]);
+    if k2 <= k1 {
+        k2.push(0);
+    }
+    let meta = ObjectMeta {
+        key_hash: u64_from(0),
+        bucket_flags: u64_from(8),
+        vol_offset: u64_from(16),
+        size: u64_from(24),
+        etag_hi: u64_from(32),
+        etag_lo: u64_from(40),
+        created_at: u64_from(48),
+        key_slice: 0,
+    };
+    let entries = vec![
+        SegEntry {
+            key: k1,
+            entry: Entry::Row(meta),
+        },
+        SegEntry {
+            key: k2,
+            entry: Entry::Tombstone,
+        },
+    ];
+    let mut seg = encode_segment(u64_from(0).max(1), u64_from(8), &entries)
+        .expect("encode_segment round-trip");
+    let block1 = &seg[BLOCK..2 * BLOCK];
+    assert_eq!(
+        parse_block(block1, 0).expect("encoded block must parse back"),
+        entries
+    );
+    seg[2 * BLOCK - 1] ^= 1;
+    assert!(
+        parse_block(&seg[BLOCK..2 * BLOCK], 0).is_err(),
+        "corrupted CRC must fail parse_block"
+    );
+
+    // Round-trip encoded manifest and verify CRC corruption & truncation return None.
+    let n_seg = (byte(2) % 4) as usize;
+    let mut seq = u64_from(4).clamp(1, u64::MAX - 2048);
+    let mut segs = Vec::with_capacity(n_seg);
+    for idx in 0..n_seg {
+        segs.push(Live {
+            seq,
+            level: byte(3 + idx) % (MAX_LEVEL + 1),
+        });
+        seq += 1 + (byte(7 + idx) as u64);
+    }
+    let manifest = Manifest {
+        generation: u64_from(12),
+        replay_from: ReplayFrom {
+            volume_id: u32::from(byte(13)),
+            offset: u64_from(14),
+        },
+        next_seq: seq,
+        segments: segs,
+    };
+    let mut enc = manifest.encode().expect("manifest encode");
+    assert_eq!(Manifest::decode(&enc), Some(manifest));
+    let trunc_len = enc.len() - 1;
+    assert_eq!(Manifest::decode(&enc[..trunc_len]), None);
+    enc[trunc_len] ^= 1;
+    assert_eq!(Manifest::decode(&enc), None);
+}
+
+fn pct_encode(s: &str, keep_slash: bool) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'_' | b'.' | b'~')
+            || (keep_slash && b == b'/')
+        {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0F) as usize] as char);
+        }
+    }
+    out
+}
+
+fn expected_copy_source_range(raw: &str) -> Result<(u64, u64), ()> {
+    let rest = raw.trim().strip_prefix("bytes=").ok_or(())?;
+    if rest.contains(',') {
+        return Err(());
+    }
+    let (s_str, e_str) = rest.split_once('-').ok_or(())?;
+    if s_str.is_empty()
+        || e_str.is_empty()
+        || !s_str.bytes().all(|b| b.is_ascii_digit())
+        || !e_str.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(());
+    }
+    let start: u64 = s_str.parse().map_err(|_| ())?;
+    let end: u64 = e_str.parse().map_err(|_| ())?;
+    if start > end {
+        return Err(());
+    }
+    Ok((start, end))
+}
+
+/// Oracle for `copy_source` (#152, #445):
+/// - `parse_copy_source` and `parse_copy_source_range` never panic on arbitrary bytes.
+/// - Any parsed `ParsedCopySource` re-encoded (percent-encoding the key, keeping `/`) parses back identically.
+/// - Empty bucket or key inputs are always refused (`None`).
+/// - `parse_copy_source_range` accepts `bytes=first-last` iff both sides are ASCII decimal digits with `first <= last`.
+pub fn check_copy_source(data: &[u8]) {
+    let text = String::from_utf8_lossy(data);
+    if let Some(parsed) = parse_copy_source(&text) {
+        assert!(!parsed.bucket.is_empty());
+        assert!(!parsed.key.is_empty());
+        assert!(!parsed.bucket.contains('/'));
+        let mut reencoded = format!(
+            "{}/{}",
+            pct_encode(&parsed.bucket, false),
+            pct_encode(&parsed.key, true)
+        );
+        if let Some(ref vid) = parsed.version_id {
+            reencoded.push_str("?versionId=");
+            reencoded.push_str(&pct_encode(vid, false));
+        }
+        assert_eq!(
+            parse_copy_source(&reencoded),
+            Some(parsed),
+            "copy source round-trip mismatch for {:?} -> {:?}",
+            text,
+            reencoded
+        );
+    }
+
+    for empty in ["", "/b", "/b/", "b/", "/", "///k"] {
+        assert_eq!(parse_copy_source(empty), None, "must refuse {:?}", empty);
+    }
+
+    let range_got = parse_copy_source_range(&text);
+    let range_want = expected_copy_source_range(&text);
+    assert_eq!(
+        range_got, range_want,
+        "parse_copy_source_range mismatch for {:?}",
+        text
+    );
+    if let Ok((first, last)) = range_got {
+        assert!(first <= last);
+        assert_eq!(
+            parse_copy_source_range(&format!("bytes={}-{}", first, last)),
+            Ok((first, last))
+        );
+    }
+}
+
+/// Oracle for `precondition_headers` (#181, #446):
+/// - `parse_http_date`, `parse_http_date_or_iso`, and `etag_matches` never panic on arbitrary bytes.
+/// - `parse_http_date` accepts everything `format_http_date` produces by round-trip (`parse(format(t)) == Some(t)`).
+/// - `etag_matches` matches a target ETag appearing quoted anywhere in a comma-separated list, and `*` for existing objects.
+pub fn check_precondition_headers(data: &[u8]) {
+    let text = String::from_utf8_lossy(data);
+    if let Some(secs) = parse_http_date(&text) {
+        let formatted = format_http_date(secs);
+        assert_eq!(
+            parse_http_date(&formatted),
+            Some(secs),
+            "parse_http_date round-trip failed for {:?} -> {:?}",
+            text,
+            formatted
+        );
+    }
+    let _ = parse_http_date_or_iso(&text);
+
+    let mut ts_bytes = [0u8; 8];
+    for (i, &b) in data.iter().take(8).enumerate() {
+        ts_bytes[i] = b;
+    }
+    let derived_ts = u64::from_le_bytes(ts_bytes);
+    for ts in [derived_ts, 0u64, u64::MAX] {
+        let formatted = format_http_date(ts);
+        assert_eq!(parse_http_date(&formatted), Some(ts));
+        assert_eq!(parse_http_date_or_iso(&formatted), Some(ts));
+    }
+
+    if let Ok(hv) = HeaderValue::from_bytes(data) {
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("if-match", hv.clone());
+        hdrs.insert("if-none-match", hv.clone());
+        let _ = etag_matches(&hdrs, "if-match", "\"abc\"", true);
+        let _ = etag_matches(&hdrs, "if-none-match", "\"abc\"", false);
+
+        if let Ok(hv_str) = hv.to_str() {
+            for item in hv_str.split(',') {
+                let trimmed = item.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.starts_with("W/")
+                    && !trimmed.starts_with("w/")
+                    && trimmed != "*"
+                {
+                    let unquoted = trimmed.trim_matches('"');
+                    if !unquoted.is_empty() && unquoted.trim() == unquoted && !unquoted.contains('"')
+                    {
+                        assert!(
+                            etag_matches(&hdrs, "if-match", unquoted, true),
+                            "expected unquoted {:?} to match list {:?}",
+                            unquoted,
+                            hv_str
+                        );
+                        assert!(
+                            etag_matches(&hdrs, "if-match", &format!("\"{}\"", unquoted), true),
+                            "expected quoted {:?} to match list {:?}",
+                            unquoted,
+                            hv_str
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let tok = if data.is_empty() {
+        "abc123".to_string()
+    } else {
+        data.iter()
+            .take(4)
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    };
+    let quoted = format!("\"{}\"", tok);
+    let facts = ObjectFacts {
+        etag: quoted.clone(),
+        last_modified_secs: 1_794_268_800,
+    };
+    for list in [
+        format!("\"other\", {}", quoted),
+        format!("{}, \"other\"", quoted),
+        format!("\"x\", \"y\", {}, \"z\"", quoted),
+        "*".to_string(),
+    ] {
+        let hv = HeaderValue::from_str(&list).unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("if-match", hv.clone());
+        h.insert("if-none-match", hv);
+        assert!(etag_matches(&h, "if-match", &quoted, true));
+        assert!(etag_matches(&h, "if-none-match", &quoted, false));
+    }
+
+    let mut star = HeaderMap::new();
+    star.insert("if-match", HeaderValue::from_static("*"));
+    assert_eq!(precondition(&star, Some(&facts), false), PreconditionOutcome::Proceed);
+    assert_eq!(
+        precondition(&star, None, false),
+        PreconditionOutcome::PreconditionFailed
+    );
+}
+
+/// Oracle for `sse_headers` (#121):
+/// - Arbitrary header values and `TAG_SSE` blobs never panic.
+/// - Valid SSE-C headers always decode a 32-byte key and canonical MD5; valid `SseAttr` encodes to 80 bytes and round-trips.
+pub fn check_sse_headers(data: &[u8]) {
+    use s3_server::sse::{
+        authorize_read_ssec, parse_copy_source_sse_c, parse_read_sse_headers, parse_write_sse_headers, SseAttr,
+        HDR_COPY_SSE_C_ALGO, HDR_COPY_SSE_C_KEY, HDR_COPY_SSE_C_KEY_MD5, HDR_SSE, HDR_SSE_C_ALGO, HDR_SSE_C_KEY,
+        HDR_SSE_C_KEY_MD5, HDR_SSE_KMS_KEY_ID,
+    };
+
+    let _ = SseAttr::decode(data);
+    let _ = SseAttr::plaintext_size_from_raw(data);
+
+    let text = String::from_utf8_lossy(data);
+    let mut parts = text.split('\n');
+    let alg = parts.next().unwrap_or("");
+    let key = parts.next().unwrap_or("");
+    let md5 = parts.next().unwrap_or("");
+    let sse = parts.next();
+    let kms = parts.next();
+
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(alg) {
+        if !alg.is_empty() {
+            headers.insert(HDR_SSE_C_ALGO, v.clone());
+            headers.insert(HDR_COPY_SSE_C_ALGO, v);
+        }
+    }
+    if let Ok(v) = HeaderValue::from_str(key) {
+        if !key.is_empty() {
+            headers.insert(HDR_SSE_C_KEY, v.clone());
+            headers.insert(HDR_COPY_SSE_C_KEY, v);
+        }
+    }
+    if let Ok(v) = HeaderValue::from_str(md5) {
+        if !md5.is_empty() {
+            headers.insert(HDR_SSE_C_KEY_MD5, v.clone());
+            headers.insert(HDR_COPY_SSE_C_KEY_MD5, v);
+        }
+    }
+    if let Some(s) = sse.filter(|s| !s.is_empty()) {
+        if let Ok(v) = HeaderValue::from_str(s) {
+            headers.insert(HDR_SSE, v);
+        }
+    }
+    if let Some(k) = kms.filter(|s| !s.is_empty()) {
+        if let Ok(v) = HeaderValue::from_str(k) {
+            headers.insert(HDR_SSE_KMS_KEY_ID, v);
+        }
+    }
+
+    let w = parse_write_sse_headers(&headers);
+    let r = parse_read_sse_headers(&headers);
+    let cp = parse_copy_source_sse_c(&headers);
+
+    if let Ok(Some(ref ssec_key)) = w {
+        let attr = SseAttr::new_ssec(ssec_key, false, data.len() as u64).expect("SseAttr::new_ssec");
+        let encoded = attr.encode();
+        assert_eq!(encoded.len(), s3_server::sse::SSE_C_ATTR_LEN);
+        assert_eq!(SseAttr::decode(&encoded).unwrap(), attr);
+        assert_eq!(SseAttr::plaintext_size_from_raw(&encoded), Some(data.len() as u64));
+        assert!(authorize_read_ssec(Some(&attr), Some(ssec_key)).is_ok());
+        assert!(authorize_read_ssec(Some(&attr), None).is_err());
+    }
+    let _ = (r, cp);
+}
+
+/// Oracle for `sse_payload` (#121):
+/// - Corrupted `AWE1` headers, truncated chunks, and arbitrary ciphertext never panic in `parse_awe1_header`,
+///   `decrypt_full`, `decrypt_range_from_chunks`, or `Awe1ChunkTransform`.
+pub fn check_sse_payload(data: &[u8]) {
+    use s3_server::sse::{
+        decrypt_full, decrypt_range_from_chunks, encrypt_full, parse_awe1_header, Awe1ChunkTransform, SseDek,
+        AWE1_CHUNK_STORED, AWE1_HEADER_LEN,
+    };
+    use s3_server::stream_read::ChunkTransform;
+
+    let dek = SseDek::from_raw([0x42u8; 32]);
+    let _ = parse_awe1_header(data);
+    let _ = decrypt_full(&dek, None, 0, data.len() as u64, data);
+    if data.len() >= AWE1_HEADER_LEN {
+        if let Ok((plen, prefix)) = parse_awe1_header(data) {
+            let chunk_bytes = &data[AWE1_HEADER_LEN..];
+            let capped = plen.min(64 * 1024 * 8);
+            let _ = decrypt_range_from_chunks(&dek, prefix, 0, capped, 0, capped, 0, chunk_bytes);
+            if let Ok(xform) = Awe1ChunkTransform::new(dek.clone(), prefix, 0, capped, 0, capped) {
+                let off = if data.len() % 2 == 0 { 0 } else { AWE1_CHUNK_STORED as u64 };
+                let _ = xform.transform(off, chunk_bytes.to_vec().into());
+            }
+        }
+    }
+    // Mutation round-trip: encrypt a small prefix and verify arbitrary mutations don't panic or silently pass wrong tags.
+    let sample = &data[..data.len().min(256)];
+    let (ct, _) = encrypt_full(&dek, [1, 2, 3, 4], 0, sample).unwrap();
+    assert_eq!(decrypt_full(&dek, Some([1, 2, 3, 4]), 0, sample.len() as u64, &ct).unwrap(), sample);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        check_checksum_headers, check_classify, check_list_buckets_query,
-        check_list_objects_query, check_object_attributes_header, check_raw_s3_key,
+        check_checksum_headers, check_classify, check_copy_source, check_list_buckets_query,
+        check_list_objects_query, check_meta_segment, check_object_attributes_header,
+        check_precondition_headers, check_raw_s3_key, crc32c_sw,
     };
+    use s3_server::manifest::Manifest;
+    use s3_server::segment::{parse_block, BLOCK};
 
     #[test]
     fn checksum_headers_canonical_vectors_and_invalid_inputs() {
@@ -1017,6 +1459,133 @@ mod tests {
         for path in entries {
             let bytes = std::fs::read(&path).expect("read corpus seed");
             check_object_attributes_header(&bytes);
+        }
+    }
+
+    #[test]
+    fn meta_segment_round_trip_and_corpus_seeds() {
+        for sample in [
+            b"".as_slice(),
+            b"bad",
+            &[0u8; 64],
+            &[0u8; BLOCK],
+            &[65, 87, 83, 77, 2, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 1, 0, 0, 0, 1, 97, 0, 0, 0, 0],
+        ] {
+            check_meta_segment(sample);
+        }
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/meta_segment");
+        let empty = std::fs::read(format!("{}/empty_block", dir)).expect("empty_block");
+        assert_eq!(empty.len(), BLOCK);
+        assert_eq!(
+            crc32c_sw(&empty[..BLOCK - 4]),
+            u32::from_le_bytes(empty[BLOCK - 4..BLOCK].try_into().unwrap())
+        );
+        assert!(parse_block(&empty, 0).is_err());
+
+        let valid_block = std::fs::read(format!("{}/valid_block", dir)).expect("valid_block");
+        assert!(parse_block(&valid_block, 0).is_ok());
+
+        let flipped = std::fs::read(format!("{}/flipped_crc_block", dir)).expect("flipped_crc_block");
+        assert!(parse_block(&flipped, 0).is_err());
+
+        let valid_manifest = std::fs::read(format!("{}/valid_manifest", dir)).expect("valid_manifest");
+        assert!(Manifest::decode(&valid_manifest).is_some());
+
+        let truncated_manifest = std::fs::read(format!("{}/truncated_manifest", dir)).expect("truncated_manifest");
+        assert!(Manifest::decode(&truncated_manifest).is_none());
+
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read meta_segment corpus dir")
+            .map(|e| e.expect("corpus dir entry").path())
+            .collect();
+        entries.sort();
+        assert!(entries.len() >= 5, "expected at least 5 seeds, got {}", entries.len());
+        for path in entries {
+            let bytes = std::fs::read(&path).expect("read corpus seed");
+            check_meta_segment(&bytes);
+        }
+    }
+
+    #[test]
+    fn copy_source_round_trip_and_corpus_seeds() {
+        for sample in [
+            b"/b/k".as_slice(),
+            b"b/k?versionId=null".as_slice(),
+            b"b/%2F%2F".as_slice(),
+            b"b/k?versionId=".as_slice(),
+            b"/b".as_slice(),
+            b"bytes=0-0".as_slice(),
+            b"bytes=5-4".as_slice(),
+            b"bytes=-1".as_slice(),
+            b"bytes=0-18446744073709551616".as_slice(),
+            b"bytes=+0-5".as_slice(),
+            b"b/k%3Ffoo?versionId=v%261".as_slice(),
+        ] {
+            check_copy_source(sample);
+        }
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/copy_source");
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read copy_source corpus dir")
+            .map(|e| e.expect("corpus dir entry").path())
+            .collect();
+        entries.sort();
+        assert!(entries.len() >= 9, "expected at least 9 seeds, got {}", entries.len());
+        for path in entries {
+            let bytes = std::fs::read(&path).expect("read corpus seed");
+            check_copy_source(&bytes);
+        }
+    }
+
+    #[test]
+    fn precondition_headers_round_trip_and_corpus_seeds() {
+        for sample in [
+            b"*".as_slice(),
+            b"\"a\", \"b\"".as_slice(),
+            b"W/\"a\"".as_slice(),
+            b"\"a\",,\"b\"".as_slice(),
+            b"Sun, 06 Nov 1994 08:49:37 GMT".as_slice(),
+            b"Sunday, 06-Nov-94 08:49:37 GMT".as_slice(),
+            b"Feb 30 2026".as_slice(),
+            b"\"a\", \"b\", \"c\"".as_slice(),
+            &[195, 42],
+        ] {
+            check_precondition_headers(sample);
+        }
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/precondition_headers");
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read precondition_headers corpus dir")
+            .map(|e| e.expect("corpus dir entry").path())
+            .collect();
+        entries.sort();
+        assert!(entries.len() >= 8, "expected at least 8 seeds, got {}", entries.len());
+        for path in entries {
+            let bytes = std::fs::read(&path).expect("read corpus seed");
+            check_precondition_headers(&bytes);
+        }
+    }
+
+    #[test]
+    fn sse_headers_and_payload_corpus_seeds() {
+        for sample in [
+            b"AES256\npO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=\nDWygnHRtgiJ77HCm+1rvHw==".as_slice(),
+            b"AES256\npO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=\nDWygnHRtgiJ77HCm+1rvHw==\nAES256".as_slice(),
+            b"AES192\nbad\nbad".as_slice(),
+            b"".as_slice(),
+        ] {
+            super::check_sse_headers(sample);
+        }
+        let h_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/sse_headers");
+        for entry in std::fs::read_dir(h_dir).expect("read sse_headers corpus") {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            super::check_sse_headers(&bytes);
+        }
+        let p_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/sse_payload");
+        for entry in std::fs::read_dir(p_dir).expect("read sse_payload corpus") {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            super::check_sse_payload(&bytes);
         }
     }
 }

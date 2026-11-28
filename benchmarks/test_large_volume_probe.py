@@ -123,7 +123,7 @@ class ConnectProbeTest(unittest.TestCase):
             ("MinIO", 2, {"connect": (11.40, 25.00), "open_conn": (0.46, 0.70)}),
             ("AwanFS", 2, {"connect": (11.60, 25.90), "open_conn": (0.36, 0.54)}),
         ]
-        cmd = "python benchmarks/large_volume_probe.py --server-bin s3-server --minio-bin minio --mc-bin mc --connect-only"
+        cmd = "python benchmarks/large_volume_probe.py --server-bin awanfs --minio-bin minio --mc-bin mc --connect-only"
         text = lvp.render_connect(results, 300, cmd)
         self.assertTrue(text.startswith(f"Command: `{cmd}`"))
         for needle in ("opening the connection (connect)", "AwanFS, round 1", "MinIO, round 1", "AwanFS", "MinIO"):
@@ -180,7 +180,7 @@ class ConnectProbeTest(unittest.TestCase):
              mock.patch.object(lvp, "start_minio", side_effect=fake_start_minio), \
              mock.patch.object(lvp, "measure_connect", side_effect=fake_measure), \
              mock.patch.object(lvp, "stop_server", side_effect=fake_stop):
-            res = lvp.run_connect_comparison("s3-server", "minio", "mc", rounds=5)
+            res = lvp.run_connect_comparison("awanfs", "minio", "mc", rounds=5)
         self.assertEqual([(s, r) for s, r, _ in res], [("AwanFS", 1), ("MinIO", 1), ("MinIO", 2), ("AwanFS", 2)])
         self.assertEqual(len(stopped), 4)
 
@@ -190,7 +190,7 @@ class ConnectProbeTest(unittest.TestCase):
              mock.patch.object(lvp, "measure_connect", side_effect=lvp.NotMeasured("bad")), \
              mock.patch.object(lvp, "stop_server", side_effect=fake_stop):
             with self.assertRaises(lvp.NotMeasured):
-                lvp.run_connect_comparison("s3-server", "minio", "mc", rounds=1)
+                lvp.run_connect_comparison("awanfs", "minio", "mc", rounds=1)
         self.assertEqual(stopped, [("proc-a", "dir-a")])
 
 
@@ -245,7 +245,7 @@ class FourListenerConnectTest(unittest.TestCase):
             return (f"proc-{mode}", 1100 + len(started), f"dir-{mode}")
 
         def fake_awanfs(bin_path):
-            started.append(("s3-server", bin_path))
+            started.append(("awanfs", bin_path))
             return ("proc-s3", 1200 + len(started), "dir-s3")
 
         def fake_minio(bin_path, mc_path):
@@ -264,17 +264,17 @@ class FourListenerConnectTest(unittest.TestCase):
              mock.patch.object(lvp, "measure_connect", side_effect=fake_measure), \
              mock.patch.object(lvp, "stop_server", side_effect=fake_stop):
             res = lvp.run_connect_comparison(
-                "s3-server", "minio", "mc", rounds=5, bare_bin="bare_listeners", connect_rounds=3
+                "awanfs", "minio", "mc", rounds=5, bare_bin="bare_listeners", connect_rounds=3
             )
 
         self.assertEqual(len(res), 12)
         self.assertEqual(len(stopped), 12)
         for rnd in (1, 2, 3):
             names = [name for name, r, _ in res if r == rnd]
-            self.assertEqual(set(names), {"bare std", "bare tokio", "s3-server", "MinIO"})
+            self.assertEqual(set(names), {"bare std", "bare tokio", "awanfs", "MinIO"})
         r1 = [name for name, r, _ in res if r == 1]
         r2 = [name for name, r, _ in res if r == 2]
-        self.assertEqual(r1, ["bare std", "bare tokio", "s3-server", "MinIO"])
+        self.assertEqual(r1, ["bare std", "bare tokio", "awanfs", "MinIO"])
         self.assertEqual(r2, list(reversed(r1)))
         self.assertIn(("bare", "std", "bare_listeners"), started)
         self.assertIn(("bare", "tokio", "bare_listeners"), started)
@@ -287,7 +287,7 @@ class FourListenerConnectTest(unittest.TestCase):
              mock.patch.object(lvp, "stop_server", side_effect=fake_stop):
             with self.assertRaises(lvp.NotMeasured):
                 lvp.run_connect_comparison(
-                    "s3-server", "minio", "mc", rounds=1, bare_bin="bare_listeners", connect_rounds=3
+                    "awanfs", "minio", "mc", rounds=1, bare_bin="bare_listeners", connect_rounds=3
                 )
         self.assertEqual(stopped, [("proc-std", "dir-std")])
 
@@ -295,14 +295,14 @@ class FourListenerConnectTest(unittest.TestCase):
         results = [
             ("bare std", 1, {"connect": (0.20, 0.40), "open_conn": (0.30, 0.55)}),
             ("bare tokio", 1, {"connect": (15.00, 22.00), "open_conn": (0.32, 0.60)}),
-            ("s3-server", 1, {"connect": (15.30, 24.00), "open_conn": (0.38, 0.70)}),
+            ("awanfs", 1, {"connect": (15.30, 24.00), "open_conn": (0.38, 0.70)}),
             ("MinIO", 1, {"connect": (0.30, 25.00), "open_conn": (0.95, 1.40)}),
             ("MinIO", 2, {"connect": (0.34, 26.00), "open_conn": (0.99, 1.50)}),
-            ("s3-server", 2, {"connect": (15.50, 26.00), "open_conn": (0.40, 0.74)}),
+            ("awanfs", 2, {"connect": (15.50, 26.00), "open_conn": (0.40, 0.74)}),
             ("bare tokio", 2, {"connect": (15.50, 24.00), "open_conn": (0.36, 0.64)}),
             ("bare std", 2, {"connect": (0.30, 0.60), "open_conn": (0.34, 0.65)}),
             ("bare tokio", 3, {"connect": (15.20, 23.00), "open_conn": (0.34, 0.62)}),
-            ("s3-server", 3, {"connect": (15.40, 25.00), "open_conn": (0.39, 0.72)}),
+            ("awanfs", 3, {"connect": (15.40, 25.00), "open_conn": (0.39, 0.72)}),
             ("MinIO", 3, {"connect": (0.31, 24.00), "open_conn": (0.97, 1.45)}),
             ("bare std", 3, {"connect": (0.25, 0.50), "open_conn": (0.32, 0.60)}),
         ]
@@ -311,19 +311,19 @@ class FourListenerConnectTest(unittest.TestCase):
         self.assertAlmostEqual(summary["bare std"]["connect_p50_min_ms"], 0.20, places=2)
         self.assertAlmostEqual(summary["bare std"]["connect_p50_max_ms"], 0.30, places=2)
         self.assertAlmostEqual(summary["bare tokio"]["connect_p50_ms"], 15.20, places=2)
-        self.assertAlmostEqual(summary["s3-server"]["connect_p50_ms"], 15.40, places=2)
+        self.assertAlmostEqual(summary["awanfs"]["connect_p50_ms"], 15.40, places=2)
         self.assertAlmostEqual(summary["MinIO"]["connect_p50_ms"], 0.31, places=2)
         self.assertAlmostEqual(summary["ratios"]["bare_tokio_vs_bare_std"], 15.20 / 0.25, places=2)
         self.assertAlmostEqual(summary["ratios"]["s3_server_vs_bare_tokio"], 15.40 / 15.20, places=2)
         self.assertAlmostEqual(summary["ratios"]["s3_server_vs_minio"], 15.40 / 0.31, places=2)
 
-        cmd = "python benchmarks/large_volume_probe.py --server-bin s3-server --bare-bin bare_listeners --minio-bin minio --mc-bin mc --connect-only --connect-rounds 3"
+        cmd = "python benchmarks/large_volume_probe.py --server-bin awanfs --bare-bin bare_listeners --minio-bin minio --mc-bin mc --connect-only --connect-rounds 3"
         text = lvp.render_connect(results, 300, cmd)
         self.assertTrue(text.startswith(f"Command: `{cmd}`"))
         for needle in (
             "| bare std | 0.25 (0.20..0.30) | 0.50 (0.40..0.60) | 0.32 (0.30..0.34) |",
             "| bare tokio | 15.20 (15.00..15.50) | 23.00 (22.00..24.00) | 0.34 (0.32..0.36) |",
-            "| s3-server | 15.40 (15.30..15.50) | 25.00 (24.00..26.00) | 0.39 (0.38..0.40) |",
+            "| awanfs | 15.40 (15.30..15.50) | 25.00 (24.00..26.00) | 0.39 (0.38..0.40) |",
             "| MinIO | 0.31 (0.30..0.34) | 25.00 (24.00..26.00) | 0.97 (0.95..0.99) |",
         ):
             self.assertIn(needle, text)
@@ -333,7 +333,7 @@ class FourListenerConnectTest(unittest.TestCase):
         self.assertAlmostEqual(parsed["bare std"]["connect_p50_min_ms"], 0.20, places=2)
         self.assertAlmostEqual(parsed["bare std"]["connect_p50_max_ms"], 0.30, places=2)
         self.assertAlmostEqual(parsed["bare tokio"]["connect_p50_ms"], 15.20, places=2)
-        self.assertAlmostEqual(parsed["s3-server"]["connect_p99_ms"], 25.00, places=2)
+        self.assertAlmostEqual(parsed["awanfs"]["connect_p99_ms"], 25.00, places=2)
         self.assertAlmostEqual(parsed["MinIO"]["open_conn_p50_ms"], 0.97, places=2)
         self.assertAlmostEqual(parsed["ratios"]["bare_tokio_vs_bare_std"], 15.20 / 0.25, places=2)
         self.assertAlmostEqual(parsed["ratios"]["s3_server_vs_bare_tokio"], 15.40 / 15.20, places=2)
@@ -343,14 +343,14 @@ class FourListenerConnectTest(unittest.TestCase):
         results = [
             ("bare std", 1, {"connect": (0.20, 0.40), "open_conn": (0.30, 0.55)}),
             ("bare tokio", 1, {"connect": (0.25, 0.45), "open_conn": (0.31, 0.56)}),
-            ("s3-server", 1, {"connect": (15.20, 22.00), "open_conn": (0.38, 0.70)}),
+            ("awanfs", 1, {"connect": (15.20, 22.00), "open_conn": (0.38, 0.70)}),
         ]
         text = lvp.render_connect(results, 300, "cmd")
         self.assertIn("| MinIO | not measured | not measured | not measured |", text)
         parsed = lvp.parse_connect_summary(text)
         self.assertIsNotNone(parsed["bare std"])
         self.assertIsNotNone(parsed["bare tokio"])
-        self.assertIsNotNone(parsed["s3-server"])
+        self.assertIsNotNone(parsed["awanfs"])
         self.assertIsNone(parsed["MinIO"])
         self.assertIsNone(parsed["ratios"]["s3_server_vs_minio"])
 
@@ -361,7 +361,7 @@ class FourListenerConnectTest(unittest.TestCase):
                  mock.patch.object(lvp, "start_awanfs", side_effect=lambda _b: ("proc-s3", self.port, "dir-s3")), \
                  mock.patch.object(lvp, "stop_server"):
                 rc = lvp.main([
-                    "--server-bin", "s3-server",
+                    "--server-bin", "awanfs",
                     "--bare-bin", "bare_listeners",
                     "--connect-only",
                     "--rounds", "2",
@@ -373,7 +373,7 @@ class FourListenerConnectTest(unittest.TestCase):
                 report = fh.read()
         self.assertIn("| bare std |", report)
         self.assertIn("| bare tokio |", report)
-        self.assertIn("| s3-server |", report)
+        self.assertIn("| awanfs |", report)
         self.assertIn("| MinIO | not measured | not measured | not measured |", report)
 
 

@@ -56,7 +56,7 @@ jobs:
           workspaces: server
       - name: Build
         if: steps.changes.outputs.run == 'true'
-        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+        run: cargo build --locked --release --bin awanfs --manifest-path server/Cargo.toml
       - name: Start AwanFS
         if: steps.changes.outputs.run == 'true'
         run: bash tests/s3tests/start_server.sh
@@ -242,7 +242,7 @@ jobs:
           workspaces: server
       - name: Build
         if: steps.changes.outputs.run == 'true'
-        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+        run: cargo build --locked --release --bin awanfs --manifest-path server/Cargo.toml
       - name: Start AwanFS
         if: steps.changes.outputs.run == 'true'
         run: bash tests/s3tests/start_server.sh

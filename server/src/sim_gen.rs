@@ -437,8 +437,8 @@ pub fn generate_storage(seed: u64, len: usize) -> Vec<StorageOp> {
     ops
 }
 
-/// Delta-debugging shrinker over [`StorageOp`] sequences to produce a minimal failing trace.
-pub fn shrink_storage(ops: &[StorageOp], mut still_fails: impl FnMut(&[StorageOp]) -> bool) -> Vec<StorageOp> {
+/// Delta-debugging shrinker over arbitrary op slices to produce a 1-minimal witness.
+fn shrink_slice<T: Clone>(ops: &[T], mut still_fails: impl FnMut(&[T]) -> bool) -> Vec<T> {
     if ops.is_empty() || still_fails(&[]) {
         return Vec::new();
     }
@@ -488,6 +488,171 @@ pub fn shrink_storage(ops: &[StorageOp], mut still_fails: impl FnMut(&[StorageOp
         }
     }
     cur
+}
+
+/// Delta-debugging shrinker over [`StorageOp`] sequences to produce a minimal failing trace.
+pub fn shrink_storage(ops: &[StorageOp], still_fails: impl FnMut(&[StorageOp]) -> bool) -> Vec<StorageOp> {
+    shrink_slice(ops, still_fails)
+}
+
+/// Key space size for joint `VolumeManager<SimFs>` + `MetaStore<SimFs>` simulation (#408).
+pub const JOINT_KEY_SPACE: u8 = 80;
+/// Maximum operations without a forced crash in [`generate_joint`].
+const MAX_JOINT_OPS_WITHOUT_CRASH: usize = 20;
+
+/// Which file role of a joint simulation run a fault is armed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JointFileKind {
+    Data,
+    Journal,
+    Segment,
+    Manifest,
+}
+
+/// One step in the joint deterministic `VolumeManager<SimFs>` + `MetaStore<SimFs>` simulation (#408).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JointOp {
+    Put { key: u8, len: u32, fill: u64 },
+    Delete { key: u8 },
+    Sync,
+    FlushMeta,
+    CompactMeta { all: bool },
+    CompactVolume { seal_if_single: bool },
+    VerifyLookup { key: u8 },
+    Fault { file: JointFileKind, op: SimOp, fault: SimFault },
+    ProbeReadFault { file: JointFileKind, fault: SimFault },
+    Crash { mode: CrashMode },
+}
+
+fn joint_put_len(rng: &mut SimRng) -> u32 {
+    match rng.below(6) {
+        0 => 0,
+        1..=2 => ((rng.below(4) + 1) * 4096) as u32,
+        3 => (rng.below(1024) + 1) as u32,
+        _ => (rng.below(12288) + 1) as u32,
+    }
+}
+
+fn random_joint_fault(rng: &mut SimRng) -> JointOp {
+    let file = match rng.below(4) {
+        0 => JointFileKind::Data,
+        1 => JointFileKind::Journal,
+        2 => JointFileKind::Segment,
+        _ => JointFileKind::Manifest,
+    };
+    let op = match rng.below(4) {
+        0 => SimOp::Write,
+        1 => SimOp::Read,
+        2 => SimOp::SetLen,
+        _ => SimOp::Sync,
+    };
+    let fault = if rng.below(2) == 0 {
+        SimFault::Eio
+    } else {
+        SimFault::NoSpace
+    };
+    JointOp::Fault { file, op, fault }
+}
+
+/// Deterministically generates `len` operations for joint `VolumeManager<SimFs>` +
+/// `MetaStore<SimFs>` crash/fault simulation (#408).
+pub fn generate_joint(seed: u64, len: usize) -> Vec<JointOp> {
+    let mut rng = SimRng::new(seed ^ 0x408A_19E5_77B3_D201);
+    let mut ops = Vec::with_capacity(len);
+    let mut since_crash = 0usize;
+
+    for idx in 0..len {
+        if since_crash >= MAX_JOINT_OPS_WITHOUT_CRASH || idx + 1 == len {
+            ops.push(JointOp::Crash {
+                mode: random_crash_mode(&mut rng),
+            });
+            since_crash = 0;
+            continue;
+        }
+
+        let op = match rng.below(100) {
+            0..=33 => {
+                since_crash += 1;
+                JointOp::Put {
+                    key: rng.below(JOINT_KEY_SPACE as u64) as u8,
+                    len: joint_put_len(&mut rng),
+                    fill: rng.next_u64(),
+                }
+            }
+            34..=42 => {
+                since_crash += 1;
+                JointOp::Delete {
+                    key: rng.below(JOINT_KEY_SPACE as u64) as u8,
+                }
+            }
+            43..=51 => {
+                since_crash += 1;
+                JointOp::Sync
+            }
+            52..=66 => {
+                since_crash += 1;
+                JointOp::FlushMeta
+            }
+            67..=76 => {
+                since_crash += 1;
+                JointOp::CompactMeta {
+                    all: rng.below(3) == 0,
+                }
+            }
+            77..=81 => {
+                since_crash += 1;
+                JointOp::CompactVolume {
+                    seal_if_single: rng.below(3) == 0,
+                }
+            }
+            82..=86 => {
+                since_crash += 1;
+                JointOp::VerifyLookup {
+                    key: rng.below(JOINT_KEY_SPACE as u64) as u8,
+                }
+            }
+            87..=94 => {
+                since_crash += 1;
+                let f = random_joint_fault(&mut rng);
+                match f {
+                    JointOp::Fault {
+                        file: file @ (JointFileKind::Journal | JointFileKind::Segment | JointFileKind::Manifest),
+                        op: SimOp::Read,
+                        fault,
+                    } if rng.below(2) == 0 => JointOp::ProbeReadFault { file, fault },
+                    other => other,
+                }
+            }
+            95..=96 => {
+                since_crash += 1;
+                let file = match rng.below(3) {
+                    0 => JointFileKind::Journal,
+                    1 => JointFileKind::Segment,
+                    _ => JointFileKind::Manifest,
+                };
+                let fault = if rng.below(2) == 0 {
+                    SimFault::Eio
+                } else {
+                    SimFault::NoSpace
+                };
+                JointOp::ProbeReadFault { file, fault }
+            }
+            _ => {
+                since_crash = 0;
+                JointOp::Crash {
+                    mode: random_crash_mode(&mut rng),
+                }
+            }
+        };
+        ops.push(op);
+    }
+
+    ops
+}
+
+/// Delta-debugging shrinker over [`JointOp`] sequences to produce a minimal failing trace.
+pub fn shrink_joint(ops: &[JointOp], still_fails: impl FnMut(&[JointOp]) -> bool) -> Vec<JointOp> {
+    shrink_slice(ops, still_fails)
 }
 
 #[cfg(test)]
@@ -783,6 +948,21 @@ mod tests {
         let shrunk = shrink_storage(&a, |seq| {
             seq.iter().any(|op| matches!(op, StorageOp::Compact { .. }))
                 && seq.iter().any(|op| matches!(op, StorageOp::Basic(SimOperation::Crash { .. })))
+        });
+        assert_eq!(shrunk.len(), 2);
+    }
+
+    #[test]
+    fn joint_generator_is_deterministic_and_shrinks() {
+        let a = generate_joint(408, 60);
+        let b = generate_joint(408, 60);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 60);
+        assert!(matches!(a.last(), Some(JointOp::Crash { .. })));
+
+        let shrunk = shrink_joint(&a, |seq| {
+            seq.iter().any(|op| matches!(op, JointOp::FlushMeta))
+                && seq.iter().any(|op| matches!(op, JointOp::Crash { .. }))
         });
         assert_eq!(shrunk.len(), 2);
     }

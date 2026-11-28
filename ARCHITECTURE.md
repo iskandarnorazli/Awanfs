@@ -45,7 +45,7 @@ Owner decisions after the 2026-11-12 unattended run (#64-#83), each the recommen
 | 21 | **Versioning** after #50 and #53. | #31 |
 | 22 | **Compression:** zstd level 1, enabled per bucket in the TOML config. | #51 |
 | 23 | **Metadata scale:** close #13 if the redb spill meets its gate; #26 waits as `unmeasured` until a deployment needs over 100M objects. Superseded by decision 59: #207 measured it (go, owner 2026-11-16), and #26 is built to replace the redb spill. | #13, #26, #207 |
-| 24 | **Compaction I/O:** token-bucket limit (50 MB/s, configurable); copy-on-write cloning only after a measurement. | #28 |
+| 24 | **Compaction I/O:** token-bucket limit (50 MB/s, configurable); copy-on-write cloning only after a measurement (#104 measured Linux XFS `FICLONERANGE` at 2.51×–1485× faster, and #524 adds the `FICLONERANGE` fast path with automatic read+write fallback; stored bytes in `FORMAT.md` unchanged). | #28, #104, #524 |
 | 25 | **Multi-node:** #15 closed as a duplicate of #27; the #52 design note after Phase 2; no code yet. The note is approved (decision 64); cluster code starts after #26. | #15, #27, #52 |
 | 26 | **Benchmark hardware:** the owner's machine as a self-hosted runner (`benchmarks/RUNNER.md`); paid runners only for published numbers. | #58 |
 | 27 | **Invalid ranges** (`bytes=5-3`): whatever ceph s3-tests expects, once #47 runs. | #47 |
@@ -77,14 +77,16 @@ Owner decisions after the 2026-11-12 unattended run (#64-#83), each the recommen
 | 38 | **Encryption: SSE-S3 with a local master key that wraps per-object keys, and SSE-C;** SSE-KMS first from a local key file of named keys (decision 49, 2026-11-14, replacing "through an external service later"); an external KMS can replace the file without a format change. | #121 |
 | 39 | **Access: bucket policies (on the #53 evaluator), canned ACLs, per-grantee ACL grants and the public access block.** Per-grantee grants were ruled out here at first and allowed by decision 48 (2026-11-14); new buckets have ACLs off. | #122 |
 
-**Decision 40 (2026-11-13): `--allow-anonymous` is refused together with users in `--config`.**
-Policies are checked for `Principal::User` only, so an unsigned request accepted by
-`--allow-anonymous` would get more access than any user the config restricts. The server exits 2
-and names both flags. `--allow-anonymous` on its own is unchanged: the startup message already
-says anyone who can reach the port can read, write and delete. A config that sets only
-`[[buckets]]` restricts nobody, so it is not the combination. The policy model for public access
-is #122 (decision 39), which replaces this guard when it lands. Found by an adversarial review of
-#53, filed as #130.
+**Decision 40 (2026-11-13; updated 2026-11-27 for #122): `--allow-anonymous` is refused together with users in `--config`.**
+When users are configured in `--config` (or root keys are set), `--allow-anonymous` is
+still refused with exit code 2 (server with `--config` + `--allow-anonymous`) so an open-server
+switch cannot bypass restricted users. `#122` fulfills the replacement model: without
+`--allow-anonymous`, unsigned HTTP requests authenticate as `Principal::Anonymous` and pass
+through `authz::authorize`, denied by default unless granted by an explicit public bucket
+policy (`Principal: *`) or `AllUsers` ACL permitted by Public Access Block (and `BucketOwnership`
+defaults to `BucketOwnerEnforced` unless `--default-bucket-ownership` overrides it for
+compatibility profiles). `--allow-anonymous` on its own with no keys/users remains an open
+server for local dev/benchmarking. Found by an adversarial review of #53, filed as #130.
 
 **Decision 43 (2026-11-14): volume format 3 stores object attributes in the needle.** The
 reserved header bytes 18..20 become the length of an attributes block between the key and the
@@ -275,6 +277,8 @@ since Linux-first runtimes conflict with the both-platforms rule. The owner's ag
 1. **Commit events (`server/src/events.rs`):** Every acknowledged write, copy, multipart complete, delete, delete marker, version delete, `0x200` attribute update, and bucket manifest/config change emits one `CommitEvent` from the commit lock (unversioned objects via `S3ServiceState::commit_unversioned_put`, versioned changes via `S3ServiceState::record_version_commit`, unversioned deletes and attribute updates under their commit locks) with per-bucket monotonic `seq`. Failed requests (including `AfterRecord` late failures that answer 500) emit no event. Subscribers use bounded `4096`-entry non-blocking queues (`sync_channel` + `try_send`, Decision 41 pattern) and count drops in `awanfs_commit_events_dropped_total{subscriber}`; when no subscriber exists, `has_subscribers()` costs one relaxed atomic branch.
 2. **Usage counters:** `BucketUsage { objects, bytes }` per bucket is updated atomically inside `StorageEngine` (`current_objects`, `current_bytes` across both in-memory rows and spill segments) under `engine.write()`, with `VersionStore` separately tracking noncurrent versions (`all_versions = current + noncurrent`), rebuilt exactly by volume replay at boot. Prometheus always exports aggregate `awanfs_objects_total` and `awanfs_bytes_total` gauges, exports `awanfs_bucket_objects{bucket}`, `awanfs_bucket_bytes{bucket}`, `awanfs_bucket_all_versions_objects{bucket}`, and `awanfs_bucket_all_versions_bytes{bucket}` automatically up to `1,000` buckets, and gates per-bucket emission above `1,000` behind `--per-bucket-metrics` / `AWANFS_PER_BUCKET_METRICS=1` to bound cardinality ([owner decision](https://github.com/iskandarnorazli/Awanfs/issues/159#issuecomment-7125803228)).
 3. **Namespace:** `StorageEngine::bucket_names` keys buckets by `(namespace, name)` alongside `buckets.manifest` `+<id>:<name>[:<created_ns>[:<owner>[:<namespace>]]]`; legacy manifests default `namespace` to `""`. Replaceable storage class (`TAG_STORAGE_CLASS = 0x0014`) was already registered in #203.
+
+**Decision 71 (owner, 2026-11-24, #121 Decisions 3A & 4A): encrypted objects skip zstd compression, store `TAG_SSE` (`0x0050`) + `AWE1` 64 KiB AES-256-GCM chunks, and SSE-C plaintext is never cached.** Compressing before encryption leaks plaintext length and complicates range decryption, so buckets with `compression = "zstd"` store encrypted objects uncompressed (`FLAG_COMPRESSED` is never set alongside `TAG_SSE`). Per-object `HKDF-SHA256` derives the 256-bit DEK from a 128-bit random `key_salt`, and 12-byte GCM nonces (`nonce_prefix[4] || part_number[4 BE] || chunk_index[4 BE]`) with AAD (`"AWE1" || part_number || chunk_index || is_last_chunk`) allow O(1) range reads decrypting only touched chunks. Encrypted objects never serve from volume/staging memory mappings, and SSE-C plaintext never enters `payload_cache` or `single_flight`.
 
 **Decision 66 (owner, 2026-11-17): no GPU or APU code path for now.** Erasure coding (decision
 64) is built with CPU vector instructions first and measured against the network rate. A GPU path

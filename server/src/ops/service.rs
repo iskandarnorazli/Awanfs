@@ -12,6 +12,8 @@ pub async fn list_buckets(
     state: Arc<S3ServiceState>,
     query_map: &HashMap<String, String>,
     caller_account: Option<&str>,
+    list_all_open_anon: bool,
+    iam: Option<&crate::iam::Iam>,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let max_buckets = match query_map.get("max-buckets") {
         Some(s) => match s.parse::<i32>() {
@@ -48,29 +50,31 @@ pub async fn list_buckets(
     let created_map = state.bucket_created_ns.read();
     let cfg_snap = state.bucket_config_reader.snapshot();
     let mut entries: Vec<(String, String)> = Vec::new();
-    if let Some(ns_map) = engine.bucket_names.get("") {
-        for (name, &b_id) in ns_map {
-            if let Some(acct) = caller_account {
-                let owner = cfg_snap
-                    .get(&b_id)
-                    .map(|c| c.effective_owner())
-                    .unwrap_or("root");
-                if owner != acct {
-                    continue;
+    if caller_account.is_some() || list_all_open_anon {
+        if let Some(ns_map) = engine.bucket_names.get("") {
+            for (name, &b_id) in ns_map {
+                if let Some(acct) = caller_account {
+                    let owner = cfg_snap
+                        .get(&b_id)
+                        .map(|c| c.effective_owner())
+                        .unwrap_or("root");
+                    if owner != acct {
+                        continue;
+                    }
                 }
-            }
-            if let Some(pfx) = prefix {
-                if !name.starts_with(pfx) {
-                    continue;
+                if let Some(pfx) = prefix {
+                    if !name.starts_with(pfx) {
+                        continue;
+                    }
                 }
-            }
-            if let Some(ref marker) = after {
-                if name.as_str() <= marker.as_str() {
-                    continue;
+                if let Some(ref marker) = after {
+                    if name.as_str() <= marker.as_str() {
+                        continue;
+                    }
                 }
+                let ts = created_map.get(&b_id).copied().filter(|&t| t != 0).unwrap_or(state.started_at_ns);
+                entries.push((name.clone(), crate::versions::iso8601(ts)));
             }
-            let ts = created_map.get(&b_id).copied().filter(|&t| t != 0).unwrap_or(state.started_at_ns);
-            entries.push((name.clone(), crate::versions::iso8601(ts)));
         }
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -82,8 +86,9 @@ pub async fn list_buckets(
         None
     };
 
+    let owner = crate::acl::owner_for_account(caller_account.unwrap_or(""), iam);
     let b_list: Vec<(&str, &str)> = entries.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
-    let xml = list_buckets_xml(&b_list, prefix, next_token.as_deref(), "req-list-buckets");
+    let xml = list_buckets_xml(&b_list, prefix, next_token.as_deref(), &owner.id, &owner.display_name, "req-list-buckets");
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/xml")

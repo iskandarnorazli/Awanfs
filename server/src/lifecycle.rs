@@ -602,6 +602,22 @@ async fn sweep_unversioned_or_null_key_locked(
 
 /// Runs one rate-limited lifecycle sweep tick using [`fsm::expiry_step`]. Returns `true` if
 /// the work budget was exhausted and another tick should run promptly.
+/// The lifecycle sweep runs every 1/24 of a lifecycle day, kept between these bounds (#486,
+/// owner decision 2026-11-27): hourly at the default day of 86,400 s, every 500 ms under the
+/// suite's 2-second day. A pass over 1M objects cost 2.8 s of CPU
+/// (`measurements/2026-11-27-lifecycle-sweep-cost.md`), and rules count in days.
+pub const MIN_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+pub const MAX_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How often to sweep for a lifecycle day of `day_seconds` (`--lifecycle-day-seconds`).
+pub fn sweep_interval(day_seconds: u64) -> std::time::Duration {
+    let ms = day_seconds.max(1).saturating_mul(1000) / 24;
+    std::time::Duration::from_millis(ms).clamp(MIN_SWEEP_INTERVAL, MAX_SWEEP_INTERVAL)
+}
+
+/// Keys the sweep lists from the engine at a time (#475).
+const SWEEP_PAGE: usize = 1024;
+
 pub async fn run_lifecycle_sweep_async(
     state: &S3ServiceState,
     now_epoch_ms: u64,
@@ -644,24 +660,34 @@ pub async fn run_lifecycle_sweep_async(
             continue;
         }
 
-        // Collect candidate keys from `versions` and `engine` without holding both locks together
-        // to preserve strict lock ordering (`engine` before `versions` elsewhere in `s3_api.rs`).
+        // Versioned keys first, then every current object in key order, a page at a time:
+        // `list_keys` merges the in-memory rows with the spill index, where rows past the hot
+        // set live (#475). `engine` and `versions` are never held together (lock order
+        // elsewhere in `s3_api.rs` is `engine` before `versions`), and neither while sweeping.
         let v_keys = state.versions.read().keys_of(b_id, "");
-        let mut seen_keys: HashSet<String> = v_keys.iter().cloned().collect();
-        let mut candidate_keys: Vec<String> = v_keys.into_iter().collect();
-        {
-            let engine = state.engine.read();
-            if let Some(bucket) = engine.buckets.get(&b_id) {
-                for key_bytes in bucket.key_index.keys() {
-                    let key_str = String::from_utf8_lossy(key_bytes).into_owned();
-                    if seen_keys.insert(key_str.clone()) {
-                        candidate_keys.push(key_str);
+        let versioned: HashSet<String> = v_keys.iter().cloned().collect();
+        let mut pending: std::collections::VecDeque<String> = v_keys.into_iter().collect();
+        let mut after: Vec<u8> = Vec::new();
+        let mut listed_all = false;
+        loop {
+            if pending.is_empty() {
+                if listed_all {
+                    break;
+                }
+                let page = state.engine.read().list_keys(b_id, b"", &after, SWEEP_PAGE);
+                listed_all = page.len() < SWEEP_PAGE;
+                if let Some((last, _)) = page.last() {
+                    after = last.clone();
+                }
+                for (k, _) in page {
+                    let key_str = String::from_utf8_lossy(&k).into_owned();
+                    if !versioned.contains(&key_str) {
+                        pending.push_back(key_str);
                     }
                 }
+                continue;
             }
-        }
-
-        for key_str in candidate_keys {
+            let key_str = pending.pop_front().expect("pending is not empty");
             if actions_done >= budget {
                 return true;
             }
@@ -764,5 +790,21 @@ pub fn run_lifecycle_sweep(
         let _ = std::thread::scope(|s| s.spawn(exec).join());
     } else {
         let _ = exec();
+    }
+}
+
+#[cfg(test)]
+mod sweep_interval_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn the_sweep_runs_every_twenty_fourth_of_a_day_within_bounds() {
+        assert_eq!(sweep_interval(86_400), Duration::from_secs(3600));
+        assert_eq!(sweep_interval(2_400), Duration::from_secs(100));
+        assert_eq!(sweep_interval(2), Duration::from_millis(500));
+        assert_eq!(sweep_interval(0), Duration::from_millis(500));
+        assert_eq!(sweep_interval(30 * 86_400), Duration::from_secs(3600));
+        assert_eq!(sweep_interval(u64::MAX), Duration::from_secs(3600));
     }
 }

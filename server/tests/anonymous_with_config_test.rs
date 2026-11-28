@@ -52,7 +52,7 @@ impl Drop for Server {
 /// `(exit code, stderr)`, or `None` when it was still running at the deadline.
 fn run_until_exit(dir: &Path, extra: &[&str], env: &[(&str, &str)]) -> Option<(i32, String)> {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-server"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_awanfs"));
     cmd.args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap()])
         .args(extra)
         .stdout(Stdio::null())
@@ -61,7 +61,7 @@ fn run_until_exit(dir: &Path, extra: &[&str], env: &[(&str, &str)]) -> Option<(i
         cmd.env(k, v);
     }
     // A server that starts stays up forever, so poll and kill instead of waiting.
-    let mut child = Server(cmd.spawn().expect("spawn s3-server"));
+    let mut child = Server(cmd.spawn().expect("spawn awanfs"));
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         match child.0.try_wait().expect("try_wait") {

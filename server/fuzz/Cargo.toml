@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-s3-server = { path = ".." }
+s3_server = { package = "awanfs", path = ".." }
 hyper = "1"
 http-body-util = "0.1"
 tokio = { version = "1", features = ["rt"] }
@@ -157,5 +157,53 @@ doc = false
 [[bin]]
 name = "object_attributes_header"
 path = "fuzz_targets/object_attributes_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "meta_segment"
+path = "fuzz_targets/meta_segment.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "copy_source"
+path = "fuzz_targets/copy_source.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "precondition_headers"
+path = "fuzz_targets/precondition_headers.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sim_storage"
+path = "fuzz_targets/sim_storage.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "bucket_policy"
+path = "fuzz_targets/bucket_policy.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sse_headers"
+path = "fuzz_targets/sse_headers.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "acl_xml"
+path = "fuzz_targets/acl_xml.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sse_payload"
+path = "fuzz_targets/sse_payload.rs"
 test = false
 doc = false

@@ -46,6 +46,11 @@ pub trait VolFile: Send + Sync + 'static {
     /// The read mapping over the whole file, where there is one. `None` makes reads use
     /// positioned reads (the simulation has no mapping).
     fn map(&self) -> io::Result<Option<Mmap>>;
+    /// Clones a 4096-byte aligned range from `src` without copying payload bytes where
+    /// supported (`ioctl(FICLONERANGE)` on Linux XFS/Btrfs); returns `Unsupported` elsewhere.
+    fn clone_range_from(&self, _src: &Self, _src_offset: u64, _len: u64, _dest_offset: u64) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "clone_range_from unsupported"))
+    }
 }
 
 /// Where a volume's files live: the disk, or the simulation's in-memory files.
@@ -134,6 +139,9 @@ impl VolFile for DiskFile {
         // SAFETY: as everywhere volumes map their file: AwanFS only appends to a volume and
         // never truncates below a mapped length while a mapping is in use.
         Ok(Some(unsafe { Mmap::map(self.main.file()) }?))
+    }
+    fn clone_range_from(&self, src: &Self, src_offset: u64, len: u64, dest_offset: u64) -> io::Result<()> {
+        self.main.clone_range_from(&src.main, src_offset, len, dest_offset)
     }
 }
 

@@ -112,12 +112,15 @@ pub(crate) fn entity_too_large(resource: &str, limit: u64) -> Response<ResponseB
 
 /// Reads a request body of at most `limit` bytes, timing out if no frame arrives within
 /// `idle_timeout`. `Ok(Err(response))` is the answer to send when the body is too large,
-/// times out, or is cut short.
-pub(crate) async fn read_body<B>(
+/// times out, or is cut short. The buffer starts at `capacity` bytes; a body that outgrows it
+/// is counted in `work` (#454).
+pub(crate) async fn read_body_sized<B>(
     mut body: B,
     limit: u64,
     idle_timeout: std::time::Duration,
     resource: &str,
+    capacity: usize,
+    work: Option<&WorkCounters>,
 ) -> Result<Result<Bytes, Response<ResponseBody>>, hyper::Error>
 where
     B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Unpin,
@@ -125,7 +128,7 @@ where
     if body.size_hint().lower() > limit {
         return Ok(Err(entity_too_large(resource, limit)));
     }
-    let mut buf = bytes::BytesMut::new();
+    let mut buf = bytes::BytesMut::with_capacity(capacity);
     loop {
         match crate::body_timeout::next_frame_with_idle(&mut body, idle_timeout).await {
             Err(crate::body_timeout::BodyIdleTimeout) => {
@@ -141,7 +144,13 @@ where
                     if buf.is_empty() && body.is_end_stream() {
                         return Ok(Ok(data));
                     }
+                    let cap = buf.capacity();
                     buf.extend_from_slice(&data);
+                    if let Some(work) = work {
+                        if cap != 0 && buf.capacity() != cap {
+                            work.body_regrowth();
+                        }
+                    }
                 }
             }
         }
@@ -195,7 +204,10 @@ where
         }
     };
     let inflight = work.hold_inflight(guard.bytes());
-    match read_body(body, limit, idle_timeout, resource).await? {
+    // The buffer is the size the budget admitted when the length was declared, so a body
+    // arriving in many frames is not moved to a larger buffer as it grows (#454).
+    let capacity = estimated_bytes.map_or(0, |n| n.min(guard.bytes()) as usize);
+    match read_body_sized(body, limit, idle_timeout, resource, capacity, Some(work.as_ref())).await? {
         Ok(bytes) => {
             let actual = if (bytes.len() as u64) != guard.bytes() {
                 drop(inflight);
@@ -684,6 +696,10 @@ pub struct S3ServiceState {
     pub stream_relocations: Arc<AtomicU64>,
     /// Who may call; `AuthConfig::open()` by default, the binary sets it from flags and env.
     pub auth: crate::auth::AuthConfig,
+    /// Default object ownership applied to buckets with no explicit ownership config (#122, D5).
+    pub default_bucket_ownership: crate::authz::BucketOwnership,
+    /// True when the server serves TLS (`--cert` / `--key`), reported in `aws:SecureTransport`.
+    pub is_https: bool,
     /// Why the server is not ready yet (`None` when it is); see `/_awanfs/health/ready` (#44).
     pub not_ready: Arc<RwLock<Option<&'static str>>>,
     /// Request counts, latencies and bytes for `/_awanfs/metrics` (#42).
@@ -1035,6 +1051,8 @@ impl S3ServiceState {
             streams: Arc::new(StreamsInFlight::default()),
             stream_relocations: Arc::new(AtomicU64::new(0)),
             auth: crate::auth::AuthConfig::open(),
+            default_bucket_ownership: crate::authz::DEFAULT_BUCKET_OWNERSHIP,
+            is_https: false,
             not_ready: Arc::new(RwLock::new(None)),
             metrics,
             access_log: Arc::new(RwLock::new(None)),
@@ -1290,6 +1308,8 @@ impl S3ServiceState {
                                 }
                                 _ => return Ok(()),
                             }
+                        } else if let Some(pt_size) = n.sse_plaintext_size {
+                            (pt_size, 0)
                         } else if flags & crate::meta_index::FLAG_COMPRESSED != 0 {
                             match vm.payload_prefix(local, key.len(), crate::compress::PREFIX_LEN).ok().and_then(|p| crate::compress::logical_size(&p)) {
                                 Some(n) => (n, 0),
@@ -1374,8 +1394,10 @@ impl S3ServiceState {
                         }
                     }
                 } else {
-                    // A compressed needle's index row holds the object's size, not the stored one (#51).
-                    let size = if flags & crate::meta_index::FLAG_COMPRESSED != 0 {
+                    // An encrypted or compressed needle's index row holds the plaintext size (#121, #51).
+                    let size = if let Some(pt_size) = n.sse_plaintext_size {
+                        pt_size
+                    } else if flags & crate::meta_index::FLAG_COMPRESSED != 0 {
                         match vm.payload_prefix(local, key.len(), crate::compress::PREFIX_LEN).ok().and_then(|p| crate::compress::logical_size(&p)) {
                             Some(n) => n,
                             None => return Ok(()),
@@ -1546,6 +1568,8 @@ impl S3ServiceState {
             streams: Arc::new(StreamsInFlight::default()),
             stream_relocations: Arc::new(AtomicU64::new(0)),
             auth: crate::auth::AuthConfig::open(),
+            default_bucket_ownership: crate::authz::DEFAULT_BUCKET_OWNERSHIP,
+            is_https: false,
             not_ready: Arc::new(RwLock::new(None)),
             metrics,
             access_log: Arc::new(RwLock::new(None)),
@@ -2624,6 +2648,11 @@ impl S3ServiceState {
         if old.writers_in_flight() > 0 {
             return Ok(CompactionReport { busy: true, ..CompactionReport::default() });
         }
+        // Sync the sealed source volume once before FICLONERANGE/aligned copies (#524).
+        let old_sync = Arc::clone(&old);
+        tokio::task::spawn_blocking(move || old_sync.sync_now())
+            .await
+            .map_err(|e| VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))??;
         let mut needles = Vec::new();
         old.scan_needles(|n| {
             needles.push((
@@ -2631,18 +2660,17 @@ impl S3ServiceState {
                 n.key,
                 n.offset,
                 n.payload_size,
-                n.etag_hi,
-                n.etag_lo,
                 n.flags,
                 n.payload_crc32c,
                 n.created_at_ns,
+                n.header,
             ))
         })?;
 
         let mut report = CompactionReport::default();
         let mut written: BTreeMap<u32, Arc<VolumeManager>> = BTreeMap::new();
         let mut throttle = crate::throttle::Throttle::new(self.compaction_rate.load(Ordering::Relaxed));
-        for (b_id, key, local, size, etag_hi, etag_lo, flags, crc, created_at) in needles {
+        for (b_id, key, local, size, flags, crc, created_at, hdr) in needles {
             let g_old = global_offset(old_id, local);
             // Compacts live 0x200 attribute-update needles, keeping only the latest live group
             // entries whose target version still exists and dropping superseded/deleted ones (#203).
@@ -2718,16 +2746,9 @@ impl S3ServiceState {
                 continue;
             }
             self.hook("compact_copy", &key);
-            let bytes = if size == 0 { Bytes::new() } else { old.read_needle_bytes(old_id, local, crc)? };
-            let copied = bytes.len() as u64;
-            // The creation time moves with the needle: it is a version's id (#31).
-            // The attributes block moves with the needle, unknown tags included (#150).
-            let attrs = if flags & crate::meta_index::FLAG_ATTRS != 0 {
-                old.read_attrs(local)?.encode().map_err(|_| VolumeError::CorruptIndex)?
-            } else {
-                Vec::new()
-            };
-            let (vm, loc, g_new) = self.write_to_active_with(b_id, &key, &attrs, &bytes, flags, etag_hi, etag_lo, Some(created_at))?;
+            // Compaction clones the needle directly via FICLONERANGE on Linux XFS/Btrfs and falls
+            // back automatically to sector-aligned read+write on unsupported filesystems (#524).
+            let (vm, loc, g_new, cloned) = self.copy_needle_to_active(&old, local, &key, &hdr)?;
             self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
             written.insert(vm.id(), Arc::clone(&vm));
             self.versions.write().move_offset(b_id, &key, g_old, g_new);
@@ -2738,11 +2759,16 @@ impl S3ServiceState {
             }
             self.payload_cache.remove(b_id, g_old);
             report.live_needles_copied += 1;
+            if cloned {
+                report.live_needles_cloned += 1;
+            }
             report.new_locations.insert(key, loc);
             drop(_guard);
             // Let requests run between copies, and pace the copies (#28), with no key locked.
+            // Cloned needles pay metadata cost only; read+write fallback paces full payload bytes.
             tokio::task::yield_now().await;
-            throttle.spend(copied).await;
+            let paced = if cloned { crate::direct_io::SECTOR_SIZE as u64 } else { size };
+            throttle.spend(paced).await;
         }
 
         // The copies must be on disk before the only other copy goes, in every durability mode.
@@ -3119,8 +3145,10 @@ impl S3ServiceState {
     #[allow(clippy::too_many_arguments)]
     pub async fn store_object(&self, b_id: u32, bucket: &str, key: &str, attrs: &[u8], data: &Bytes, flags: u16, etag_hi: u64, etag_lo: u64, created_at: Option<u64>) -> Result<(u64, u16), VolumeError> {
         let flags = if attrs.is_empty() { flags } else { flags | crate::meta_index::FLAG_ATTRS };
+        let encrypted = crate::attrs::Attrs::raw_tag_value(attrs, crate::attrs::TAG_SSE).is_some();
         let plain = flags & (AWAN_FLAG_MULTIPART | AWAN_FLAG_ZERO_BYTE | AWAN_FLAG_TOMBSTONE) == 0;
-        if plain && self.compresses(bucket) {
+        // Decision 71 (#121): encrypted objects skip zstd compression.
+        if !encrypted && plain && self.compresses(bucket) {
             if let Some(enc) = crate::compress::encode(data) {
                 let f = flags | crate::meta_index::FLAG_COMPRESSED;
                 let off = self.store_payload_with(b_id, key, attrs, &Bytes::from(enc), f, etag_hi, etag_lo, created_at).await?;
@@ -3217,7 +3245,10 @@ impl S3ServiceState {
         // volume mapping instead (#126, reverted) has to read the payload back, and volumes are
         // written with direct I/O: that faults every byte in from disk and took peak RSS over
         // the ratio workloads from 117.0 MiB to 2258.9 MiB.
-        if !data.is_empty() && data.len() <= 4 * 1024 * 1024 && flags & crate::meta_index::FLAG_COMPRESSED == 0 {
+        // SSE-C payloads carry ciphertext in `data`, and encrypted objects are never placed in
+        // `payload_cache` (#121 Requirement 12, Decision 71).
+        let is_encrypted = crate::attrs::Attrs::raw_tag_value(attrs, crate::attrs::TAG_SSE).is_some();
+        if !is_encrypted && !data.is_empty() && data.len() <= 4 * 1024 * 1024 && flags & crate::meta_index::FLAG_COMPRESSED == 0 {
             self.payload_cache.insert(b_id, offset, data.clone());
         }
         Ok(offset)
@@ -3309,6 +3340,47 @@ impl S3ServiceState {
                     // The needle header is whole on disk (#184, #403), so recovery will
                     // replay it at `loc.offset`: note that exact global offset.
                     self.streams.note_append(b_id, key, global_offset(loc.volume_id, loc.offset));
+                    return Err(VolumeError::AfterRecord { loc, flags, cause });
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Relocates a needle from `src` at `src_offset` to the active volume using copy-on-write
+    /// cloning when supported or sector-aligned read+write fallback, rolling full/older-format
+    /// active volumes as needed (#524).
+    pub(crate) fn copy_needle_to_active(
+        &self,
+        src: &VolumeManager,
+        src_offset: u64,
+        key: &str,
+        hdr: &crate::volume::NeedleHeader,
+    ) -> Result<(Arc<VolumeManager>, NeedleLocation, u64, bool), VolumeError> {
+        let mut attempts = 0;
+        let needed = crate::volume::needed_format_for_flags(hdr.flags, hdr.attrs_len > 0);
+        loop {
+            let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+            if vm.format() < needed && attempts < 8 {
+                attempts += 1;
+                self.roll_volume(&vm)?;
+                continue;
+            }
+            match vm.copy_needle_from(src, src_offset, hdr) {
+                Ok((loc, cloned)) => {
+                    let g = global_offset(vm.id(), loc.offset);
+                    self.streams.note_append(hdr.bucket_id as u32, key, g);
+                    return Ok((vm, loc, g, cloned));
+                }
+                Err(VolumeError::VolumeFull { len, .. }) if len + crate::direct_io::SECTOR_SIZE as u64 > vm.max_span() => {
+                    return Err(VolumeError::VolumeFull { offset: 0, len });
+                }
+                Err(VolumeError::VolumeFull { .. }) if attempts < 8 => {
+                    attempts += 1;
+                    self.roll_volume(&vm)?;
+                }
+                Err(VolumeError::AfterRecord { loc, flags, cause }) => {
+                    self.streams.note_append(hdr.bucket_id as u32, key, global_offset(loc.volume_id, loc.offset));
                     return Err(VolumeError::AfterRecord { loc, flags, cause });
                 }
                 Err(e) => return Err(e),
@@ -3412,6 +3484,9 @@ impl S3ServiceState {
         self.volumes.write().insert(next_id, Arc::clone(&vm));
         *self.volume_manager.write() = Some(vm);
         self.active_volume_id.store(next_id, Ordering::SeqCst);
+        // Only the active volume needs pooled write buffers (#527); drop the full volume's
+        // pool and refuse any buffers returned later by in-flight writes.
+        full.retire_write_buffers();
         Ok(())
     }
 
@@ -4070,6 +4145,8 @@ impl S3ServiceState {
             len,
             verify: verify.then_some(expected_crc),
             transform: None,
+            step_bytes: None,
+            output_len: None,
         };
         Ok(crate::stream_read::PreadBody::from_job(crate::stream_read::Job {
             segments: vec![segment],
@@ -4105,7 +4182,7 @@ impl S3ServiceState {
                     if file.metadata()?.len() < ext.part_size {
                         return Err(VolumeError::CorruptIndex);
                     }
-                    Segment { source: Source::File(Arc::new(file)), at: in_part, len: seg_len, verify: None, transform: None }
+                    Segment { source: Source::File(Arc::new(file)), at: in_part, len: seg_len, verify: None, transform: None, step_bytes: None, output_len: None }
                 }
                 None => {
                     let (vm, local) = self.volume_for(ext.vol_offset)?;
@@ -4121,7 +4198,7 @@ impl S3ServiceState {
                     }
                     let check = (verify && whole).then_some(expected_crc);
                     let direct = seg_len >= self.direct_read_min.load(Ordering::Relaxed);
-                    Segment { source: Source::Volume { vm, direct }, at: payload_at + in_part, len: seg_len, verify: check, transform: None }
+                    Segment { source: Source::Volume { vm, direct }, at: payload_at + in_part, len: seg_len, verify: check, transform: None, step_bytes: None, output_len: None }
                 }
             };
             segments.push(segment);
@@ -4131,6 +4208,606 @@ impl S3ServiceState {
         }
         Ok(PreadBody::from_job(Job {
             segments,
+            what,
+            failures: Arc::clone(&self.read_checksum_failures),
+            work: Arc::clone(&self.work),
+            body_budget: Some(Arc::clone(&self.body_budget)),
+            on_corrupt: None,
+        }))
+    }
+
+    /// Reads an entire encrypted object's plaintext bytes (single-part or multipart, <= `STREAM_PUT_MIN`) (#121).
+    pub fn read_encrypted_object_bytes(
+        &self,
+        b_id: u32,
+        key: &str,
+        vol_offset: u64,
+        size: u64,
+        flags: u16,
+        sse: &crate::sse::SseAttr,
+        dek: &crate::sse::SseDek,
+    ) -> Result<Bytes, VolumeError> {
+        if flags & AWAN_FLAG_MULTIPART == 0 {
+            self.read_encrypted_single_range(b_id, key, vol_offset, sse, dek, 0, size)
+        } else {
+            let extents = self
+                .manifest_extents(b_id, vol_offset)
+                .or_else(|| self.multipart.get_completed_extents(b_id, key))
+                .ok_or(VolumeError::CorruptIndex)?;
+            self.read_encrypted_multipart_range(b_id, key, &extents, dek, 0, size)
+        }
+    }
+
+    /// Reads `[start, start + len)` plaintext bytes of any encrypted object (single-part or multipart) (#121).
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_encrypted_object_range(
+        &self,
+        b_id: u32,
+        key: &str,
+        vol_offset: u64,
+        flags: u16,
+        sse: &crate::sse::SseAttr,
+        dek: &crate::sse::SseDek,
+        start: u64,
+        len: u64,
+    ) -> Result<Bytes, VolumeError> {
+        if flags & AWAN_FLAG_MULTIPART == 0 {
+            self.read_encrypted_single_range(b_id, key, vol_offset, sse, dek, start, len)
+        } else {
+            let extents = self
+                .manifest_extents(b_id, vol_offset)
+                .or_else(|| self.multipart.get_completed_extents(b_id, key))
+                .ok_or(VolumeError::CorruptIndex)?;
+            self.read_encrypted_multipart_range(b_id, key, &extents, dek, start, len)
+        }
+    }
+
+    /// Copies a large object (`src_size > STREAM_PUT_MIN`) between encryption states in bounded
+    /// 1 MiB pieces: unencrypted <-> encrypted or encrypted(A) -> encrypted(B). Returns
+    /// `(vol_offset, flags, dst_etag_hi, dst_etag_lo)` (#121).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream_copy_encrypted_object(
+        self: &Arc<Self>,
+        dst_b_id: u32,
+        dst_key: &str,
+        dst_attrs: &[u8],
+        dst_flags: u16,
+        dst_sse: Option<(crate::sse::SseAttr, crate::sse::SseDek)>,
+        src_b_id: u32,
+        src_key: &str,
+        src_vol_offset: u64,
+        src_size: u64,
+        src_flags: u16,
+        src_sse: Option<(crate::sse::SseAttr, crate::sse::SseDek)>,
+        created_at: u64,
+    ) -> Result<(u64, u16, u64, u64), VolumeError> {
+        let eff_flags = if dst_attrs.is_empty() {
+            dst_flags
+        } else {
+            dst_flags | crate::meta_index::FLAG_ATTRS
+        };
+        let dst_stored_size = match &dst_sse {
+            Some(_) => crate::sse::stored_len(src_size).map_err(sse_error)?,
+            None => src_size,
+        };
+        let state = Arc::clone(self);
+        let dst_key_s = dst_key.to_string();
+        let src_key_s = src_key.to_string();
+        let attrs_vec = dst_attrs.to_vec();
+        let res = tokio::task::spawn_blocking(
+            move || -> Result<(Arc<VolumeManager>, NeedleLocation, u64, u64, u64), VolumeError> {
+                let mut writer = state.begin_needle_on_active(dst_b_id, &dst_key_s, &attrs_vec, dst_stored_size, eff_flags)?;
+                writer.set_created_at(created_at);
+                let mut enc_writer = match &dst_sse {
+                    Some((attr, dek)) => {
+                        Some(crate::sse::Awe1EncryptWriter::new(dek, attr.nonce_prefix(), 0, src_size).map_err(sse_error)?)
+                    }
+                    None => None,
+                };
+                let mut plain_digest = if dst_sse.is_none() {
+                    Some(crate::digest::StreamingDigest::new_md5_only())
+                } else {
+                    None
+                };
+
+                let piece_max = crate::volume::STREAM_CHUNK as u64;
+                let mut pos = 0u64;
+                while pos < src_size {
+                    let take = piece_max.min(src_size - pos);
+                    let piece = match &src_sse {
+                        Some((ss, sdek)) => {
+                            state.read_encrypted_object_range(src_b_id, &src_key_s, src_vol_offset, src_flags, ss, sdek, pos, take)?
+                        }
+                        None => state.read_object_range_unmapped(src_b_id, &src_key_s, src_vol_offset, src_size, src_flags, pos, take)?,
+                    };
+                    if let Some(ew) = enc_writer.as_mut() {
+                        match ew.write(&piece, &mut |ct| writer.write(ct)) {
+                            Ok(()) => {}
+                            Err(Ok(e)) => return Err(sse_error(e)),
+                            Err(Err(e)) => return Err(e),
+                        }
+                    } else {
+                        if let Some(d) = plain_digest.as_mut() {
+                            d.update(&piece);
+                        }
+                        writer.write(&piece)?;
+                    }
+                    pos += take;
+                }
+
+                let (etag_hi, etag_lo) = if let Some(ew) = enc_writer.take() {
+                    let raw_md5 = match ew.finish(|ct| writer.write(ct)) {
+                        Ok(m) => m,
+                        Err(Ok(e)) => return Err(sse_error(e)),
+                        Err(Err(e)) => return Err(e),
+                    };
+                    (
+                        u64::from_be_bytes(raw_md5[0..8].try_into().unwrap()),
+                        u64::from_be_bytes(raw_md5[8..16].try_into().unwrap()),
+                    )
+                } else {
+                    let (hi, lo, _, _, _) = plain_digest.take().expect("plain_digest").finalize();
+                    (hi, lo)
+                };
+
+                let vm = Arc::clone(writer.volume());
+                let g = global_offset(vm.id(), writer.offset());
+                match writer.finish(etag_hi, etag_lo) {
+                    Ok(l) => {
+                        state.streams.note_append(dst_b_id, &dst_key_s, g);
+                        Ok((vm, l, g, etag_hi, etag_lo))
+                    }
+                    Err(VolumeError::AfterRecord { loc, flags, cause }) => {
+                        state.streams.note_append(dst_b_id, &dst_key_s, g);
+                        Err(VolumeError::AfterRecord { loc, flags, cause })
+                    }
+                    Err(e) => Err(e),
+                }
+            },
+        )
+        .await
+        .map_err(|e| VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+
+        let (vm, loc, g, etag_hi, etag_lo) = match res {
+            Ok(x) => x,
+            Err(VolumeError::AfterRecord { loc, flags, cause }) => {
+                self.note_record(dst_b_id, &loc);
+                return Err(VolumeError::AfterRecord { loc, flags, cause });
+            }
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = self.make_durable(&vm, loc.seq).await {
+            self.note_record(dst_b_id, &loc);
+            return Err(VolumeError::AfterRecord {
+                loc,
+                flags: eff_flags,
+                cause: format!("could not sync the object: {:?}", e),
+            });
+        }
+        self.note_record(dst_b_id, &loc);
+        Ok((g, eff_flags, etag_hi, etag_lo))
+    }
+
+    /// Reads and decrypts `[start, start + len)` plaintext bytes of an encrypted single-part object
+    /// using positioned reads, touching only the chunks overlapped by the range (#121).
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_encrypted_single_range(
+        &self,
+        b_id: u32,
+        key: &str,
+        vol_offset: u64,
+        sse: &crate::sse::SseAttr,
+        dek: &crate::sse::SseDek,
+        start: u64,
+        len: u64,
+    ) -> Result<Bytes, VolumeError> {
+        let plaintext_len = sse.plaintext_size();
+        if vol_offset == 0 || start.checked_add(len).is_none_or(|e| e > plaintext_len) {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let want_stored = crate::sse::stored_len(plaintext_len).map_err(sse_error)?;
+        let (vm, local) = self.volume_for(vol_offset)?;
+        let (payload_at, stored, _expected_crc) = match vm.payload_extent_with_crc(b_id, local) {
+            Ok(x) => x,
+            Err(e) => {
+                self.record_read_corruption(vol_offset, key, &e);
+                return Err(e);
+            }
+        };
+        if stored != want_stored {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let mut hdr = [0u8; crate::sse::AWE1_HEADER_LEN];
+        vm.read_cached(payload_at, &mut hdr)?;
+        let (hdr_len, hdr_prefix) = crate::sse::parse_awe1_header(&hdr).map_err(sse_error)?;
+        if hdr_len != plaintext_len || hdr_prefix != sse.nonce_prefix() {
+            return Err(VolumeError::CorruptIndex);
+        }
+        if len == 0 && plaintext_len > 0 {
+            return Ok(Bytes::new());
+        }
+        let (first_chunk, stored_start, stored_span) =
+            crate::sse::stored_range_for_plaintext(plaintext_len, start, len).map_err(sse_error)?;
+        let mut raw = vec![0u8; stored_span as usize];
+        vm.read_cached(payload_at + stored_start, &mut raw)?;
+        let plain = crate::sse::decrypt_range_from_chunks(
+            dek,
+            hdr_prefix,
+            0,
+            plaintext_len,
+            start,
+            len,
+            first_chunk,
+            &raw,
+        )
+        .map_err(sse_error)?;
+        Ok(Bytes::from(plain))
+    }
+
+    /// Streaming body for `[start, start + len)` plaintext bytes of an encrypted single-part object
+    /// using positioned reads and per-chunk AES-256-GCM decryption (#121).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encrypted_single_body(
+        &self,
+        b_id: u32,
+        what: String,
+        vol_offset: u64,
+        sse: &crate::sse::SseAttr,
+        dek: crate::sse::SseDek,
+        start: u64,
+        len: u64,
+    ) -> Result<crate::stream_read::PreadBody, VolumeError> {
+        let plaintext_len = sse.plaintext_size();
+        if vol_offset == 0 || start.checked_add(len).is_none_or(|e| e > plaintext_len) {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let want_stored = crate::sse::stored_len(plaintext_len).map_err(sse_error)?;
+        let (vm, local) = self.volume_for(vol_offset)?;
+        let (payload_at, stored, _expected_crc) = match vm.payload_extent_with_crc(b_id, local) {
+            Ok(x) => x,
+            Err(e) => {
+                self.record_read_corruption(vol_offset, &what, &e);
+                return Err(e);
+            }
+        };
+        if stored != want_stored {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let mut hdr = [0u8; crate::sse::AWE1_HEADER_LEN];
+        vm.read_cached(payload_at, &mut hdr)?;
+        let (hdr_len, hdr_prefix) = crate::sse::parse_awe1_header(&hdr).map_err(sse_error)?;
+        if hdr_len != plaintext_len || hdr_prefix != sse.nonce_prefix() {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let (_first_chunk, stored_start, stored_span) =
+            crate::sse::stored_range_for_plaintext(plaintext_len, start, len).map_err(sse_error)?;
+        let xform = Arc::new(
+            crate::sse::Awe1ChunkTransform::new(dek, hdr_prefix, 0, plaintext_len, start, len).map_err(sse_error)?,
+        );
+        let direct = stored_span >= self.direct_read_min.load(Ordering::Relaxed);
+        let segment = crate::stream_read::Segment {
+            source: crate::stream_read::Source::Volume { vm, direct },
+            at: payload_at + stored_start,
+            len: stored_span,
+            verify: None,
+            transform: Some(xform),
+            step_bytes: Some(crate::sse::AWE1_CHUNK_STORED),
+            output_len: Some(len),
+        };
+        Ok(crate::stream_read::PreadBody::from_job(crate::stream_read::Job {
+            segments: vec![segment],
+            what,
+            failures: Arc::clone(&self.read_checksum_failures),
+            work: Arc::clone(&self.work),
+            body_budget: Some(Arc::clone(&self.body_budget)),
+            on_corrupt: None,
+        }))
+    }
+
+    /// Reads and decrypts `[start, start + len)` plaintext bytes across encrypted multipart extents (#121).
+    pub fn read_encrypted_multipart_range(
+        &self,
+        b_id: u32,
+        key: &str,
+        extents: &[crate::multipart::PartExtent],
+        dek: &crate::sse::SseDek,
+        start: u64,
+        len: u64,
+    ) -> Result<Bytes, VolumeError> {
+        let total_plain = extents.last().map_or(0, |e| e.cumulative_end);
+        let Some(end) = start.checked_add(len).filter(|&e| e <= total_plain) else {
+            return Err(VolumeError::CorruptIndex);
+        };
+        let mut out = Vec::with_capacity(len as usize);
+        for (idx, ext) in extents.iter().enumerate() {
+            let p_start = ext.cumulative_end - ext.part_size;
+            let (lo, hi) = (start.max(p_start), end.min(ext.cumulative_end));
+            if lo >= hi && !(ext.part_size == 0 && len == 0 && idx == 0) {
+                continue;
+            }
+            let in_part = lo - p_start;
+            let take = hi - lo;
+            let part_num = crate::sse::part_number_from_staged_path(ext.staged_path.as_deref(), (idx + 1) as u32);
+            let want_stored = crate::sse::stored_len(ext.part_size).map_err(sse_error)?;
+            let mut hdr = [0u8; crate::sse::AWE1_HEADER_LEN];
+            let (file_opt, vol_opt) = match &ext.staged_path {
+                Some(path) => {
+                    let file = std::fs::File::open(path)?;
+                    if file.metadata()?.len() != want_stored {
+                        return Err(VolumeError::CorruptIndex);
+                    }
+                    self.work.disk_read();
+                    crate::direct_io::read_exact_at(&file, 0, &mut hdr)?;
+                    (Some(file), None)
+                }
+                None => {
+                    let (vm, local) = self.volume_for(ext.vol_offset)?;
+                    let (payload_at, stored, _) = match vm.payload_extent_with_crc(b_id, local) {
+                        Ok(x) => x,
+                        Err(e) => {
+                            self.record_read_corruption(ext.vol_offset, key, &e);
+                            return Err(e);
+                        }
+                    };
+                    if stored != want_stored {
+                        return Err(VolumeError::CorruptIndex);
+                    }
+                    vm.read_cached(payload_at, &mut hdr)?;
+                    (None, Some((vm, payload_at)))
+                }
+            };
+            let (hdr_len, hdr_prefix) = crate::sse::parse_awe1_header(&hdr).map_err(sse_error)?;
+            if hdr_len != ext.part_size {
+                return Err(VolumeError::CorruptIndex);
+            }
+            let (first_chunk, stored_start, stored_span) =
+                crate::sse::stored_range_for_plaintext(ext.part_size, in_part, take).map_err(sse_error)?;
+            let mut raw = vec![0u8; stored_span as usize];
+            if let Some(file) = file_opt {
+                self.work.disk_read();
+                crate::direct_io::read_exact_at(&file, stored_start, &mut raw)?;
+            } else if let Some((vm, payload_at)) = vol_opt {
+                vm.read_cached(payload_at + stored_start, &mut raw)?;
+            }
+            let plain = crate::sse::decrypt_range_from_chunks(
+                dek,
+                hdr_prefix,
+                part_num,
+                ext.part_size,
+                in_part,
+                take,
+                first_chunk,
+                &raw,
+            )
+            .map_err(sse_error)?;
+            out.extend_from_slice(&plain);
+        }
+        if out.len() as u64 != len {
+            return Err(VolumeError::CorruptIndex);
+        }
+        Ok(Bytes::from(out))
+    }
+
+    /// Reads and decrypts a single named part of an encrypted multipart object (#121).
+    pub fn read_encrypted_part_bytes(
+        &self,
+        b_id: u32,
+        key: &str,
+        ext: &crate::multipart::PartExtent,
+        part_num: u32,
+        dek: &crate::sse::SseDek,
+    ) -> Result<Bytes, VolumeError> {
+        let single_slice = crate::multipart::PartExtent {
+            cumulative_end: ext.part_size,
+            ..ext.clone()
+        };
+        let want_stored = crate::sse::stored_len(ext.part_size).map_err(sse_error)?;
+        let mut hdr = [0u8; crate::sse::AWE1_HEADER_LEN];
+        let (file_opt, vol_opt) = match &single_slice.staged_path {
+            Some(path) => {
+                let file = std::fs::File::open(path)?;
+                if file.metadata()?.len() != want_stored {
+                    return Err(VolumeError::CorruptIndex);
+                }
+                self.work.disk_read();
+                crate::direct_io::read_exact_at(&file, 0, &mut hdr)?;
+                (Some(file), None)
+            }
+            None => {
+                let (vm, local) = self.volume_for(single_slice.vol_offset)?;
+                let (payload_at, stored, _) = match vm.payload_extent_with_crc(b_id, local) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        self.record_read_corruption(single_slice.vol_offset, key, &e);
+                        return Err(e);
+                    }
+                };
+                if stored != want_stored {
+                    return Err(VolumeError::CorruptIndex);
+                }
+                vm.read_cached(payload_at, &mut hdr)?;
+                (None, Some((vm, payload_at)))
+            }
+        };
+        let (hdr_len, hdr_prefix) = crate::sse::parse_awe1_header(&hdr).map_err(sse_error)?;
+        if hdr_len != ext.part_size {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let (first_chunk, stored_start, stored_span) =
+            crate::sse::stored_range_for_plaintext(ext.part_size, 0, ext.part_size).map_err(sse_error)?;
+        let mut raw = vec![0u8; stored_span as usize];
+        if let Some(file) = file_opt {
+            self.work.disk_read();
+            crate::direct_io::read_exact_at(&file, stored_start, &mut raw)?;
+        } else if let Some((vm, payload_at)) = vol_opt {
+            vm.read_cached(payload_at + stored_start, &mut raw)?;
+        }
+        let plain = crate::sse::decrypt_range_from_chunks(
+            dek,
+            hdr_prefix,
+            part_num,
+            ext.part_size,
+            0,
+            ext.part_size,
+            first_chunk,
+            &raw,
+        )
+        .map_err(sse_error)?;
+        Ok(Bytes::from(plain))
+    }
+
+    /// Streaming body for `[start, start + len)` plaintext bytes of an encrypted multipart object
+    /// (or single part) using positioned reads and per-chunk decryption (#121).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encrypted_multipart_body(
+        &self,
+        b_id: u32,
+        what: String,
+        extents: &[crate::multipart::PartExtent],
+        dek: crate::sse::SseDek,
+        start: u64,
+        len: u64,
+    ) -> Result<crate::stream_read::PreadBody, VolumeError> {
+        use crate::stream_read::{Job, PreadBody, Segment, Source};
+        let end = start.checked_add(len).ok_or(VolumeError::CorruptIndex)?;
+        let mut segments = Vec::new();
+        for (idx, ext) in extents.iter().enumerate() {
+            let p_start = ext.cumulative_end - ext.part_size;
+            let (lo, hi) = (start.max(p_start), end.min(ext.cumulative_end));
+            if lo >= hi && !(ext.part_size == 0 && len == 0 && idx == 0) {
+                continue;
+            }
+            let (in_part, seg_plain_len) = (lo - p_start, hi - lo);
+            let part_num = crate::sse::part_number_from_staged_path(ext.staged_path.as_deref(), (idx + 1) as u32);
+            let want_stored = crate::sse::stored_len(ext.part_size).map_err(sse_error)?;
+            let mut hdr = [0u8; crate::sse::AWE1_HEADER_LEN];
+            let (source, base_at) = match &ext.staged_path {
+                Some(path) => {
+                    let file = std::fs::File::open(path)?;
+                    if file.metadata()?.len() != want_stored {
+                        return Err(VolumeError::CorruptIndex);
+                    }
+                    self.work.disk_read();
+                    crate::direct_io::read_exact_at(&file, 0, &mut hdr)?;
+                    (Source::File(Arc::new(file)), 0u64)
+                }
+                None => {
+                    let (vm, local) = self.volume_for(ext.vol_offset)?;
+                    let (payload_at, stored, _) = match vm.payload_extent_with_crc(b_id, local) {
+                        Ok(x) => x,
+                        Err(e) => {
+                            self.record_read_corruption(ext.vol_offset, &what, &e);
+                            return Err(e);
+                        }
+                    };
+                    if stored != want_stored {
+                        return Err(VolumeError::CorruptIndex);
+                    }
+                    vm.read_cached(payload_at, &mut hdr)?;
+                    let direct = stored >= self.direct_read_min.load(Ordering::Relaxed);
+                    (Source::Volume { vm, direct }, payload_at)
+                }
+            };
+            let (hdr_len, hdr_prefix) = crate::sse::parse_awe1_header(&hdr).map_err(sse_error)?;
+            if hdr_len != ext.part_size {
+                return Err(VolumeError::CorruptIndex);
+            }
+            let (_first_chunk, stored_start, stored_span) =
+                crate::sse::stored_range_for_plaintext(ext.part_size, in_part, seg_plain_len).map_err(sse_error)?;
+            let xform = Arc::new(
+                crate::sse::Awe1ChunkTransform::new(
+                    dek.clone(),
+                    hdr_prefix,
+                    part_num,
+                    ext.part_size,
+                    in_part,
+                    seg_plain_len,
+                )
+                .map_err(sse_error)?,
+            );
+            segments.push(Segment {
+                source,
+                at: base_at + stored_start,
+                len: stored_span,
+                verify: None,
+                transform: Some(xform),
+                step_bytes: Some(crate::sse::AWE1_CHUNK_STORED),
+                output_len: Some(seg_plain_len),
+            });
+        }
+        if segments.iter().map(|s| s.output_len.unwrap_or(s.len)).sum::<u64>() != len {
+            return Err(VolumeError::CorruptIndex);
+        }
+        Ok(PreadBody::from_job(Job {
+            segments,
+            what,
+            failures: Arc::clone(&self.read_checksum_failures),
+            work: Arc::clone(&self.work),
+            body_budget: Some(Arc::clone(&self.body_budget)),
+            on_corrupt: None,
+        }))
+    }
+
+    /// Streaming body for a single encrypted multipart part (`part_num`) (#121).
+    pub fn encrypted_part_body(
+        &self,
+        b_id: u32,
+        what: String,
+        ext: &crate::multipart::PartExtent,
+        part_num: u32,
+        dek: crate::sse::SseDek,
+    ) -> Result<crate::stream_read::PreadBody, VolumeError> {
+        use crate::stream_read::{Job, PreadBody, Segment, Source};
+        let want_stored = crate::sse::stored_len(ext.part_size).map_err(sse_error)?;
+        let mut hdr = [0u8; crate::sse::AWE1_HEADER_LEN];
+        let (source, base_at) = match &ext.staged_path {
+            Some(path) => {
+                let file = std::fs::File::open(path)?;
+                if file.metadata()?.len() != want_stored {
+                    return Err(VolumeError::CorruptIndex);
+                }
+                self.work.disk_read();
+                crate::direct_io::read_exact_at(&file, 0, &mut hdr)?;
+                (Source::File(Arc::new(file)), 0u64)
+            }
+            None => {
+                let (vm, local) = self.volume_for(ext.vol_offset)?;
+                let (payload_at, stored, _) = match vm.payload_extent_with_crc(b_id, local) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        self.record_read_corruption(ext.vol_offset, &what, &e);
+                        return Err(e);
+                    }
+                };
+                if stored != want_stored {
+                    return Err(VolumeError::CorruptIndex);
+                }
+                vm.read_cached(payload_at, &mut hdr)?;
+                let direct = stored >= self.direct_read_min.load(Ordering::Relaxed);
+                (Source::Volume { vm, direct }, payload_at)
+            }
+        };
+        let (hdr_len, hdr_prefix) = crate::sse::parse_awe1_header(&hdr).map_err(sse_error)?;
+        if hdr_len != ext.part_size {
+            return Err(VolumeError::CorruptIndex);
+        }
+        let (_first_chunk, stored_start, stored_span) =
+            crate::sse::stored_range_for_plaintext(ext.part_size, 0, ext.part_size).map_err(sse_error)?;
+        let xform = Arc::new(
+            crate::sse::Awe1ChunkTransform::new(dek, hdr_prefix, part_num, ext.part_size, 0, ext.part_size)
+                .map_err(sse_error)?,
+        );
+        let segment = Segment {
+            source,
+            at: base_at + stored_start,
+            len: stored_span,
+            verify: None,
+            transform: Some(xform),
+            step_bytes: Some(crate::sse::AWE1_CHUNK_STORED),
+            output_len: Some(ext.part_size),
+        };
+        Ok(PreadBody::from_job(Job {
+            segments: vec![segment],
             what,
             failures: Arc::clone(&self.read_checksum_failures),
             work: Arc::clone(&self.work),
@@ -4200,6 +4877,10 @@ impl ObjectView {
 }
 
 fn decode_error(e: crate::compress::CompressError) -> VolumeError {
+    VolumeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+}
+
+fn sse_error(e: crate::sse::SseError) -> VolumeError {
     VolumeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 

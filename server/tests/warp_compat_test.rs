@@ -188,8 +188,8 @@ async fn warp_prepare_and_cleanup_trailing_slash_requests_succeed_without_weaken
     let body = res.text().await.unwrap();
     assert!(body.contains("<DeleteResult"), "expected DeleteResult XML, got: {}", body);
 
-    // 8. object-lock is now implemented (#120) and answers 404 when unset; unimplemented security
-    // sub-resources still answer 501 NotImplemented (Decision 61).
+    // 8. object-lock (#120), policy, and acl (#122) are now implemented; unimplemented
+    // sub-resources like encryption still answer 501 NotImplemented (Decision 61).
     let lock_res = signed(&c, "warpkey", "warpsecret", Method::GET, &host, "/warp-benchmark-bucket/?object-lock=", b"")
         .send()
         .await
@@ -202,16 +202,29 @@ async fn warp_prepare_and_cleanup_trailing_slash_requests_succeed_without_weaken
         lock_body
     );
 
-    for sub in ["policy=", "encryption=", "acl="] {
-        let path_q = format!("/warp-benchmark-bucket/?{}", sub);
-        let res = signed(&c, "warpkey", "warpsecret", Method::GET, &host, &path_q, b"")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED, "expected 501 for {}", path_q);
-        let body = res.text().await.unwrap();
-        assert!(body.contains("<Code>NotImplemented</Code>"), "expected NotImplemented for {}, got: {}", path_q, body);
-    }
+    let pol_res = signed(&c, "warpkey", "warpsecret", Method::GET, &host, "/warp-benchmark-bucket/?policy=", b"")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pol_res.status(), StatusCode::NOT_FOUND, "expected 404 for /warp-benchmark-bucket/?policy=");
+    let pol_body = pol_res.text().await.unwrap();
+    assert!(pol_body.contains("<Code>NoSuchBucketPolicy</Code>"), "expected NoSuchBucketPolicy, got: {}", pol_body);
+
+    let acl_res = signed(&c, "warpkey", "warpsecret", Method::GET, &host, "/warp-benchmark-bucket/?acl=", b"")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(acl_res.status(), StatusCode::OK, "expected 200 for /warp-benchmark-bucket/?acl=");
+    let acl_body = acl_res.text().await.unwrap();
+    assert!(acl_body.contains("<AccessControlPolicy"), "expected AccessControlPolicy, got: {}", acl_body);
+
+    let res = signed(&c, "warpkey", "warpsecret", Method::GET, &host, "/warp-benchmark-bucket/?encryption=", b"")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED, "expected 501 for /warp-benchmark-bucket/?encryption=");
+    let body = res.text().await.unwrap();
+    assert!(body.contains("<Code>NotImplemented</Code>"), "expected NotImplemented for /warp-benchmark-bucket/?encryption=, got: {}", body);
 
     handle.shutdown();
     let _ = std::fs::remove_dir_all(&dir);

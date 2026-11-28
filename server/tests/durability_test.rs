@@ -82,12 +82,12 @@ mod kill {
 
     async fn start(dir: &Path, mode: &str) -> (Child, String) {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let child = Command::new(env!("CARGO_BIN_EXE_s3-server"))
+        let child = Command::new(env!("CARGO_BIN_EXE_awanfs"))
             .args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous", "--durability", mode])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn s3-server");
+            .expect("spawn awanfs");
         let url = format!("http://127.0.0.1:{}", port);
         let c = reqwest::Client::new();
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -97,7 +97,7 @@ mod kill {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("s3-server --durability {} did not start", mode);
+        panic!("awanfs --durability {} did not start", mode);
     }
 
     async fn acknowledged_objects_survive_a_kill(mode: &str) {
@@ -146,7 +146,7 @@ mod kill {
 
 #[test]
 fn an_unknown_mode_stops_the_binary() {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_s3-server"))
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_awanfs"))
         .args(["--port", "0", "--allow-anonymous", "--durability", "sometimes"])
         .output()
         .unwrap();

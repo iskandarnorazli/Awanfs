@@ -7,6 +7,8 @@ import tempfile
 import types
 import unittest
 from unittest import mock
+from contextlib import redirect_stdout
+import io
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import core_scaling as cs  # noqa: E402
@@ -246,13 +248,13 @@ def _sample_results():
 
 class PinningTests(unittest.TestCase):
     def test_linux_pinning_command_uses_taskset(self):
-        self.assertEqual(cs.pinning_command(["s3-server", "--port", "9000"], 1, "linux"),
-                         ["taskset", "-c", "0", "s3-server", "--port", "9000"])
-        self.assertEqual(cs.pinning_command(["s3-server", "--port", "9000"], 4, "linux"),
-                         ["taskset", "-c", "0-3", "s3-server", "--port", "9000"])
+        self.assertEqual(cs.pinning_command(["awanfs", "--port", "9000"], 1, "linux"),
+                         ["taskset", "-c", "0", "awanfs", "--port", "9000"])
+        self.assertEqual(cs.pinning_command(["awanfs", "--port", "9000"], 4, "linux"),
+                         ["taskset", "-c", "0-3", "awanfs", "--port", "9000"])
 
     def test_windows_pinning_leaves_argv_and_pins_via_psutil(self):
-        argv = ["s3-server.exe", "--port", "9000"]
+        argv = ["awanfs.exe", "--port", "9000"]
         self.assertEqual(cs.pinning_command(argv, 4, "win32"), argv)
 
         calls = []
@@ -274,6 +276,134 @@ class PinningTests(unittest.TestCase):
         self.assertEqual(cs.client_cores_for(1, 4), ([1, 2, 3], False))
         self.assertEqual(cs.client_cores_for(2, 4), ([2, 3], False))
         self.assertEqual(cs.client_cores_for(4, 4), ([0, 1, 2, 3], True))
+
+
+class PinAtStartTests(unittest.TestCase):
+    """#474: on Windows a server starts already pinned: the parent takes the server's cores just
+    for the spawn, so the child inherits them, as `taskset` gives on Linux."""
+
+    def _fake_psutil(self, events, start=(0, 1, 2, 3)):
+        state = {"aff": list(start)}
+
+        class FakeSelf:
+            def cpu_affinity(self, cores=None):
+                if cores is None:
+                    return list(state["aff"])
+                events.append(("set", list(cores)))
+                state["aff"] = list(cores)
+
+        return types.SimpleNamespace(Process=lambda pid=None: FakeSelf())
+
+    def test_windows_spawn_happens_inside_the_server_cores_then_restores(self):
+        events = []
+        fake = self._fake_psutil(events)
+
+        class FakeProc:
+            pid = 4242
+
+        def fake_popen(argv, **kw):
+            events.append(("popen", list(argv)))
+            return FakeProc()
+
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(sys.modules, {"psutil": fake}), \
+                mock.patch.object(cs.sys, "platform", "win32"), \
+                mock.patch.object(cs.subprocess, "Popen", side_effect=fake_popen), \
+                mock.patch.object(cs, "pin_process", return_value=True):
+            cs._spawn_pinned(["awanfs.exe", "--port", "9000"], 2, os.path.join(d, "log"))
+        self.assertEqual(events, [("set", [0, 1]), ("popen", ["awanfs.exe", "--port", "9000"]), ("set", [0, 1, 2, 3])])
+
+    def test_linux_spawn_uses_taskset_and_leaves_the_parent_alone(self):
+        events = []
+        fake = self._fake_psutil(events)
+
+        class FakeProc:
+            pid = 4242
+
+        def fake_popen(argv, **kw):
+            events.append(("popen", list(argv)))
+            return FakeProc()
+
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(sys.modules, {"psutil": fake}), \
+                mock.patch.object(cs.sys, "platform", "linux"), \
+                mock.patch.object(cs.shutil, "which", return_value="/usr/bin/taskset"), \
+                mock.patch.object(cs.subprocess, "Popen", side_effect=fake_popen), \
+                mock.patch.object(cs, "pin_process", return_value=True):
+            cs._spawn_pinned(["awanfs", "--port", "9000"], 2, os.path.join(d, "log"))
+        self.assertEqual(events, [("popen", ["taskset", "-c", "0-1", "awanfs", "--port", "9000"])])
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows only")
+    def test_a_real_child_sees_its_cores_as_its_first_act(self):
+        try:
+            import psutil  # noqa: F401
+        except ImportError:
+            self.skipTest("psutil not installed")
+        if (os.cpu_count() or 1) < 2:
+            self.skipTest("fewer than two CPUs")
+        before = psutil.Process().cpu_affinity()
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "out.txt")
+            log = os.path.join(d, "log")
+            child = [sys.executable, "-c", f"import psutil; open({out!r}, 'w').write(repr(psutil.Process().cpu_affinity()))"]
+            with mock.patch.object(cs, "pin_process", return_value=True):
+                proc = cs._spawn_pinned(child, 1, log)
+            proc.wait(timeout=60)
+            with open(out) as f:
+                self.assertEqual(f.read(), "[0]")
+        self.assertEqual(psutil.Process().cpu_affinity(), before, "the parent's affinity is restored")
+
+
+class TwoBuildsTests(unittest.TestCase):
+    """#459: `--server-bin-b` runs a second AwanFS build next to the first, alternating, and the
+    report puts A, B and the change side by side."""
+
+    def _args(self, **kw):
+        base = dict(
+            pattern="seq-write", sizes="4KiB", concurrencies="16", prefill_size="1MiB", memory_budget="",
+            servers="AwanFS", fast_every_concurrency=False, runs=2, duration=1.0, seed=42, client_procs=1,
+            output="", durability="group", compare_fast=False, profile_threads_cores="", server_bin_b="/b/awanfs",
+        )
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    def test_builds_alternate_and_b_uses_its_binary(self):
+        started, measured = [], []
+
+        def fake_start_awanfs(server_bin, n, data_root, memory_budget=None, durability="group"):
+            started.append(server_bin)
+            return ("proc", 1, "log")
+
+        def fake_measure(server_name, starter, **kw):
+            starter()
+            measured.append(server_name)
+            ops = 1000.0 if server_name == "AwanFS" else 1100.0
+            return {("seq-write", 4 * cs.KIB, 16): cs.PointResult(ops_per_sec=ops, mib_per_sec=ops / 256, p50_ms=1.0, p99_ms=2.0, cpu_pct=100.0)}
+
+        with tempfile.TemporaryDirectory() as d:
+            a = self._args(output=os.path.join(d, "r.md"))
+            with mock.patch.object(cs, "_start_awanfs", side_effect=fake_start_awanfs), \
+                    mock.patch.object(cs, "measure_server_matrix_for_cores", side_effect=fake_measure), \
+                    mock.patch.object(cs, "write_matrix_charts", return_value=[]), \
+                    mock.patch.object(cs, "prefill_cache_check", return_value=None), \
+                    redirect_stdout(io.StringIO()):
+                rc = cs._run_matrix_mode(a, "cmd", [1], 4, d, "/a/awanfs", None, None, None, None, None)
+            self.assertEqual(rc, 0)
+            with open(a.output) as f:
+                md = f.read()
+        self.assertEqual(measured, ["AwanFS", cs.BUILD_B, cs.BUILD_B, "AwanFS"])
+        self.assertEqual(started, ["/a/awanfs", "/b/awanfs", "/b/awanfs", "/a/awanfs"])
+        self.assertIn("## Build A against build B", md)
+        self.assertIn("| seq-write | 4 KiB | 1 | 16 | 1,000 | 1,100 | +10.0% | 2.00 | 2.00 | 100.0% | 100.0% |", md)
+        self.assertEqual(sum(1 for l in md.splitlines() if l.startswith("- **Machine:**")), 1)
+
+    def test_b_needs_awanfs_in_the_servers(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self._args(servers="MinIO", output=os.path.join(d, "r.md"))
+            with mock.patch.object(cs, "prefill_cache_check", return_value=None):
+                with self.assertRaises(ValueError) as ctx:
+                    cs._run_matrix_mode(a, "cmd", [1], 4, d, "/a", None, None, None, None, None)
+            self.assertIn("--server-bin-b", str(ctx.exception))
 
 
 class ScalingAndCpuTests(unittest.TestCase):
@@ -1341,7 +1471,7 @@ class DurabilityAndAutoProfileTests(unittest.TestCase):
                 pass
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = os.path.join(tmpdir, "s3-server")
+            fake_bin = os.path.join(tmpdir, "awanfs")
             with open(fake_bin, "wb") as fh:
                 fh.write(b"bin")
             with mock.patch.object(cs, "_spawn_pinned", side_effect=lambda argv, n, lp: spawned_argvs.append(list(argv)) or FakeProc()), \

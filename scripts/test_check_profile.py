@@ -16,7 +16,7 @@ jobs:
   s3tests:
     steps:
       - name: Build
-        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+        run: cargo build --locked --release --bin awanfs --manifest-path server/Cargo.toml
       - name: Start AwanFS
         run: bash tests/s3tests/start_server.sh
 """
@@ -84,7 +84,7 @@ class CheckProfile(unittest.TestCase):
 
     def test_inline_s3_server_in_workflow_fails(self):
         wf = self.root / ".github/workflows/s3-tests.yml"
-        wf.write_text(WORKFLOW + "      - run: server/target/release/s3-server --port 9000\n", encoding="utf-8")
+        wf.write_text(WORKFLOW + "      - run: server/target/release/awanfs --port 9000\n", encoding="utf-8")
         probs = cp.problems(self.root)
         self.assertTrue(any("outside start_server.sh" in p for p in probs), probs)
 

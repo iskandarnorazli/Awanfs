@@ -1,0 +1,154 @@
+//! #454: a whole-needle write reuses its buffer. A fresh zeroed buffer per PUT cost a page
+//! fault for every 4 KiB of payload, about 14% of the server's CPU at PUT 1 MiB (profile in
+//! `measurements/2026-11-27-put-cpu-profile.md`). A reused buffer still holds the last
+//! needle's bytes, so the padding after each needle must still reach the disk as zeros.
+
+use s3_server::meta_index::AWAN_FLAG_ACTIVE;
+use s3_server::volume::VolumeManager;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn temp_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("awanfs_pool_{}_{}_{}", name, std::process::id(), nanos));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn pattern(len: usize, seed: u8) -> Vec<u8> {
+    (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed) | 1).collect()
+}
+
+#[test]
+fn twenty_writes_of_about_one_mib_allocate_one_needle_buffer() {
+    let dir = temp_dir("reuse");
+    let vm = VolumeManager::open(&dir, 1).unwrap();
+    let before = vm.needle_buffer_allocs();
+    // Every size here needs a buffer of the same 64 KiB step (just under 1 MiB).
+    for i in 0..20u8 {
+        let payload = pattern(1_000_000 - usize::from(i) * 100, i);
+        let loc = vm.write_needle_with_attrs(1, &format!("k{}", i), &[], &payload, AWAN_FLAG_ACTIVE, 1, 2, None).unwrap();
+        assert_eq!(&vm.read_needle_bytes_verified(1, loc.offset).unwrap()[..], &payload[..]);
+    }
+    assert_eq!(vm.needle_buffer_allocs() - before, 1, "every write after the first reuses the buffer");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_reused_buffer_writes_zeros_after_a_shorter_needle() {
+    let dir = temp_dir("padding");
+    let vm = VolumeManager::open(&dir, 1).unwrap();
+    // Both needles fit one buffer size (the 64 KiB step just under 1 MiB).
+    let long = vec![0xAAu8; 1_040_000];
+    vm.write_needle_with_attrs(1, "long", &[], &long, AWAN_FLAG_ACTIVE, 1, 2, None).unwrap();
+    let short = pattern(1_000_000, 7);
+    let loc = vm.write_needle_with_attrs(1, "short", &[], &short, AWAN_FLAG_ACTIVE, 1, 2, None).unwrap();
+    vm.sync_now().unwrap();
+    assert_eq!(vm.needle_buffer_allocs(), 1, "the second write reused the first one's buffer");
+
+    let raw_len = 64 + "short".len() + short.len();
+    let mut f = std::fs::File::open(dir.join("volume_0001.dat")).unwrap();
+    let mut needle = vec![0u8; loc.total_len as usize];
+    f.seek(SeekFrom::Start(loc.offset)).unwrap();
+    f.read_exact(&mut needle).unwrap();
+    assert_eq!(&needle[64 + 5..raw_len], &short[..]);
+    assert!(needle[raw_len..].iter().all(|&b| b == 0), "padding after the needle is zeros");
+    drop(vm);
+
+    let vm = VolumeManager::open(&dir, 1).unwrap();
+    assert_eq!(&vm.read_needle_bytes_verified(1, loc.offset).unwrap()[..], &short[..]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_sealed_volume_keeps_no_buffers() {
+    let dir = temp_dir("seal");
+    let vm = VolumeManager::open(&dir, 1).unwrap();
+    let payload = pattern(256 * 1024, 3);
+    vm.write_needle_with_attrs(1, "a", &[], &payload, AWAN_FLAG_ACTIVE, 1, 2, None).unwrap();
+    vm.seal();
+    // A write after the seal finds the pool empty (compaction seals before it lists).
+    let _ = vm.write_needle_with_attrs(1, "b", &[], &payload, AWAN_FLAG_ACTIVE, 1, 2, None);
+    assert_eq!(vm.needle_buffer_allocs(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn retired_or_sealed_volume_drops_pooled_and_returned_buffers() {
+    let dir = temp_dir("retire");
+    let vm = VolumeManager::open(&dir, 1).unwrap();
+    let payload = pattern(256 * 1024, 5);
+    vm.write_needle_with_attrs(1, "k1", &[], &payload, AWAN_FLAG_ACTIVE, 1, 2, None).unwrap();
+    assert!(vm.pooled_bytes() > 0, "active volume pools its write buffer");
+
+    vm.retire_write_buffers();
+    assert_eq!(vm.pooled_bytes(), 0, "retire_write_buffers must empty the pool immediately");
+
+    // Any buffer already in flight when retired must be dropped on return, never re-pooled.
+    let allocs_before = vm.needle_buffer_allocs();
+    vm.write_needle_with_attrs(1, "k2", &[], &payload, AWAN_FLAG_ACTIVE, 3, 4, None).unwrap();
+    assert_eq!(vm.needle_buffer_allocs(), allocs_before + 1);
+    assert_eq!(vm.pooled_bytes(), 0, "returned buffer on a retired volume must be dropped, not pooled");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn rolled_over_volume_holds_zero_pooled_bytes_while_remaining_readable() {
+    let dir = temp_dir("rollover");
+    let state = std::sync::Arc::new(s3_server::S3ServiceState::with_data_dir(&dir));
+    state.set_volume_span(512 * 1024);
+    let handle = s3_server::start_s3_reactor("127.0.0.1:0".parse().unwrap(), state.clone())
+        .await
+        .unwrap();
+    let url = format!("http://{}", handle.local_addr);
+    let client = reqwest::Client::new();
+
+    assert_eq!(
+        client.put(format!("{}/pool-roll-bkt", url)).send().await.unwrap().status(),
+        reqwest::StatusCode::OK
+    );
+
+    let first = pattern(256 * 1024, 1);
+    assert_eq!(
+        client
+            .put(format!("{}/pool-roll-bkt/k1", url))
+            .body(first.clone())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    let vol1 = state.volumes.read().get(&1).cloned().expect("volume 1 present");
+    assert!(vol1.pooled_bytes() > 0, "active volume 1 pools write buffers before rollover");
+
+    // Second write overflows volume 1's 512 KiB span and rolls over to volume 2.
+    let second = pattern(300 * 1024, 2);
+    assert_eq!(
+        client
+            .put(format!("{}/pool-roll-bkt/k2", url))
+            .body(second.clone())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    let vols = state.volumes.read().clone();
+    assert!(vols.len() >= 2, "expected rollover to volume 2");
+    assert_eq!(vol1.pooled_bytes(), 0, "rolled-over volume 1 must keep 0 pooled bytes");
+    let vol2 = vols.get(&2).cloned().expect("volume 2 present");
+    assert!(vol2.pooled_bytes() > 0, "new active volume 2 pools buffers");
+
+    // Reads from rolled-over volume 1 still succeed.
+    state.payload_cache.clear();
+    let res = client.get(format!("{}/pool-roll-bkt/k1", url)).send().await.unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.bytes().await.unwrap().as_ref(), &first[..]);
+
+    handle.shutdown();
+    drop(state);
+    let _ = std::fs::remove_dir_all(&dir);
+}

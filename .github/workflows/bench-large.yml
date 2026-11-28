@@ -30,6 +30,7 @@ permissions:
 
 env:
   MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+  MC_RELEASE: RELEASE.2025-08-13T08-35-41Z
 
 jobs:
   large:
@@ -44,14 +45,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
-      - name: Build s3-server
-        run: cargo build --locked --release --bin s3-server --manifest-path server/Cargo.toml
+      - name: Build awanfs
+        run: cargo build --locked --release --bin awanfs --manifest-path server/Cargo.toml
 
       - uses: actions/cache@v4
         id: minio-cache
         with:
           path: .tmp/minio
-          key: minio-${{ env.MINIO_RELEASE }}-mc-v1-${{ runner.os }}
+          key: minio-${{ env.MINIO_RELEASE }}-mc-${{ env.MC_RELEASE }}-v1-${{ runner.os }}
       - uses: actions/setup-go@v5
         if: steps.minio-cache.outputs.cache-hit != 'true'
         with:
@@ -71,9 +72,9 @@ jobs:
             git clone -q --depth 1 --branch "${MINIO_RELEASE}" https://github.com/minio/minio /tmp/minio-src
             (cd /tmp/minio-src && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/minio" .)
           fi
-          if ! from_image quay.io/minio/mc:latest /usr/bin/mc .tmp/minio/mc; then
-            git clone -q --depth 1 https://github.com/minio/mc /tmp/mc-src
-            (cd /tmp/mc-src && CGO_ENABLED=0 go build -trimpath -o "$GITHUB_WORKSPACE/.tmp/minio/mc" .)
+          if ! from_image "quay.io/minio/mc:${MC_RELEASE}" /usr/bin/mc .tmp/minio/mc; then
+            git clone -q --depth 1 --branch "${MC_RELEASE}" https://github.com/minio/mc /tmp/mc-src
+            (cd /tmp/mc-src && commit=$(git rev-parse HEAD) && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/minio/mc/cmd.Version=${MC_RELEASE} -X github.com/minio/mc/cmd.ReleaseTag=${MC_RELEASE} -X github.com/minio/mc/cmd.CommitID=${commit} -X github.com/minio/mc/cmd.ShortCommitID=${commit:0:12}" -o "$GITHUB_WORKSPACE/.tmp/minio/mc" .)
           fi
           chmod +x .tmp/minio/minio .tmp/minio/mc
       - name: MinIO versions
@@ -96,7 +97,7 @@ jobs:
           for kv in $SERVER_ENV; do
             case "$kv" in AWAN_*=*) export "$kv"; echo "$kv" >> "$GITHUB_STEP_SUMMARY" ;; *) echo "not an AWAN_ setting: $kv"; exit 2 ;; esac
           done
-          python -u benchmarks/large_object_check.py --server-bin server/target/release/s3-server \
+          python -u benchmarks/large_object_check.py --server-bin server/target/release/awanfs \
             --minio-bin .tmp/minio/minio --mc-bin .tmp/minio/mc \
             --sizes "$SIZES" --runs "$RUNS" \
             --report large_report.md
@@ -111,7 +112,7 @@ jobs:
         timeout-minutes: 10
         run: |
           set +e
-          python -u benchmarks/relocation_rss.py --server-bin server/target/release/s3-server \
+          python -u benchmarks/relocation_rss.py --server-bin server/target/release/awanfs \
             --size 64MiB --budget 32MiB --budget-mib 32 --overhead-mib 16 --report relocation_rss.md
           code=$?
           [ -f relocation_rss.md ] && cat relocation_rss.md >> "$GITHUB_STEP_SUMMARY"

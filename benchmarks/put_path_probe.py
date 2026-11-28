@@ -1,6 +1,6 @@
 """Where does a small PUT's time go on this machine? AwanFS only.
 
-    python benchmarks/put_path_probe.py --server-bin server/target/release/s3-server
+    python benchmarks/put_path_probe.py --server-bin server/target/release/awanfs
 
 Runs 64 KiB PUTs at 1, 8 and 64 clients against the server started four ways, and reports
 ops/s with P50 and P90 ms for each:

@@ -353,7 +353,7 @@ impl BucketState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BucketEvent {
-    Create { caller_id: u32, is_us_east_1: bool },
+    Create { caller_id: u32, is_us_east_1: bool, acl_matches: bool },
     Delete { empty: bool },
     PutConfig(ConfigKind),
     DeleteConfig(ConfigKind),
@@ -362,8 +362,9 @@ pub enum BucketEvent {
 /// Bucket and per-kind configuration transitions (#149).
 ///
 /// - `Absent -> Active` on `Create`, `Active -> Deleted` on `Delete { empty: true }`.
-/// - `Create` on `Active` by owner in `us-east-1` is idempotent (`Ok`), else 409
-///   `BucketAlreadyOwnedByYou`; by another account is 409 `BucketAlreadyExists`.
+/// - `Create` on `Active` by owner in `us-east-1` is idempotent (`Ok`) when `acl_matches`,
+///   else 409 `BucketAlreadyExists` (on ACL mismatch) or 409 `BucketAlreadyOwnedByYou`
+///   (non-us-east-1); by another account is always 409 `BucketAlreadyExists`.
 /// - `Delete` on non-empty `Active` is 409 `BucketNotEmpty`; on empty `Active` drops all configs.
 /// - `PutConfig(kind)` sets `kind` (`Unset -> Set`); `DeleteConfig(kind)` clears `kind` (`Set -> Unset`).
 /// - Any `Delete` or config event on `Absent` or `Deleted` is 404 `NoSuchBucket`.
@@ -374,9 +375,11 @@ pub fn bucket_step(state: BucketState, event: BucketEvent) -> Result<BucketState
             owner_id: caller_id,
             configs: 0,
         }),
-        (BucketStatus::Active, BucketEvent::Create { caller_id, is_us_east_1 }) => {
+        (BucketStatus::Active, BucketEvent::Create { caller_id, is_us_east_1, acl_matches }) => {
             if caller_id == state.owner_id {
-                if is_us_east_1 {
+                if !acl_matches {
+                    Err(BUCKET_ALREADY_EXISTS)
+                } else if is_us_east_1 {
                     Ok(state)
                 } else {
                     Err(BUCKET_ALREADY_OWNED_BY_YOU)
@@ -406,17 +409,30 @@ pub fn bucket_step(state: BucketState, event: BucketEvent) -> Result<BucketState
 
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadEncryption {
+    None,
+    SseC,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartSseC {
+    Absent,
+    Matched,
+    Mismatched,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UploadState {
-    Open,
+    Open(UploadEncryption),
     Completed,
     Aborted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UploadEvent {
-    UploadPart,
+    UploadPart { sse_c: PartSseC },
     ListParts,
-    Complete,
+    Complete { sse_c: PartSseC },
     Abort,
 }
 
@@ -426,16 +442,59 @@ pub const NO_SUCH_UPLOAD: Refusal = Refusal {
     why: "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
 };
 
-/// Transitions for a multipart upload (`#111`):
-/// - `Open`: `UploadPart` / `ListParts` keep it `Open`; `Complete` -> `Completed`; `Abort` -> `Aborted`.
+pub const SSE_C_REQUIRED: Refusal = Refusal {
+    code: "InvalidRequest",
+    status: 400,
+    why: "The upload was created with Customer-Provided Server-Side Encryption; matching SSE-C headers are required.",
+};
+
+pub const SSE_C_MISMATCH: Refusal = Refusal {
+    code: "InvalidArgument",
+    status: 400,
+    why: "The provided SSE-C encryption key does not match the upload's encryption parameters.",
+};
+
+pub const SSE_C_UNEXPECTED: Refusal = Refusal {
+    code: "InvalidArgument",
+    status: 400,
+    why: "SSE-C encryption headers were provided for an unencrypted multipart upload.",
+};
+
+/// Transitions for a multipart upload (`#111`, `#121`):
+/// - `Open(None)`: `UploadPart { Absent }` / `ListParts` keep `Open(None)`; `Complete { Absent }` -> `Completed`; `Abort` -> `Aborted`; any SSE-C header on part/complete -> `SSE_C_UNEXPECTED`.
+/// - `Open(SseC)`: `UploadPart { Matched }` keeps `Open(SseC)`; `Complete { Matched }` -> `Completed`; `ListParts` keeps `Open(SseC)`; `Abort` -> `Aborted`; `Absent` -> `SSE_C_REQUIRED`; `Mismatched` -> `SSE_C_MISMATCH`.
 /// - `Completed`: `Complete` answers the completed result (`Ok(Completed)`); other events -> `NoSuchUpload`.
 /// - `Aborted`: all events -> `NoSuchUpload`.
 pub fn upload_step(state: UploadState, event: UploadEvent) -> Result<UploadState, Refusal> {
     match (state, event) {
-        (UploadState::Open, UploadEvent::UploadPart | UploadEvent::ListParts) => Ok(UploadState::Open),
-        (UploadState::Open, UploadEvent::Complete) => Ok(UploadState::Completed),
-        (UploadState::Open, UploadEvent::Abort) => Ok(UploadState::Aborted),
-        (UploadState::Completed, UploadEvent::Complete) => Ok(UploadState::Completed),
+        (UploadState::Open(UploadEncryption::None), UploadEvent::UploadPart { sse_c: PartSseC::Absent }) => {
+            Ok(UploadState::Open(UploadEncryption::None))
+        }
+        (
+            UploadState::Open(UploadEncryption::None),
+            UploadEvent::UploadPart { sse_c: PartSseC::Matched | PartSseC::Mismatched }
+            | UploadEvent::Complete { sse_c: PartSseC::Matched | PartSseC::Mismatched },
+        ) => Err(SSE_C_UNEXPECTED),
+        (UploadState::Open(UploadEncryption::None), UploadEvent::Complete { sse_c: PartSseC::Absent }) => {
+            Ok(UploadState::Completed)
+        }
+        (UploadState::Open(UploadEncryption::SseC), UploadEvent::UploadPart { sse_c: PartSseC::Matched }) => {
+            Ok(UploadState::Open(UploadEncryption::SseC))
+        }
+        (UploadState::Open(UploadEncryption::SseC), UploadEvent::Complete { sse_c: PartSseC::Matched }) => {
+            Ok(UploadState::Completed)
+        }
+        (
+            UploadState::Open(UploadEncryption::SseC),
+            UploadEvent::UploadPart { sse_c: PartSseC::Absent } | UploadEvent::Complete { sse_c: PartSseC::Absent },
+        ) => Err(SSE_C_REQUIRED),
+        (
+            UploadState::Open(UploadEncryption::SseC),
+            UploadEvent::UploadPart { sse_c: PartSseC::Mismatched } | UploadEvent::Complete { sse_c: PartSseC::Mismatched },
+        ) => Err(SSE_C_MISMATCH),
+        (UploadState::Open(enc), UploadEvent::ListParts) => Ok(UploadState::Open(enc)),
+        (UploadState::Open(_), UploadEvent::Abort) => Ok(UploadState::Aborted),
+        (UploadState::Completed, UploadEvent::Complete { .. }) => Ok(UploadState::Completed),
         (UploadState::Completed, _) | (UploadState::Aborted, _) => Err(NO_SUCH_UPLOAD),
     }
 }
@@ -762,9 +821,10 @@ mod tests {
             BucketState { status: BucketStatus::Deleted, owner_id: 1, configs: 0 },
         ];
         let events = [
-            BucketEvent::Create { caller_id: 1, is_us_east_1: true },
-            BucketEvent::Create { caller_id: 1, is_us_east_1: false },
-            BucketEvent::Create { caller_id: 2, is_us_east_1: true },
+            BucketEvent::Create { caller_id: 1, is_us_east_1: true, acl_matches: true },
+            BucketEvent::Create { caller_id: 1, is_us_east_1: true, acl_matches: false },
+            BucketEvent::Create { caller_id: 1, is_us_east_1: false, acl_matches: true },
+            BucketEvent::Create { caller_id: 2, is_us_east_1: true, acl_matches: true },
             BucketEvent::Delete { empty: false },
             BucketEvent::Delete { empty: true },
             BucketEvent::PutConfig(kind),
@@ -778,10 +838,10 @@ mod tests {
                     (BucketStatus::Absent, BucketEvent::Create { caller_id, .. }) => {
                         assert_eq!(res, Ok(BucketState { status: BucketStatus::Active, owner_id: caller_id, configs: 0 }));
                     }
-                    (BucketStatus::Active, BucketEvent::Create { caller_id: 1, is_us_east_1: true }) => {
+                    (BucketStatus::Active, BucketEvent::Create { caller_id: 1, is_us_east_1: true, acl_matches: true }) => {
                         assert_eq!(res, Ok(s));
                     }
-                    (BucketStatus::Active, BucketEvent::Create { caller_id: 1, is_us_east_1: false }) => {
+                    (BucketStatus::Active, BucketEvent::Create { caller_id: 1, is_us_east_1: false, acl_matches: true }) => {
                         assert_eq!(res, Err(BUCKET_ALREADY_OWNED_BY_YOU));
                     }
                     (BucketStatus::Active, BucketEvent::Create { .. }) => {
@@ -819,7 +879,7 @@ mod tests {
     #[test]
     fn bucket_deleted_drops_configs_and_stays_deleted() {
         let mut st = BucketState::absent();
-        st = bucket_step(st, BucketEvent::Create { caller_id: 7, is_us_east_1: true }).unwrap();
+        st = bucket_step(st, BucketEvent::Create { caller_id: 7, is_us_east_1: true, acl_matches: true }).unwrap();
         for &k in ConfigKind::ALL {
             st = bucket_step(st, BucketEvent::PutConfig(k)).unwrap();
             assert_eq!(st.config_status(k), ConfigStatus::Set);
@@ -836,23 +896,67 @@ mod tests {
 
     #[test]
     fn upload_every_pair_is_decided() {
-        let states = [UploadState::Open, UploadState::Completed, UploadState::Aborted];
-        let events = [UploadEvent::UploadPart, UploadEvent::ListParts, UploadEvent::Complete, UploadEvent::Abort];
+        let states = [
+            UploadState::Open(UploadEncryption::None),
+            UploadState::Open(UploadEncryption::SseC),
+            UploadState::Completed,
+            UploadState::Aborted,
+        ];
+        let events = [
+            UploadEvent::UploadPart { sse_c: PartSseC::Absent },
+            UploadEvent::UploadPart { sse_c: PartSseC::Matched },
+            UploadEvent::UploadPart { sse_c: PartSseC::Mismatched },
+            UploadEvent::ListParts,
+            UploadEvent::Complete { sse_c: PartSseC::Absent },
+            UploadEvent::Complete { sse_c: PartSseC::Matched },
+            UploadEvent::Complete { sse_c: PartSseC::Mismatched },
+            UploadEvent::Abort,
+        ];
         let mut count = 0usize;
         for s in states {
             for e in events {
                 let res = upload_step(s, e);
                 match (s, e) {
-                    (UploadState::Open, UploadEvent::UploadPart | UploadEvent::ListParts) => {
-                        assert_eq!(res, Ok(UploadState::Open));
+                    (UploadState::Open(UploadEncryption::None), UploadEvent::UploadPart { sse_c: PartSseC::Absent }) => {
+                        assert_eq!(res, Ok(UploadState::Open(UploadEncryption::None)));
                     }
-                    (UploadState::Open, UploadEvent::Complete) => {
+                    (
+                        UploadState::Open(UploadEncryption::None),
+                        UploadEvent::UploadPart { sse_c: PartSseC::Matched | PartSseC::Mismatched }
+                        | UploadEvent::Complete { sse_c: PartSseC::Matched | PartSseC::Mismatched },
+                    ) => {
+                        assert_eq!(res, Err(SSE_C_UNEXPECTED));
+                    }
+                    (UploadState::Open(UploadEncryption::None), UploadEvent::Complete { sse_c: PartSseC::Absent }) => {
                         assert_eq!(res, Ok(UploadState::Completed));
                     }
-                    (UploadState::Open, UploadEvent::Abort) => {
+                    (UploadState::Open(UploadEncryption::SseC), UploadEvent::UploadPart { sse_c: PartSseC::Matched }) => {
+                        assert_eq!(res, Ok(UploadState::Open(UploadEncryption::SseC)));
+                    }
+                    (UploadState::Open(UploadEncryption::SseC), UploadEvent::Complete { sse_c: PartSseC::Matched }) => {
+                        assert_eq!(res, Ok(UploadState::Completed));
+                    }
+                    (
+                        UploadState::Open(UploadEncryption::SseC),
+                        UploadEvent::UploadPart { sse_c: PartSseC::Absent }
+                        | UploadEvent::Complete { sse_c: PartSseC::Absent },
+                    ) => {
+                        assert_eq!(res, Err(SSE_C_REQUIRED));
+                    }
+                    (
+                        UploadState::Open(UploadEncryption::SseC),
+                        UploadEvent::UploadPart { sse_c: PartSseC::Mismatched }
+                        | UploadEvent::Complete { sse_c: PartSseC::Mismatched },
+                    ) => {
+                        assert_eq!(res, Err(SSE_C_MISMATCH));
+                    }
+                    (UploadState::Open(enc), UploadEvent::ListParts) => {
+                        assert_eq!(res, Ok(UploadState::Open(enc)));
+                    }
+                    (UploadState::Open(_), UploadEvent::Abort) => {
                         assert_eq!(res, Ok(UploadState::Aborted));
                     }
-                    (UploadState::Completed, UploadEvent::Complete) => {
+                    (UploadState::Completed, UploadEvent::Complete { .. }) => {
                         assert_eq!(res, Ok(UploadState::Completed));
                     }
                     (UploadState::Completed, _) | (UploadState::Aborted, _) => {
@@ -867,10 +971,20 @@ mod tests {
 
     #[test]
     fn completed_upload_complete_is_idempotent() {
-        let s = upload_step(UploadState::Open, UploadEvent::Complete).unwrap();
+        let s = upload_step(
+            UploadState::Open(UploadEncryption::None),
+            UploadEvent::Complete { sse_c: PartSseC::Absent },
+        )
+        .unwrap();
         assert_eq!(s, UploadState::Completed);
-        assert_eq!(upload_step(s, UploadEvent::Complete), Ok(UploadState::Completed));
-        assert_eq!(upload_step(s, UploadEvent::UploadPart), Err(NO_SUCH_UPLOAD));
+        assert_eq!(
+            upload_step(s, UploadEvent::Complete { sse_c: PartSseC::Absent }),
+            Ok(UploadState::Completed)
+        );
+        assert_eq!(
+            upload_step(s, UploadEvent::UploadPart { sse_c: PartSseC::Absent }),
+            Err(NO_SUCH_UPLOAD)
+        );
         assert_eq!(upload_step(s, UploadEvent::ListParts), Err(NO_SUCH_UPLOAD));
         assert_eq!(upload_step(s, UploadEvent::Abort), Err(NO_SUCH_UPLOAD));
     }

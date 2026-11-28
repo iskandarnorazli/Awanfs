@@ -32,9 +32,9 @@ fn fix_mmap_threshold() -> &'static str {
 fn print_help() {
     println!(
         "\
-s3-server — AwanFS S3-compatible object storage server
+awanfs — AwanFS S3-compatible object storage server
 
-Usage: s3-server [OPTIONS]
+Usage: awanfs [OPTIONS]
 
 Options:
   -p, --port <PORT>                Listen port (default: 9000, or S3_PORT / AWAN_S3_PORT)
@@ -51,7 +51,8 @@ Options:
       --access-log <PATH|->        Write S3 access log to file or '-' for stdout (or AWANFS_ACCESS_LOG)
       --config <PATH>              TOML config for users/policies/buckets (or AWANFS_CONFIG)
       --memory-budget <SIZE>       Total cache + in-flight body memory budget (or AWANFS_MEMORY_BUDGET)
-      --lifecycle-day-seconds <N>  Seconds per lifecycle day (default: 86400; test use only)
+      --lifecycle-day-seconds <N>  Seconds per lifecycle day (default: 86400; test use only); the
+                                   expiry sweep runs every 1/24 of a day, 500 ms to 1 h
       --body-idle-timeout <DUR>    Idle timeout between request body frames (default: 20s)
       --region <NAME>              Server region (default: us-east-1, or AWANFS_REGION)
       --allow-anonymous            Allow unsigned requests (or AWANFS_ALLOW_ANONYMOUS=1)
@@ -62,14 +63,40 @@ Options:
                                    not record (or AWANFS_VERIFY_PAYLOADS_AT_BOOT=1); use it for the first start
                                    after upgrading from a build before #412, and after disk trouble
       --allow-small-parts          Allow multipart non-final parts under 5 MiB (off by default; for benchmarks)
+      --worker-threads <n>         Tokio worker threads (or AWANFS_WORKER_THREADS); default: the cores the
+                                   process may run on (its affinity)
       --per-bucket-metrics         Always emit awanfs_bucket_* Prometheus gauges even above 1000 buckets (or AWANFS_PER_BUCKET_METRICS=1)
+      --default-bucket-ownership <MODE>  Default ownership for new buckets: BucketOwnerEnforced (default), BucketOwnerPreferred, or ObjectWriter (or AWANFS_DEFAULT_BUCKET_OWNERSHIP)
   -h, --help                       Print this help message and exit"
     );
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let allocator = fix_mmap_threshold();
+    // The runtime is built here, not by #[tokio::main], so its worker count can follow the
+    // process affinity on Windows and --worker-threads (#456).
+    let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let (workers, source) = match s3_server::workers::pick_worker_threads(
+        s3_server::workers::worker_threads_flag(std::env::args().skip(1)).as_deref(),
+        std::env::var("AWANFS_WORKER_THREADS").ok().as_deref(),
+        s3_server::workers::affinity_cores(),
+        available,
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(workers).enable_all().build()?;
+    runtime.block_on(serve(allocator, workers, source))
+}
+
+async fn serve(
+    allocator: &'static str,
+    workers: usize,
+    worker_source: &'static str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut port: u16 = std::env::var("S3_PORT")
         .or_else(|_| std::env::var("AWAN_S3_PORT"))
         .ok()
@@ -103,6 +130,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut allow_small_parts = false;
     let mut per_bucket_metrics = std::env::var("AWANFS_PER_BUCKET_METRICS").ok().as_deref() == Some("1");
     let mut verify_payloads_at_boot = std::env::var("AWANFS_VERIFY_PAYLOADS_AT_BOOT").ok().as_deref() == Some("1");
+    let mut default_ownership_raw = std::env::var("AWANFS_DEFAULT_BUCKET_OWNERSHIP")
+        .unwrap_or_else(|_| "BucketOwnerEnforced".to_string());
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -157,7 +186,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if let Some(v) = args.next().and_then(|s| s.parse::<u64>().ok()).filter(|&n| n > 0) {
                 lifecycle_day_seconds = v;
             }
-            memory_budget = args.next();
         } else if arg == "--body-idle-timeout" {
             let Some(v) = args.next() else {
                 eprintln!("--body-idle-timeout requires a value such as 20s");
@@ -184,8 +212,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             allow_small_parts = true;
         } else if arg == "--per-bucket-metrics" {
             per_bucket_metrics = true;
+        } else if arg == "--worker-threads" {
+            // Read before the runtime starts (#456).
+            args.next();
         } else if arg == "--verify-payloads-at-boot" {
             verify_payloads_at_boot = true;
+        } else if arg == "--default-bucket-ownership" {
+            let Some(v) = args.next() else {
+                eprintln!("--default-bucket-ownership requires BucketOwnerEnforced, BucketOwnerPreferred, or ObjectWriter");
+                std::process::exit(2);
+            };
+            default_ownership_raw = v;
         } else if arg == "--data-dir" || arg == "-d" {
             if let Some(d_str) = args.next() {
                 data_dir = Some(PathBuf::from(d_str));
@@ -218,6 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         mib(budget.bodies)
     );
     println!("Allocator: {}", allocator);
+    println!("Worker threads: {} ({})", workers, worker_source);
 
     let auth = AuthConfig::from_env(allow_anonymous);
     // Users and policies (#53): --config <file> or AWANFS_CONFIG.
@@ -269,7 +307,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         },
         None => S3ServiceState::new(),
     };
+    let default_bucket_ownership = match s3_server::acl::parse_ownership_str(&default_ownership_raw) {
+        Some(o) => o,
+        None => {
+            eprintln!(
+                "--default-bucket-ownership must be BucketOwnerEnforced, BucketOwnerPreferred, or ObjectWriter, not {:?}",
+                default_ownership_raw
+            );
+            std::process::exit(2);
+        }
+    };
     state.auth = auth;
+    state.default_bucket_ownership = default_bucket_ownership;
     state.region = region;
     if let Some(r) = iam {
         r.watch(std::time::Duration::from_secs(60));
@@ -279,8 +328,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.set_body_idle_timeout(body_idle_timeout);
     state.multipart.enforce_min_part_size.store(!allow_small_parts, std::sync::atomic::Ordering::SeqCst);
     // Compaction copies at most this many MB/s (#28, decision 24); 0 = no limit.
-    state.compaction_rate.store(compaction_mb.unwrap_or(50) * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+    let compaction_rate_mb = compaction_mb.unwrap_or(50);
+    state.compaction_rate.store(compaction_rate_mb * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "Compaction: auto={} rate={} MB/s",
+        if auto_compaction { "on" } else { "off" },
+        compaction_rate_mb
+    );
     state.lifecycle_day_seconds.store(lifecycle_day_seconds, std::sync::atomic::Ordering::Relaxed);
+    let lifecycle_period = s3_server::lifecycle::sweep_interval(lifecycle_day_seconds);
+    println!("Lifecycle sweep every {:?}", lifecycle_period);
     state.set_per_bucket_metrics(per_bucket_metrics);
     if lifecycle_day_seconds != 86_400 {
         eprintln!("WARNING: --lifecycle-day-seconds {} is set (default 86400); for test use only", lifecycle_day_seconds);
@@ -325,21 +382,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
         *state.access_log.write() = Some(sink);
     }
-    let state = Arc::new(state);
-    let state_for_stop = Arc::clone(&state);
-    // Automatic compaction (owner decision 15): on unless --auto-compaction off.
-    if auto_compaction {
-        state.start_auto_compaction(std::time::Duration::from_secs(600), 0.20, 1 << 30);
-    }
-    state.start_multipart_cleanup(std::time::Duration::from_secs(600), 7 * lifecycle_day_seconds * 1000);
-    let lifecycle_period = if lifecycle_day_seconds < 60 {
-        std::time::Duration::from_millis(500)
-    } else {
-        std::time::Duration::from_secs(60)
-    };
-    state.start_lifecycle_sweep(lifecycle_period);
-    state.start_scrub(std::time::Duration::from_secs(600), scrub_mib_per_sec);
-
     // TLS (#30, owner decision 18): with --cert and --key the port serves HTTPS only; plain
     // HTTP needs --http-port.
     let tls = match (&tls_cert, &tls_key) {
@@ -360,6 +402,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
     let https = tls.is_some();
+    state.is_https = https;
+    let state = Arc::new(state);
+    let state_for_stop = Arc::clone(&state);
+    // Automatic compaction (owner decision 15): on unless --auto-compaction off.
+    if auto_compaction {
+        state.start_auto_compaction(std::time::Duration::from_secs(600), 0.20, 1 << 30);
+    }
+    state.start_multipart_cleanup(std::time::Duration::from_secs(600), 7 * lifecycle_day_seconds * 1000);
+    state.start_lifecycle_sweep(lifecycle_period);
+    state.start_scrub(std::time::Duration::from_secs(600), scrub_mib_per_sec);
     // #358: --profile production refuses an unsafe configuration, one line per reason.
     let profile = match s3_server::profile::Profile::parse(&profile_name) {
         Some(p) => p,

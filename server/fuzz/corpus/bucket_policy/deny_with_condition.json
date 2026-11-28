@@ -1,0 +1,1 @@
+{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":["arn:aws:iam::123456789012:user/a"]},"Action":["s3:*"],"Resource":["arn:aws:s3:::fuzz-bkt","arn:aws:s3:::fuzz-bkt/*"],"Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/8"},"StringLikeIfExists":{"s3:prefix":["home/*"]}}}]}

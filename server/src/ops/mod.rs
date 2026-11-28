@@ -1,9 +1,11 @@
+pub mod acl;
 pub mod bucket;
 pub mod cors;
 pub mod lifecycle;
 pub mod lock;
 pub mod multipart;
 pub mod object;
+pub mod policy;
 pub mod post_object;
 pub mod service;
 pub mod tagging;
@@ -17,7 +19,7 @@ use std::sync::Arc;
 
 use crate::authz::{
     AclGrants, AuthzContext, BucketOwnership, BucketPolicyDecision, BucketTarget, Decision,
-    ObjectTarget, PolicyMatch, PublicAccessBlock, DEFAULT_BUCKET_OWNERSHIP,
+    ObjectTarget, PolicyMatch, PublicAccessBlock,
 };
 use crate::bucket_config::BucketConfig;
 use crate::ffi_bridge::unpack_flags;
@@ -77,6 +79,20 @@ pub enum Operation {
     PutObjectRetention,
     GetObjectLegalHold,
     PutObjectLegalHold,
+    GetBucketPolicy,
+    PutBucketPolicy,
+    DeleteBucketPolicy,
+    GetBucketPolicyStatus,
+    GetBucketAcl,
+    PutBucketAcl,
+    GetObjectAcl,
+    PutObjectAcl,
+    GetBucketOwnershipControls,
+    PutBucketOwnershipControls,
+    DeleteBucketOwnershipControls,
+    GetPublicAccessBlock,
+    PutPublicAccessBlock,
+    DeletePublicAccessBlock,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +115,7 @@ pub struct OpSpec {
     pub op: Operation,
     pub name: &'static str,
     pub iam_action: Option<&'static str>,
-    pub acl_permission: AclPermission,
+    pub acl_permission: Option<AclPermission>,
     pub target: TargetKind,
     pub requires_existing_bucket: bool,
 }
@@ -109,7 +125,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::ListBuckets,
         name: "ListBuckets",
         iam_action: Some("s3:ListAllMyBuckets"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Service,
         requires_existing_bucket: false,
     },
@@ -117,7 +133,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::CreateBucket,
         name: "CreateBucket",
         iam_action: Some("s3:CreateBucket"),
-        acl_permission: AclPermission::Write,
+        acl_permission: Some(AclPermission::Write),
         target: TargetKind::Bucket,
         requires_existing_bucket: false,
     },
@@ -125,7 +141,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::DeleteBucket,
         name: "DeleteBucket",
         iam_action: Some("s3:DeleteBucket"),
-        acl_permission: AclPermission::FullControl,
+        acl_permission: Some(AclPermission::FullControl),
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -133,7 +149,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::HeadBucket,
         name: "HeadBucket",
         iam_action: Some("s3:ListBucket"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -141,7 +157,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::ListObjects,
         name: "ListObjects",
         iam_action: Some("s3:ListBucket"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -149,7 +165,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::ListObjectsV2,
         name: "ListObjects",
         iam_action: Some("s3:ListBucket"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -157,7 +173,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::ListObjectVersions,
         name: "ListObjectVersions",
         iam_action: Some("s3:ListBucket"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -165,7 +181,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::GetBucketLocation,
         name: "ListObjects",
         iam_action: Some("s3:ListBucket"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -173,7 +189,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::GetBucketVersioning,
         name: "GetBucketVersioning",
         iam_action: Some("s3:ListBucket"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -181,7 +197,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::PutBucketVersioning,
         name: "PutBucketVersioning",
         iam_action: Some("s3:CreateBucket"),
-        acl_permission: AclPermission::Write,
+        acl_permission: None,
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -189,7 +205,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::GetBucketLifecycle,
         name: "GetBucketLifecycle",
         iam_action: Some("s3:GetLifecycleConfiguration"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -197,7 +213,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::PutBucketLifecycle,
         name: "PutBucketLifecycle",
         iam_action: Some("s3:PutLifecycleConfiguration"),
-        acl_permission: AclPermission::Write,
+        acl_permission: None,
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -205,7 +221,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::DeleteBucketLifecycle,
         name: "DeleteBucket",
         iam_action: Some("s3:PutLifecycleConfiguration"),
-        acl_permission: AclPermission::Write,
+        acl_permission: None,
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -213,7 +229,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::GetBucketCors,
         name: "GetBucketCors",
         iam_action: Some("s3:ListBucket"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -221,7 +237,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::PutBucketCors,
         name: "PutBucketCors",
         iam_action: Some("s3:CreateBucket"),
-        acl_permission: AclPermission::Write,
+        acl_permission: None,
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -229,7 +245,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::DeleteBucketCors,
         name: "DeleteBucketCors",
         iam_action: Some("s3:DeleteBucket"),
-        acl_permission: AclPermission::Write,
+        acl_permission: None,
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -237,7 +253,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::GetBucketTagging,
         name: "GetBucketTagging",
         iam_action: Some("s3:ListBucket"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -245,7 +261,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::PutBucketTagging,
         name: "PutBucketTagging",
         iam_action: Some("s3:CreateBucket"),
-        acl_permission: AclPermission::Write,
+        acl_permission: None,
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -253,7 +269,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::DeleteBucketTagging,
         name: "DeleteBucketTagging",
         iam_action: Some("s3:DeleteBucket"),
-        acl_permission: AclPermission::Write,
+        acl_permission: None,
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -261,7 +277,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::CorsPreflight,
         name: "CorsPreflight",
         iam_action: None,
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -269,7 +285,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::ListMultipartUploads,
         name: "ListObjects",
         iam_action: Some("s3:ListBucketMultipartUploads"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -277,7 +293,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::DeleteObjects,
         name: "DeleteObjects",
         iam_action: None,
-        acl_permission: AclPermission::Write,
+        acl_permission: Some(AclPermission::Write),
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -285,7 +301,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::PutObject,
         name: "PutObject",
         iam_action: Some("s3:PutObject"),
-        acl_permission: AclPermission::Write,
+        acl_permission: Some(AclPermission::Write),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -294,7 +310,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::PostObject,
         name: "PostObject",
         iam_action: Some("s3:PutObject"),
-        acl_permission: AclPermission::Write,
+        acl_permission: Some(AclPermission::Write),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -302,7 +318,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::CopyObject,
         name: "CopyObject",
         iam_action: Some("s3:PutObject"),
-        acl_permission: AclPermission::Write,
+        acl_permission: Some(AclPermission::Write),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -310,7 +326,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::GetObject,
         name: "GetObject",
         iam_action: Some("s3:GetObject"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -318,7 +334,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::GetObjectAttributes,
         name: "GetObjectAttributes",
         iam_action: Some("s3:GetObject"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -326,7 +342,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::HeadObject,
         name: "HeadObject",
         iam_action: Some("s3:GetObject"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -334,7 +350,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::DeleteObject,
         name: "DeleteObject",
         iam_action: Some("s3:DeleteObject"),
-        acl_permission: AclPermission::Write,
+        acl_permission: Some(AclPermission::Write),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -342,7 +358,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::CreateMultipartUpload,
         name: "CreateMultipartUpload",
         iam_action: Some("s3:PutObject"),
-        acl_permission: AclPermission::Write,
+        acl_permission: Some(AclPermission::Write),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -350,7 +366,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::UploadPart,
         name: "UploadPart",
         iam_action: Some("s3:PutObject"),
-        acl_permission: AclPermission::Write,
+        acl_permission: Some(AclPermission::Write),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -358,7 +374,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::UploadPartCopy,
         name: "UploadPartCopy",
         iam_action: Some("s3:PutObject"),
-        acl_permission: AclPermission::Write,
+        acl_permission: Some(AclPermission::Write),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -366,7 +382,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::CompleteMultipartUpload,
         name: "CompleteMultipartUpload",
         iam_action: Some("s3:PutObject"),
-        acl_permission: AclPermission::Write,
+        acl_permission: Some(AclPermission::Write),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -374,7 +390,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::AbortMultipartUpload,
         name: "AbortMultipartUpload",
         iam_action: Some("s3:AbortMultipartUpload"),
-        acl_permission: AclPermission::Write,
+        acl_permission: Some(AclPermission::Write),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -382,7 +398,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::ListParts,
         name: "GetObject",
         iam_action: Some("s3:ListMultipartUploadParts"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -390,7 +406,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::GetObjectTagging,
         name: "GetObjectTagging",
         iam_action: Some("s3:GetObjectTagging"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -398,7 +414,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::PutObjectTagging,
         name: "PutObjectTagging",
         iam_action: Some("s3:PutObjectTagging"),
-        acl_permission: AclPermission::Write,
+        acl_permission: Some(AclPermission::Write),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -406,7 +422,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::DeleteObjectTagging,
         name: "DeleteObjectTagging",
         iam_action: Some("s3:DeleteObjectTagging"),
-        acl_permission: AclPermission::Write,
+        acl_permission: Some(AclPermission::Write),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -414,7 +430,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::GetObjectLockConfiguration,
         name: "GetObjectLockConfiguration",
         iam_action: Some("s3:GetBucketObjectLockConfiguration"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -422,7 +438,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::PutObjectLockConfiguration,
         name: "PutObjectLockConfiguration",
         iam_action: Some("s3:PutBucketObjectLockConfiguration"),
-        acl_permission: AclPermission::Write,
+        acl_permission: None,
         target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
@@ -430,7 +446,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::GetObjectRetention,
         name: "GetObjectRetention",
         iam_action: Some("s3:GetObjectRetention"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -438,7 +454,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::PutObjectRetention,
         name: "PutObjectRetention",
         iam_action: Some("s3:PutObjectRetention"),
-        acl_permission: AclPermission::Write,
+        acl_permission: Some(AclPermission::Write),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -446,7 +462,7 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::GetObjectLegalHold,
         name: "GetObjectLegalHold",
         iam_action: Some("s3:GetObjectLegalHold"),
-        acl_permission: AclPermission::Read,
+        acl_permission: Some(AclPermission::Read),
         target: TargetKind::Object,
         requires_existing_bucket: true,
     },
@@ -454,8 +470,120 @@ pub const OPS: &[OpSpec] = &[
         op: Operation::PutObjectLegalHold,
         name: "PutObjectLegalHold",
         iam_action: Some("s3:PutObjectLegalHold"),
-        acl_permission: AclPermission::Write,
+        acl_permission: Some(AclPermission::Write),
         target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::GetBucketPolicy,
+        name: "GetBucketPolicy",
+        iam_action: Some("s3:GetBucketPolicy"),
+        acl_permission: None,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::PutBucketPolicy,
+        name: "PutBucketPolicy",
+        iam_action: Some("s3:PutBucketPolicy"),
+        acl_permission: None,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::DeleteBucketPolicy,
+        name: "DeleteBucketPolicy",
+        iam_action: Some("s3:DeleteBucketPolicy"),
+        acl_permission: None,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::GetBucketPolicyStatus,
+        name: "GetBucketPolicyStatus",
+        iam_action: Some("s3:GetBucketPolicyStatus"),
+        acl_permission: None,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::GetBucketAcl,
+        name: "GetBucketAcl",
+        iam_action: Some("s3:GetBucketAcl"),
+        acl_permission: Some(AclPermission::ReadAcp),
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::PutBucketAcl,
+        name: "PutBucketAcl",
+        iam_action: Some("s3:PutBucketAcl"),
+        acl_permission: Some(AclPermission::WriteAcp),
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::GetObjectAcl,
+        name: "GetObjectAcl",
+        iam_action: Some("s3:GetObjectAcl"),
+        acl_permission: Some(AclPermission::ReadAcp),
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::PutObjectAcl,
+        name: "PutObjectAcl",
+        iam_action: Some("s3:PutObjectAcl"),
+        acl_permission: Some(AclPermission::WriteAcp),
+        target: TargetKind::Object,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::GetBucketOwnershipControls,
+        name: "GetBucketOwnershipControls",
+        iam_action: Some("s3:GetBucketOwnershipControls"),
+        acl_permission: None,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::PutBucketOwnershipControls,
+        name: "PutBucketOwnershipControls",
+        iam_action: Some("s3:PutBucketOwnershipControls"),
+        acl_permission: None,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::DeleteBucketOwnershipControls,
+        name: "DeleteBucketOwnershipControls",
+        iam_action: Some("s3:DeleteBucketOwnershipControls"),
+        acl_permission: None,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::GetPublicAccessBlock,
+        name: "GetPublicAccessBlock",
+        iam_action: Some("s3:GetBucketPublicAccessBlock"),
+        acl_permission: None,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::PutPublicAccessBlock,
+        name: "PutPublicAccessBlock",
+        iam_action: Some("s3:PutBucketPublicAccessBlock"),
+        acl_permission: None,
+        target: TargetKind::Bucket,
+        requires_existing_bucket: true,
+    },
+    OpSpec {
+        op: Operation::DeletePublicAccessBlock,
+        name: "DeletePublicAccessBlock",
+        iam_action: Some("s3:DeleteBucketPublicAccessBlock"),
+        acl_permission: None,
+        target: TargetKind::Bucket,
         requires_existing_bucket: true,
     },
 ];
@@ -486,12 +614,14 @@ const BUILT_SUBRESOURCES: &[&str] = &[
     "object-lock",
     "retention",
     "legal-hold",
-];
-
-const UNBUILT_S3_SUBRESOURCES: &[&str] = &[
     "acl",
     "policy",
     "policyStatus",
+    "ownershipControls",
+    "publicAccessBlock",
+];
+
+const UNBUILT_S3_SUBRESOURCES: &[&str] = &[
     "encryption",
     "website",
     "notification",
@@ -505,8 +635,6 @@ const UNBUILT_S3_SUBRESOURCES: &[&str] = &[
     "select",
     "restore",
     "torrent",
-    "ownershipControls",
-    "publicAccessBlock",
     "logging",
 
     "parts",
@@ -575,6 +703,18 @@ pub fn classify(
             (&Method::DELETE, ["tagging"]) => Ok(Operation::DeleteBucketTagging),
             (&Method::GET, ["object-lock"]) => Ok(Operation::GetObjectLockConfiguration),
             (&Method::PUT, ["object-lock"]) => Ok(Operation::PutObjectLockConfiguration),
+            (&Method::GET, ["policy"]) => Ok(Operation::GetBucketPolicy),
+            (&Method::PUT, ["policy"]) => Ok(Operation::PutBucketPolicy),
+            (&Method::DELETE, ["policy"]) => Ok(Operation::DeleteBucketPolicy),
+            (&Method::GET, ["policyStatus"]) => Ok(Operation::GetBucketPolicyStatus),
+            (&Method::GET, ["acl"]) => Ok(Operation::GetBucketAcl),
+            (&Method::PUT, ["acl"]) => Ok(Operation::PutBucketAcl),
+            (&Method::GET, ["ownershipControls"]) => Ok(Operation::GetBucketOwnershipControls),
+            (&Method::PUT, ["ownershipControls"]) => Ok(Operation::PutBucketOwnershipControls),
+            (&Method::DELETE, ["ownershipControls"]) => Ok(Operation::DeleteBucketOwnershipControls),
+            (&Method::GET, ["publicAccessBlock"]) => Ok(Operation::GetPublicAccessBlock),
+            (&Method::PUT, ["publicAccessBlock"]) => Ok(Operation::PutPublicAccessBlock),
+            (&Method::DELETE, ["publicAccessBlock"]) => Ok(Operation::DeletePublicAccessBlock),
             (&Method::OPTIONS, []) => Ok(Operation::CorsPreflight),
             (&Method::GET, ["location"]) => Ok(Operation::GetBucketLocation),
             (&Method::GET, ["uploads"]) => Ok(Operation::ListMultipartUploads),
@@ -617,6 +757,8 @@ pub fn classify(
             (&Method::PUT, ["legal-hold"]) | (&Method::PUT, ["legal-hold", "versionId"]) => {
                 Ok(Operation::PutObjectLegalHold)
             }
+            (&Method::GET, ["acl"]) | (&Method::GET, ["acl", "versionId"]) => Ok(Operation::GetObjectAcl),
+            (&Method::PUT, ["acl"]) | (&Method::PUT, ["acl", "versionId"]) => Ok(Operation::PutObjectAcl),
                         (&Method::GET, ["versionId"])
             | (&Method::GET, ["partNumber"])
             | (&Method::GET, ["partNumber", "versionId"])
@@ -683,6 +825,10 @@ pub struct CopySourceResolved {
     pub key: String,
     pub bucket_cfg: Option<Arc<BucketConfig>>,
     pub object_owner: Option<String>,
+    pub object_acl: Option<AclGrants>,
+    pub object_tags: Vec<(String, String)>,
+    pub object_exists: bool,
+    pub bucket_exists: bool,
 }
 
 pub struct Resolved {
@@ -690,6 +836,9 @@ pub struct Resolved {
     pub b_id: Option<u32>,
     pub bucket_cfg: Option<Arc<BucketConfig>>,
     pub object_owner: Option<String>,
+    pub object_acl: Option<AclGrants>,
+    pub object_tags: Vec<(String, String)>,
+    pub object_exists: bool,
     pub copy_source: Option<CopySourceResolved>,
 }
 
@@ -822,8 +971,7 @@ fn authenticate_form(state: &S3ServiceState, mut c: Classified) -> Result<Authen
     let signature = crate::post_object::read_signature(&form.fields).map_err(refuse)?;
     let no_keys = state.auth.credentials.is_none() && iam.as_deref().is_none_or(|i| i.is_empty());
     let principal = match &signature {
-        None if state.auth.allow_anonymous => Principal::Anonymous,
-        None => return Err(post_object::refusal_response(Refusal { code: "AccessDenied", status: 403, why: "Access Denied" }, &path)),
+        None => Principal::Anonymous,
         Some(_) if no_keys && state.auth.allow_anonymous => Principal::Anonymous,
         Some(_) if no_keys => return Err(refuse(crate::post_object::UNKNOWN_KEY)),
         Some(sig) => {
@@ -852,30 +1000,94 @@ fn authenticate_form(state: &S3ServiceState, mut c: Classified) -> Result<Authen
     Ok(Authenticated { classified: c, principal, iam })
 }
 
-fn lookup_object_owner(
+/// Parsed `x-amz-copy-source` header components (`bucket`, `key`, optional `versionId`) (#152, #445).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCopySource {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Option<String>,
+}
+
+/// Parses an `x-amz-copy-source` header value into bucket, key, and optional `versionId`.
+pub fn parse_copy_source(raw: &str) -> Option<ParsedCopySource> {
+    let (copy_path, copy_query) = raw.split_once('?').unwrap_or((raw, ""));
+    let version_id = copy_query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("versionId="))
+        .map(percent_decode_path);
+    let decoded = percent_decode_path(copy_path);
+    let trimmed = decoded.trim_start_matches('/');
+    let (bucket, key) = trimmed.split_once('/')?;
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some(ParsedCopySource {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        version_id,
+    })
+}
+
+struct ResolvedObjectMeta {
+    exists: bool,
+    owner: Option<String>,
+    acl: Option<AclGrants>,
+    tags: Vec<(String, String)>,
+}
+
+fn resolve_object_meta(
     state: &S3ServiceState,
     b_id: u32,
     key: &str,
     vid: Option<&str>,
-) -> Option<String> {
+) -> ResolvedObjectMeta {
+    let empty = ResolvedObjectMeta {
+        exists: false,
+        owner: None,
+        acl: None,
+        tags: Vec::new(),
+    };
     let (target_vid, vol_offset, flags) = if vid.is_some() || state.versions.read().has(b_id, key) {
         let id = vid.and_then(crate::versions::parse_id);
         if vid.is_some() && id.is_none() {
-            return None;
+            return empty;
         }
-        let v = object::find_version(state, b_id, key, id)?;
+        let Some(v) = object::find_version(state, b_id, key, id) else {
+            return empty;
+        };
+        if v.marker && vid.is_none() {
+            return empty;
+        }
         (v.id(), v.vol_offset, v.flags)
     } else {
-        let m = state.engine.read().get_object(b_id, key.as_bytes()).ok()?;
+        let Ok(m) = state.engine.read().get_object(b_id, key.as_bytes()) else {
+            return empty;
+        };
         (0, m.vol_offset, unpack_flags(m.bucket_flags))
     };
     if flags & FLAG_ATTRS == 0 && !state.attr_updates.has_updates() {
-        return None;
+        return ResolvedObjectMeta { exists: true, owner: None, acl: None, tags: Vec::new() };
     }
-    state
-        .object_view_for(b_id, key, target_vid, vol_offset, flags)
-        .ok()
-        .and_then(|v| v.attrs.owner().map(str::to_string))
+    let Ok(view) = state.object_view_for(b_id, key, target_vid, vol_offset, flags) else {
+        return ResolvedObjectMeta { exists: true, owner: None, acl: None, tags: Vec::new() };
+    };
+    let owner = view.attrs.owner().map(str::to_string);
+    let acl = view
+        .attrs
+        .acl_xml()
+        .and_then(|x| crate::acl::parse_acl_xml_structural(x).ok())
+        .map(|a| a.to_authz_grants());
+    let tags = view
+        .attrs
+        .tag_set()
+        .map(|ts| ts.tags.into_iter().map(|t| (t.key, t.value)).collect())
+        .unwrap_or_default();
+    ResolvedObjectMeta {
+        exists: true,
+        owner,
+        acl,
+        tags,
+    }
 }
 
 fn bucket_not_found_response(op: Operation, bucket: &str) -> Response<ResponseBody> {
@@ -902,6 +1114,9 @@ pub fn resolve_bucket(state: &S3ServiceState, a: Authenticated) -> Result<Resolv
             b_id: None,
             bucket_cfg: None,
             object_owner: None,
+            object_acl: None,
+            object_tags: Vec::new(),
+            object_exists: false,
             copy_source: None,
         });
     }
@@ -913,9 +1128,8 @@ pub fn resolve_bucket(state: &S3ServiceState, a: Authenticated) -> Result<Resolv
     let bucket_cfg = state.bucket_config_reader.load_bucket(b_id);
     let ownership = bucket_cfg
         .as_ref()
-        .map_or(DEFAULT_BUCKET_OWNERSHIP, |c| c.ownership());
-    let object_owner = if ownership != BucketOwnership::BucketOwnerEnforced
-        && s.target == TargetKind::Object
+        .map_or(state.default_bucket_ownership, |c| c.ownership_or(state.default_bucket_ownership));
+    let (object_owner, object_acl, object_tags, object_exists) = if s.target == TargetKind::Object
         && matches!(
             a.classified.op,
             Operation::GetObject
@@ -929,72 +1143,81 @@ pub fn resolve_bucket(state: &S3ServiceState, a: Authenticated) -> Result<Resolv
                 | Operation::PutObjectRetention
                 | Operation::GetObjectLegalHold
                 | Operation::PutObjectLegalHold
+                | Operation::GetObjectAcl
+                | Operation::PutObjectAcl
         ) {
         let vid = a.classified.query_map.get("versionId").map(String::as_str);
-        a.classified
-            .key
-            .as_deref()
-            .and_then(|k| lookup_object_owner(state, b_id, k, vid))
+        if let Some(k) = a.classified.key.as_deref() {
+            let meta = resolve_object_meta(state, b_id, k, vid);
+            let owner = if ownership != BucketOwnership::BucketOwnerEnforced {
+                meta.owner
+            } else {
+                None
+            };
+            (owner, meta.acl, meta.tags, meta.exists)
+        } else {
+            (None, None, Vec::new(), false)
+        }
+    } else if s.target == TargetKind::Object
+        && matches!(
+            a.classified.op,
+            Operation::ListParts | Operation::AbortMultipartUpload | Operation::UploadPart | Operation::UploadPartCopy | Operation::CompleteMultipartUpload
+        ) {
+        let owner = a
+            .classified
+            .query_map
+            .get("uploadId")
+            .and_then(|uid| state.multipart.upload_owner_account(uid));
+        (owner, None, Vec::new(), false)
     } else {
-        None
+        (None, None, Vec::new(), false)
     };
 
     let copy_source = if matches!(
         a.classified.op,
         Operation::CopyObject | Operation::UploadPartCopy
     ) {
-        if let Some(raw) = a
+        if let Some(src) = a
             .classified
             .parts
             .headers
             .get("x-amz-copy-source")
             .and_then(|v| v.to_str().ok())
+            .and_then(parse_copy_source)
         {
-            let (copy_path, copy_query) = raw.split_once('?').unwrap_or((raw, ""));
-            let src_vid = copy_query
-                .split('&')
-                .find_map(|kv| kv.strip_prefix("versionId="))
-                .map(percent_decode_path);
-            let decoded = percent_decode_path(copy_path);
-            let trimmed = decoded.trim_start_matches('/');
-            if let Some((src_bucket, src_key)) = trimmed.split_once('/') {
-                if !src_bucket.is_empty() && !src_key.is_empty() {
-                    let src_b_id = match state.engine.read().lookup_bucket(src_bucket) {
-                        Ok(id) => id,
-                        Err(_) => {
-                            let xml = s3_error_xml(
-                                "NoSuchBucket",
-                                "Source bucket does not exist",
-                                src_bucket,
-                                "req-cp",
-                            );
-                            return Err(Response::builder()
-                                .status(StatusCode::NOT_FOUND)
-                                .header(CONTENT_TYPE, "application/xml")
-                                .body(full_body(Bytes::from(xml)))
-                                .unwrap());
-                        }
-                    };
+            match state.engine.read().lookup_bucket(&src.bucket) {
+                Ok(src_b_id) => {
                     let src_cfg = state.bucket_config_reader.load_bucket(src_b_id);
                     let src_ownership = src_cfg
                         .as_ref()
-                        .map_or(DEFAULT_BUCKET_OWNERSHIP, |c| c.ownership());
+                        .map_or(state.default_bucket_ownership, |c| c.ownership_or(state.default_bucket_ownership));
+                    let src_meta = resolve_object_meta(state, src_b_id, &src.key, src.version_id.as_deref());
                     let src_obj_owner = if src_ownership != BucketOwnership::BucketOwnerEnforced {
-                        lookup_object_owner(state, src_b_id, src_key, src_vid.as_deref())
+                        src_meta.owner
                     } else {
                         None
                     };
                     Some(CopySourceResolved {
-                        bucket: src_bucket.to_string(),
-                        key: src_key.to_string(),
+                        bucket: src.bucket,
+                        key: src.key,
                         bucket_cfg: src_cfg,
                         object_owner: src_obj_owner,
+                        object_acl: src_meta.acl,
+                        object_tags: src_meta.tags,
+                        object_exists: src_meta.exists,
+                        bucket_exists: true,
                     })
-                } else {
-                    None
                 }
-            } else {
-                None
+                Err(_) => Some(CopySourceResolved {
+                    bucket: src.bucket,
+                    key: src.key,
+                    bucket_cfg: None,
+                    object_owner: None,
+                    object_acl: None,
+                    object_tags: Vec::new(),
+                    object_exists: false,
+                    bucket_exists: false,
+                }),
             }
         } else {
             None
@@ -1008,6 +1231,9 @@ pub fn resolve_bucket(state: &S3ServiceState, a: Authenticated) -> Result<Resolv
         b_id: Some(b_id),
         bucket_cfg,
         object_owner,
+        object_acl,
+        object_tags,
+        object_exists,
         copy_source,
     })
 }
@@ -1049,29 +1275,121 @@ fn identity_policy_for(
     iam.evaluate_user(name, action, &resource)
 }
 
+fn policy_actions_for(op: Operation) -> Vec<&'static str> {
+    let real = match op {
+        Operation::ListObjectVersions => Some("s3:ListBucketVersions"),
+        Operation::GetBucketVersioning => Some("s3:GetBucketVersioning"),
+        Operation::PutBucketVersioning => Some("s3:PutBucketVersioning"),
+        Operation::GetBucketLocation => Some("s3:GetBucketLocation"),
+        Operation::GetBucketCors => Some("s3:GetBucketCors"),
+        Operation::PutBucketCors | Operation::DeleteBucketCors => Some("s3:PutBucketCors"),
+        Operation::GetBucketTagging => Some("s3:GetBucketTagging"),
+        Operation::PutBucketTagging | Operation::DeleteBucketTagging => Some("s3:PutBucketTagging"),
+        Operation::DeleteObjects => Some("s3:DeleteObject"),
+        _ => spec(op).iam_action,
+    };
+    real.into_iter().collect()
+}
+
+fn parse_request_tags_list(
+    op: Operation,
+    headers: &HeaderMap,
+    form: Option<&post_object::PostForm>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if op == Operation::PostObject {
+        if let Some(f) = form {
+            if let Some(xml) = f.fields.get("tagging") {
+                if let Ok(ts) = crate::tagging::parse_tagging_xml(xml, crate::tagging::Scope::Object) {
+                    for t in ts.tags {
+                        out.push((t.key, t.value));
+                    }
+                }
+            }
+        }
+        return out;
+    }
+    if op == Operation::CopyObject {
+        let replace = headers
+            .get("x-amz-tagging-directive")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|d| d.trim().eq_ignore_ascii_case("REPLACE"));
+        if !replace {
+            return out;
+        }
+    }
+    if let Some(raw) = headers.get("x-amz-tagging").and_then(|v| v.to_str().ok()) {
+        for pair in raw.split('&').filter(|s| !s.is_empty()) {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            out.push((percent_decode(k), percent_decode(v)));
+        }
+    }
+    out
+}
+
+fn evaluate_bucket_policy_actions(
+    cfg: Option<&BucketConfig>,
+    principal: &Principal,
+    actions: &[&str],
+    resource: &str,
+    ctx: &crate::policy::PolicyRequestContext<'_>,
+) -> BucketPolicyDecision {
+    let Some(cfg) = cfg else {
+        return BucketPolicyDecision::none();
+    };
+    let Some(policy) = cfg.bucket_policy() else {
+        return BucketPolicyDecision::none();
+    };
+    policy.evaluate(principal, actions, resource, ctx)
+}
+
+fn evaluate_bucket_policy_decision(
+    cfg: Option<&BucketConfig>,
+    principal: &Principal,
+    op: Operation,
+    bucket: &str,
+    key: Option<&str>,
+    ctx: &crate::policy::PolicyRequestContext<'_>,
+) -> BucketPolicyDecision {
+    let resource = match (spec(op).target, key) {
+        (TargetKind::Object, Some(k)) => format!("arn:aws:s3:::{}/{}", bucket, k),
+        _ => format!("arn:aws:s3:::{}", bucket),
+    };
+    let actions = policy_actions_for(op);
+    evaluate_bucket_policy_actions(cfg, principal, &actions, &resource, ctx)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn bucket_target_for<'a>(
     name: &'a str,
     cfg: Option<&'a BucketConfig>,
-    empty_acl: &'a AclGrants,
+    default_ownership: BucketOwnership,
+    policy: BucketPolicyDecision,
+    bucket_acl: &'a AclGrants,
 ) -> BucketTarget<'a> {
     match cfg {
         Some(c) => BucketTarget {
             name,
             owner_account: c.effective_owner(),
-            ownership: c.ownership(),
+            ownership: c.ownership_or(default_ownership),
             public_access_block: c.public_access_block(),
-            policy: c.policy_decision(),
-            acl: empty_acl,
+            policy,
+            acl: bucket_acl,
         },
         None => BucketTarget {
             name,
             owner_account: ROOT_ACCOUNT,
-            ownership: DEFAULT_BUCKET_OWNERSHIP,
+            ownership: default_ownership,
             public_access_block: PublicAccessBlock::default(),
-            policy: BucketPolicyDecision::none(),
-            acl: empty_acl,
+            policy,
+            acl: bucket_acl,
         },
     }
+}
+
+fn expected_owner_matches(expected: &str, owner_account: &str, iam: Option<&Iam>) -> bool {
+    let owner_id = crate::acl::owner_for_account(owner_account, iam).id;
+    expected == owner_id || expected == owner_account
 }
 
 fn access_denied_response(path: &str) -> Response<ResponseBody> {
@@ -1095,6 +1413,7 @@ pub fn authorize(state: &S3ServiceState, r: Resolved) -> Result<Authorized, Resp
     let wants_bypass = matches!(c.op, Operation::PutObjectRetention | Operation::DeleteObject)
         && crate::object_lock::parse_bypass_governance_header(&c.parts.headers);
     if state.auth.allow_anonymous
+        && state.auth.credentials.is_none()
         && matches!(r.auth.principal, Principal::Anonymous)
         && r.auth.iam.as_deref().is_none_or(|i| i.is_empty())
     {
@@ -1105,15 +1424,150 @@ pub fn authorize(state: &S3ServiceState, r: Resolved) -> Result<Authorized, Resp
         });
     }
 
-    let empty_acl = AclGrants::default();
+    if c.op == Operation::ListBuckets && matches!(r.auth.principal, Principal::Anonymous) {
+        record_authz_reason("anonymous-list-buckets-empty");
+        return Ok(Authorized {
+            resolved: r,
+            bypass_governance: false,
+        });
+    }
+
+    if r.b_id.is_some() {
+        if let Some(raw_expected) = c.parts.headers.get("x-amz-expected-bucket-owner") {
+            let Ok(expected) = raw_expected.to_str() else {
+                return Err(crate::s3_api::bad_request(
+                    "InvalidArgument",
+                    "Invalid x-amz-expected-bucket-owner header",
+                    c.parts.uri.path(),
+                ));
+            };
+            let actual = r.bucket_cfg.as_deref().map_or(ROOT_ACCOUNT, |cfg| cfg.effective_owner());
+            if !expected_owner_matches(expected, actual, r.auth.iam.as_deref()) {
+                return Err(access_denied_response(c.parts.uri.path()));
+            }
+        }
+    }
+
+    let hdr = |k: &str| c.parts.headers.get(k).and_then(|v| v.to_str().ok());
+    let grant_vals = |k: &str| -> Result<Vec<&str>, Response<ResponseBody>> {
+        let mut vals = Vec::new();
+        for hv in c.parts.headers.get_all(k) {
+            let Ok(s) = hv.to_str() else {
+                return Err(crate::s3_api::bad_request(
+                    "InvalidArgument",
+                    "Invalid header value",
+                    c.parts.uri.path(),
+                ));
+            };
+            vals.push(s);
+        }
+        Ok(vals)
+    };
+    let grant_read = grant_vals("x-amz-grant-read")?;
+    let grant_write = grant_vals("x-amz-grant-write")?;
+    let grant_read_acp = grant_vals("x-amz-grant-read-acp")?;
+    let grant_write_acp = grant_vals("x-amz-grant-write-acp")?;
+    let grant_full_control = grant_vals("x-amz-grant-full-control")?;
+    let qstr = |k: &str| c.query_map.get(k).map(|s| s.as_str());
+    let req_tags = parse_request_tags_list(c.op, &c.parts.headers, c.form.as_deref());
+    let src_ip_owned = c
+        .parts
+        .extensions
+        .get::<crate::s3_api::RemoteAddr>()
+        .map(|ra| ra.0.ip().to_string());
+    let copy_src_norm = r
+        .copy_source
+        .as_ref()
+        .map(|s| format!("{}/{}", s.bucket, s.key));
+    let form_acl = c
+        .form
+        .as_deref()
+        .and_then(|f| f.fields.get("acl"));
+    let pctx_acl = if c.op == Operation::PostObject {
+        form_acl
+    } else {
+        if let Some(raw_acl) = c.parts.headers.get("x-amz-acl") {
+            if raw_acl.to_str().is_err() {
+                return Err(crate::s3_api::bad_request(
+                    "InvalidArgument",
+                    "Invalid x-amz-acl header",
+                    c.parts.uri.path(),
+                ));
+            }
+        }
+        hdr("x-amz-acl").or(form_acl)
+    };
+
+    let pctx = crate::policy::PolicyRequestContext {
+        acl: pctx_acl,
+        grant_read: &grant_read,
+        grant_write: &grant_write,
+        grant_read_acp: &grant_read_acp,
+        grant_write_acp: &grant_write_acp,
+        grant_full_control: &grant_full_control,
+        sse: hdr("x-amz-server-side-encryption"),
+        sse_kms_key_id: hdr("x-amz-server-side-encryption-aws-kms-key-id"),
+        sse_c_alg: hdr("x-amz-server-side-encryption-customer-algorithm"),
+        copy_source: copy_src_norm.as_deref(),
+        metadata_directive: hdr("x-amz-metadata-directive"),
+        tagging_directive: hdr("x-amz-tagging-directive"),
+        existing_tags: &r.object_tags,
+        request_tags: &req_tags,
+        prefix: qstr("prefix"),
+        delimiter: qstr("delimiter"),
+        max_keys: qstr("max-keys"),
+        secure_transport: state.is_https,
+        source_ip: src_ip_owned.as_deref(),
+        referer: hdr("referer"),
+        now_epoch_secs: state.clock.now_ns() / 1_000_000_000,
+    };
+
+    let default_own = state.default_bucket_ownership;
+    let bucket_acl_grants = r
+        .bucket_cfg
+        .as_deref()
+        .and_then(|cfg| cfg.acl())
+        .map(|a| a.to_authz_grants())
+        .unwrap_or_default();
+    let bucket_pol_decision = match (r.b_id, c.bucket.as_deref()) {
+        (Some(_), Some(b)) => evaluate_bucket_policy_decision(
+            r.bucket_cfg.as_deref(),
+            &r.auth.principal,
+            c.op,
+            b,
+            c.key.as_deref(),
+            &pctx,
+        ),
+        _ => BucketPolicyDecision::none(),
+    };
     let bucket_target = if r.b_id.is_some() {
-        c.bucket
-            .as_deref()
-            .map(|b| bucket_target_for(b, r.bucket_cfg.as_deref(), &empty_acl))
+        c.bucket.as_deref().map(|b| {
+            bucket_target_for(
+                b,
+                r.bucket_cfg.as_deref(),
+                default_own,
+                bucket_pol_decision,
+                &bucket_acl_grants,
+            )
+        })
     } else {
         None
     };
-    let object_target = if spec(c.op).target == TargetKind::Object {
+    let empty_acl = AclGrants::default();
+    let object_acl = r.object_acl.as_ref().unwrap_or(&empty_acl);
+    let is_bucket_write_op = matches!(
+        c.op,
+        Operation::PutObject
+            | Operation::PostObject
+            | Operation::CopyObject
+            | Operation::DeleteObject
+            | Operation::CreateMultipartUpload
+            | Operation::UploadPart
+            | Operation::UploadPartCopy
+            | Operation::CompleteMultipartUpload
+            | Operation::AbortMultipartUpload
+    );
+    let object_target = if spec(c.op).target == TargetKind::Object && r.object_exists && !is_bucket_write_op {
         c.key.as_deref().map(|k| ObjectTarget {
             key: k,
             owner_account: r
@@ -1121,7 +1575,7 @@ pub fn authorize(state: &S3ServiceState, r: Resolved) -> Result<Authorized, Resp
                 .as_deref()
                 .or_else(|| bucket_target.as_ref().map(|b| b.owner_account))
                 .unwrap_or(ROOT_ACCOUNT),
-            acl: &empty_acl,
+            acl: object_acl,
         })
     } else {
         None
@@ -1145,16 +1599,132 @@ pub fn authorize(state: &S3ServiceState, r: Resolved) -> Result<Authorized, Resp
         &ctx,
     );
     record_authz_reason(decision.reason().as_str());
+    let mut bypassed_allow_anonymous = false;
     if matches!(decision, Decision::Deny { .. }) {
-        return Err(access_denied_response(c.parts.uri.path()));
+        // S3 returns 404 NoSuchKey for GetObject/HeadObject on a missing object whenever the caller
+        // has `s3:ListBucket` permission matching `s3:prefix = key` (`test_head_object_404_with_policy_prefix`
+        // and `test_object_raw_get_object_gone`). Never override explicit Deny.
+        let allow_missing_404 = matches!(decision, Decision::Deny { reason: crate::authz::Reason::DefaultDeny, .. })
+            && matches!(c.op, Operation::GetObject | Operation::HeadObject)
+            && !r.object_exists
+            && bucket_target.is_some()
+            && c.bucket.is_some()
+            && c.key.is_some()
+            && {
+                let b = c.bucket.as_deref().unwrap();
+                let k = c.key.as_deref().unwrap();
+                let mut list_ctx = pctx.clone();
+                list_ctx.prefix = Some(k);
+                let list_pol = evaluate_bucket_policy_decision(
+                    r.bucket_cfg.as_deref(),
+                    &r.auth.principal,
+                    Operation::ListObjects,
+                    b,
+                    None,
+                    &list_ctx,
+                );
+                let list_b_target = bucket_target_for(
+                    b,
+                    r.bucket_cfg.as_deref(),
+                    default_own,
+                    list_pol,
+                    &bucket_acl_grants,
+                );
+                let list_id_pol = identity_policy_for(
+                    &r.auth.principal,
+                    r.auth.iam.as_deref(),
+                    Operation::ListObjects,
+                    Some(b),
+                    None,
+                );
+                let list_authz_ctx = AuthzContext {
+                    identity_policy: list_id_pol,
+                    _marker: PhantomData,
+                };
+                crate::authz::authorize(
+                    &r.auth.principal,
+                    Operation::ListObjects,
+                    Some(&list_b_target),
+                    None,
+                    &list_authz_ctx,
+                )
+                .is_allowed()
+            };
+        if !allow_missing_404 {
+            let allow_anon_fallback = matches!(decision, Decision::Deny { reason: crate::authz::Reason::DefaultDeny, .. })
+                && state.auth.allow_anonymous
+                && matches!(r.auth.principal, Principal::Anonymous)
+                && r.auth.iam.as_deref().is_none_or(|i| i.is_empty())
+                && !bucket_target.as_ref().is_some_and(|b| b.public_access_block.restrict_public_buckets);
+            if allow_anon_fallback {
+                record_authz_reason("allow-anonymous");
+                bypassed_allow_anonymous = true;
+            } else {
+                let defer_to_delete_keys = c.op == Operation::DeleteObjects
+                    && matches!(decision, Decision::Deny { reason: crate::authz::Reason::DefaultDeny, .. })
+                    && r.bucket_cfg.as_deref().is_some_and(|cfg| cfg.bucket_policy().is_some());
+                if !defer_to_delete_keys {
+                    return Err(access_denied_response(c.parts.uri.path()));
+                }
+            }
+        }
     }
 
     if let Some(ref src) = r.copy_source {
-        let src_bucket = bucket_target_for(&src.bucket, src.bucket_cfg.as_deref(), &empty_acl);
+        if !src.bucket_exists {
+            let xml = s3_error_xml(
+                "NoSuchBucket",
+                "Source bucket does not exist",
+                &src.bucket,
+                "req-cp",
+            );
+            return Err(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(full_body(Bytes::from(xml)))
+                .unwrap());
+        }
+        if let Some(raw_expected_src) = c.parts.headers.get("x-amz-copy-source-expected-bucket-owner") {
+            let Ok(expected_src) = raw_expected_src.to_str() else {
+                return Err(crate::s3_api::bad_request(
+                    "InvalidArgument",
+                    "Invalid x-amz-copy-source-expected-bucket-owner header",
+                    c.parts.uri.path(),
+                ));
+            };
+            let actual_src = src.bucket_cfg.as_deref().map_or(ROOT_ACCOUNT, |cfg| cfg.effective_owner());
+            if !expected_owner_matches(expected_src, actual_src, r.auth.iam.as_deref()) {
+                return Err(access_denied_response(c.parts.uri.path()));
+            }
+        }
+        let mut src_pctx = pctx.clone();
+        src_pctx.existing_tags = &src.object_tags;
+        let src_b_acl = src
+            .bucket_cfg
+            .as_deref()
+            .and_then(|cfg| cfg.acl())
+            .map(|a| a.to_authz_grants())
+            .unwrap_or_default();
+        let src_b_pol = evaluate_bucket_policy_decision(
+            src.bucket_cfg.as_deref(),
+            &r.auth.principal,
+            Operation::GetObject,
+            &src.bucket,
+            Some(&src.key),
+            &src_pctx,
+        );
+        let src_bucket = bucket_target_for(
+            &src.bucket,
+            src.bucket_cfg.as_deref(),
+            default_own,
+            src_b_pol,
+            &src_b_acl,
+        );
+        let src_obj_acl = src.object_acl.as_ref().unwrap_or(&empty_acl);
         let src_object = ObjectTarget {
             key: &src.key,
             owner_account: src.object_owner.as_deref().unwrap_or(src_bucket.owner_account),
-            acl: &empty_acl,
+            acl: src_obj_acl,
         };
         let src_pol = identity_policy_for(
             &r.auth.principal,
@@ -1167,11 +1737,12 @@ pub fn authorize(state: &S3ServiceState, r: Resolved) -> Result<Authorized, Resp
             identity_policy: src_pol,
             _marker: PhantomData,
         };
+        let src_obj_opt = if src.object_exists { Some(&src_object) } else { None };
         let src_dec = crate::authz::authorize(
             &r.auth.principal,
             Operation::GetObject,
             Some(&src_bucket),
-            Some(&src_object),
+            src_obj_opt,
             &src_ctx,
         );
         if matches!(src_dec, Decision::Deny { .. }) {
@@ -1180,12 +1751,46 @@ pub fn authorize(state: &S3ServiceState, r: Resolved) -> Result<Authorized, Resp
         }
     }
 
-    let bypass_governance = if wants_bypass {
+    let bypass_governance = if wants_bypass && !bypassed_allow_anonymous {
+        let bypass_res_arn = match (c.bucket.as_deref(), c.key.as_deref()) {
+            (Some(b), Some(k)) => format!("arn:aws:s3:::{}/{}", b, k),
+            (Some(b), None) => format!("arn:aws:s3:::{}", b),
+            _ => String::new(),
+        };
         let bypass_pol = match (&r.auth.principal, r.auth.iam.as_deref(), c.bucket.as_deref(), c.key.as_deref()) {
-            (Principal::User { name, .. }, Some(iam), Some(b), Some(k)) => {
-                iam.evaluate_user(name, "s3:BypassGovernanceRetention", &format!("arn:aws:s3:::{}/{}", b, k))
+            (Principal::User { name, .. }, Some(iam), Some(_), Some(_)) => {
+                iam.evaluate_user(name, "s3:BypassGovernanceRetention", &bypass_res_arn)
             }
             _ => PolicyMatch::NoOpinion,
+        };
+        let bypass_b_pol = if r.b_id.is_some() && !bypass_res_arn.is_empty() {
+            evaluate_bucket_policy_actions(
+                r.bucket_cfg.as_deref(),
+                &r.auth.principal,
+                &["s3:BypassGovernanceRetention"],
+                &bypass_res_arn,
+                &pctx,
+            )
+        } else {
+            BucketPolicyDecision::none()
+        };
+        let bypass_bucket = c.bucket.as_deref().filter(|_| r.b_id.is_some()).map(|b| {
+            bucket_target_for(
+                b,
+                r.bucket_cfg.as_deref(),
+                default_own,
+                bypass_b_pol,
+                &empty_acl,
+            )
+        });
+        let bypass_object = if r.object_exists {
+            object_target.as_ref().map(|o| ObjectTarget {
+                key: o.key,
+                owner_account: o.owner_account,
+                acl: &empty_acl,
+            })
+        } else {
+            None
         };
         let bypass_ctx = AuthzContext {
             identity_policy: bypass_pol,
@@ -1193,8 +1798,8 @@ pub fn authorize(state: &S3ServiceState, r: Resolved) -> Result<Authorized, Resp
         };
         crate::authz::authorize_bypass_governance(
             &r.auth.principal,
-            bucket_target.as_ref(),
-            object_target.as_ref(),
+            bypass_bucket.as_ref(),
+            bypass_object.as_ref(),
             &bypass_ctx,
         )
         .is_allowed()
@@ -1208,6 +1813,7 @@ pub fn authorize(state: &S3ServiceState, r: Resolved) -> Result<Authorized, Resp
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn authorize_key_action(
     state: &S3ServiceState,
     principal: &Principal,
@@ -1216,32 +1822,53 @@ fn authorize_key_action(
     bucket_cfg: Option<&BucketConfig>,
     bucket: &str,
     key: &str,
+    vid: Option<&str>,
+    source_ip: Option<&str>,
+    referer: Option<&str>,
     bypass: bool,
 ) -> bool {
     if state.auth.allow_anonymous
+        && state.auth.credentials.is_none()
         && matches!(principal, Principal::Anonymous)
         && iam.is_none_or(|i| i.is_empty())
     {
         return true;
     }
+    let meta = resolve_object_meta(state, b_id, key, vid);
+    let pctx = crate::policy::PolicyRequestContext {
+        existing_tags: &meta.tags,
+        secure_transport: state.is_https,
+        source_ip,
+        referer,
+        now_epoch_secs: state.clock.now_ns() / 1_000_000_000,
+        ..Default::default()
+    };
     let empty_acl = AclGrants::default();
-    let b_target = bucket_target_for(bucket, bucket_cfg, &empty_acl);
-    let obj_owner = if b_target.ownership != BucketOwnership::BucketOwnerEnforced {
-        lookup_object_owner(state, b_id, key, None)
-    } else {
-        None
-    };
-    let o_target = ObjectTarget {
-        key,
-        owner_account: obj_owner.as_deref().unwrap_or(b_target.owner_account),
-        acl: &empty_acl,
-    };
     if bypass {
+        let res_arn = format!("arn:aws:s3:::{}/{}", bucket, key);
+        let b_pol = evaluate_bucket_policy_actions(
+            bucket_cfg,
+            principal,
+            &["s3:BypassGovernanceRetention"],
+            &res_arn,
+            &pctx,
+        );
+        let b_target = bucket_target_for(bucket, bucket_cfg, state.default_bucket_ownership, b_pol, &empty_acl);
+        let obj_owner = if b_target.ownership != BucketOwnership::BucketOwnerEnforced {
+            meta.owner.as_deref()
+        } else {
+            None
+        };
+        let o_target = ObjectTarget {
+            key,
+            owner_account: obj_owner.unwrap_or(b_target.owner_account),
+            acl: &empty_acl,
+        };
         let id_pol = match (principal, iam) {
             (Principal::User { name, .. }, Some(iam)) => iam.evaluate_user(
                 name,
                 "s3:BypassGovernanceRetention",
-                &format!("arn:aws:s3:::{}/{}", bucket, key),
+                &res_arn,
             ),
             _ => PolicyMatch::NoOpinion,
         };
@@ -1249,17 +1876,40 @@ fn authorize_key_action(
             identity_policy: id_pol,
             _marker: PhantomData,
         };
-        crate::authz::authorize_bypass_governance(principal, Some(&b_target), Some(&o_target), &ctx).is_allowed()
+        let o_target_opt = if meta.exists { Some(&o_target) } else { None };
+        crate::authz::authorize_bypass_governance(principal, Some(&b_target), o_target_opt, &ctx).is_allowed()
     } else {
+        let b_acl = bucket_cfg
+            .and_then(|c| c.acl())
+            .map(|a| a.to_authz_grants())
+            .unwrap_or_default();
+        let b_pol = evaluate_bucket_policy_decision(
+            bucket_cfg,
+            principal,
+            Operation::DeleteObject,
+            bucket,
+            Some(key),
+            &pctx,
+        );
+        let b_target = bucket_target_for(bucket, bucket_cfg, state.default_bucket_ownership, b_pol, &b_acl);
         let id_pol = identity_policy_for(principal, iam, Operation::DeleteObject, Some(bucket), Some(key));
         let ctx = AuthzContext {
             identity_policy: id_pol,
             _marker: PhantomData,
         };
-        crate::authz::authorize(principal, Operation::DeleteObject, Some(&b_target), Some(&o_target), &ctx).is_allowed()
+        let dec = crate::authz::authorize(principal, Operation::DeleteObject, Some(&b_target), None, &ctx);
+        if dec.is_allowed() {
+            return true;
+        }
+        matches!(dec, Decision::Deny { reason: crate::authz::Reason::DefaultDeny, .. })
+            && state.auth.allow_anonymous
+            && matches!(principal, Principal::Anonymous)
+            && iam.is_none_or(|i| i.is_empty())
+            && !b_target.public_access_block.restrict_public_buckets
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn authorize_delete_key(
     state: &S3ServiceState,
     principal: &Principal,
@@ -1268,10 +1918,14 @@ fn authorize_delete_key(
     bucket_cfg: Option<&BucketConfig>,
     bucket: &str,
     key: &str,
+    vid: Option<&str>,
+    source_ip: Option<&str>,
+    referer: Option<&str>,
 ) -> bool {
-    authorize_key_action(state, principal, iam, b_id, bucket_cfg, bucket, key, false)
+    authorize_key_action(state, principal, iam, b_id, bucket_cfg, bucket, key, vid, source_ip, referer, false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn authorize_bypass_key(
     state: &S3ServiceState,
     principal: &Principal,
@@ -1280,8 +1934,11 @@ fn authorize_bypass_key(
     bucket_cfg: Option<&BucketConfig>,
     bucket: &str,
     key: &str,
+    vid: Option<&str>,
+    source_ip: Option<&str>,
+    referer: Option<&str>,
 ) -> bool {
-    authorize_key_action(state, principal, iam, b_id, bucket_cfg, bucket, key, true)
+    authorize_key_action(state, principal, iam, b_id, bucket_cfg, bucket, key, vid, source_ip, referer, true)
 }
 
 pub fn validate(a: Authorized) -> Result<Validated, Response<ResponseBody>> {
@@ -1355,13 +2012,18 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
     let writer_account = principal.account().unwrap_or("");
 
     match c.op {
-        Operation::ListBuckets => service::list_buckets(state, &c.query_map, principal.account()).await,
-        Operation::CreateBucket => bucket::create_bucket(state, bucket, &path, &c.parts.headers, writer_account, c.body).await,
+        Operation::ListBuckets => {
+            let list_all = state.auth.allow_anonymous
+                && matches!(principal, Principal::Anonymous)
+                && iam.as_deref().is_none_or(|i| i.is_empty());
+            service::list_buckets(state, &c.query_map, principal.account(), list_all, iam.as_deref()).await
+        }
+        Operation::CreateBucket => bucket::create_bucket(state, bucket, &path, &c.parts.headers, writer_account, iam.as_deref(), c.body).await,
         Operation::DeleteBucket => bucket::delete_bucket(state, b_id.unwrap(), bucket).await,
         Operation::HeadBucket => bucket::head_bucket().await,
-        Operation::ListObjects => bucket::list_objects(state, b_id.unwrap(), bucket, &c.query_map, false).await,
-        Operation::ListObjectsV2 => bucket::list_objects(state, b_id.unwrap(), bucket, &c.query_map, true).await,
-        Operation::ListObjectVersions => bucket::list_object_versions(state, b_id.unwrap(), bucket, &c.query_map).await,
+        Operation::ListObjects => bucket::list_objects(state, b_id.unwrap(), bucket, &c.query_map, false, iam.as_deref()).await,
+        Operation::ListObjectsV2 => bucket::list_objects(state, b_id.unwrap(), bucket, &c.query_map, true, iam.as_deref()).await,
+        Operation::ListObjectVersions => bucket::list_object_versions(state, b_id.unwrap(), bucket, &c.query_map, iam.as_deref()).await,
         Operation::GetBucketLocation => bucket::get_bucket_location(state).await,
         Operation::GetBucketVersioning => bucket::get_bucket_versioning(state, b_id.unwrap()).await,
         Operation::PutBucketVersioning => bucket::put_bucket_versioning(state, b_id.unwrap(), bucket, &path, c.body).await,
@@ -1375,7 +2037,7 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         Operation::PutBucketTagging => tagging::put_bucket_tagging(state, b_id.unwrap(), bucket, &path, c.body).await,
         Operation::DeleteBucketTagging => tagging::delete_bucket_tagging(state, b_id.unwrap(), bucket).await,
         Operation::CorsPreflight => cors::preflight(state, b_id.unwrap(), &path, &c.parts.headers).await,
-        Operation::ListMultipartUploads => multipart::list_multipart_uploads(state, bucket, &c.query_map).await,
+        Operation::ListMultipartUploads => multipart::list_multipart_uploads(state, bucket, &c.query_map, iam.as_deref()).await,
         Operation::DeleteObjects => {
             let bid = b_id.unwrap();
             let st_for_del = Arc::clone(&state);
@@ -1389,12 +2051,25 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
             let iam_for_byp = iam.clone();
             let cfg_for_byp = bucket_cfg.clone();
             let b_name_byp = bucket.to_string();
+            let src_ip_del = c
+                .parts
+                .extensions
+                .get::<crate::s3_api::RemoteAddr>()
+                .map(|ra| ra.0.ip().to_string());
+            let referer_del = c
+                .parts
+                .headers
+                .get("referer")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let src_ip_byp = src_ip_del.clone();
+            let referer_byp = referer_del.clone();
             bucket::delete_objects(
                 state,
                 bid,
                 bucket,
                 &path,
-                move |k| {
+                move |k, vid| {
                     authorize_delete_key(
                         &st_for_del,
                         &p_for_del,
@@ -1403,9 +2078,12 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
                         cfg_for_del.as_deref(),
                         &b_name,
                         k,
+                        vid,
+                        src_ip_del.as_deref(),
+                        referer_del.as_deref(),
                     )
                 },
-                move |k| {
+                move |k, vid| {
                     wants_bypass
                         && authorize_bypass_key(
                             &st_for_byp,
@@ -1415,6 +2093,9 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
                             cfg_for_byp.as_deref(),
                             &b_name_byp,
                             k,
+                            vid,
+                            src_ip_byp.as_deref(),
+                            referer_byp.as_deref(),
                         )
                 },
                 c.body,
@@ -1423,12 +2104,12 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         }
         Operation::PutObject => {
             let verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &c.parts.headers);
-            object::put_object(state, b_id.unwrap(), bucket, key, &path, &c.parts.headers, writer_account, &bucket_owner, verifier, c.body).await
+            object::put_object(state, b_id.unwrap(), bucket, key, &path, &c.parts.headers, writer_account, &bucket_owner, iam.as_deref(), verifier, c.body).await
         }
         Operation::PostObject => {
-            post_object::execute(state, b_id.unwrap(), bucket, key, &path, &c.parts.headers, writer_account, &bucket_owner, c.form, c.body).await
+            post_object::execute(state, b_id.unwrap(), bucket, key, &path, &c.parts.headers, writer_account, &bucket_owner, iam.as_deref(), c.form, c.body).await
         }
-        Operation::CopyObject => object::copy_object(state, b_id.unwrap(), bucket, key, &c.parts.headers, writer_account, &bucket_owner).await,
+        Operation::CopyObject => object::copy_object(state, b_id.unwrap(), bucket, key, &c.parts.headers, writer_account, &bucket_owner, iam.as_deref()).await,
         Operation::GetObject => {
             let auth_enabled = state.auth.credentials.is_some() || iam.as_deref().is_some_and(|i| !i.is_empty());
             let is_anon_with_auth = auth_enabled && matches!(principal, Principal::Anonymous);
@@ -1444,20 +2125,20 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         }
         Operation::DeleteObject => object::delete_object(state, b_id.unwrap(), key, &c.query_map, &c.parts.headers, bypass_governance).await,
         Operation::CreateMultipartUpload => {
-            multipart::create_multipart_upload(state, b_id.unwrap(), bucket, key, &c.parts.headers, writer_account, &bucket_owner).await
+            multipart::create_multipart_upload(state, b_id.unwrap(), bucket, key, &c.parts.headers, writer_account, &bucket_owner, iam.as_deref()).await
         }
         Operation::UploadPart => {
             let verifier = crate::auth::ChunkVerifier::for_request_with(&state.auth, iam.as_deref(), &c.parts.headers);
-            multipart::upload_part(state, key, &path, &c.query_map, &c.parts.headers, verifier, c.body).await
+            multipart::upload_part(state, bucket, key, &path, &c.query_map, &c.parts.headers, verifier, c.body).await
         }
         Operation::UploadPartCopy => {
-            multipart::upload_part_copy(state, key, &c.query_map, &c.parts.headers).await
+            multipart::upload_part_copy(state, bucket, key, &c.query_map, &c.parts.headers).await
         }
         Operation::CompleteMultipartUpload => {
             multipart::complete_multipart_upload(state, b_id.unwrap(), bucket, key, &path, &c.query_map, &c.parts.headers, c.body).await
         }
-        Operation::AbortMultipartUpload => multipart::abort_multipart_upload(state, b_id.unwrap(), key, &c.query_map).await,
-        Operation::ListParts => multipart::list_parts(state, bucket, key, &c.query_map).await,
+        Operation::AbortMultipartUpload => multipart::abort_multipart_upload(state, b_id.unwrap(), bucket, key, &c.query_map).await,
+        Operation::ListParts => multipart::list_parts(state, bucket, key, &c.query_map, iam.as_deref()).await,
         Operation::GetObjectTagging => tagging::get_object_tagging(state, b_id.unwrap(), key, &c.query_map).await,
         Operation::PutObjectTagging => tagging::put_object_tagging(state, b_id.unwrap(), key, &path, &c.query_map, c.body).await,
         Operation::DeleteObjectTagging => tagging::delete_object_tagging(state, b_id.unwrap(), key, &c.query_map).await,
@@ -1467,6 +2148,20 @@ pub async fn execute(state: Arc<S3ServiceState>, v: Validated) -> Result<Respons
         Operation::PutObjectRetention => lock::put_object_retention(state, b_id.unwrap(), key, &path, &c.query_map, bypass_governance, c.body).await,
         Operation::GetObjectLegalHold => lock::get_object_legal_hold(state, b_id.unwrap(), key, &c.query_map).await,
         Operation::PutObjectLegalHold => lock::put_object_legal_hold(state, b_id.unwrap(), key, &path, &c.query_map, c.body).await,
+        Operation::GetBucketPolicy => policy::get_bucket_policy(state, b_id.unwrap(), bucket).await,
+        Operation::PutBucketPolicy => policy::put_bucket_policy(state, b_id.unwrap(), bucket, &path, c.body).await,
+        Operation::DeleteBucketPolicy => policy::delete_bucket_policy(state, b_id.unwrap(), bucket).await,
+        Operation::GetBucketPolicyStatus => policy::get_bucket_policy_status(state, b_id.unwrap(), bucket).await,
+        Operation::GetBucketAcl => acl::get_bucket_acl(state, b_id.unwrap(), iam.as_deref()).await,
+        Operation::PutBucketAcl => acl::put_bucket_acl(state, b_id.unwrap(), bucket, &path, &c.parts.headers, iam.as_deref(), c.body).await,
+        Operation::GetObjectAcl => acl::get_object_acl(state, b_id.unwrap(), bucket, key, &c.query_map, iam.as_deref()).await,
+        Operation::PutObjectAcl => acl::put_object_acl(state, b_id.unwrap(), bucket, key, &path, &c.query_map, &c.parts.headers, iam.as_deref(), c.body).await,
+        Operation::GetBucketOwnershipControls => policy::get_bucket_ownership_controls(state, b_id.unwrap(), bucket).await,
+        Operation::PutBucketOwnershipControls => policy::put_bucket_ownership_controls(state, b_id.unwrap(), bucket, &path, iam.as_deref(), c.body).await,
+        Operation::DeleteBucketOwnershipControls => policy::delete_bucket_ownership_controls(state, b_id.unwrap(), bucket).await,
+        Operation::GetPublicAccessBlock => policy::get_public_access_block(state, b_id.unwrap(), bucket).await,
+        Operation::PutPublicAccessBlock => policy::put_public_access_block(state, b_id.unwrap(), bucket, &path, c.body).await,
+        Operation::DeletePublicAccessBlock => policy::delete_public_access_block(state, b_id.unwrap(), bucket).await,
     }
 }
 
@@ -1521,6 +2216,20 @@ mod tests {
             (Operation::PutObjectRetention, Method::PUT, Some("bkt"), Some("obj"), "retention", None),
             (Operation::GetObjectLegalHold, Method::GET, Some("bkt"), Some("obj"), "legal-hold", None),
             (Operation::PutObjectLegalHold, Method::PUT, Some("bkt"), Some("obj"), "legal-hold", None),
+            (Operation::GetBucketPolicy, Method::GET, Some("bkt"), None, "policy", None),
+            (Operation::PutBucketPolicy, Method::PUT, Some("bkt"), None, "policy", None),
+            (Operation::DeleteBucketPolicy, Method::DELETE, Some("bkt"), None, "policy", None),
+            (Operation::GetBucketPolicyStatus, Method::GET, Some("bkt"), None, "policyStatus", None),
+            (Operation::GetBucketAcl, Method::GET, Some("bkt"), None, "acl", None),
+            (Operation::PutBucketAcl, Method::PUT, Some("bkt"), None, "acl", None),
+            (Operation::GetObjectAcl, Method::GET, Some("bkt"), Some("obj"), "acl", None),
+            (Operation::PutObjectAcl, Method::PUT, Some("bkt"), Some("obj"), "acl", None),
+            (Operation::GetBucketOwnershipControls, Method::GET, Some("bkt"), None, "ownershipControls", None),
+            (Operation::PutBucketOwnershipControls, Method::PUT, Some("bkt"), None, "ownershipControls", None),
+            (Operation::DeleteBucketOwnershipControls, Method::DELETE, Some("bkt"), None, "ownershipControls", None),
+            (Operation::GetPublicAccessBlock, Method::GET, Some("bkt"), None, "publicAccessBlock", None),
+            (Operation::PutPublicAccessBlock, Method::PUT, Some("bkt"), None, "publicAccessBlock", None),
+            (Operation::DeletePublicAccessBlock, Method::DELETE, Some("bkt"), None, "publicAccessBlock", None),
         ]
     }
 
@@ -1576,8 +2285,6 @@ mod tests {
             (Method::PUT, Some("bkt"), None, "fooBar"),
             (Method::GET, Some("bkt"), Some("obj"), "fooBar"),
             (Method::PUT, Some("bkt"), Some("obj"), "fooBar"),
-            (Method::GET, Some("bkt"), None, "acl"),
-            (Method::PUT, Some("bkt"), None, "policy"),
             (Method::GET, Some("bkt"), None, "website"),
             (Method::GET, Some("bkt"), None, "notification"),
             (Method::GET, Some("bkt"), None, "replication"),

@@ -1,4 +1,4 @@
-# AwanFS (`s3-server`)
+# AwanFS (`awanfs`)
 
 Split from `awan-lang/awan-storage` on 2026-11-12, with its git history. Measurement files keep the commands they were produced with, which use the old `benchmarks/s3_warp/` path.
 
@@ -20,11 +20,12 @@ Read this before you run it anywhere that matters. Plan of record: the Phase 1-4
 - **Versioning** per bucket (#31), **Object Lock** (GOVERNANCE/COMPLIANCE retention and legal hold, #120), **Lifecycle** expiration rules (`?lifecycle`, noncurrent versions, delete markers, multipart abort, #118), and opt-in **zstd compression** per bucket in the config file (#51).
 - **Conformance:** the ceph s3-tests suite passes 335 of 886 tests (94 skipped; main at 38660ee, 2026-11-19), checked nightly and on every pull request that changes server code; the tracker is #123. The plan to pass the rest is [`CONFORMANCE_DESIGN.md`](CONFORMANCE_DESIGN.md), and [`tests/s3tests/CONFORMANCE_MAP.md`](tests/s3tests/CONFORMANCE_MAP.md) gives every test its area and owner.
 - **Browser form uploads** (POST object, #119): HTML forms and SDK presigned POSTs signed with SigV4, with policy conditions, `success_action_status` and redirects; a file above 4 MiB streams. SigV2-signed forms are refused (AwanFS accepts SigV4 only), so the suite's 36 POST tests run as SigV4 versions in [`server/tests/post_object_suite_test.rs`](server/tests/post_object_suite_test.rs) ([`tests/s3tests/PORTED.md`](tests/s3tests/PORTED.md)).
-- **Not yet:** replication and erasure coding across nodes, bucket policies and ACLs, server-side encryption (all in #123's area issues).
+- **Access & Authorization:** Bucket policies (`?policy`, `?policyStatus`), bucket and object ACLs (`?acl`, canned ACLs, `x-amz-grant-*`), Object Ownership Controls (`?ownershipControls`, defaulting to `BucketOwnerEnforced` via `--default-bucket-ownership` / `AWANFS_DEFAULT_BUCKET_OWNERSHIP`), Public Access Block (`?publicAccessBlock`), and anonymous access governed by `authorize()` (#122, #151).
+- **Not yet:** replication and erasure coding across nodes, SSE-S3 and SSE-KMS (SSE-C is supported; the remaining items are in #123's area issues).
 
 ## 1. Executive Summary
 
-`s3-server` is a standalone, drop-in AWS S3-compatible object storage server implemented 100% in pure Rust. It combines:
+`awanfs` is a standalone, drop-in AWS S3-compatible object storage server implemented 100% in pure Rust. It combines:
 
 1. **64-Byte Columnar Struct-of-Arrays (`ObjectMeta`) Metadata Index:**
    - 1,000,000 objects indexed in ~40 MB of RAM.
@@ -119,7 +120,7 @@ cargo build --release
 ```bash
 # Port 9000, data in ./s3_data, requests must carry a SigV4 signature made with these keys
 AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
-  ./target/release/s3-server --port 9000 --data-dir ./s3_data
+  ./target/release/awanfs --port 9000 --data-dir ./s3_data
 ```
 - The server listens on `127.0.0.1` only. `--listen 0.0.0.0` (or `AWANFS_LISTEN`) opens it to the network.
 - HTTPS: `--cert cert.pem --key key.pem` (or `AWANFS_TLS_CERT`/`AWANFS_TLS_KEY`) serves TLS with HTTP/1.1 and HTTP/2 on the port, and no plain HTTP unless `--http-port <port>` adds a plain listener. A renewed certificate is picked up within 60 s of the files changing, or at once on SIGHUP (Unix); a broken file keeps the old certificate.
@@ -131,6 +132,14 @@ AWANFS_ACCESS_KEY=mykey AWANFS_SECRET_KEY=mysecret \
   A killed process (no power cut) loses nothing acknowledged in `group` or `strict`. In `fast`, an acknowledged write that sits after a gap (a failed write or an abandoned upload) survives a killed process only once the next background sync has run, because a restart steps over a gap through journal records, which a sync writes (#412). A clean stop (Ctrl-C, SIGTERM) syncs every volume first.
 - Startup reads each volume's needle headers and checks the payload CRC only of needles its journal does not record (#412). `--verify-payloads-at-boot` (or `AWANFS_VERIFY_PAYLOADS_AT_BOOT=1`) checks every payload instead: slower, reading every stored byte. **Upgrading from a build before #412:** stop the old server cleanly (Ctrl-C or SIGTERM), or start the new one once with `--verify-payloads-at-boot`. An older build wrote journal records before its syncs, so after a crash its journal can name a needle that never reached the disk whole.
 - Health probes and scrub report, without authentication: `GET /_awanfs/health/live` (200 while the process serves), `GET /_awanfs/health/ready` (200, or 503 with the reason), and `GET /_awanfs/scrub` (JSON report of the latest background scrub pass counts and any bad needles). `_` cannot appear in a bucket name, so these paths never shadow a bucket.
+- `--worker-threads <n>` (or `AWANFS_WORKER_THREADS`) sets the number of request worker threads. By default it is the number of cores the process may run on: on Windows the cores in its affinity mask, on Linux what `available_parallelism` reports (affinity and cgroup quota). The server prints the count and its source at startup (#456).
+- `awanfs --help` (or `-h`) lists every option. Every setting, flag and environment variable, with its default and what else it sets, is in `features.toml` (`[[setting]]`) and the Settings table of [`FEATURES.md`](FEATURES.md) (#494).
+- Compaction: on by default (`--auto-compaction on|off`, or `AWANFS_AUTO_COMPACTION`), every 10 minutes for volumes with at least 20% dead bytes; on Linux filesystems that support reflinks (XFS, Btrfs), live needles are cloned via `ioctl(FICLONERANGE)` without copying payload bytes, falling back automatically to sector-aligned read+write (at most `--compaction-rate <MB/s>`, or `AWANFS_COMPACTION_RATE_MB`, default `50`, `0` = no limit) on unsupported filesystems (ext4, tmpfs, Windows NTFS) or per-call errors (#104, #524).
+- `--region <name>` (or `AWANFS_REGION`, default `us-east-1`) is the region GetBucketLocation answers and CreateBucket's LocationConstraint must match.
+- The per-request log on stderr (one JSON line per request) is on by default; `AWANFS_LOG=off` turns it off.
+- `--per-bucket-metrics` (or `AWANFS_PER_BUCKET_METRICS=1`) keeps the `awanfs_bucket_*` gauges above 1000 buckets, where they stop by default.
+- `--allow-small-parts` accepts multipart parts under 5 MiB before the last one (off by default; for benchmarks).
+- Lifecycle rules are applied by a background sweep every 1/24 of a lifecycle day: hourly by default, so an object can outlive its expiration by up to an hour. A pass costs about 2.8 s of CPU per million objects under a rule (`measurements/2026-11-27-lifecycle-sweep-cost.md`, #486). `--lifecycle-day-seconds <n>` (test use only, default `86400`; the server warns when it is set) shortens the day, and the sweep with it, down to every 500 ms.
 - `--scrub-mib-per-sec <n>` (or `AWANFS_SCRUB_MIB_PER_SEC`, default `10`) caps the background needle scrub read rate in MiB/s; `0` disables the background scrub (#155).
 - Prometheus metrics, without authentication: `GET /_awanfs/metrics` (requests and latency per S3 operation, bytes in and out, volume use, payload cache hits, the disk and copy counters from `server/src/work.rs`, integrity counters `awanfs_read_checksum_failures_total`, `awanfs_corrupt_needles_total`, and `awanfs_scrub_pass_duration_seconds`, and `awanfs_log_lines_dropped_total`: the per-request log on stderr is written by a background thread, so a stderr nobody reads costs log lines, counted there, and never stalls requests).
 - Dashboards and alerts: `deploy/grafana/awanfs-dashboard.json` (Grafana) and `deploy/prometheus/alerts.yml` (Prometheus rules), both built on `/_awanfs/metrics`.
@@ -207,7 +216,7 @@ python benchmarks/run_warp_benchmark.py --sizes 64KiB,1MiB,1GiB,10GiB --concurre
 ## 5. Standalone Binary Distribution
 
 Pre-compiled standalone binaries with SHA-256 integrity verification:
-- `dist/s3-server-x86_64-windows.exe` (Windows x86_64 Release Binary)
+- `dist/awanfs-x86_64-windows.exe` (Windows x86_64 Release Binary)
 - `dist/SHA256SUMS.txt` (SHA-256 Checksum Manifest)
 
 The repository can be copied or shared standalone as a complete, independent Rust project.

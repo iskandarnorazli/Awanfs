@@ -3,7 +3,7 @@
     python3 scripts/check_profile.py
 
 Checks:
-  (a) .github/workflows/s3-tests.yml uses start_server.sh and has no s3-server
+  (a) .github/workflows/s3-tests.yml uses start_server.sh and has no awanfs
       invocation outside start_server.sh.
   (b) Every CLI flag and AWANFS_* env var in tests/s3tests/start_server.sh has a row
       in tests/s3tests/PROFILE.md, and vice versa.
@@ -50,12 +50,12 @@ def _strip_comments_and_continuations(text: str) -> str:
 
 
 def script_settings(script_text: str) -> Tuple[Set[str], Set[str]]:
-    """Extract (cli_flags, awanfs_env_vars) from the s3-server command in start_server.sh."""
+    """Extract (cli_flags, awanfs_env_vars) from the awanfs command in start_server.sh."""
     joined = _strip_comments_and_continuations(script_text)
     flags: Set[str] = set()
     envs: Set[str] = set()
     for line in joined.splitlines():
-        if '"$BIN"' in line or "s3-server" in line:
+        if '"$BIN"' in line or re.search(r"(?:^|[;&|\s'\"/])awanfs(?:\.exe)?(?=\s|$)", line):
             flags.update(re.findall(r"(?<!\S)(--[a-z0-9][a-z0-9-]*)", line))
             envs.update(re.findall(r"\b(AWANFS_[A-Z0-9_]+)=", line))
     return flags, envs
@@ -109,7 +109,7 @@ def map_skip_reasons(map_text: str) -> Set[str]:
 
 
 def check_workflow(workflow_text: str) -> List[str]:
-    """Verify s3-tests.yml uses start_server.sh and has no inline s3-server invocation."""
+    """Verify s3-tests.yml uses start_server.sh and has no inline awanfs invocation."""
     problems: List[str] = []
     used_script = False
     for lineno, line in enumerate(workflow_text.splitlines(), 1):
@@ -118,11 +118,11 @@ def check_workflow(workflow_text: str) -> List[str]:
             continue
         if "start_server.sh" in stripped:
             used_script = True
-        if "s3-server" in stripped:
-            if re.search(r"\bcargo\s+build\b.*--bin\s+s3-server\b", stripped):
+        if re.search(r"(?:^|[;&|\s'\"/])awanfs(?:\.exe)?(?=\s|$)", stripped):
+            if re.search(r"\bcargo\s+build\b.*--bin\s+awanfs\b", stripped):
                 continue
             problems.append(
-                f".github/workflows/s3-tests.yml:{lineno}: invokes s3-server outside start_server.sh"
+                f".github/workflows/s3-tests.yml:{lineno}: invokes awanfs outside start_server.sh"
             )
     if not used_script:
         problems.append(".github/workflows/s3-tests.yml: does not invoke start_server.sh")

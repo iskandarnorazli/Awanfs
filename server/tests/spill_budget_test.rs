@@ -24,12 +24,12 @@ impl Drop for Server {
 
 fn start(dir: &Path, extra: &[&str]) -> (Server, String, String) {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_s3-server"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_awanfs"));
     cmd.args(["--port", &port.to_string(), "--data-dir", dir.to_str().unwrap(), "--allow-anonymous"])
         .args(extra)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = cmd.spawn().expect("spawn s3-server");
+    let mut child = cmd.spawn().expect("spawn awanfs");
     let mut out = child.stdout.take().expect("piped stdout");
     let url = format!("http://127.0.0.1:{}", port);
     let server = Server(child);
@@ -61,7 +61,7 @@ fn start(dir: &Path, extra: &[&str]) -> (Server, String, String) {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("s3-server did not answer on {}. stdout so far:\n{}", url, text);
+    panic!("awanfs did not answer on {}. stdout so far:\n{}", url, text);
 }
 
 fn http_request(method: &str, url: &str, body: &[u8]) -> Option<String> {

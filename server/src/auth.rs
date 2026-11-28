@@ -21,7 +21,7 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    /// The library default, used by tests and embedders: anyone may call. The `s3-server`
+    /// The library default, used by tests and embedders: anyone may call. The `awanfs`
     /// binary never uses it unless `--allow-anonymous` is given.
     pub fn open() -> Self {
         AuthConfig { credentials: None, allow_anonymous: true }
@@ -200,7 +200,11 @@ pub fn authenticate(
     headers: &HeaderMap,
     now_sec: u64,
 ) -> Result<(), &'static str> {
-    authenticate_with(cfg, None, cache, method, raw_path, raw_query, headers, now_sec).map(|_| ())
+    let p = authenticate_with(cfg, None, cache, method, raw_path, raw_query, headers, now_sec)?;
+    if matches!(p, Principal::Anonymous) && !cfg.allow_anonymous {
+        return Err("AccessDenied");
+    }
+    Ok(())
 }
 
 /// The secret for an access key, and who it belongs to: the root pair, or a config user.
@@ -234,13 +238,20 @@ pub fn authenticate_with(
     headers: &HeaderMap,
     now_sec: u64,
 ) -> Result<Principal, &'static str> {
-    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+    let has_auth_header = headers.contains_key("authorization");
+    let auth_header = match headers.get("authorization") {
+        Some(v) => Some(v.to_str().map_err(|_| "AuthorizationHeaderMalformed")?),
+        None => None,
+    };
     let pairs = query_pairs(raw_query);
     let q = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
-    let presigned = q("X-Amz-Algorithm").is_some();
+    let presigned = q("X-Amz-Algorithm").is_some()
+        || q("X-Amz-Signature").is_some()
+        || q("X-Amz-Credential").is_some()
+        || raw_query.contains("X-Amz-Signature");
 
-    if auth_header.is_none() && !presigned {
-        return if cfg.allow_anonymous { Ok(Principal::Anonymous) } else { Err("AccessDenied") };
+    if !has_auth_header && !presigned {
+        return Ok(Principal::Anonymous);
     }
     if cfg.credentials.is_none() && iam.is_none_or(|i| i.is_empty()) {
         return if cfg.allow_anonymous { Ok(Principal::Anonymous) } else { Err("InvalidAccessKeyId") };
@@ -288,7 +299,7 @@ pub fn authenticate_with(
         let amz_date = q("X-Amz-Date").ok_or("AuthorizationQueryParametersError")?.to_string();
         let req_epoch = parse_iso8601_epoch(&amz_date).ok_or("AuthorizationQueryParametersError")?;
         let expires: u64 = q("X-Amz-Expires").and_then(|v| v.parse().ok()).ok_or("AuthorizationQueryParametersError")?;
-        if expires > 604_800 {
+        if expires == 0 || expires > 604_800 {
             return Err("AuthorizationQueryParametersError");
         }
         if now_sec > req_epoch + expires {

@@ -2,9 +2,9 @@
 //! reads and payload copies. Tests assert these counts per request type, so a change that
 //! adds a copy, a write or a sync fails CI on any machine, however fast it is.
 //!
-//! Not counted: the copy `http_body_util::Collected::to_bytes` makes when a request body
-//! arrives in several frames, and reads served from the page cache through the volume mmap
-//! (those are not system calls).
+//! Not counted: the copy of each frame into the request's body buffer when a body arrives in
+//! several frames, and reads served from the page cache through the volume mmap (those are not
+//! system calls). `body_regrowths` counts the times that buffer had to grow (#454).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,6 +20,8 @@ pub struct WorkCounters {
     payload_verify_bytes: AtomicU64,
     inflight_bytes: AtomicU64,
     peak_inflight_bytes: AtomicU64,
+    /// A buffered request body outgrew its buffer and was moved to a larger one (#454).
+    body_regrowths: AtomicU64,
 }
 
 /// Releases `bytes` from `WorkCounters::inflight_bytes` when dropped.
@@ -116,6 +118,15 @@ pub struct WorkSnapshot {
 }
 
 impl WorkCounters {
+    /// Times a buffered request body outgrew its buffer (#454).
+    pub fn body_regrowths(&self) -> u64 {
+        self.body_regrowths.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn body_regrowth(&self) {
+        self.body_regrowths.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn disk_write(&self, bytes: u64) {
         self.disk_writes.fetch_add(1, Ordering::Relaxed);
         self.disk_write_bytes.fetch_add(bytes, Ordering::Relaxed);

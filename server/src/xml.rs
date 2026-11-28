@@ -68,16 +68,20 @@ pub fn list_buckets_xml(
     buckets: &[(&str, &str)],
     prefix: Option<&str>,
     continuation_token: Option<&str>,
+    owner_id: &str,
+    owner_display_name: &str,
     request_id: &str,
 ) -> String {
-    let mut out = String::from(
+    let mut out = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
         <ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  \
           <Owner>\n    \
-            <ID>s3-storage-root</ID>\n    \
-            <DisplayName>root</DisplayName>\n  \
+            <ID>{}</ID>\n    \
+            <DisplayName>{}</DisplayName>\n  \
           </Owner>\n  \
-          <Buckets>\n"
+          <Buckets>\n",
+        xml_escape(owner_id),
+        xml_escape(owner_display_name)
     );
     for (name, created_at) in buckets {
         out.push_str("    <Bucket>\n");
@@ -110,6 +114,8 @@ pub struct S3ObjectEntry<'a> {
     pub last_modified: &'a str,
     pub etag: &'a str,
     pub size: u64,
+    pub owner_id: &'a str,
+    pub owner_display_name: &'a str,
 }
 
 /// ListObjectVersions for a bucket without versioning: each object is its only version, id
@@ -134,7 +140,11 @@ pub fn list_object_versions_xml(bucket: &str, prefix: &str, key_marker: &str, ma
         out.push_str(&format!("    <ETag>\"{}\"</ETag>\n", obj.etag));
         out.push_str(&format!("    <Size>{}</Size>\n", obj.size));
         out.push_str("    <StorageClass>STANDARD</StorageClass>\n");
-        out.push_str("    <Owner><ID>awanfs</ID><DisplayName>awanfs</DisplayName></Owner>\n");
+        out.push_str(&format!(
+            "    <Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner>\n",
+            xml_escape(obj.owner_id),
+            xml_escape(obj.owner_display_name)
+        ));
         out.push_str("  </Version>\n");
     }
     out.push_str("</ListVersionsResult>");
@@ -150,6 +160,8 @@ pub struct VersionListing {
     pub last_modified: String,
     pub etag: String,
     pub size: u64,
+    pub owner_id: String,
+    pub owner_display_name: String,
 }
 
 /// Parameters for `list_versions_xml`.
@@ -207,7 +219,11 @@ pub fn list_versions_xml(p: &ListVersionsParams<'_>) -> String {
             out.push_str(&format!("    <Size>{}</Size>\n", e.size));
             out.push_str("    <StorageClass>STANDARD</StorageClass>\n");
         }
-        out.push_str("    <Owner><ID>awanfs</ID><DisplayName>awanfs</DisplayName></Owner>\n");
+        out.push_str(&format!(
+            "    <Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner>\n",
+            xml_escape(&e.owner_id),
+            xml_escape(&e.owner_display_name)
+        ));
         out.push_str(&format!("  </{}>\n", tag));
     }
     for cp in p.common_prefixes {
@@ -244,7 +260,11 @@ fn contents_and_prefixes(out: &mut String, contents: &[S3ObjectEntry], prefixes:
         out.push_str(&format!("    <ETag>\"{}\"</ETag>\n", obj.etag));
         out.push_str(&format!("    <Size>{}</Size>\n", obj.size));
         if include_owner {
-            out.push_str("    <Owner><ID>awanfs</ID><DisplayName>awanfs</DisplayName></Owner>\n");
+            out.push_str(&format!(
+            "    <Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner>\n",
+            xml_escape(obj.owner_id),
+            xml_escape(obj.owner_display_name)
+        ));
         }
         out.push_str("    <StorageClass>STANDARD</StorageClass>\n");
         out.push_str("  </Contents>\n");

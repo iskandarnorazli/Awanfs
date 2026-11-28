@@ -1,6 +1,7 @@
 //! awan-storage/server/src/lib.rs
 //! High-Performance S3 Storage Server — Columnar SoA Index & Needle Storage Substrate
 
+pub mod acl;
 pub mod aws_chunked;
 pub mod body_timeout;
 pub mod bucket_config;
@@ -32,6 +33,7 @@ pub mod metrics;
 pub mod multipart;
 pub mod mvcc;
 pub mod ops;
+pub mod policy;
 pub mod precondition;
 pub mod profile;
 pub mod names;
@@ -54,13 +56,16 @@ pub mod auth;
 pub mod authz;
 pub mod sim;
 pub mod sim_gen;
+pub mod sim_harness;
 pub mod sim_model;
+pub mod sse;
 pub mod vfile;
 pub mod volume;
 pub mod stream_read;
 pub mod tagging;
 pub mod attrs;
 pub mod work;
+pub mod workers;
 pub mod xml;
 
 pub use aws_chunked::*;

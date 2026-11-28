@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Drives a fresh s3-server the way a user does (aws CLI) and keeps the evidence.
-#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle (default: all)
+# Drives a fresh awanfs the way a user does (aws CLI) and keeps the evidence.
+#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle access encryption (default: all)
 # Needs: a built server (cargo build --release --manifest-path server/Cargo.toml), the aws CLI, curl.
 # Evidence: verification/evidence/<UTC timestamp>/ (kept after cleanup). Exit 0 only if every journey passed.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="${AWANFS_BIN:-$ROOT/server/target/release/s3-server}"
+BIN="${AWANFS_BIN:-$ROOT/server/target/release/awanfs}"
 [ -x "$BIN" ] || [ -x "$BIN.exe" ] || { echo "no server binary at $BIN: run cargo build --release --manifest-path server/Cargo.toml"; exit 2; }
 command -v aws >/dev/null || { echo "the aws CLI is not installed"; exit 2; }
 EVID="$ROOT/verification/evidence/$(date -u +%Y%m%dT%H%M%SZ)"
@@ -27,8 +27,8 @@ check() { # name, command...
   if "$@" >>"$EVID/$name.txt" 2>&1; then echo "ok    $name"; pass=$((pass+1)); else echo "FAIL  $name (see $EVID/$name.txt)"; tail -n 15 "$EVID/$name.txt" | sed "s/^/      /"; fail=$((fail+1)); fi; }
 same() { cmp -s "$1" "$2"; }
 
-# Up, refusing unsigned requests (403), and answering the aws CLI's signed ones.
-doctor() { curl -s -o /dev/null -w '%{http_code}\n' "$URL/" | grep -q 403 && S3 list-buckets >/dev/null &&
+# Up, refusing unsigned write requests (403), and answering the aws CLI's signed ones.
+doctor() { curl -s -o /dev/null -w '%{http_code}\n' -X PUT "$URL/doctor-unsigned" | grep -q 403 && S3 list-buckets >/dev/null &&
   echo "server up on $PORT, pid $PID, data $DATA; unsigned 403, signed 200"; }
 
 # A journey declares its locals before its && chain: `A && local x; x=... && B` is two lists, and
@@ -259,13 +259,13 @@ j_restart() { local id e1 e2 a; echo "survives" >"$EVID/s.bin" && S3 put-object 
   S3 get-bucket-versioning --bucket verify-rv --query Status --output text | grep -qx Enabled &&
   S3 get-object --bucket verify-rv --key k --version-id "$a" "$EVID/srv.out" >/dev/null && same "$EVID/s.bin" "$EVID/srv.out" &&
   S3 head-bucket --bucket verify-bkt; }
-j_quickstart() { local qd qpid; qd="$EVID/qs" && mkdir -p "$qd/server/target/release" && ln -sfn "$BIN" "$qd/server/target/release/s3-server" && (
+j_quickstart() { local qd qpid; qd="$EVID/qs" && mkdir -p "$qd/server/target/release" && ln -sfn "$BIN" "$qd/server/target/release/awanfs" && (
   cd "$qd" || exit 1
   qpid=""
   cleanup_qs() { [ -n "${qpid:-}" ] && kill "$qpid" 2>/dev/null || true; [ -n "${qpid:-}" ] && wait "$qpid" 2>/dev/null || true; }
   trap cleanup_qs EXIT
   AWANFS_ACCESS_KEY=s3admin AWANFS_SECRET_KEY=s3secret \
-    ./server/target/release/s3-server --port 9000 --data-dir ./s3-data >"$EVID/quickstart-server.log" 2>&1 &
+    ./server/target/release/awanfs --port 9000 --data-dir ./s3-data >"$EVID/quickstart-server.log" 2>&1 &
   qpid=$!
   for _ in $(seq 1 100); do curl -sf http://127.0.0.1:9000/_awanfs/health/ready >/dev/null && break; sleep 0.1; done
   curl -sf http://127.0.0.1:9000/_awanfs/health/ready >/dev/null || exit 1
@@ -385,6 +385,49 @@ j_lifecycle() { local lc_data lc_port lc_url lc_pid="";
     done
     [ "$expired" -eq 1 ]
   ); }
+j_access() { local code;
+  S3 create-bucket --bucket verify-access &&
+  echo "public-via-policy" >"$EVID/access.bin" &&
+  S3 put-object --bucket verify-access --key pub.txt --body "$EVID/access.bin" >/dev/null &&
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/verify-access/pub.txt") && [ "$code" = "403" ] &&
+  S3 put-bucket-policy --bucket verify-access --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::verify-access/*"}]}' &&
+  S3 get-bucket-policy-status --bucket verify-access --query 'PolicyStatus.IsPublic' --output text | grep -qi true &&
+  curl -sf "$URL/verify-access/pub.txt" | grep -qx "public-via-policy" &&
+  S3 put-public-access-block --bucket verify-access --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true &&
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/verify-access/pub.txt") && [ "$code" = "403" ] &&
+  S3 delete-public-access-block --bucket verify-access &&
+  S3 delete-bucket-policy --bucket verify-access &&
+  S3 create-bucket --bucket verify-acl-own --object-ownership ObjectWriter >/dev/null &&
+  S3 put-bucket-ownership-controls --bucket verify-acl-own --ownership-controls 'Rules=[{ObjectOwnership=ObjectWriter}]' &&
+  S3 get-bucket-ownership-controls --bucket verify-acl-own --query 'OwnershipControls.Rules[0].ObjectOwnership' --output text | grep -qx ObjectWriter &&
+  S3 put-bucket-acl --bucket verify-acl-own --acl public-read &&
+  S3 get-bucket-acl --bucket verify-acl-own --query 'Grants[?Grantee.URI!=null].Permission' --output text | grep -q READ &&
+  S3 put-bucket-acl --bucket verify-acl-own --acl private &&
+  S3 delete-bucket-ownership-controls --bucket verify-acl-own; }
+j_encryption() { local upid p1 p2 k1 k2;
+  k1="pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=" && k2="6b+WOZ1T3cqZMxgThRcXAQBrS5mXKdDUphvpxptl9/4=" &&
+  S3 create-bucket --bucket verify-ssec &&
+  echo "sse-c secret payload" >"$EVID/ssec.bin" &&
+  S3 put-object --bucket verify-ssec --key secret --body "$EVID/ssec.bin" --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" >"$EVID/ssec-put.json" &&
+  grep -q '"SSECustomerAlgorithm": "AES256"' "$EVID/ssec-put.json" &&
+  ! S3 get-object --bucket verify-ssec --key secret "$EVID/ssec-nokey.out" 2>"$EVID/ssec-nokey.err" &&
+  ! S3 head-object --bucket verify-ssec --key secret 2>/dev/null &&
+  ! S3 get-object --bucket verify-ssec --key secret --sse-customer-algorithm AES256 --sse-customer-key "$k2" --sse-customer-key-md5 "arxBvwY2V4SiOne6yppVPQ==" "$EVID/ssec-badkey.out" 2>/dev/null &&
+  S3 get-object --bucket verify-ssec --key secret --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" "$EVID/ssec.out" >"$EVID/ssec-get.json" &&
+  same "$EVID/ssec.bin" "$EVID/ssec.out" &&
+  S3 get-object --bucket verify-ssec --key secret --range "bytes=6-11" --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" "$EVID/ssec-range.out" >/dev/null &&
+  grep -qx "secret" "$EVID/ssec-range.out" &&
+  S3 copy-object --bucket verify-ssec --key rotated --copy-source "verify-ssec/secret" --copy-source-sse-customer-algorithm AES256 --copy-source-sse-customer-key "$k1" --copy-source-sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" --sse-customer-algorithm AES256 --sse-customer-key "$k2" --sse-customer-key-md5 "arxBvwY2V4SiOne6yppVPQ==" >/dev/null &&
+  S3 get-object --bucket verify-ssec --key rotated --sse-customer-algorithm AES256 --sse-customer-key "$k2" --sse-customer-key-md5 "arxBvwY2V4SiOne6yppVPQ==" "$EVID/ssec-rot.out" >/dev/null &&
+  same "$EVID/ssec.bin" "$EVID/ssec-rot.out" &&
+  upid=$(S3 create-multipart-upload --bucket verify-ssec --key mp-ssec --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" --query UploadId --output text) &&
+  head -c 5242880 /dev/urandom >"$EVID/ssec-p1.bin" &&
+  p1=$(S3 upload-part --bucket verify-ssec --key mp-ssec --part-number 1 --upload-id "$upid" --body "$EVID/ssec-p1.bin" --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" --query ETag --output text) &&
+  p2=$(S3 upload-part --bucket verify-ssec --key mp-ssec --part-number 2 --upload-id "$upid" --body "$EVID/ssec.bin" --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" --query ETag --output text) &&
+  S3 complete-multipart-upload --bucket verify-ssec --key mp-ssec --upload-id "$upid" --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$p1},{\"PartNumber\":2,\"ETag\":$p2}]}" >/dev/null &&
+  S3 get-object --bucket verify-ssec --key mp-ssec --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" "$EVID/ssec-mp.out" >/dev/null &&
+  cat "$EVID/ssec-p1.bin" "$EVID/ssec.bin" >"$EVID/ssec-mp.want" &&
+  same "$EVID/ssec-mp.want" "$EVID/ssec-mp.out"; }
 
 # Refuse to run a journey whose && chain is split by a `local x;` (see the note above md5q).
 masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:]]+local [^;]*;|&& *local ' || true)
@@ -392,7 +435,7 @@ masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:
 
 start || exit 1
 check doctor doctor
-features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle)
+features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle access encryption)
 [[ " ${features[*]} " == *" buckets "* ]] || check buckets j_buckets
 for f in "${features[@]}"; do check "$f" "j_$f"; done
 ls -la "$DATA" >"$EVID/data-dir.txt" 2>&1

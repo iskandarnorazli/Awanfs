@@ -334,7 +334,7 @@ proptest! {
                         if !name_to_id.contains_key(&name) {
                             let id = next_id;
                             next_id += 1;
-                            let st = bucket_step(BucketState::absent(), BucketEvent::Create { caller_id: 0, is_us_east_1: true }).unwrap();
+                            let st = bucket_step(BucketState::absent(), BucketEvent::Create { caller_id: 0, is_us_east_1: true, acl_matches: true }).unwrap();
                             assert_eq!(st.status, BucketStatus::Active);
                             store.apply_bucket_create(id, &name, 0, "root", "").unwrap();
                             name_to_id.insert(name, id);

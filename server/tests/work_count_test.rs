@@ -181,3 +181,36 @@ async fn streamed_put_is_digested_while_it_is_written() {
     let res = s.client.get(format!("{}/bkt/big", s.url)).send().await.unwrap();
     assert!(res.bytes().await.unwrap() == payload, "the streamed object reads back");
 }
+
+/// #454: a buffered PUT with a Content-Length is read into a buffer of that size, so a body
+/// that arrives in many frames is never moved to a larger buffer. Without the size the buffer
+/// doubled from the first frame, copying the body again and faulting in fresh pages.
+#[tokio::test]
+async fn a_put_body_in_many_frames_is_read_into_one_buffer() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let s = Server::start("frames").await;
+    let payload = pattern(1024 * 1024, 5);
+    let addr = s.url.trim_start_matches("http://").to_string();
+    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    sock.set_nodelay(true).unwrap();
+    let head = format!(
+        "PUT /bkt/frames HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        addr,
+        payload.len()
+    );
+    let before = s.state.work.body_regrowths();
+    sock.write_all(head.as_bytes()).await.unwrap();
+    for chunk in payload.chunks(16 * 1024) {
+        sock.write_all(chunk).await.unwrap();
+        sock.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    let mut answer = Vec::new();
+    sock.read_to_end(&mut answer).await.unwrap();
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(answer.starts_with("HTTP/1.1 200"), "{}", answer);
+    assert_eq!(s.state.work.body_regrowths() - before, 0, "the body buffer never grew");
+
+    let got = s.client.get(format!("{}/bkt/frames", s.url)).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(&got[..], &payload[..]);
+}

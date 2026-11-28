@@ -61,7 +61,14 @@ async fn signed_server() -> Srv {
 }
 
 async fn anonymous_server() -> Srv {
-    server(AuthConfig::open()).await
+    let mut state = S3ServiceState::new();
+    state.auth = AuthConfig::open();
+    // #122: these tests substitute anonymous access for a public-read-write ACL bucket, so they
+    // create ACL-enabled buckets rather than BucketOwnerEnforced.
+    state.default_bucket_ownership = s3_server::acl::BucketOwnership::ObjectWriter;
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let h = start_s3_reactor(addr, Arc::new(state)).await.unwrap();
+    Srv { host: h.local_addr.to_string(), _h: h }
 }
 
 /// A SigV4 header-signed request, for the bucket set-up and the read-backs.
