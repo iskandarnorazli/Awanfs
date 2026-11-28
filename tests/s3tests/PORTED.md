@@ -40,6 +40,7 @@ Some ceph s3-tests cannot run against AwanFS as written, for a reason that is no
 | `test_s3::test_post_object_tags_anonymous_request` | unsigned form to a `public-read-write` bucket (canned ACLs are #122); runs with anonymous access | `server/tests/post_object_suite_test.rs::test_post_object_tags_anonymous_request` |
 | `test_s3::test_post_object_tags_authenticated_request` | SigV2 form signature | `server/tests/post_object_suite_test.rs::test_post_object_tags_authenticated_request` |
 | `test_s3::test_post_object_upload_checksum` | SigV2 form signature | `server/tests/post_object_suite_test.rs::test_post_object_upload_checksum` |
+| `test_s3::test_encryption_sse_c_post_object_authenticated_request` | SigV2 form signature | `server/tests/sse_c_test.rs::test_encryption_sse_c_post_object_authenticated_request` |
 
 
 ## SigV2 request signing (`sigv2`, #433)

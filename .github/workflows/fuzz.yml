@@ -29,6 +29,10 @@ on:
       - "server/src/post_object.rs"
       - "server/src/precondition.rs"
       - "server/src/s3_api.rs"
+      - "server/src/sse.rs"
+      - "server/src/policy.rs"
+      - "server/src/acl.rs"
+      - "server/src/authz.rs"
       - "server/src/segment.rs"
       - "server/src/sim.rs"
       - "server/src/sim_gen.rs"
@@ -55,7 +59,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, attrs_values, form_upload, post_policy, cors_xml, object_lock_xml, request_xml, lifecycle_config_xml, tagging_xml, s3_target, iso8601, traceparent, version_id, parse_size, checksum_headers, list_buckets_query, raw_s3_key, classify, list_objects_query, object_attributes_header, meta_segment, copy_source, precondition_headers, sim_storage ]
+        target: [ range, aws_chunked, sigv4, lifecycle_xml, attrs_block, attrs_values, form_upload, post_policy, cors_xml, object_lock_xml, request_xml, lifecycle_config_xml, tagging_xml, s3_target, iso8601, traceparent, version_id, parse_size, checksum_headers, list_buckets_query, raw_s3_key, classify, list_objects_query, object_attributes_header, meta_segment, copy_source, precondition_headers, sim_storage, sse_headers, sse_payload, bucket_policy, acl_xml ]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

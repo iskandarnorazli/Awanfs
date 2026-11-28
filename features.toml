@@ -257,6 +257,23 @@ mint = [
   "minio-js::Set Encryption on a bucket:",
   "minio-js::Stat of an object to check for default encryption applied on a bucket:",
 ]
+drive = ["encryption"]
+fuzz = ["sse_headers", "sse_payload"]
+server_tests = [
+  "server/tests/sse_c_test.rs::header_conflicts_and_malformed_ssec_are_refused",
+  "server/tests/sse_c_test.rs::single_part_ssec_roundtrip_all_boundaries_and_errors",
+  "server/tests/sse_c_test.rs::plaintext_and_customer_key_never_appear_on_disk_or_in_logs",
+  "server/tests/sse_c_test.rs::range_get_touches_only_overlapped_chunks",
+  "server/tests/sse_c_test.rs::multipart_ssec_resend_distinct_nonce_sparse_parts_and_fsm_refusals",
+  "server/tests/sse_c_test.rs::copy_object_and_upload_part_copy_matrix_including_streamed_and_self_copy",
+  "server/tests/sse_c_test.rs::restart_recovery_compaction_and_zstd_skip_preserve_ssec",
+  "server/tests/sse_c_test.rs::test_encryption_sse_c_post_object_authenticated_request",
+  "server/tests/sse_c_proptest.rs::decrypt_encrypt_roundtrip_and_arbitrary_ranges",
+  "server/tests/sse_c_proptest.rs::bit_flip_truncation_and_chunk_swap_always_fail",
+]
+
+[feature.ported]
+"test_s3::test_encryption_sse_c_post_object_authenticated_request" = "server/tests/sse_c_test.rs::test_encryption_sse_c_post_object_authenticated_request"
 
 [[feature]]
 id = "lifecycle"

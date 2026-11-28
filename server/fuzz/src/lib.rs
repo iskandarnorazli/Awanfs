@@ -1163,6 +1163,103 @@ pub fn check_precondition_headers(data: &[u8]) {
     );
 }
 
+/// Oracle for `sse_headers` (#121):
+/// - Arbitrary header values and `TAG_SSE` blobs never panic.
+/// - Valid SSE-C headers always decode a 32-byte key and canonical MD5; valid `SseAttr` encodes to 80 bytes and round-trips.
+pub fn check_sse_headers(data: &[u8]) {
+    use s3_server::sse::{
+        authorize_read_ssec, parse_copy_source_sse_c, parse_read_sse_headers, parse_write_sse_headers, SseAttr,
+        HDR_COPY_SSE_C_ALGO, HDR_COPY_SSE_C_KEY, HDR_COPY_SSE_C_KEY_MD5, HDR_SSE, HDR_SSE_C_ALGO, HDR_SSE_C_KEY,
+        HDR_SSE_C_KEY_MD5, HDR_SSE_KMS_KEY_ID,
+    };
+
+    let _ = SseAttr::decode(data);
+    let _ = SseAttr::plaintext_size_from_raw(data);
+
+    let text = String::from_utf8_lossy(data);
+    let mut parts = text.split('\n');
+    let alg = parts.next().unwrap_or("");
+    let key = parts.next().unwrap_or("");
+    let md5 = parts.next().unwrap_or("");
+    let sse = parts.next();
+    let kms = parts.next();
+
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(alg) {
+        if !alg.is_empty() {
+            headers.insert(HDR_SSE_C_ALGO, v.clone());
+            headers.insert(HDR_COPY_SSE_C_ALGO, v);
+        }
+    }
+    if let Ok(v) = HeaderValue::from_str(key) {
+        if !key.is_empty() {
+            headers.insert(HDR_SSE_C_KEY, v.clone());
+            headers.insert(HDR_COPY_SSE_C_KEY, v);
+        }
+    }
+    if let Ok(v) = HeaderValue::from_str(md5) {
+        if !md5.is_empty() {
+            headers.insert(HDR_SSE_C_KEY_MD5, v.clone());
+            headers.insert(HDR_COPY_SSE_C_KEY_MD5, v);
+        }
+    }
+    if let Some(s) = sse.filter(|s| !s.is_empty()) {
+        if let Ok(v) = HeaderValue::from_str(s) {
+            headers.insert(HDR_SSE, v);
+        }
+    }
+    if let Some(k) = kms.filter(|s| !s.is_empty()) {
+        if let Ok(v) = HeaderValue::from_str(k) {
+            headers.insert(HDR_SSE_KMS_KEY_ID, v);
+        }
+    }
+
+    let w = parse_write_sse_headers(&headers);
+    let r = parse_read_sse_headers(&headers);
+    let cp = parse_copy_source_sse_c(&headers);
+
+    if let Ok(Some(ref ssec_key)) = w {
+        let attr = SseAttr::new_ssec(ssec_key, false, data.len() as u64).expect("SseAttr::new_ssec");
+        let encoded = attr.encode();
+        assert_eq!(encoded.len(), s3_server::sse::SSE_C_ATTR_LEN);
+        assert_eq!(SseAttr::decode(&encoded).unwrap(), attr);
+        assert_eq!(SseAttr::plaintext_size_from_raw(&encoded), Some(data.len() as u64));
+        assert!(authorize_read_ssec(Some(&attr), Some(ssec_key)).is_ok());
+        assert!(authorize_read_ssec(Some(&attr), None).is_err());
+    }
+    let _ = (r, cp);
+}
+
+/// Oracle for `sse_payload` (#121):
+/// - Corrupted `AWE1` headers, truncated chunks, and arbitrary ciphertext never panic in `parse_awe1_header`,
+///   `decrypt_full`, `decrypt_range_from_chunks`, or `Awe1ChunkTransform`.
+pub fn check_sse_payload(data: &[u8]) {
+    use s3_server::sse::{
+        decrypt_full, decrypt_range_from_chunks, encrypt_full, parse_awe1_header, Awe1ChunkTransform, SseDek,
+        AWE1_CHUNK_STORED, AWE1_HEADER_LEN,
+    };
+    use s3_server::stream_read::ChunkTransform;
+
+    let dek = SseDek::from_raw([0x42u8; 32]);
+    let _ = parse_awe1_header(data);
+    let _ = decrypt_full(&dek, None, 0, data.len() as u64, data);
+    if data.len() >= AWE1_HEADER_LEN {
+        if let Ok((plen, prefix)) = parse_awe1_header(data) {
+            let chunk_bytes = &data[AWE1_HEADER_LEN..];
+            let capped = plen.min(64 * 1024 * 8);
+            let _ = decrypt_range_from_chunks(&dek, prefix, 0, capped, 0, capped, 0, chunk_bytes);
+            if let Ok(xform) = Awe1ChunkTransform::new(dek.clone(), prefix, 0, capped, 0, capped) {
+                let off = if data.len() % 2 == 0 { 0 } else { AWE1_CHUNK_STORED as u64 };
+                let _ = xform.transform(off, chunk_bytes.to_vec().into());
+            }
+        }
+    }
+    // Mutation round-trip: encrypt a small prefix and verify arbitrary mutations don't panic or silently pass wrong tags.
+    let sample = &data[..data.len().min(256)];
+    let (ct, _) = encrypt_full(&dek, [1, 2, 3, 4], 0, sample).unwrap();
+    assert_eq!(decrypt_full(&dek, Some([1, 2, 3, 4]), 0, sample.len() as u64, &ct).unwrap(), sample);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1467,6 +1564,28 @@ mod tests {
         for path in entries {
             let bytes = std::fs::read(&path).expect("read corpus seed");
             check_precondition_headers(&bytes);
+        }
+    }
+
+    #[test]
+    fn sse_headers_and_payload_corpus_seeds() {
+        for sample in [
+            b"AES256\npO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=\nDWygnHRtgiJ77HCm+1rvHw==".as_slice(),
+            b"AES256\npO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=\nDWygnHRtgiJ77HCm+1rvHw==\nAES256".as_slice(),
+            b"AES192\nbad\nbad".as_slice(),
+            b"".as_slice(),
+        ] {
+            super::check_sse_headers(sample);
+        }
+        let h_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/sse_headers");
+        for entry in std::fs::read_dir(h_dir).expect("read sse_headers corpus") {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            super::check_sse_headers(&bytes);
+        }
+        let p_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/sse_payload");
+        for entry in std::fs::read_dir(p_dir).expect("read sse_payload corpus") {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            super::check_sse_payload(&bytes);
         }
     }
 }

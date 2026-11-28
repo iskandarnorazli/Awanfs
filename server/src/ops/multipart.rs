@@ -26,8 +26,18 @@ use crate::xml::s3_error_xml;
 
 use super::object::{
     find_version, finish_version_put, format_object_etag, last_modified_secs_from_ms, last_modified_secs_from_ns, no_such_version,
-    precondition_failure_response, version_etag,
+    precondition_failure_response, sse_error_response, version_etag, with_sse_header_pairs, with_sse_headers,
 };
+
+fn upload_sse_refusal(r: crate::fsm::Refusal, key: &str, req_id: &str) -> Response<ResponseBody> {
+    let status = StatusCode::from_u16(r.status).unwrap_or(StatusCode::BAD_REQUEST);
+    let xml = s3_error_xml(r.code, r.why, key, req_id);
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/xml")
+        .body(full_body(Bytes::from(xml)))
+        .unwrap()
+}
 
 pub async fn list_multipart_uploads(
     state: Arc<S3ServiceState>,
@@ -193,6 +203,17 @@ pub async fn create_multipart_upload(
     } else {
         None
     };
+    let write_sse_key = match crate::sse::parse_write_sse_headers(headers) {
+        Ok(k) => k,
+        Err(e) => return Ok(sse_error_response(e, key, false)),
+    };
+    let sse_attr = match write_sse_key {
+        Some(ref k) => match crate::sse::SseAttr::new_ssec(k, true, 0) {
+            Ok(a) => Some(a),
+            Err(e) => return Ok(internal_error_response(key, &format!("could not initialize SSE-C: {}", e))),
+        },
+        None => None,
+    };
     let mut attrs = match super::object::request_attrs_map(headers, key, None) {
         Ok(a) => a,
         Err(resp) => return Ok(resp),
@@ -208,7 +229,7 @@ pub async fn create_multipart_upload(
         Ok(t) => t,
         Err(resp) => return Ok(resp),
     };
-    let upload_id = match state.multipart.create_upload(bucket, b_id, key) {
+    let upload_id = match state.multipart.create_upload_with_sse(bucket, b_id, key, sse_attr.clone()) {
         Ok(id) => id,
         Err(e) => return Ok(internal_error_response(key, &format!("could not start the upload: {}", e))),
     };
@@ -224,9 +245,12 @@ pub async fn create_multipart_upload(
         state.multipart.set_upload_tags(&upload_id, tags);
     }
     let xml = initiate_multipart_upload_result_xml(bucket, key, &upload_id);
-    let mut resp = Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/xml");
+    let mut resp = with_sse_headers(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/xml"),
+        sse_attr.as_ref(),
+    );
     if let (Some((alg, _)), Some(ref ct)) = (&req_cksum, &cksum_type) {
         resp = resp
             .header("x-amz-checksum-algorithm", alg.name())
@@ -269,6 +293,18 @@ pub async fn upload_part(
 
     let is_chunked = crate::auth::is_aws_chunked(headers);
     let signed_headers = headers.clone();
+    let req_sse = match crate::sse::parse_write_sse_headers(&signed_headers) {
+        Ok(k) => k,
+        Err(e) => return Ok(sse_error_response(e, key, false)),
+    };
+    let upload_sse = match state.multipart.check_upload_sse(
+        upload_id,
+        crate::multipart::UploadSseOp::UploadPart,
+        req_sse.as_ref(),
+    ) {
+        Ok(s) => s,
+        Err(r) => return Ok(upload_sse_refusal(r, key, "req-up-part")),
+    };
     let upload_info = state.multipart.upload_checksum_info(upload_id);
     let req_checksum = match crate::checksum::requested_checksum(&signed_headers) {
         Ok(Some(c)) => Some(c),
@@ -307,24 +343,51 @@ pub async fn upload_part(
         let _ = recycle_tx.try_send(crate::work::InflightBuf::with_capacity(&state.work, PART_COALESCE));
         let mp_for_task = Arc::clone(&state.multipart);
         let uid_for_task = upload_id.to_string();
+        let dek_for_task = upload_sse.as_ref().map(|(_, d)| d.clone());
         let mut writer_task = Some(tokio::task::spawn_blocking(
             move || -> Result<Option<std::path::PathBuf>, (&'static str, String)> {
+                let mut enc_writer = match dek_for_task {
+                    Some(ref dek) => {
+                        let part_prefix = crate::sse::random_bytes::<4>()
+                            .map_err(|e| ("InternalError", format!("SSE-C init failed: {}", e)))?;
+                        Some(
+                            crate::sse::Awe1EncryptWriter::new(dek, part_prefix, part_num, len)
+                                .map_err(|e| ("InternalError", format!("SSE-C init failed: {}", e)))?,
+                        )
+                    }
+                    None => None,
+                };
                 let mut writer = mp_for_task
                     .begin_part(&uid_for_task, part_num)
                     .map_err(|e| ("InternalError", format!("could not store the part: {}", e)))?;
+                let mut plain_fed = 0u64;
                 while let Some(msg) = rx.blocking_recv() {
                     match msg {
                         PartMsg::Data(mut buf) => {
-                            if writer.written() + buf.len() as u64 > len {
+                            if plain_fed + buf.len() as u64 > len {
                                 return Err(("IncompleteBody", "more bytes than the declared length".to_string()));
                             }
-                            if let Err(e) = writer.write_coalesced(&buf) {
+                            plain_fed += buf.len() as u64;
+                            if let Some(ew) = enc_writer.as_mut() {
+                                match ew.write(&buf, &mut |ct| writer.write_coalesced(ct)) {
+                                    Ok(()) => {}
+                                    Err(Ok(e)) => return Err(("InternalError", format!("SSE-C encrypt failed: {}", e))),
+                                    Err(Err(e)) => return Err(("InternalError", format!("could not store the part: {}", e))),
+                                }
+                            } else if let Err(e) = writer.write_coalesced(&buf) {
                                 return Err(("InternalError", format!("could not store the part: {}", e)));
                             }
                             buf.clear();
                             let _ = recycle_tx.try_send(buf);
                         }
                         PartMsg::Finish => {
+                            if let Some(ew) = enc_writer.take() {
+                                match ew.finish(|ct| writer.write_coalesced(ct)) {
+                                    Ok(_) => {}
+                                    Err(Ok(e)) => return Err(("InternalError", format!("SSE-C finish failed: {}", e))),
+                                    Err(Err(e)) => return Err(("InternalError", format!("could not store the part: {}", e))),
+                                }
+                            }
                             let p = writer
                                 .finish()
                                 .map_err(|e| ("InternalError", format!("could not store the part: {}", e)))?;
@@ -342,6 +405,7 @@ pub async fn upload_part(
             .map(|h| h.to_ascii_lowercase());
         let mut sha = declared_sha.as_ref().map(|_| sha2::Sha256::new());
         let mut md5 = Some(Md5::new());
+        let mut sse_etag = upload_sse.as_ref().map(|(_, d)| crate::sse::SsecPartEtag::new(d, part_num));
         let mut cksum_hasher = req_checksum.as_ref().map(|(alg, _)| crate::checksum::Checksum::new(*alg));
         let mut body = body;
         let cache = &state.sigv4_cache;
@@ -376,6 +440,9 @@ pub async fn upload_part(
                                         total_fed += d.len() as u64;
                                         if let Some(m) = md5.as_mut() {
                                             m.update(d);
+                                        }
+                                        if let Some(e) = sse_etag.as_mut() {
+                                            e.update(d);
                                         }
                                         if let Some(h) = cksum_hasher.as_mut() {
                                             h.update(d);
@@ -583,17 +650,25 @@ pub async fn upload_part(
             }
         }
         let staged_path = staged_path.expect("Done state guarantees staged_path");
-        let raw_md5: [u8; 16] = md5.take().expect("md5 hasher present").finalize().into();
+        let raw_md5: [u8; 16] = if let Some(eh) = sse_etag.take() {
+            let _ = md5.take();
+            eh.finish()
+        } else {
+            md5.take().expect("md5 hasher present").finalize().into()
+        };
         let hi = u64::from_be_bytes(raw_md5[0..8].try_into().unwrap());
         let lo = u64::from_be_bytes(raw_md5[8..16].try_into().unwrap());
         let hex: String = raw_md5.iter().map(|b| format!("{:02x}", b)).collect();
         return Ok(
             match state.multipart.upload_part(upload_id, part_num, 0, len, raw_md5, hi, lo, hex.clone(), Some(staged_path)) {
                 Ok(_) => {
-                    let mut b = Response::builder()
-                        .status(StatusCode::OK)
-                        .header(ETAG, format!("\"{}\"", hex))
-                        .header(CONTENT_LENGTH, "0");
+                    let mut b = with_sse_headers(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(ETAG, format!("\"{}\"", hex))
+                            .header(CONTENT_LENGTH, "0"),
+                        upload_sse.as_ref().map(|(a, _)| a),
+                    );
                     if let Some((alg, val)) = stream_cksum_out {
                         state.multipart.set_part_checksum(upload_id, part_num, alg, val.clone());
                         b = b.header(alg.header_name(), val);
@@ -669,10 +744,27 @@ pub async fn upload_part(
     } else {
         None
     };
-    let (hi, lo, hex, raw_md5) = compute_md5(&decoded_bytes);
+    let (hi, lo, hex, raw_md5, write_bytes) = if let Some((_, ref dek)) = upload_sse {
+        let part_prefix = match crate::sse::random_bytes::<4>() {
+            Ok(p) => p,
+            Err(e) => return Ok(internal_error_response(key, &format!("SSE-C init failed: {}", e))),
+        };
+        let (ct, _) = match crate::sse::encrypt_full(dek, part_prefix, part_num, &decoded_bytes) {
+            Ok(r) => r,
+            Err(e) => return Ok(internal_error_response(key, &format!("SSE-C encrypt failed: {}", e))),
+        };
+        let raw_md5 = crate::sse::ssec_part_etag(dek, part_num, &decoded_bytes);
+        let hi = u64::from_be_bytes(raw_md5[0..8].try_into().unwrap());
+        let lo = u64::from_be_bytes(raw_md5[8..16].try_into().unwrap());
+        let hex: String = raw_md5.iter().map(|b| format!("{:02x}", b)).collect();
+        (hi, lo, hex, raw_md5, Bytes::from(ct))
+    } else {
+        let (hi, lo, hex, raw_md5) = compute_md5(&decoded_bytes);
+        (hi, lo, hex, raw_md5, decoded_bytes.clone())
+    };
+    let plain_len = decoded_bytes.len() as u64;
     let mp_for_task = Arc::clone(&state.multipart);
     let uid_for_task = upload_id.to_string();
-    let write_bytes = decoded_bytes.clone();
     let staged_path = match tokio::task::spawn_blocking(move || {
         mp_for_task.write_staged_part(&uid_for_task, part_num, &write_bytes)
     })
@@ -688,7 +780,7 @@ pub async fn upload_part(
         upload_id,
         part_num,
         vol_offset,
-        decoded_bytes.len() as u64,
+        plain_len,
         raw_md5,
         hi,
         lo,
@@ -696,10 +788,13 @@ pub async fn upload_part(
         staged_path,
     ) {
         Ok(_) => {
-            let mut b = Response::builder()
-                .status(StatusCode::OK)
-                .header(ETAG, format!("\"{}\"", hex))
-                .header(CONTENT_LENGTH, "0");
+            let mut b = with_sse_headers(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(ETAG, format!("\"{}\"", hex))
+                    .header(CONTENT_LENGTH, "0"),
+                upload_sse.as_ref().map(|(a, _)| a),
+            );
             if let Some((alg, val)) = buf_cksum_out {
                 state.multipart.set_part_checksum(upload_id, part_num, alg, val.clone());
                 b = b.header(alg.header_name(), val);
@@ -733,6 +828,10 @@ pub async fn complete_multipart_upload(
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let upload_id = &query_map["uploadId"];
+    let req_sse = match crate::sse::parse_write_sse_headers(headers) {
+        Ok(k) => k,
+        Err(e) => return Ok(sse_error_response(e, key, false)),
+    };
     let (body_bytes, _body_guard) = match read_body_admitted(&state.body_budget, &state.work, body, MAX_XML_BODY, None, state.body_idle_timeout(), path).await? {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
@@ -808,10 +907,13 @@ pub async fn complete_multipart_upload(
                 &cached.location,
                 cached.checksum.as_ref().map(|(a, ct, v)| (*a, ct.as_str(), v.as_str())),
             );
-            let mut resp = Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/xml")
-                .header(ETAG, format!("\"{}\"", cached.composite_etag));
+            let mut resp = with_sse_header_pairs(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .header(ETAG, format!("\"{}\"", cached.composite_etag)),
+                &cached.sse_headers,
+            );
             if let Some(ref v) = cached.version_id {
                 resp = resp.header("x-amz-version-id", v.as_str());
             }
@@ -822,6 +924,14 @@ pub async fn complete_multipart_upload(
         }
     }
 
+    let complete_sse = match state.multipart.check_upload_sse(
+        upload_id,
+        crate::multipart::UploadSseOp::Complete,
+        req_sse.as_ref(),
+    ) {
+        Ok(s) => s,
+        Err(r) => return Ok(upload_sse_refusal(r, key, "req-cmp-part")),
+    };
     let declared_pairs: Vec<(u32, String)> = declared_parts.iter().map(|(n, e, _)| (*n, e.clone())).collect();
     match state.multipart.prepare_complete(upload_id, &declared_pairs) {
         Ok((composite_etag, total_size, extents)) => {
@@ -846,11 +956,21 @@ pub async fn complete_multipart_upload(
                     let state_c = Arc::clone(&state);
                     let extents_c = extents.clone();
                     let key_c = key.to_string();
+                    let dek_c = complete_sse.as_ref().map(|(_, d)| d.clone());
                     let res = tokio::task::spawn_blocking(move || -> Result<String, crate::volume::VolumeError> {
                         let mut full_hasher = crate::checksum::Checksum::new(alg);
                         let chunk_len = crate::stream_read::read_chunk();
                         let mut buf = vec![0u8; chunk_len];
-                        for ext in &extents_c {
+                        for (idx, ext) in extents_c.iter().enumerate() {
+                            if let Some(ref dek) = dek_c {
+                                let actual_pn = crate::sse::part_number_from_staged_path(
+                                    ext.staged_path.as_deref(),
+                                    (idx + 1) as u32,
+                                );
+                                let bytes = state_c.read_encrypted_part_bytes(b_id, &key_c, ext, actual_pn, dek)?;
+                                full_hasher.update(&bytes);
+                                continue;
+                            }
                             if total_size <= crate::s3_api::VERIFY_WHILE_SENDING_MIN
                                 && ext.part_size <= crate::s3_api::VERIFY_WHILE_SENDING_MIN
                             {
@@ -894,6 +1014,9 @@ pub async fn complete_multipart_upload(
                 None
             };
             let mut attrs = upload_attrs.clone().unwrap_or_default();
+            if let Some((ref sse_attr, _)) = complete_sse {
+                attrs.set_sse(&sse_attr.with_plaintext_size(total_size));
+            }
             if matches!(attrs.retention(), Ok(None)) {
                 if let Some(dr) = state.bucket_object_lock(b_id).and_then(|c| c.default_retention) {
                     let now_ns = state.clock.now_ns();
@@ -1026,6 +1149,10 @@ pub async fn complete_multipart_upload(
                 }
             }
 
+            let sse_headers = complete_sse
+                .as_ref()
+                .map(|(a, _)| a.response_headers())
+                .unwrap_or_default();
             let location = format!("http://127.0.0.1:9000/{}/{}", bucket, key);
             state.multipart.record_completed_result(
                 upload_id,
@@ -1036,6 +1163,7 @@ pub async fn complete_multipart_upload(
                     location: location.clone(),
                     version_id: version_id.clone(),
                     checksum: final_cksum.clone(),
+                    sse_headers,
                 },
             );
             if let Some(e) = late {
@@ -1048,10 +1176,13 @@ pub async fn complete_multipart_upload(
                 &location,
                 final_cksum.as_ref().map(|(a, ct, v)| (*a, ct.as_str(), v.as_str())),
             );
-            let mut resp = Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/xml")
-                .header(ETAG, format!("\"{}\"", composite_etag));
+            let mut resp = with_sse_headers(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .header(ETAG, format!("\"{}\"", composite_etag)),
+                complete_sse.as_ref().map(|(a, _)| a),
+            );
             if let Some(v) = version_id {
                 resp = resp.header("x-amz-version-id", v);
             }
@@ -1154,6 +1285,22 @@ pub async fn upload_part_copy(
             .body(full_body(Bytes::from(xml)))
             .unwrap());
     }
+    let dst_sse_key = match crate::sse::parse_write_sse_headers(headers) {
+        Ok(k) => k,
+        Err(e) => return Ok(sse_error_response(e, key, false)),
+    };
+    let src_sse_key = match crate::sse::parse_copy_source_sse_c(headers) {
+        Ok(k) => k,
+        Err(e) => return Ok(sse_error_response(e, key, false)),
+    };
+    let dst_upload_sse = match state.multipart.check_upload_sse(
+        upload_id,
+        crate::multipart::UploadSseOp::UploadPart,
+        dst_sse_key.as_ref(),
+    ) {
+        Ok(s) => s,
+        Err(r) => return Ok(upload_sse_refusal(r, key, "req-upc")),
+    };
 
     let range_req = match headers.get("x-amz-copy-source-range").and_then(|v| v.to_str().ok()) {
         Some(raw) => match parse_copy_source_range(raw) {
@@ -1214,7 +1361,7 @@ pub async fn upload_part_copy(
         (src_b_id, src_meta)
     };
 
-    let (src_size, src_facts, copied_vid, version_opt) = match (&src_vid, &src_meta) {
+    let (src_vol_offset, src_flags, src_size, src_facts, copied_vid, version_opt, src_view) = match (&src_vid, &src_meta) {
         (Some(vid), _) => {
             let Some(id) = crate::versions::parse_id(vid) else {
                 return Ok(no_such_version(src_key, false));
@@ -1234,7 +1381,10 @@ pub async fn upload_part_copy(
                 last_modified_secs: last_modified_secs_from_ns(v.modified),
             };
             let vid_str = v.id_string();
-            (v.size, facts, Some(vid_str), Some(v))
+            let view = state
+                .object_view_for(src_b_id, src_key, v.id(), v.vol_offset, v.flags)
+                .map(|vw| vw.attrs);
+            (v.vol_offset, v.flags, v.size, facts, Some(vid_str), Some(v), view)
         }
         (None, Some(m)) => {
             let flags = unpack_flags(m.bucket_flags);
@@ -1243,9 +1393,29 @@ pub async fn upload_part_copy(
                 etag: format_object_etag(m.etag_hi, m.etag_lo, is_mp, unpack_part_count(m.bucket_flags)),
                 last_modified_secs: last_modified_secs_from_ms(m.created_at),
             };
-            (m.size, facts, None, None)
+            let target_vid = state
+                .versions
+                .read()
+                .current(src_b_id, src_key)
+                .map_or(0, |v| v.id());
+            let view = state
+                .object_view_for(src_b_id, src_key, target_vid, m.vol_offset, flags)
+                .map(|vw| vw.attrs);
+            (m.vol_offset, flags, m.size, facts, None, None, view)
         }
         (None, None) => unreachable!(),
+    };
+    let src_attrs = match src_view {
+        Ok(a) => a,
+        Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source's attributes: {:?}", e))),
+    };
+    let src_sse = match src_attrs.sse() {
+        Ok(s) => s,
+        Err(e) => return Ok(internal_error_response(key, &format!("could not read source encryption metadata: {:?}", e))),
+    };
+    let src_dek = match crate::sse::authorize_read_ssec(src_sse.as_ref(), src_sse_key.as_ref()) {
+        Ok(d) => d,
+        Err(e) => return Ok(sse_error_response(e, key, false)),
     };
 
     if precondition(headers, Some(&src_facts), true) != PreconditionOutcome::Proceed {
@@ -1268,28 +1438,28 @@ pub async fn upload_part_copy(
         }
     }
 
-    let part_bytes = if src_size > crate::s3_api::VERIFY_WHILE_SENDING_MIN {
-        let (vol_offset, flags) = match (version_opt, src_meta) {
-            (Some(v), _) => (v.vol_offset, v.flags),
-            (None, Some(m)) => (m.vol_offset, unpack_flags(m.bucket_flags)),
-            _ => unreachable!(),
-        };
+    let part_bytes = if let (Some(ref ss), Some(ref sdek)) = (&src_sse, &src_dek) {
         let (start, len) = match range_req {
             Some((s, e)) => (s, e - s + 1),
             None => (0, src_size),
         };
-        match state.read_object_range_unmapped(src_b_id, src_key, vol_offset, src_size, flags, start, len) {
+        match state.read_encrypted_object_range(src_b_id, src_key, src_vol_offset, src_flags, ss, sdek, start, len) {
+            Ok(b) => b,
+            Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
+        }
+    } else if src_size > crate::s3_api::VERIFY_WHILE_SENDING_MIN {
+        let (start, len) = match range_req {
+            Some((s, e)) => (s, e - s + 1),
+            None => (0, src_size),
+        };
+        match state.read_object_range_unmapped(src_b_id, src_key, src_vol_offset, src_size, src_flags, start, len) {
             Ok(b) => b,
             Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
         }
     } else {
-        let bytes = match (version_opt, src_meta) {
-            (Some(v), _) => state.read_version_bytes(src_b_id, src_key, &v),
-            (None, Some(m)) => {
-                let flags = unpack_flags(m.bucket_flags);
-                state.read_object_bytes(src_b_id, src_key, m.vol_offset, m.size, flags)
-            }
-            _ => unreachable!(),
+        let bytes = match version_opt {
+            Some(v) => state.read_version_bytes(src_b_id, src_key, &v),
+            None => state.read_object_bytes(src_b_id, src_key, src_vol_offset, src_size, src_flags),
         };
         let bytes = match bytes {
             Ok(b) => b,
@@ -1302,8 +1472,26 @@ pub async fn upload_part_copy(
     };
     let part_slice: &[u8] = &part_bytes[..];
 
-    let (hi, lo, hex, raw_md5) = compute_md5(part_slice);
-    let staged_path = match state.multipart.write_staged_part(upload_id, part_num, part_slice) {
+    let (hi, lo, hex, raw_md5, write_slice) = if let Some((_, ref ddek)) = dst_upload_sse {
+        let part_prefix = match crate::sse::random_bytes::<4>() {
+            Ok(p) => p,
+            Err(e) => return Ok(internal_error_response(key, &format!("SSE-C init failed: {}", e))),
+        };
+        let (ct, _) = match crate::sse::encrypt_full(ddek, part_prefix, part_num, part_slice) {
+            Ok(r) => r,
+            Err(e) => return Ok(internal_error_response(key, &format!("SSE-C encrypt failed: {}", e))),
+        };
+        let raw_md5 = crate::sse::ssec_part_etag(ddek, part_num, part_slice);
+        let hi = u64::from_be_bytes(raw_md5[0..8].try_into().unwrap());
+        let lo = u64::from_be_bytes(raw_md5[8..16].try_into().unwrap());
+        let hex: String = raw_md5.iter().map(|b| format!("{:02x}", b)).collect();
+        (hi, lo, hex, raw_md5, Bytes::from(ct))
+    } else {
+        let (hi, lo, hex, raw_md5) = compute_md5(part_slice);
+        (hi, lo, hex, raw_md5, part_bytes.clone())
+    };
+    let plain_len = part_slice.len() as u64;
+    let staged_path = match state.multipart.write_staged_part(upload_id, part_num, &write_slice) {
         Ok(p) => Some(p),
         Err(e) => return Ok(internal_error_response(key, &format!("could not store the part: {}", e))),
     };
@@ -1312,7 +1500,7 @@ pub async fn upload_part_copy(
         upload_id,
         part_num,
         0,
-        part_slice.len() as u64,
+        plain_len,
         raw_md5,
         hi,
         lo,
@@ -1322,10 +1510,13 @@ pub async fn upload_part_copy(
         Ok(_) => {
             let lm = crate::versions::iso8601(state.clock.now_ns());
             let xml = copy_part_result_xml(&hex, &lm);
-            let mut resp = Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/xml")
-                .header(ETAG, format!("\"{}\"", hex));
+            let mut resp = with_sse_headers(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .header(ETAG, format!("\"{}\"", hex)),
+                dst_upload_sse.as_ref().map(|(a, _)| a),
+            );
             if let Some(v) = copied_vid {
                 resp = resp.header("x-amz-copy-source-version-id", v);
             }

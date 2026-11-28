@@ -129,6 +129,11 @@ pub struct Segment {
     pub len: u64,
     pub verify: Option<u32>,
     pub transform: Option<Arc<dyn ChunkTransform>>,
+    /// When `Some(step)`, read lengths (except the last piece) align to a multiple of `step`
+    /// that fits inside `read_chunk()`. Used for `AWE1` 64 KiB encrypted chunk framing (#121).
+    pub step_bytes: Option<usize>,
+    /// When `Some(n)`, the segment emits `n` transformed bytes for HTTP `size_hint` rather than `len`.
+    pub output_len: Option<u64>,
 }
 
 /// What one response sends: its segments, in order.
@@ -157,6 +162,8 @@ impl PreadBody {
             len: range.len,
             verify: range.verify,
             transform: None,
+            step_bytes: None,
+            output_len: None,
         };
         Self::from_job(Job {
             segments: vec![segment],
@@ -170,7 +177,7 @@ impl PreadBody {
 
     /// A body that sends `job`'s segments one after the other, as one reader.
     pub fn from_job(job: Job) -> Self {
-        let remaining = job.segments.iter().map(|s| s.len).sum();
+        let remaining = job.segments.iter().map(|s| s.output_len.unwrap_or(s.len)).sum();
         PreadBody { start: Some(job), rx: None, remaining }
     }
 }
@@ -301,6 +308,10 @@ fn read_into(job: Job, tx: tokio::sync::mpsc::Sender<std::io::Result<Bytes>>) {
 
     for seg in &job.segments {
         let mut crc = 0u32;
+        let seg_chunk_len = match seg.step_bytes {
+            Some(step) if step > 0 && step <= chunk_len => (chunk_len / step).max(1) * step,
+            _ => chunk_len,
+        };
         let (mut pos, end) = (seg.at, seg.at + seg.len);
         while pos < end {
             if tx.is_closed() {
@@ -329,7 +340,7 @@ fn read_into(job: Job, tx: tokio::sync::mpsc::Sender<std::io::Result<Bytes>>) {
                 }
                 None => None,
             };
-            let n = (chunk_len as u64).min(end - pos);
+            let n = (seg_chunk_len as u64).min(end - pos);
             // One buffer size for every chunk, so pooled buffers fit any read.
             let mut window = take_buffer(buf_bytes);
             let read = read_one(&seg.source, &work, pos, n, &mut window[..])

@@ -191,7 +191,19 @@ test = false
 doc = false
 
 [[bin]]
+name = "sse_headers"
+path = "fuzz_targets/sse_headers.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "acl_xml"
 path = "fuzz_targets/acl_xml.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sse_payload"
+path = "fuzz_targets/sse_payload.rs"
 test = false
 doc = false

@@ -239,8 +239,22 @@ A tag number is never reused. 0x8000 and above are for tests.
 | 0x0031 | Object ACL (`AccessControlPolicy` XML) | acl (mutable) | #122, #203 (Decision 3A) |
 | 0x0040 | Object Lock retention (`mode (u8: 0=Governance, 1=Compliance) \|\| retain_until_ns (u64 LE) \|\| iso_text (UTF-8)`; empty = cleared) | retention (mutable) | #120, #203 (Decision 3A) |
 | 0x0041 | Object Lock legal hold (`u8`: 0=OFF, 1=ON) | legal hold (mutable) | #120, #203 (Decision 3A) |
-| 0x0050 | Reserved for server-side encryption | — | #121 (Decision 3A) |
+| 0x0050 | `TAG_SSE`: server-side encryption metadata (`version \| mode \| cipher \| flags \| nonce_prefix \| plaintext_size \| key_md5 \| key_salt \| verifier_mac`) | encryption (write-time) | #121 (Decision 3A & 4A) |
 | 0x0060 | Storage class (`STANDARD`, etc.) | storage class (mutable) | #159, #203 (Decision 3A) |
+
+#### `TAG_SSE` (`0x0050`) binary layout
+
+| Bytes | Field |
+|---|---|
+| 0 | `version: u8 = 1` |
+| 1 | `mode: u8` (`1 = SSE-C`; `2 = SSE-S3` reserved for PR 2; `3 = SSE-KMS` reserved for PR 3) |
+| 2 | `cipher: u8 = 1` (`AES-256-GCM`, 64 KiB plaintext chunks, `AWE1` framing) |
+| 3 | `flags: u8` (`bit 0 = multipart`; bits `1..7 = 0`) |
+| 4..8 | `nonce_prefix: [u8; 4]` (CSPRNG per single-part object; upload-level random prefix for multipart) |
+| 8..16 | `plaintext_size: u64` LE (logical object size; boot recovery reads this into index rows) |
+| 16..32 | `key_md5: [u8; 16]` (mode 1: MD5 of the 32-byte SSE-C customer key for response echo) |
+| 32..48 | `key_salt: [u8; 16]` (mode 1: CSPRNG salt for HKDF-SHA256 DEK derivation and salted HMAC verifier) |
+| 48..80 | `verifier_mac: [u8; 32]` (mode 1: `HMAC-SHA256(key = customer_key, msg = "awanfs-sse-c-verifier-v1" \|\| key_salt)`) |
 
 ## Attribute update needle (flag 0x200, format 3, #203)
 
@@ -302,6 +316,27 @@ index row holds the object's size, which recovery reads from bytes 8..16.
 | then | the blocks, each one zstd frame (level 1), with nothing after the last |
 
 A range GET decodes only the blocks it overlaps.
+
+## Encrypted payloads (`AWE1`, #121 Decisions 3A & 4A)
+
+Objects carrying `TAG_SSE` (`0x0050`) skip zstd compression (`FLAG_COMPRESSED` is never set) and store AES-256-GCM chunked ciphertext (`AWE1`) inside the single-part needle payload (`part_number = 0`) or each staged multipart part file (`part_number = 1..=10000`).
+
+### `AWE1` container header (16 bytes)
+
+| Bytes | Field |
+|---|---|
+| 0..4 | magic `AWE1` |
+| 4..12 | `plaintext_len: u64` LE (for single-part, matches `TAG_SSE.plaintext_size`; for multipart part, matches `part_size`) |
+| 12..16 | `nonce_prefix: [u8; 4]` (for single-part, matches `TAG_SSE.nonce_prefix`; for multipart part, fresh CSPRNG per upload attempt) |
+
+### Chunk framing, nonce, and AAD
+
+- Plaintext chunk size: `CHUNK_PLAIN = 65536` (64 KiB). GCM tag length: `TAG_LEN = 16`. Full stored chunk: `CHUNK_STORED = 65552`.
+- Chunks above `u32::MAX` (`256 TiB`) are refused. A `0`-byte plaintext writes `1` empty chunk (`0B` ciphertext + `16B` GCM tag with `is_last_chunk = 1`, `32B` total stored) so empty encrypted objects are authenticated.
+- **SSE-C DEK derivation:** `DEK = HKDF-SHA256(salt = key_salt, ikm = customer_key, info = "awanfs-sse-c-dek-v1")` (32 bytes), isolating each object under its own random 128-bit salt.
+- **12-byte GCM nonce:** `nonce_prefix[0..4] || part_number.to_be_bytes()[0..4] || chunk_index.to_be_bytes()[0..4]`.
+- **13-byte GCM AAD:** `"AWE1" || part_number.to_be_bytes()[0..4] || chunk_index.to_be_bytes()[0..4] || is_last_chunk (u8: 0 or 1)`.
+- **O(1) range seek:** plaintext byte `off` lies in chunk `i = off / 65536`, stored at payload byte offset `16 + i * 65552`. A range GET reads and authenticates only the chunks covering `[start, end]`.
 
 ## Versions (flags 0x40, 0x80, 0x100, format 2)
 

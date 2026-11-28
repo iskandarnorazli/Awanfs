@@ -44,6 +44,7 @@ fn finish_put(
     etag_hex: &str,
     created_ns: u64,
     checksum: Option<(crate::checksum::ChecksumAlgorithm, &str)>,
+    sse: Option<&crate::sse::SseAttr>,
     reservation: CapacityReservation,
     acked: bool,
 ) -> Response<ResponseBody> {
@@ -66,10 +67,13 @@ fn finish_put(
     ) {
         return engine_error_response(code, key);
     }
-    let mut b = Response::builder()
-        .status(StatusCode::OK)
-        .header(ETAG, format!("\"{}\"", etag_hex))
-        .header(CONTENT_LENGTH, "0");
+    let mut b = with_sse_headers(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(ETAG, format!("\"{}\"", etag_hex))
+            .header(CONTENT_LENGTH, "0"),
+        sse,
+    );
     if let Some((alg, val)) = checksum {
         b = b.header(alg.header_name(), val);
     }
@@ -86,11 +90,19 @@ fn after_late_failure(key: &str, late: Option<VolumeError>, answer: Response<Res
     }
 }
 
-fn put_ok_response(etag_hex: &str, version_id: Option<&str>, checksum: Option<(crate::checksum::ChecksumAlgorithm, &str)>) -> Response<ResponseBody> {
-    let mut b = Response::builder()
-        .status(StatusCode::OK)
-        .header(ETAG, format!("\"{}\"", etag_hex))
-        .header(CONTENT_LENGTH, "0");
+fn put_ok_response(
+    etag_hex: &str,
+    version_id: Option<&str>,
+    checksum: Option<(crate::checksum::ChecksumAlgorithm, &str)>,
+    sse: Option<&crate::sse::SseAttr>,
+) -> Response<ResponseBody> {
+    let mut b = with_sse_headers(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(ETAG, format!("\"{}\"", etag_hex))
+            .header(CONTENT_LENGTH, "0"),
+        sse,
+    );
     if let Some(v) = version_id {
         b = b.header("x-amz-version-id", v);
     }
@@ -98,6 +110,46 @@ fn put_ok_response(etag_hex: &str, version_id: Option<&str>, checksum: Option<(c
         b = b.header(alg.header_name(), val);
     }
     b.body(empty_body()).unwrap()
+}
+
+pub(crate) fn sse_error_response(
+    err: crate::sse::SseHeaderError,
+    resource: &str,
+    head: bool,
+) -> Response<ResponseBody> {
+    let status = StatusCode::from_u16(err.status).unwrap_or(StatusCode::BAD_REQUEST);
+    let body = if head {
+        empty_body()
+    } else {
+        full_body(Bytes::from(s3_error_xml(err.code, err.message, resource, "req-sse")))
+    };
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/xml")
+        .body(body)
+        .unwrap()
+}
+
+pub(crate) fn with_sse_headers(
+    mut builder: hyper::http::response::Builder,
+    sse: Option<&crate::sse::SseAttr>,
+) -> hyper::http::response::Builder {
+    if let Some(attr) = sse {
+        for (k, v) in attr.response_headers() {
+            builder = builder.header(k, v);
+        }
+    }
+    builder
+}
+
+pub(crate) fn with_sse_header_pairs(
+    mut builder: hyper::http::response::Builder,
+    pairs: &[(&'static str, String)],
+) -> hyper::http::response::Builder {
+    for (k, v) in pairs {
+        builder = builder.header(*k, v.as_str());
+    }
+    builder
 }
 
 fn with_expiration(mut resp: Response<ResponseBody>, exp: Option<String>) -> Response<ResponseBody> {
@@ -792,6 +844,10 @@ fn version_get_response(
     headers: &HeaderMap,
     overrides: &ResponseOverrides<'_>,
 ) -> Response<ResponseBody> {
+    let read_sse = match crate::sse::parse_read_sse_headers(headers) {
+        Ok(s) => s,
+        Err(e) => return sse_error_response(e, key, head),
+    };
     let id = match vid {
         Some(s) => match crate::versions::parse_id(s) {
             Some(i) => Some(i),
@@ -848,22 +904,15 @@ fn version_get_response(
         etag: etag_val.clone(),
         last_modified_secs: lm_secs,
     };
-    match precondition(headers, Some(&facts), false) {
-        PreconditionOutcome::Proceed => {}
-        outcome => return precondition_failure_response(outcome, Some(&facts), key, head),
-    }
     let view = match state.object_view_for(b_id, key, v.id(), v.vol_offset, v.flags) {
         Ok(view) => view,
         Err(e) => return internal_error_response(key, &format!("could not read the version's attributes: {:?}", e)),
     };
-    let is_current = id.is_none() || state.versions.read().current(b_id, key).is_some_and(|c| c.id() == v.id());
-    let exp_hdr = if is_current {
-        crate::lifecycle::expiration_header_for_attrs(state, b_id, key, v.size, &view.attrs, v.modified)
-    } else {
-        None
+    let stored_sse = match view.attrs.sse() {
+        Ok(s) => s,
+        Err(e) => return internal_error_response(key, &format!("could not read encryption metadata: {:?}", e)),
     };
-    let resp = (|| -> Response<ResponseBody> {
-    if let Some(pn) = part_num {
+    let mp_part_extents = if let Some(pn) = part_num {
         if v.flags & AWAN_FLAG_MULTIPART != 0 {
             let extents = match state
                 .manifest_extents(b_id, v.vol_offset)
@@ -885,43 +934,7 @@ fn version_get_response(
                     .body(body)
                     .unwrap();
             }
-            let ext = &extents[(pn - 1) as usize];
-            let body = if head {
-                empty_body()
-            } else if v.size > VERIFY_WHILE_SENDING_MIN {
-                match state.multipart_body(
-                    b_id,
-                    format!("{}/{} part {}", bucket, key, pn),
-                    &extents,
-                    ext.cumulative_end - ext.part_size,
-                    ext.part_size,
-                    true,
-                ) {
-                    Ok(b) => b.boxed(),
-                    Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
-                }
-            } else {
-                let b = match state.part_bytes(b_id, ext) {
-                    Ok(b) => b,
-                    Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
-                };
-                full_body(b.slice(..(ext.part_size as usize).min(b.len())))
-            };
-            return with_part_checksum_headers(
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, view.content_type())
-                    .header(ETAG, etag_val)
-                    .header(ACCEPT_RANGES, "bytes")
-                    .header("x-amz-mp-parts-count", parts_count.to_string())
-                    .header("x-amz-version-id", v.id_string())
-                    .header(CONTENT_LENGTH, ext.part_size.to_string())
-                    .header(LAST_MODIFIED, crate::clock::format_http_date(v.modified)),
-                &view.attrs,
-                ext.checksum.as_ref(),
-            )
-            .body(body)
-            .unwrap();
+            Some(extents)
         } else if pn > 1 {
             let body = if head {
                 empty_body()
@@ -933,21 +946,188 @@ fn version_get_response(
                 .header(CONTENT_TYPE, "application/xml")
                 .body(body)
                 .unwrap();
+        } else {
+            None
         }
+    } else {
+        None
+    };
+    let sse_dek = match crate::sse::authorize_read_ssec(stored_sse.as_ref(), read_sse.as_ref()) {
+        Ok(d) => d,
+        Err(e) => return sse_error_response(e, key, head),
+    };
+    match precondition(headers, Some(&facts), false) {
+        PreconditionOutcome::Proceed => {}
+        outcome => return precondition_failure_response(outcome, Some(&facts), key, head),
+    }
+    let is_current = id.is_none() || state.versions.read().current(b_id, key).is_some_and(|c| c.id() == v.id());
+    let exp_hdr = if is_current {
+        crate::lifecycle::expiration_header_for_attrs(state, b_id, key, v.size, &view.attrs, v.modified)
+    } else {
+        None
+    };
+    let resp = (|| -> Response<ResponseBody> {
+    if let (Some(pn), Some(extents)) = (part_num, mp_part_extents) {
+        let parts_count = extents.len();
+        let ext = &extents[(pn - 1) as usize];
+        let actual_pn = crate::sse::part_number_from_staged_path(ext.staged_path.as_deref(), pn);
+        let body = if head {
+            empty_body()
+        } else if let Some(dek) = sse_dek {
+            if v.size > VERIFY_WHILE_SENDING_MIN {
+                match state.encrypted_part_body(b_id, format!("{}/{} part {}", bucket, key, pn), ext, actual_pn, dek) {
+                    Ok(b) => b.boxed(),
+                    Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
+                }
+            } else {
+                match state.read_encrypted_part_bytes(b_id, key, ext, actual_pn, &dek) {
+                    Ok(b) => full_body(b),
+                    Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
+                }
+            }
+        } else if v.size > VERIFY_WHILE_SENDING_MIN {
+            match state.multipart_body(
+                b_id,
+                format!("{}/{} part {}", bucket, key, pn),
+                &extents,
+                ext.cumulative_end - ext.part_size,
+                ext.part_size,
+                true,
+            ) {
+                Ok(b) => b.boxed(),
+                Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
+            }
+        } else {
+            let b = match state.part_bytes(b_id, ext) {
+                Ok(b) => b,
+                Err(e) => return internal_error_response(key, &format!("could not read a part: {:?}", e)),
+            };
+            full_body(b.slice(..(ext.part_size as usize).min(b.len())))
+        };
+        return with_sse_headers(
+            with_part_checksum_headers(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, view.content_type())
+                    .header(ETAG, etag_val)
+                    .header(ACCEPT_RANGES, "bytes")
+                    .header("x-amz-mp-parts-count", parts_count.to_string())
+                    .header("x-amz-version-id", v.id_string())
+                    .header(CONTENT_LENGTH, ext.part_size.to_string())
+                    .header(LAST_MODIFIED, crate::clock::format_http_date(v.modified)),
+                &view.attrs,
+                ext.checksum.as_ref(),
+            ),
+            stored_sse.as_ref(),
+        )
+        .body(body)
+        .unwrap();
     }
     let tag_count = view.attrs.tag_count();
     let cksum_mode = checksum_mode_enabled(headers);
     let is_compressed = v.flags & crate::meta_index::FLAG_COMPRESSED != 0;
     let is_multipart = v.flags & AWAN_FLAG_MULTIPART != 0;
-    let builder = with_tagging_count(
-        Response::builder()
-            .with_object_metadata(&view, overrides)
-            .header(ETAG, etag_val)
-            .header(ACCEPT_RANGES, "bytes")
-            .header("x-amz-version-id", v.id_string())
-            .header(LAST_MODIFIED, crate::clock::format_http_date(v.modified)),
-        tag_count,
+    let builder = with_sse_headers(
+        with_tagging_count(
+            Response::builder()
+                .with_object_metadata(&view, overrides)
+                .header(ETAG, etag_val)
+                .header(ACCEPT_RANGES, "bytes")
+                .header("x-amz-version-id", v.id_string())
+                .header(LAST_MODIFIED, crate::clock::format_http_date(v.modified)),
+            tag_count,
+        ),
+        stored_sse.as_ref(),
     );
+    if let Some(dek) = sse_dek {
+        let sse_attr = stored_sse.as_ref().expect("dek implies stored_sse");
+        let what = format!("{}/{}", bucket, key);
+        if let Some(h) = range {
+            match parse_range_header(h, v.size) {
+                Ok(Some(r)) => {
+                    let len = r.end - r.start + 1;
+                    let body = if head {
+                        empty_body()
+                    } else if v.size > VERIFY_WHILE_SENDING_MIN || len > VERIFY_WHILE_SENDING_MIN {
+                        let b_res = if is_multipart {
+                            match state
+                                .manifest_extents(b_id, v.vol_offset)
+                                .or_else(|| state.multipart.get_completed_extents(b_id, key))
+                            {
+                                Some(extents) => state.encrypted_multipart_body(b_id, what, &extents, dek, r.start, len),
+                                None => return internal_error_response(key, "the multipart object's part list is missing"),
+                            }
+                        } else {
+                            state.encrypted_single_body(b_id, what, v.vol_offset, sse_attr, dek, r.start, len)
+                        };
+                        match b_res {
+                            Ok(b) => b.boxed(),
+                            Err(e) => return internal_error_response(key, &format!("could not read the version: {:?}", e)),
+                        }
+                    } else {
+                        match state.read_encrypted_object_range(b_id, key, v.vol_offset, v.flags, sse_attr, &dek, r.start, len) {
+                            Ok(b) => full_body(b),
+                            Err(e) => return internal_error_response(key, &format!("could not read the version: {:?}", e)),
+                        }
+                    };
+                    return builder
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(CONTENT_RANGE, format!("bytes {}-{}/{}", r.start, r.end, v.size))
+                        .header(CONTENT_LENGTH, len.to_string())
+                        .body(body)
+                        .unwrap();
+                }
+                Err(()) => {
+                    let body = if head {
+                        empty_body()
+                    } else {
+                        full_body(Bytes::from(s3_error_xml(
+                            "InvalidRange",
+                            "The requested range cannot be satisfied.",
+                            key,
+                            "req-range-err",
+                        )))
+                    };
+                    return Response::builder()
+                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                        .header(CONTENT_TYPE, "application/xml")
+                        .header(CONTENT_RANGE, format!("bytes */{}", v.size))
+                        .body(body)
+                        .unwrap();
+                }
+                Ok(None) => {}
+            }
+        }
+        let body = if head {
+            empty_body()
+        } else if v.size > VERIFY_WHILE_SENDING_MIN {
+            let b_res = if is_multipart {
+                match state
+                    .manifest_extents(b_id, v.vol_offset)
+                    .or_else(|| state.multipart.get_completed_extents(b_id, key))
+                {
+                    Some(extents) => state.encrypted_multipart_body(b_id, what, &extents, dek, 0, v.size),
+                    None => return internal_error_response(key, "the multipart object's part list is missing"),
+                }
+            } else {
+                state.encrypted_single_body(b_id, what, v.vol_offset, sse_attr, dek, 0, v.size)
+            };
+            match b_res {
+                Ok(b) => b.boxed(),
+                Err(e) => return internal_error_response(key, &format!("could not read the version: {:?}", e)),
+            }
+        } else {
+            match state.read_encrypted_object_bytes(b_id, key, v.vol_offset, v.size, v.flags, sse_attr, &dek) {
+                Ok(b) => full_body(b),
+                Err(e) => return internal_error_response(key, &format!("could not read the version: {:?}", e)),
+            }
+        };
+        return with_checksum_headers(builder, &view.attrs, cksum_mode)
+            .status(StatusCode::OK)
+            .header(CONTENT_LENGTH, v.size.to_string())
+            .body(body)
+            .unwrap();
+    }
     if !head && !is_compressed && v.size > VERIFY_WHILE_SENDING_MIN {
         let what = format!("{}/{}", bucket, key);
         if let Some(h) = range {
@@ -1073,6 +1253,14 @@ pub async fn copy_object(
     bucket_owner: &str,
     iam: Option<&crate::iam::Iam>,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
+    let dst_sse_key = match crate::sse::parse_write_sse_headers(headers) {
+        Ok(k) => k,
+        Err(e) => return Ok(sse_error_response(e, key, false)),
+    };
+    let src_sse_key = match crate::sse::parse_copy_source_sse_c(headers) {
+        Ok(k) => k,
+        Err(e) => return Ok(sse_error_response(e, key, false)),
+    };
     let copy_source = headers.get("x-amz-copy-source").expect("CopyObject requires x-amz-copy-source");
     let copy_source_raw = copy_source.to_str().unwrap_or("");
     let (copy_path, copy_query) = copy_source_raw.split_once('?').unwrap_or((copy_source_raw, ""));
@@ -1126,7 +1314,7 @@ pub async fn copy_object(
     };
 
     let src_view: Result<crate::attrs::Attrs, VolumeError>;
-    let (src_vol_offset, src_flags, src_size, src_etag_hi, src_etag_lo, copied_vid, version_opt) = match (&src_vid, &src_meta) {
+    let (src_vol_offset, src_flags, src_size, src_etag_hi, src_etag_lo, copied_vid, version_opt, src_facts) = match (&src_vid, &src_meta) {
         (Some(vid), _) => {
             let Some(id) = crate::versions::parse_id(vid) else {
                 return Ok(no_such_version(src_key, false));
@@ -1151,14 +1339,11 @@ pub async fn copy_object(
                 etag: version_etag(&v),
                 last_modified_secs: last_modified_secs_from_ns(v.modified),
             };
-            if precondition(headers, Some(&src_facts), true) != PreconditionOutcome::Proceed {
-                return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
-            }
             src_view = state
                 .object_view_for(src_b_id, src_key, v.id(), v.vol_offset, v.flags)
                 .map(|view| view.attrs);
             let vid_s = v.id_string();
-            (v.vol_offset, v.flags, v.size, v.etag_hi, v.etag_lo, Some(vid_s), Some(v))
+            (v.vol_offset, v.flags, v.size, v.etag_hi, v.etag_lo, Some(vid_s), Some(v), src_facts)
         }
         (None, Some(m)) => {
             let flags = unpack_flags(m.bucket_flags);
@@ -1167,9 +1352,6 @@ pub async fn copy_object(
                 etag: format_object_etag(m.etag_hi, m.etag_lo, is_mp, unpack_part_count(m.bucket_flags)),
                 last_modified_secs: last_modified_secs_from_ms(m.created_at),
             };
-            if precondition(headers, Some(&src_facts), true) != PreconditionOutcome::Proceed {
-                return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
-            }
             let target_vid = state
                 .versions
                 .read()
@@ -1178,25 +1360,25 @@ pub async fn copy_object(
             src_view = state
                 .object_view_for(src_b_id, src_key, target_vid, m.vol_offset, flags)
                 .map(|view| view.attrs);
-            (m.vol_offset, flags, m.size, m.etag_hi, m.etag_lo, None, None)
+            (m.vol_offset, flags, m.size, m.etag_hi, m.etag_lo, None, None, src_facts)
         }
         (None, None) => unreachable!("src_meta is read whenever no version is named"),
     };
-    let stream_copy = src_size > STREAM_PUT_MIN
-        && (src_flags & crate::meta_index::FLAG_COMPRESSED == 0)
-        && !state.compresses(bucket);
-    let bytes = if stream_copy {
-        Bytes::new()
-    } else {
-        let read = match version_opt {
-            Some(v) => state.read_version_bytes(src_b_id, src_key, &v),
-            None => state.read_object_bytes(src_b_id, src_key, src_vol_offset, src_size, src_flags),
-        };
-        match read {
-            Ok(b) => b,
-            Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
-        }
+    let src_attrs = match src_view {
+        Ok(a) => a,
+        Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source's attributes: {:?}", e))),
     };
+    let src_sse = match src_attrs.sse() {
+        Ok(s) => s,
+        Err(e) => return Ok(internal_error_response(key, &format!("could not read source encryption metadata: {:?}", e))),
+    };
+    let src_dek = match crate::sse::authorize_read_ssec(src_sse.as_ref(), src_sse_key.as_ref()) {
+        Ok(d) => d,
+        Err(e) => return Ok(sse_error_response(e, key, false)),
+    };
+    if precondition(headers, Some(&src_facts), true) != PreconditionOutcome::Proceed {
+        return Ok(precondition_failure_response(PreconditionOutcome::PreconditionFailed, None, key, false));
+    }
     let replace = match headers.get("x-amz-metadata-directive").and_then(|v| v.to_str().ok()) {
         None => false,
         Some(v) if v.eq_ignore_ascii_case("COPY") => false,
@@ -1209,7 +1391,7 @@ pub async fn copy_object(
         Some(v) if v.eq_ignore_ascii_case("REPLACE") => true,
         Some(_) => return Ok(bad_request("InvalidArgument", "Unknown tagging directive.", key)),
     };
-    if src_bucket == bucket && src_key == key && src_vid.is_none() && !replace && !tagging_replace {
+    if src_bucket == bucket && src_key == key && src_vid.is_none() && !replace && !tagging_replace && dst_sse_key.is_none() && src_sse.is_none() {
         return Ok(bad_request(
             "InvalidRequest",
             "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.",
@@ -1223,10 +1405,7 @@ pub async fn copy_object(
         };
         crate::attrs::Attrs::decode(&raw).unwrap_or_default()
     } else {
-        match src_view {
-            Ok(ref a) => a.clone(),
-            Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source's attributes: {:?}", e))),
-        }
+        src_attrs.clone()
     };
     if tagging_replace {
         match crate::ops::tagging::parse_tagging_header_from(headers, key) {
@@ -1237,10 +1416,6 @@ pub async fn copy_object(
             Err(resp) => return Ok(resp),
         }
     } else if replace {
-        let src_attrs = match src_view {
-            Ok(ref a) => a,
-            Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source's attributes: {:?}", e))),
-        };
         match src_attrs.get(crate::attrs::TAG_TAGGING) {
             Some(raw) => copy_attrs_obj.set(crate::attrs::TAG_TAGGING, raw),
             None => copy_attrs_obj.remove(crate::attrs::TAG_TAGGING),
@@ -1248,6 +1423,7 @@ pub async fn copy_object(
     }
     copy_attrs_obj.remove(crate::attrs::TAG_RETENTION);
     copy_attrs_obj.remove(crate::attrs::TAG_LEGAL_HOLD);
+    copy_attrs_obj.remove(crate::attrs::TAG_SSE);
     if let Err(resp) = apply_lock_headers_and_default(&state, b_id, key, headers, &mut copy_attrs_obj, true, false) {
         return Ok(resp);
     }
@@ -1255,11 +1431,71 @@ pub async fn copy_object(
     if let Err(resp) = apply_object_ownership_and_acl(&state, b_id, key, headers, writer_account, bucket_owner, iam, &mut copy_attrs_obj) {
         return Ok(resp);
     }
+    let dst_sse_pair = match dst_sse_key {
+        Some(ref k) => {
+            let attr = match crate::sse::SseAttr::new_ssec(k, false, src_size) {
+                Ok(a) => a,
+                Err(e) => return Ok(internal_error_response(key, &format!("could not initialize SSE-C: {}", e))),
+            };
+            let dek = match attr.derive_dek(k) {
+                Ok(d) => d,
+                Err(e) => return Ok(internal_error_response(key, &format!("could not derive SSE-C key: {}", e))),
+            };
+            copy_attrs_obj.set_sse(&attr);
+            Some((attr, dek))
+        }
+        None => None,
+    };
     let copy_attrs = match copy_attrs_obj.encode() {
         Ok(a) => a,
         Err(_) => return Ok(bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key)),
     };
-    let flags = if src_size == 0 {
+
+    let any_encrypted = src_sse.is_some() || dst_sse_pair.is_some();
+    let stream_copy = src_size > STREAM_PUT_MIN
+        && (any_encrypted || ((src_flags & crate::meta_index::FLAG_COMPRESSED == 0) && !state.compresses(bucket)));
+
+    let (bytes, mut dst_etag_hi, mut dst_etag_lo) = if stream_copy {
+        (Bytes::new(), src_etag_hi, src_etag_lo)
+    } else if let (Some(ref ss), Some(ref sdek)) = (&src_sse, &src_dek) {
+        let plain = match state.read_encrypted_object_bytes(src_b_id, src_key, src_vol_offset, src_size, src_flags, ss, sdek) {
+            Ok(b) => b,
+            Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
+        };
+        if let Some((ref dst_attr, ref dst_dek)) = dst_sse_pair {
+            let (ct, ct_md5) = match crate::sse::encrypt_full(dst_dek, dst_attr.nonce_prefix(), 0, &plain) {
+                Ok(x) => x,
+                Err(e) => return Ok(internal_error_response(key, &format!("could not encrypt the copy: {}", e))),
+            };
+            let hi = u64::from_be_bytes(ct_md5[0..8].try_into().unwrap());
+            let lo = u64::from_be_bytes(ct_md5[8..16].try_into().unwrap());
+            (Bytes::from(ct), hi, lo)
+        } else {
+            let (hi, lo, _, _) = crate::s3_api::compute_md5(&plain);
+            (plain, hi, lo)
+        }
+    } else {
+        let read = match version_opt {
+            Some(v) => state.read_version_bytes(src_b_id, src_key, &v),
+            None => state.read_object_bytes(src_b_id, src_key, src_vol_offset, src_size, src_flags),
+        };
+        let plain = match read {
+            Ok(b) => b,
+            Err(e) => return Ok(internal_error_response(key, &format!("could not read the copy source: {:?}", e))),
+        };
+        if let Some((ref dst_attr, ref dst_dek)) = dst_sse_pair {
+            let (ct, ct_md5) = match crate::sse::encrypt_full(dst_dek, dst_attr.nonce_prefix(), 0, &plain) {
+                Ok(x) => x,
+                Err(e) => return Ok(internal_error_response(key, &format!("could not encrypt the copy: {}", e))),
+            };
+            let hi = u64::from_be_bytes(ct_md5[0..8].try_into().unwrap());
+            let lo = u64::from_be_bytes(ct_md5[8..16].try_into().unwrap());
+            (Bytes::from(ct), hi, lo)
+        } else {
+            (plain, src_etag_hi, src_etag_lo)
+        }
+    };
+    let flags = if src_size == 0 && dst_sse_pair.is_none() {
         AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE
     } else {
         AWAN_FLAG_ACTIVE
@@ -1281,8 +1517,38 @@ pub async fn copy_object(
     let stamp = state.version_stamp(b_id, key);
     let flags = flags | stamp.map_or(0, |s| s.0);
     let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.unversioned_write_ts(b_id, key));
-    let store_res = if stream_copy {
-        state
+    let (vol_offset, flags, mut late) = if stream_copy && any_encrypted {
+        let src_pair = src_sse.clone().zip(src_dek.clone());
+        let dst_pair = dst_sse_pair.clone();
+        match state
+            .stream_copy_encrypted_object(
+                b_id,
+                key,
+                &copy_attrs,
+                flags,
+                dst_pair,
+                src_b_id,
+                src_key,
+                src_vol_offset,
+                src_size,
+                src_flags,
+                src_pair,
+                created_ns,
+            )
+            .await
+        {
+            Ok((o, f, ehi, elo)) => {
+                dst_etag_hi = ehi;
+                dst_etag_lo = elo;
+                (o, f, None)
+            }
+            Err(e) => match S3ServiceState::late_record(&e) {
+                Some((o, f)) => (o, f, Some(e)),
+                None => return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e))),
+            },
+        }
+    } else if stream_copy {
+        match state
             .stream_copy_object(
                 b_id,
                 key,
@@ -1293,25 +1559,33 @@ pub async fn copy_object(
                 src_vol_offset,
                 src_size,
                 src_flags,
-                src_etag_hi,
-                src_etag_lo,
+                dst_etag_hi,
+                dst_etag_lo,
                 created_ns,
             )
             .await
+        {
+            Ok((o, f)) => (o, f, None),
+            // Indexed as on success, then answered 500 (#184, owner decision 4B).
+            Err(e) => match S3ServiceState::late_record(&e) {
+                Some((o, f)) => (o, f, Some(e)),
+                None => return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e))),
+            },
+        }
     } else {
-        state
-            .store_object(b_id, bucket, key, &copy_attrs, &bytes, flags, src_etag_hi, src_etag_lo, Some(created_ns))
+        match state
+            .store_object(b_id, bucket, key, &copy_attrs, &bytes, flags, dst_etag_hi, dst_etag_lo, Some(created_ns))
             .await
+        {
+            Ok((o, f)) => (o, f, None),
+            Err(e) => match S3ServiceState::late_record(&e) {
+                Some((o, f)) => (o, f, Some(e)),
+                None => return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e))),
+            },
+        }
     };
-    let (vol_offset, flags, mut late) = match store_res {
-        Ok((o, f)) => (o, f, None),
-        // Indexed as on success, then answered 500 (#184, owner decision 4B).
-        Err(e) => match S3ServiceState::late_record(&e) {
-            Some((o, f)) => (o, f, Some(e)),
-            None => return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e))),
-        },
-    };
-    let etag_hex = md5_to_etag_hex(src_etag_hi, src_etag_lo);
+    let etag_hex = md5_to_etag_hex(dst_etag_hi, dst_etag_lo);
+    let dst_sse_attr = dst_sse_pair.as_ref().map(|(a, _)| a);
     if let Some((_, ts)) = stamp {
         let vid = match finish_version_put(
             &state,
@@ -1321,8 +1595,8 @@ pub async fn copy_object(
             flags,
             vol_offset,
             src_size,
-            src_etag_hi,
-            src_etag_lo,
+            dst_etag_hi,
+            dst_etag_lo,
             0,
             reservation,
             crate::events::CommitKind::Copy,
@@ -1335,11 +1609,14 @@ pub async fn copy_object(
         if let Some(e) = late.take() {
             return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e)));
         }
-        let resp = Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/xml")
-            .header(ETAG, format!("\"{}\"", etag_hex))
-            .header("x-amz-version-id", vid);
+        let resp = with_sse_headers(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/xml")
+                .header(ETAG, format!("\"{}\"", etag_hex))
+                .header("x-amz-version-id", vid),
+            dst_sse_attr,
+        );
         let resp = match &copied_vid {
             Some(v) => resp.header("x-amz-copy-source-version-id", v.as_str()),
             None => resp,
@@ -1354,8 +1631,8 @@ pub async fn copy_object(
         key,
         vol_offset,
         src_size,
-        src_etag_hi,
-        src_etag_lo,
+        dst_etag_hi,
+        dst_etag_lo,
         0,
         flags,
         created_ns,
@@ -1371,10 +1648,13 @@ pub async fn copy_object(
         return Ok(internal_error_response(key, &format!("could not store the copy: {:?}", e)));
     }
     let xml = copy_object_result_xml(&etag_hex, &crate::versions::iso8601(created_ns));
-    let resp = Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/xml")
-        .header(ETAG, format!("\"{}\"", etag_hex));
+    let resp = with_sse_headers(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/xml")
+            .header(ETAG, format!("\"{}\"", etag_hex)),
+        dst_sse_attr,
+    );
     let resp = match &copied_vid {
         Some(v) => resp.header("x-amz-copy-source-version-id", v.as_str()),
         None => resp,
@@ -1388,7 +1668,7 @@ struct StreamPipeline {
     state: crate::fsm::PipelineState,
     tx: Option<tokio::sync::mpsc::Sender<crate::work::InflightBuf>>,
     recycle_rx: Option<tokio::sync::mpsc::Receiver<crate::work::InflightBuf>>,
-    writer_task: Option<tokio::task::JoinHandle<Result<crate::volume::NeedleWriter, (&'static str, String)>>>,
+    writer_task: Option<tokio::task::JoinHandle<Result<(crate::volume::NeedleWriter, Option<[u8; 16]>), (&'static str, String)>>>,
     cur_buf: crate::work::InflightBuf,
     work: Arc<crate::work::WorkCounters>,
     failure: Option<Result<Response<ResponseBody>, hyper::Error>>,
@@ -1398,7 +1678,7 @@ impl StreamPipeline {
     fn new(
         tx: tokio::sync::mpsc::Sender<crate::work::InflightBuf>,
         recycle_rx: tokio::sync::mpsc::Receiver<crate::work::InflightBuf>,
-        writer_task: tokio::task::JoinHandle<Result<crate::volume::NeedleWriter, (&'static str, String)>>,
+        writer_task: tokio::task::JoinHandle<Result<(crate::volume::NeedleWriter, Option<[u8; 16]>), (&'static str, String)>>,
         work: Arc<crate::work::WorkCounters>,
         cap: usize,
     ) -> Self {
@@ -1450,7 +1730,7 @@ impl StreamPipeline {
         });
     }
 
-    async fn join_writer(&mut self, key: &str) -> Option<crate::volume::NeedleWriter> {
+    async fn join_writer(&mut self, key: &str) -> Option<(crate::volume::NeedleWriter, Option<[u8; 16]>)> {
         self.release_buffers();
         let res = match self.writer_task.take() {
             Some(t) => t.await,
@@ -1493,7 +1773,7 @@ impl StreamPipeline {
     }
 
     async fn fail_from_writer(&mut self, key: &str) {
-        if let Some(w) = self.join_writer(key).await {
+        if let Some((w, _)) = self.join_writer(key).await {
             drop(w);
             self.abort(
                 crate::fsm::PipelineEvent::WriteError,
@@ -1564,6 +1844,10 @@ where
         None => None,
     };
     let signed_headers = headers.clone();
+    let write_sse_key = match crate::sse::parse_write_sse_headers(&signed_headers) {
+        Ok(k) => k,
+        Err(e) => return Ok(sse_error_response(e, key, false)),
+    };
     let req_checksum = match crate::checksum::requested_checksum(&signed_headers) {
         Ok(c) => c,
         Err(r) => return Ok(bad_request(r.code, r.why, key)),
@@ -1595,10 +1879,34 @@ where
         expected_len.map(|n| n as u64)
     };
     if let Some(len) = stream_len.filter(|&n| n > STREAM_PUT_MIN) {
-        let base_flags = if key.ends_with('/') {
+        let base_flags = if key.ends_with('/') && write_sse_key.is_none() {
             AWAN_FLAG_ACTIVE | AWAN_FLAG_ZERO_BYTE
         } else {
             AWAN_FLAG_ACTIVE
+        };
+        let (stream_sse_attr, stream_dek, disk_payload_len, final_put_attrs) = match write_sse_key {
+            Some(ref k) => {
+                let disk_len = match crate::sse::stored_len(len) {
+                    Ok(n) => n,
+                    Err(_) => return Ok(crate::s3_api::entity_too_large(path, crate::s3_api::MAX_OBJECT_BODY)),
+                };
+                let attr = match crate::sse::SseAttr::new_ssec(k, false, len) {
+                    Ok(a) => a,
+                    Err(e) => return Ok(internal_error_response(key, &format!("could not initialize SSE-C: {}", e))),
+                };
+                let dek = match attr.derive_dek(k) {
+                    Ok(d) => d,
+                    Err(e) => return Ok(internal_error_response(key, &format!("could not derive SSE-C key: {}", e))),
+                };
+                let mut m = put_attrs_map.clone();
+                m.set_sse(&attr);
+                let enc = match m.encode() {
+                    Ok(a) => a,
+                    Err(_) => return Ok(bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key)),
+                };
+                (Some(attr), Some(dek), disk_len, enc)
+            }
+            None => (None, None, len, put_attrs),
         };
         let mut reservation = match CapacityReservation::acquire(&state.engine, b_id, key.as_bytes()) {
             Ok(r) => r,
@@ -1606,7 +1914,7 @@ where
         };
         let ticket = state.streams.enter(b_id, key);
         let begin_flags = base_flags | state.version_stamp(b_id, key).map_or(0, |s| s.0);
-        let mut writer = match state.begin_needle_on_active(b_id, key, &put_attrs, len, begin_flags) {
+        let mut writer = match state.begin_needle_on_active(b_id, key, &final_put_attrs, disk_payload_len, begin_flags) {
             Ok(w) => w,
             Err(e) => return Ok(internal_error_response(key, &format!("could not store the object: {:?}", e))),
         };
@@ -1631,22 +1939,46 @@ where
         let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::work::InflightBuf>(2);
         let (recycle_tx, recycle_rx) = tokio::sync::mpsc::channel::<crate::work::InflightBuf>(2);
         drop(recycle_tx.try_send(crate::work::InflightBuf::with_capacity(&state.work, COALESCE_CAP)));
+        let sse_nonce_prefix = stream_sse_attr.as_ref().map(|a| a.nonce_prefix()).unwrap_or([0; 4]);
         let writer_task = tokio::task::spawn_blocking(
-            move || -> Result<crate::volume::NeedleWriter, (&'static str, String)> {
+            move || -> Result<(crate::volume::NeedleWriter, Option<[u8; 16]>), (&'static str, String)> {
+                let mut enc_writer = match stream_dek {
+                    Some(dek) => Some(
+                        crate::sse::Awe1EncryptWriter::new(&dek, sse_nonce_prefix, 0, len)
+                            .map_err(|e| ("InternalError", format!("SSE-C init failed: {}", e)))?,
+                    ),
+                    None => None,
+                };
+                let mut plain_fed = 0u64;
                 while let Some(mut buf) = rx.blocking_recv() {
-                    if writer.written() + buf.len() as u64 > len {
+                    if plain_fed + buf.len() as u64 > len {
                         return Err((
                             "IncompleteBody",
                             "The body is longer than its declared length.".to_string(),
                         ));
                     }
-                    if let Err(e) = writer.write(&buf) {
+                    plain_fed += buf.len() as u64;
+                    if let Some(ew) = enc_writer.as_mut() {
+                        match ew.write(&buf, &mut |ct| writer.write(ct)) {
+                            Ok(()) => {}
+                            Err(Ok(e)) => return Err(("InternalError", format!("SSE-C encrypt failed: {}", e))),
+                            Err(Err(e)) => return Err(("InternalError", format!("could not store the object: {:?}", e))),
+                        }
+                    } else if let Err(e) = writer.write(&buf) {
                         return Err(("InternalError", format!("could not store the object: {:?}", e)));
                     }
                     buf.clear();
                     drop(recycle_tx.try_send(buf));
                 }
-                Ok(writer)
+                let ct_md5 = match enc_writer.take() {
+                    Some(ew) => match ew.finish(|ct| writer.write(ct)) {
+                        Ok(m) => Some(m),
+                        Err(Ok(e)) => return Err(("InternalError", format!("SSE-C finish failed: {}", e))),
+                        Err(Err(e)) => return Err(("InternalError", format!("could not store the object: {:?}", e))),
+                    },
+                    None => None,
+                };
+                Ok((writer, ct_md5))
             },
         );
         let mut pipe = StreamPipeline::new(tx, recycle_rx, writer_task, Arc::clone(&state.work), COALESCE_CAP);
@@ -1788,10 +2120,10 @@ where
                             continue;
                         }
                     }
-                    let Some(writer) = pipe.join_writer(key).await else {
+                    let Some((writer, ct_md5)) = pipe.join_writer(key).await else {
                         continue;
                     };
-                    if decoder.as_ref().is_some_and(|d| d.finish().is_err()) || writer.written() != len {
+                    if decoder.as_ref().is_some_and(|d| d.finish().is_err()) || writer.written() != disk_payload_len {
                         drop(writer);
                         pipe.abort(
                             crate::fsm::PipelineEvent::LengthMismatch,
@@ -1832,6 +2164,14 @@ where
                             continue;
                         }
                     }
+                    let (etag_hi, etag_lo, etag_hex) = if let Some(cm) = ct_md5 {
+                        let hi = u64::from_be_bytes(cm[0..8].try_into().unwrap());
+                        let lo = u64::from_be_bytes(cm[8..16].try_into().unwrap());
+                        let hex: String = cm.iter().map(|b| format!("{:02x}", b)).collect();
+                        (hi, lo, hex)
+                    } else {
+                        (etag_hi, etag_lo, etag_hex)
+                    };
                     let stream_cksum_out = match (req_checksum.as_ref(), cksum_hasher.take()) {
                         (Some((alg, expected_opt)), Some(h)) => {
                             let got = h.finish_base64();
@@ -1871,7 +2211,7 @@ where
                 crate::fsm::PipelineState::Failed => {
                     pipe.release_buffers();
                     if let Some(t) = pipe.writer_task.take() {
-                        if let Ok(Ok(w)) = t.await {
+                        if let Ok(Ok((w, _))) = t.await {
                             drop(w);
                         }
                     }
@@ -1898,7 +2238,7 @@ where
             .ok()
             .map(|m| (m.vol_offset, m.size, unpack_flags(m.bucket_flags)));
         let stamp = state.version_stamp(b_id, key);
-        let attrs_flag = if put_attrs.is_empty() { 0 } else { crate::meta_index::FLAG_ATTRS };
+        let attrs_flag = if final_put_attrs.is_empty() { 0 } else { crate::meta_index::FLAG_ATTRS };
         let flags = base_flags | attrs_flag | stamp.map_or(0, |s| s.0);
         if flags & FORMAT_2_FLAGS != 0 && writer.volume().format() < 2 {
             return Ok(internal_error_response(
@@ -1973,12 +2313,12 @@ where
                 Ok(vid) => {
                     let resp_vid = (extra & crate::meta_index::FLAG_NULL_ID == 0).then_some(vid.as_str());
                     let exp = crate::lifecycle::expiration_header_for_attrs(&state, b_id, key, len, &put_attrs_map, created_ns);
-                    with_expiration(put_ok_response(&etag_hex, resp_vid, stream_cksum_ref), exp)
+                    with_expiration(put_ok_response(&etag_hex, resp_vid, stream_cksum_ref, stream_sse_attr.as_ref()), exp)
                 }
                 Err(r) => r,
             }
         } else {
-            let resp = finish_put(&state, b_id, bucket, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns, stream_cksum_ref, reservation, late.is_none());
+            let resp = finish_put(&state, b_id, bucket, key, old_info, vol_offset, len, etag_hi, etag_lo, flags, &etag_hex, created_ns, stream_cksum_ref, stream_sse_attr.as_ref(), reservation, late.is_none());
             let exp = crate::lifecycle::expiration_header_for_attrs(&state, b_id, key, len, &put_attrs_map, created_ns);
             with_expiration(resp, exp)
         };
@@ -2114,6 +2454,27 @@ where
     if let Err(resp) = apply_object_ownership_and_acl(&state, b_id, key, &signed_headers, writer_account, bucket_owner, iam, &mut buf_attrs_map) {
         return Ok(resp);
     }
+    let (buf_sse_attr, stored_bytes, etag_hi, etag_lo, final_etag_hex, flags) = if let Some(ref sse_key) = write_sse_key {
+        let attr = match crate::sse::SseAttr::new_ssec(sse_key, false, payload_len) {
+            Ok(a) => a,
+            Err(e) => return Ok(internal_error_response(key, &format!("could not initialize SSE-C: {}", e))),
+        };
+        let dek = match attr.derive_dek(sse_key) {
+            Ok(d) => d,
+            Err(e) => return Ok(internal_error_response(key, &format!("could not derive SSE-C key: {}", e))),
+        };
+        let (ct, ct_md5) = match crate::sse::encrypt_full(&dek, attr.nonce_prefix(), 0, &decoded_bytes) {
+            Ok(r) => r,
+            Err(e) => return Ok(internal_error_response(key, &format!("SSE-C encrypt failed: {}", e))),
+        };
+        buf_attrs_map.set_sse(&attr);
+        let hi = u64::from_be_bytes(ct_md5[0..8].try_into().unwrap());
+        let lo = u64::from_be_bytes(ct_md5[8..16].try_into().unwrap());
+        let hex: String = ct_md5.iter().map(|b| format!("{:02x}", b)).collect();
+        (Some(attr), Bytes::from(ct), hi, lo, hex, AWAN_FLAG_ACTIVE)
+    } else {
+        (None, decoded_bytes, etag_hi, etag_lo, final_etag_hex, flags)
+    };
     let buf_attrs = match buf_attrs_map.encode() {
         Ok(a) => a,
         Err(_) => return Ok(bad_request("MetadataTooLarge", "Your metadata headers exceed the maximum allowed metadata size.", key)),
@@ -2122,7 +2483,7 @@ where
     let flags = flags | stamp.map_or(0, |s| s.0);
     let created_ns = stamp.map(|s| s.1).unwrap_or_else(|| state.unversioned_write_ts(b_id, key));
     let (vol_offset, flags, late) = match state
-        .store_object(b_id, bucket, key, &buf_attrs, &decoded_bytes, flags, etag_hi, etag_lo, Some(created_ns))
+        .store_object(b_id, bucket, key, &buf_attrs, &stored_bytes, flags, etag_hi, etag_lo, Some(created_ns))
         .await
     {
         Ok((o, f)) => (o, f, None),
@@ -2153,12 +2514,12 @@ where
             Ok(vid) => {
                 let resp_vid = (extra & crate::meta_index::FLAG_NULL_ID == 0).then_some(vid.as_str());
                 let exp = crate::lifecycle::expiration_header_for_attrs(&state, b_id, key, payload_len, &buf_attrs_map, created_ns);
-                with_expiration(put_ok_response(&final_etag_hex, resp_vid, buf_cksum_ref), exp)
+                with_expiration(put_ok_response(&final_etag_hex, resp_vid, buf_cksum_ref, buf_sse_attr.as_ref()), exp)
             }
             Err(r) => r,
         }
     } else {
-        let resp = finish_put(&state, b_id, bucket, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns, buf_cksum_ref, reservation, late.is_none());
+        let resp = finish_put(&state, b_id, bucket, key, old_info, vol_offset, payload_len, etag_hi, etag_lo, flags, &final_etag_hex, created_ns, buf_cksum_ref, buf_sse_attr.as_ref(), reservation, late.is_none());
         let exp = crate::lifecycle::expiration_header_for_attrs(&state, b_id, key, payload_len, &buf_attrs_map, created_ns);
         with_expiration(resp, exp)
     };
@@ -2175,6 +2536,10 @@ pub async fn get_or_head_object(
     is_head: bool,
     is_anon_with_auth: bool,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
+    let read_sse_key = match crate::sse::parse_read_sse_headers(headers) {
+        Ok(k) => k,
+        Err(e) => return Ok(sse_error_response(e, key, is_head)),
+    };
     let overrides = match ResponseOverrides::from_query(query_map, key, is_anon_with_auth) {
         Ok(ov) => ov,
         Err(resp) => return Ok(resp),
@@ -2253,20 +2618,11 @@ pub async fn get_or_head_object(
         etag: etag_val.clone(),
         last_modified_secs: lm_secs,
     };
-    match precondition(headers, Some(&facts), false) {
-        PreconditionOutcome::Proceed => {}
-        outcome => return Ok(precondition_failure_response(outcome, Some(&facts), key, is_head)),
-    }
-    let exp_hdr = crate::lifecycle::expiration_header_for_attrs(
-        &state,
-        b_id,
-        key,
-        meta.size,
-        &view.attrs,
-        meta.created_at.saturating_mul(1_000_000),
-    );
-
-    if let Some(pn) = part_num {
+    let stored_sse = match view.attrs.sse() {
+        Ok(s) => s,
+        Err(e) => return Ok(internal_error_response(key, &format!("could not decode SSE attribute: {:?}", e))),
+    };
+    let mp_part_extents = if let Some(pn) = part_num {
         if is_multipart {
             let extents = match state.multipart.get_completed_extents(b_id, key) {
                 Some(e) => e,
@@ -2285,37 +2641,7 @@ pub async fn get_or_head_object(
                     .body(body)
                     .unwrap());
             }
-            let ext = &extents[(pn - 1) as usize];
-            let body = if is_head {
-                empty_body()
-            } else if meta.size > VERIFY_WHILE_SENDING_MIN {
-                // A part of a large object is read from its file, not its mapping (#155
-                // requirement 5), whatever the part's own size.
-                match state.multipart_body(b_id, format!("{}/{} part {}", bucket, key, pn), &extents, ext.cumulative_end - ext.part_size, ext.part_size, true) {
-                    Ok(b) => b.boxed(),
-                    Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
-                }
-            } else {
-                let b = match state.part_bytes(b_id, ext) {
-                    Ok(b) => b,
-                    Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
-                };
-                full_body(b.slice(..(ext.part_size as usize).min(b.len())))
-            };
-            return Ok(with_expiration_header(with_part_checksum_headers(
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, view.content_type())
-                    .header(ETAG, etag_val)
-                    .header(ACCEPT_RANGES, "bytes")
-                    .header("x-amz-mp-parts-count", parts_count.to_string())
-                    .header(CONTENT_LENGTH, ext.part_size.to_string())
-                    .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)),
-                &view.attrs,
-                ext.checksum.as_ref(),
-            ), exp_hdr.as_deref())
-            .body(body)
-            .unwrap());
+            Some(extents)
         } else if pn > 1 {
             let body = if is_head {
                 empty_body()
@@ -2327,7 +2653,78 @@ pub async fn get_or_head_object(
                 .header(CONTENT_TYPE, "application/xml")
                 .body(body)
                 .unwrap());
+        } else {
+            None
         }
+    } else {
+        None
+    };
+
+    let sse_dek = match crate::sse::authorize_read_ssec(stored_sse.as_ref(), read_sse_key.as_ref()) {
+        Ok(d) => d,
+        Err(e) => return Ok(sse_error_response(e, key, is_head)),
+    };
+
+    match precondition(headers, Some(&facts), false) {
+        PreconditionOutcome::Proceed => {}
+        outcome => return Ok(precondition_failure_response(outcome, Some(&facts), key, is_head)),
+    }
+    let exp_hdr = crate::lifecycle::expiration_header_for_attrs(
+        &state,
+        b_id,
+        key,
+        meta.size,
+        &view.attrs,
+        meta.created_at.saturating_mul(1_000_000),
+    );
+
+    if let (Some(pn), Some(extents)) = (part_num, mp_part_extents) {
+        let parts_count = extents.len();
+        let ext = &extents[(pn - 1) as usize];
+        let actual_pn = crate::sse::part_number_from_staged_path(ext.staged_path.as_deref(), pn);
+        let body = if is_head {
+            empty_body()
+        } else if let Some(dek) = sse_dek {
+            if meta.size > VERIFY_WHILE_SENDING_MIN {
+                match state.encrypted_part_body(b_id, format!("{}/{} part {}", bucket, key, pn), ext, actual_pn, dek) {
+                    Ok(b) => b.boxed(),
+                    Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
+                }
+            } else {
+                let b = match state.read_encrypted_part_bytes(b_id, key, ext, actual_pn, &dek) {
+                    Ok(b) => b,
+                    Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
+                };
+                full_body(b.slice(..(ext.part_size as usize).min(b.len())))
+            }
+        } else if meta.size > VERIFY_WHILE_SENDING_MIN {
+            // A part of a large object is read from its file, not its mapping (#155
+            // requirement 5), whatever the part's own size.
+            match state.multipart_body(b_id, format!("{}/{} part {}", bucket, key, pn), &extents, ext.cumulative_end - ext.part_size, ext.part_size, true) {
+                Ok(b) => b.boxed(),
+                Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
+            }
+        } else {
+            let b = match state.part_bytes(b_id, ext) {
+                Ok(b) => b,
+                Err(e) => return Ok(internal_error_response(key, &format!("could not read a part: {:?}", e))),
+            };
+            full_body(b.slice(..(ext.part_size as usize).min(b.len())))
+        };
+        return Ok(with_sse_headers(with_expiration_header(with_part_checksum_headers(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, view.content_type())
+                .header(ETAG, etag_val)
+                .header(ACCEPT_RANGES, "bytes")
+                .header("x-amz-mp-parts-count", parts_count.to_string())
+                .header(CONTENT_LENGTH, ext.part_size.to_string())
+                .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)),
+            &view.attrs,
+            ext.checksum.as_ref(),
+        ), exp_hdr.as_deref()), stored_sse.as_ref())
+        .body(body)
+        .unwrap());
     }
 
     let range_hdr = headers.get("Range").and_then(|v| v.to_str().ok());
@@ -2336,6 +2733,43 @@ pub async fn get_or_head_object(
     if let Some(range_opt) = range_res {
         match range_opt {
             Ok(Some(range)) => {
+                if let Some(dek) = sse_dek {
+                    let sse_attr = stored_sse.as_ref().expect("dek implies stored_sse");
+                    let len = range.end - range.start + 1;
+                    let body = if is_head {
+                        empty_body()
+                    } else if meta.size > VERIFY_WHILE_SENDING_MIN {
+                        let what = format!("{}/{}", bucket, key);
+                        let b = if is_multipart {
+                            match state.multipart.get_completed_extents(b_id, key) {
+                                Some(extents) => state.encrypted_multipart_body(b_id, what, &extents, dek, range.start, len),
+                                None => return Ok(internal_error_response(key, "the multipart object's part list is missing")),
+                            }
+                        } else {
+                            state.encrypted_single_body(b_id, what, meta.vol_offset, sse_attr, dek, range.start, len)
+                        };
+                        match b {
+                            Ok(b) => b.boxed(),
+                            Err(e) => return Ok(internal_error_response(key, &format!("could not read the object: {:?}", e))),
+                        }
+                    } else {
+                        let flags = unpack_flags(meta.bucket_flags);
+                        match state.read_encrypted_object_range(b_id, key, meta.vol_offset, flags, sse_attr, &dek, range.start, len) {
+                            Ok(b) => full_body(b),
+                            Err(e) => return Ok(internal_error_response(key, &format!("could not read the object: {:?}", e))),
+                        }
+                    };
+                    return Ok(with_sse_headers(with_expiration_header(with_tagging_count(Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .with_object_metadata(&view, &overrides)
+                        .header(ETAG, etag_val)
+                        .header(ACCEPT_RANGES, "bytes")
+                        .header(CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, meta.size))
+                        .header(CONTENT_LENGTH, len.to_string())
+                        .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), tag_count), exp_hdr.as_deref()), stored_sse.as_ref())
+                        .body(body)
+                        .unwrap());
+                }
                 if !is_head && !is_compressed && meta.size > VERIFY_WHILE_SENDING_MIN {
                     let len = range.end - range.start + 1;
                     let what = format!("{}/{}", bucket, key);
@@ -2473,6 +2907,42 @@ pub async fn get_or_head_object(
             }
             Ok(None) => {}
         }
+    }
+
+    if let Some(dek) = sse_dek {
+        let sse_attr = stored_sse.as_ref().expect("dek implies stored_sse");
+        let body = if is_head {
+            empty_body()
+        } else if meta.size > VERIFY_WHILE_SENDING_MIN {
+            let what = format!("{}/{}", bucket, key);
+            let b = if is_multipart {
+                match state.multipart.get_completed_extents(b_id, key) {
+                    Some(extents) => state.encrypted_multipart_body(b_id, what, &extents, dek, 0, meta.size),
+                    None => return Ok(internal_error_response(key, "the multipart object's part list is missing")),
+                }
+            } else {
+                state.encrypted_single_body(b_id, what, meta.vol_offset, sse_attr, dek, 0, meta.size)
+            };
+            match b {
+                Ok(b) => b.boxed(),
+                Err(e) => return Ok(internal_error_response(key, &format!("could not read the object: {:?}", e))),
+            }
+        } else {
+            let flags = unpack_flags(meta.bucket_flags);
+            match state.read_encrypted_object_bytes(b_id, key, meta.vol_offset, meta.size, flags, sse_attr, &dek) {
+                Ok(b) => full_body(b),
+                Err(e) => return Ok(internal_error_response(key, &format!("could not read the object: {:?}", e))),
+            }
+        };
+        return Ok(with_sse_headers(with_expiration_header(with_tagging_count(with_checksum_headers(Response::builder()
+            .status(StatusCode::OK)
+            .with_object_metadata(&view, &overrides)
+            .header(ETAG, etag_val)
+            .header(ACCEPT_RANGES, "bytes")
+            .header(CONTENT_LENGTH, meta.size.to_string())
+            .header(LAST_MODIFIED, crate::clock::format_http_date_ms(meta.created_at)), &view.attrs, cksum_mode), tag_count), exp_hdr.as_deref()), stored_sse.as_ref())
+            .body(body)
+            .unwrap());
     }
 
     if is_multipart && !is_head {
@@ -2723,6 +3193,10 @@ pub async fn get_object_attributes(
     query_map: &HashMap<String, String>,
     headers: &HeaderMap,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
+    let read_sse_key = match crate::sse::parse_read_sse_headers(headers) {
+        Ok(k) => k,
+        Err(e) => return Ok(sse_error_response(e, key, false)),
+    };
     let ObjectAttributesQuery {
         want_etag,
         want_checksum,
@@ -2795,6 +3269,13 @@ pub async fn get_object_attributes(
         Ok(v) => v,
         Err(e) => return Ok(internal_error_response(key, &format!("could not read the object's attributes: {:?}", e))),
     };
+    let stored_sse = match view.attrs.sse() {
+        Ok(s) => s,
+        Err(e) => return Ok(internal_error_response(key, &format!("could not decode SSE attribute: {:?}", e))),
+    };
+    if let Err(e) = crate::sse::authorize_read_ssec(stored_sse.as_ref(), read_sse_key.as_ref()) {
+        return Ok(sse_error_response(e, key, false));
+    }
 
     let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<GetObjectAttributesResponse xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n");
     if want_etag {
@@ -2868,10 +3349,13 @@ pub async fn get_object_attributes(
     }
     xml.push_str("</GetObjectAttributesResponse>");
 
-    let mut b = Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/xml")
-        .header(LAST_MODIFIED, last_mod_http);
+    let mut b = with_sse_headers(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/xml")
+            .header(LAST_MODIFIED, last_mod_http),
+        stored_sse.as_ref(),
+    );
     if let Some(vid_str) = version_id_str {
         b = b.header("x-amz-version-id", vid_str);
     }

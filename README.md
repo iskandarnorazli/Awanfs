@@ -21,7 +21,7 @@ Read this before you run it anywhere that matters. Plan of record: the Phase 1-4
 - **Conformance:** the ceph s3-tests suite passes 335 of 886 tests (94 skipped; main at 38660ee, 2026-11-19), checked nightly and on every pull request that changes server code; the tracker is #123. The plan to pass the rest is [`CONFORMANCE_DESIGN.md`](CONFORMANCE_DESIGN.md), and [`tests/s3tests/CONFORMANCE_MAP.md`](tests/s3tests/CONFORMANCE_MAP.md) gives every test its area and owner.
 - **Browser form uploads** (POST object, #119): HTML forms and SDK presigned POSTs signed with SigV4, with policy conditions, `success_action_status` and redirects; a file above 4 MiB streams. SigV2-signed forms are refused (AwanFS accepts SigV4 only), so the suite's 36 POST tests run as SigV4 versions in [`server/tests/post_object_suite_test.rs`](server/tests/post_object_suite_test.rs) ([`tests/s3tests/PORTED.md`](tests/s3tests/PORTED.md)).
 - **Access & Authorization:** Bucket policies (`?policy`, `?policyStatus`), bucket and object ACLs (`?acl`, canned ACLs, `x-amz-grant-*`), Object Ownership Controls (`?ownershipControls`, defaulting to `BucketOwnerEnforced` via `--default-bucket-ownership` / `AWANFS_DEFAULT_BUCKET_OWNERSHIP`), Public Access Block (`?publicAccessBlock`), and anonymous access governed by `authorize()` (#122, #151).
-- **Not yet:** replication and erasure coding across nodes, server-side encryption (in #123's area issues).
+- **Not yet:** replication and erasure coding across nodes, SSE-S3 and SSE-KMS (SSE-C is supported; the remaining items are in #123's area issues).
 
 ## 1. Executive Summary
 

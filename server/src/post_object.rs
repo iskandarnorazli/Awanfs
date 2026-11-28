@@ -407,7 +407,11 @@ pub fn object_header_fields(form: &FormFields) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (name, value) in &form.fields {
         let n = name.to_ascii_lowercase();
-        if PLAIN.contains(&n.as_str()) || n.starts_with("x-amz-meta-") || n.starts_with("x-amz-checksum-") {
+        if PLAIN.contains(&n.as_str())
+            || n.starts_with("x-amz-meta-")
+            || n.starts_with("x-amz-checksum-")
+            || n.starts_with("x-amz-server-side-encryption")
+        {
             out.push((n, value.clone()));
         }
     }
