@@ -172,6 +172,18 @@ class RunnerIntegrationTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"RUNNER_TEMP": "/runner/fast-tmp"}):
             self.assertEqual(br.default_work_dir(), "/runner/fast-tmp")
 
+    def test_bin_name_for_manifest_supports_pre_and_post_rename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_toml = os.path.join(tmp, "old.toml")
+            new_toml = os.path.join(tmp, "new.toml")
+            with open(old_toml, "w", encoding="utf-8") as fh:
+                fh.write('[package]\nname = "s3-server"\n[[bin]]\nname = "s3-server"\n')
+            with open(new_toml, "w", encoding="utf-8") as fh:
+                fh.write('[package]\nname = "awanfs"\n[lib]\nname = "s3_server"\n[[bin]]\nname = "awanfs"\n')
+            self.assertEqual(br._bin_name_for_manifest(old_toml), "s3-server")
+            self.assertEqual(br._bin_name_for_manifest(new_toml), "awanfs")
+            self.assertEqual(br._bin_name_for_manifest(os.path.join(tmp, "missing.toml")), "s3-server")
+
     def test_build_commits_uses_worktree_under_work_dir_and_cleans_up(self):
         calls = []
 

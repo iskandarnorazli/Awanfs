@@ -32,9 +32,9 @@ fn fix_mmap_threshold() -> &'static str {
 fn print_help() {
     println!(
         "\
-s3-server — AwanFS S3-compatible object storage server
+awanfs — AwanFS S3-compatible object storage server
 
-Usage: s3-server [OPTIONS]
+Usage: awanfs [OPTIONS]
 
 Options:
   -p, --port <PORT>                Listen port (default: 9000, or S3_PORT / AWAN_S3_PORT)
@@ -51,7 +51,8 @@ Options:
       --access-log <PATH|->        Write S3 access log to file or '-' for stdout (or AWANFS_ACCESS_LOG)
       --config <PATH>              TOML config for users/policies/buckets (or AWANFS_CONFIG)
       --memory-budget <SIZE>       Total cache + in-flight body memory budget (or AWANFS_MEMORY_BUDGET)
-      --lifecycle-day-seconds <N>  Seconds per lifecycle day (default: 86400; test use only)
+      --lifecycle-day-seconds <N>  Seconds per lifecycle day (default: 86400; test use only); the
+                                   expiry sweep runs every 1/24 of a day, 500 ms to 1 h
       --body-idle-timeout <DUR>    Idle timeout between request body frames (default: 20s)
       --region <NAME>              Server region (default: us-east-1, or AWANFS_REGION)
       --allow-anonymous            Allow unsigned requests (or AWANFS_ALLOW_ANONYMOUS=1)
@@ -182,7 +183,6 @@ async fn serve(
             if let Some(v) = args.next().and_then(|s| s.parse::<u64>().ok()).filter(|&n| n > 0) {
                 lifecycle_day_seconds = v;
             }
-            memory_budget = args.next();
         } else if arg == "--body-idle-timeout" {
             let Some(v) = args.next() else {
                 eprintln!("--body-idle-timeout requires a value such as 20s");
@@ -308,8 +308,16 @@ async fn serve(
     state.set_body_idle_timeout(body_idle_timeout);
     state.multipart.enforce_min_part_size.store(!allow_small_parts, std::sync::atomic::Ordering::SeqCst);
     // Compaction copies at most this many MB/s (#28, decision 24); 0 = no limit.
-    state.compaction_rate.store(compaction_mb.unwrap_or(50) * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+    let compaction_rate_mb = compaction_mb.unwrap_or(50);
+    state.compaction_rate.store(compaction_rate_mb * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "Compaction: auto={} rate={} MB/s",
+        if auto_compaction { "on" } else { "off" },
+        compaction_rate_mb
+    );
     state.lifecycle_day_seconds.store(lifecycle_day_seconds, std::sync::atomic::Ordering::Relaxed);
+    let lifecycle_period = s3_server::lifecycle::sweep_interval(lifecycle_day_seconds);
+    println!("Lifecycle sweep every {:?}", lifecycle_period);
     state.set_per_bucket_metrics(per_bucket_metrics);
     if lifecycle_day_seconds != 86_400 {
         eprintln!("WARNING: --lifecycle-day-seconds {} is set (default 86400); for test use only", lifecycle_day_seconds);
@@ -361,11 +369,6 @@ async fn serve(
         state.start_auto_compaction(std::time::Duration::from_secs(600), 0.20, 1 << 30);
     }
     state.start_multipart_cleanup(std::time::Duration::from_secs(600), 7 * lifecycle_day_seconds * 1000);
-    let lifecycle_period = if lifecycle_day_seconds < 60 {
-        std::time::Duration::from_millis(500)
-    } else {
-        std::time::Duration::from_secs(60)
-    };
     state.start_lifecycle_sweep(lifecycle_period);
     state.start_scrub(std::time::Duration::from_secs(600), scrub_mib_per_sec);
 

@@ -48,7 +48,7 @@ startup_refuses_a_split_chain() {
   local d; d=$(mktemp -d); mkdir -p "$d/scripts" "$d/server/target/release"
   sed 's/^j_listing() { local tok; S3 create-bucket/j_listing() { S3 create-bucket/; s/^  tok=\$(S3 list-objects-v2/  local tok; tok=$(S3 list-objects-v2/' "$H" >"$d/scripts/verify_drive.sh"
   grep -q '^  local tok; tok=' "$d/scripts/verify_drive.sh" || return 1   # the mutation took
-  printf '#!/bin/sh\nexit 0\n' >"$d/server/target/release/s3-server"; chmod +x "$d/server/target/release/s3-server"
+  printf '#!/bin/sh\nexit 0\n' >"$d/server/target/release/awanfs"; chmod +x "$d/server/target/release/awanfs"
   local out; out=$(PATH="$d:$PATH" bash -c 'aws() { :; }; export -f aws; bash "$0"' "$d/scripts/verify_drive.sh" 2>&1); local code=$?
   [ "$code" -eq 2 ] && grep -q "splits its && chain" <<<"$out"; }
 t startup_refuses_a_split_chain

@@ -1,6 +1,6 @@
 """Bisect a get_64k AwanFS / MinIO throughput ratio change across candidate commits.
 
-Builds `s3-server` at each candidate commit in a detached `git worktree` under the runner's temp
+Builds `awanfs` (or `s3-server` on pre-rename commits) at each candidate commit in a detached `git worktree` under the runner's temp
 directory, then measures the `get_64k` workload (64 KiB GET, 128 objects, 16 workers) from
 `benchmarks/ratio_check.py` against every build and MinIO for `--rounds` rounds (default 7),
 rotating the server order each round.
@@ -203,12 +203,24 @@ def _run_cmd(cmd: List[str], env: Optional[Dict[str, str]] = None, error_prefix:
     return res.stdout
 
 
+def _bin_name_for_manifest(manifest_path: str) -> str:
+    """Return 'awanfs' for post-rename commits and 's3-server' for older commits."""
+    if os.path.isfile(manifest_path):
+        with open(manifest_path, encoding="utf-8") as fh:
+            text = fh.read()
+        if re.search(r'(?m)^\[\[bin\]\]\s*\r?\nname\s*=\s*"awanfs"', text) or re.search(
+            r'(?m)^\[package\]\s*\r?\nname\s*=\s*"awanfs"', text
+        ):
+            return "awanfs"
+    return "s3-server"
+
+
 def build_commits(
     commits: Sequence[str],
     repo_root: str = ROOT,
     work_dir: Optional[str] = None,
 ) -> List[BuiltCommit]:
-    """Check out each commit in a git worktree under `work_dir` and build `s3-server`."""
+    """Check out each commit in a git worktree under `work_dir` and build the AwanFS binary."""
     base_dir = work_dir or default_work_dir()
     os.makedirs(base_dir, exist_ok=True)
     wt_root = os.path.join(base_dir, "worktrees")
@@ -241,13 +253,14 @@ def build_commits(
             error_prefix=f"git worktree add failed for {ref} ({short_sha})",
         )
         try:
-            built_bin = os.path.join(target_dir, "release", "s3-server" + EXE)
+            manifest = os.path.join(wt_dir, "server", "Cargo.toml")
+            bin_name = _bin_name_for_manifest(manifest)
+            built_bin = os.path.join(target_dir, "release", bin_name + EXE)
             if os.path.exists(built_bin):
                 os.remove(built_bin)
-            manifest = os.path.join(wt_dir, "server", "Cargo.toml")
             print(f"Building commit {ref} ({short_sha}): {subject}", flush=True)
             _run_cmd(
-                ["cargo", "build", "--locked", "--release", "--bin", "s3-server", "--manifest-path", manifest],
+                ["cargo", "build", "--locked", "--release", "--bin", bin_name, "--manifest-path", manifest],
                 env=cargo_env,
                 error_prefix=f"cargo build failed for {ref} ({short_sha})",
             )
@@ -255,7 +268,7 @@ def build_commits(
                 raise RuntimeError(f"cargo build succeeded for {ref} ({short_sha}) but binary is missing at {built_bin}")
             out_dir = os.path.join(bins_root, f"{idx:02d}_{short_sha}")
             os.makedirs(out_dir, exist_ok=True)
-            dest_bin = os.path.join(out_dir, "s3-server" + EXE)
+            dest_bin = os.path.join(out_dir, bin_name + EXE)
             shutil.copy2(built_bin, dest_bin)
             built.append(BuiltCommit(commit=ref, sha=short_sha, subject=subject, bin_path=dest_bin))
         finally:

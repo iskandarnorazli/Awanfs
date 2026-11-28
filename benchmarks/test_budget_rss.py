@@ -64,7 +64,7 @@ class Verdict(unittest.TestCase):
 class HeapAndFilePages(unittest.TestCase):
     """#127: peak RSS split into heap (RssAnon) and pages of mapped files (RssFile)."""
 
-    STATUS = ("Name:\ts3-server\nVmHWM:\t  555000 kB\nVmRSS:\t  540000 kB\n"
+    STATUS = ("Name:\tawanfs\nVmHWM:\t  555000 kB\nVmRSS:\t  540000 kB\n"
               "RssAnon:\t  262144 kB\nRssFile:\t  276480 kB\nRssShmem:\t       0 kB\n")
 
     def test_the_status_fields_parse_to_mib(self):

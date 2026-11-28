@@ -286,6 +286,64 @@ impl AlignedFile {
     pub fn sync_data(&self) -> io::Result<()> {
         self.file.sync_data()
     }
+
+    /// Clones a 4096-byte aligned byte range directly from `src` at `src_offset` to `dest_offset`
+    /// via Linux `ioctl(FICLONERANGE)` without copying payload bytes. Returns
+    /// `io::ErrorKind::Unsupported` outside Linux or `InvalidInput` on unaligned arguments.
+    pub fn clone_range_from(&self, src: &AlignedFile, src_offset: u64, len: u64, dest_offset: u64) -> io::Result<()> {
+        let align = SECTOR_SIZE as u64;
+        if src_offset % align != 0 || dest_offset % align != 0 || len % align != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "FICLONERANGE requires 4096-byte aligned offset and length",
+            ));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+
+            #[repr(C)]
+            struct FileCloneRange {
+                src_fd: i64,
+                src_offset: u64,
+                src_length: u64,
+                dest_offset: u64,
+            }
+            const _: () = assert!(std::mem::size_of::<FileCloneRange>() == 32);
+            const FICLONERANGE: libc::Ioctl = 0x4020_940d as libc::Ioctl;
+
+            let range = FileCloneRange {
+                src_fd: src.file.as_raw_fd() as i64,
+                src_offset,
+                src_length: len,
+                dest_offset,
+            };
+            let rc = unsafe {
+                libc::ioctl(
+                    self.file.as_raw_fd(),
+                    FICLONERANGE,
+                    &range as *const FileCloneRange,
+                )
+            };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (src, src_offset, len, dest_offset);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "FICLONERANGE is only supported on Linux",
+            ))
+        }
+    }
 }
 
 /// A positioned write of all of `buf` at `offset` (no alignment), without a shared cursor.

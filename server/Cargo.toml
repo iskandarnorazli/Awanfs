@@ -1,5 +1,5 @@
 [package]
-name = "s3-server"
+name = "awanfs"
 version = "0.1.0"
 edition = "2021"
 authors = ["Iskandar Norazli <111472977+iskandarnorazli@users.noreply.github.com>"]
@@ -11,7 +11,7 @@ name = "s3_server"
 path = "src/lib.rs"
 
 [[bin]]
-name = "s3-server"
+name = "awanfs"
 path = "src/main.rs"
 
 [dependencies]

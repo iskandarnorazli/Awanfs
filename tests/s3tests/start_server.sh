@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Starts s3-server under the conformance profile documented in tests/s3tests/PROFILE.md.
+# Starts awanfs under the conformance profile documented in tests/s3tests/PROFILE.md.
 # Used by .github/workflows/s3-tests.yml so the suite's server flags live in one place.
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-BIN="${AWANFS_BIN:-$ROOT/server/target/release/s3-server}"
+BIN="${AWANFS_BIN:-$ROOT/server/target/release/awanfs}"
 DATA_DIR="${AWANFS_DATA_DIR:-/tmp/awanfs-data}"
 USERS_FILE="${AWANFS_USERS_FILE:-/tmp/awanfs-users.toml}"
 LOG_FILE="${AWANFS_LOG_FILE:-/tmp/awanfs.log}"
@@ -32,5 +32,5 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
-echo "s3-server did not become ready at http://127.0.0.1:9000/_awanfs/health/ready" >&2
+echo "awanfs did not become ready at http://127.0.0.1:9000/_awanfs/health/ready" >&2
 exit 1

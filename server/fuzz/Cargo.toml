@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-s3-server = { path = ".." }
+s3_server = { package = "awanfs", path = ".." }
 hyper = "1"
 http-body-util = "0.1"
 tokio = { version = "1", features = ["rt"] }

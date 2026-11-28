@@ -2640,6 +2640,11 @@ impl S3ServiceState {
         if old.writers_in_flight() > 0 {
             return Ok(CompactionReport { busy: true, ..CompactionReport::default() });
         }
+        // Sync the sealed source volume once before FICLONERANGE/aligned copies (#524).
+        let old_sync = Arc::clone(&old);
+        tokio::task::spawn_blocking(move || old_sync.sync_now())
+            .await
+            .map_err(|e| VolumeError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))??;
         let mut needles = Vec::new();
         old.scan_needles(|n| {
             needles.push((
@@ -2647,18 +2652,17 @@ impl S3ServiceState {
                 n.key,
                 n.offset,
                 n.payload_size,
-                n.etag_hi,
-                n.etag_lo,
                 n.flags,
                 n.payload_crc32c,
                 n.created_at_ns,
+                n.header,
             ))
         })?;
 
         let mut report = CompactionReport::default();
         let mut written: BTreeMap<u32, Arc<VolumeManager>> = BTreeMap::new();
         let mut throttle = crate::throttle::Throttle::new(self.compaction_rate.load(Ordering::Relaxed));
-        for (b_id, key, local, size, etag_hi, etag_lo, flags, crc, created_at) in needles {
+        for (b_id, key, local, size, flags, crc, created_at, hdr) in needles {
             let g_old = global_offset(old_id, local);
             // Compacts live 0x200 attribute-update needles, keeping only the latest live group
             // entries whose target version still exists and dropping superseded/deleted ones (#203).
@@ -2734,16 +2738,9 @@ impl S3ServiceState {
                 continue;
             }
             self.hook("compact_copy", &key);
-            let bytes = if size == 0 { Bytes::new() } else { old.read_needle_bytes(old_id, local, crc)? };
-            let copied = bytes.len() as u64;
-            // The creation time moves with the needle: it is a version's id (#31).
-            // The attributes block moves with the needle, unknown tags included (#150).
-            let attrs = if flags & crate::meta_index::FLAG_ATTRS != 0 {
-                old.read_attrs(local)?.encode().map_err(|_| VolumeError::CorruptIndex)?
-            } else {
-                Vec::new()
-            };
-            let (vm, loc, g_new) = self.write_to_active_with(b_id, &key, &attrs, &bytes, flags, etag_hi, etag_lo, Some(created_at))?;
+            // Compaction clones the needle directly via FICLONERANGE on Linux XFS/Btrfs and falls
+            // back automatically to sector-aligned read+write on unsupported filesystems (#524).
+            let (vm, loc, g_new, cloned) = self.copy_needle_to_active(&old, local, &key, &hdr)?;
             self.total_volume_bytes.fetch_add(loc.total_len, Ordering::Relaxed);
             written.insert(vm.id(), Arc::clone(&vm));
             self.versions.write().move_offset(b_id, &key, g_old, g_new);
@@ -2754,11 +2751,16 @@ impl S3ServiceState {
             }
             self.payload_cache.remove(b_id, g_old);
             report.live_needles_copied += 1;
+            if cloned {
+                report.live_needles_cloned += 1;
+            }
             report.new_locations.insert(key, loc);
             drop(_guard);
             // Let requests run between copies, and pace the copies (#28), with no key locked.
+            // Cloned needles pay metadata cost only; read+write fallback paces full payload bytes.
             tokio::task::yield_now().await;
-            throttle.spend(copied).await;
+            let paced = if cloned { crate::direct_io::SECTOR_SIZE as u64 } else { size };
+            throttle.spend(paced).await;
         }
 
         // The copies must be on disk before the only other copy goes, in every durability mode.
@@ -3337,6 +3339,47 @@ impl S3ServiceState {
         }
     }
 
+    /// Relocates a needle from `src` at `src_offset` to the active volume using copy-on-write
+    /// cloning when supported or sector-aligned read+write fallback, rolling full/older-format
+    /// active volumes as needed (#524).
+    pub(crate) fn copy_needle_to_active(
+        &self,
+        src: &VolumeManager,
+        src_offset: u64,
+        key: &str,
+        hdr: &crate::volume::NeedleHeader,
+    ) -> Result<(Arc<VolumeManager>, NeedleLocation, u64, bool), VolumeError> {
+        let mut attempts = 0;
+        let needed = crate::volume::needed_format_for_flags(hdr.flags, hdr.attrs_len > 0);
+        loop {
+            let vm = self.volume_manager.read().clone().ok_or_else(no_volume_error)?;
+            if vm.format() < needed && attempts < 8 {
+                attempts += 1;
+                self.roll_volume(&vm)?;
+                continue;
+            }
+            match vm.copy_needle_from(src, src_offset, hdr) {
+                Ok((loc, cloned)) => {
+                    let g = global_offset(vm.id(), loc.offset);
+                    self.streams.note_append(hdr.bucket_id as u32, key, g);
+                    return Ok((vm, loc, g, cloned));
+                }
+                Err(VolumeError::VolumeFull { len, .. }) if len + crate::direct_io::SECTOR_SIZE as u64 > vm.max_span() => {
+                    return Err(VolumeError::VolumeFull { offset: 0, len });
+                }
+                Err(VolumeError::VolumeFull { .. }) if attempts < 8 => {
+                    attempts += 1;
+                    self.roll_volume(&vm)?;
+                }
+                Err(VolumeError::AfterRecord { loc, flags, cause }) => {
+                    self.streams.note_append(hdr.bucket_id as u32, key, global_offset(loc.volume_id, loc.offset));
+                    return Err(VolumeError::AfterRecord { loc, flags, cause });
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Starts a streamed needle on the active volume, rolling over when it is full (#36, #37).
     /// Writes the needle at `from` again at the end of the log, in `STREAM_CHUNK` pieces, and
     /// returns the copy's place. The first needle stays in the log as dead space: recovery
@@ -3433,6 +3476,9 @@ impl S3ServiceState {
         self.volumes.write().insert(next_id, Arc::clone(&vm));
         *self.volume_manager.write() = Some(vm);
         self.active_volume_id.store(next_id, Ordering::SeqCst);
+        // Only the active volume needs pooled write buffers (#527); drop the full volume's
+        // pool and refuse any buffers returned later by in-flight writes.
+        full.retire_write_buffers();
         Ok(())
     }
 

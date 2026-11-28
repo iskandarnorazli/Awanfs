@@ -540,7 +540,7 @@ def _start_awanfs(server_bin: str, durability: str, data_root: str, srv_mask: Op
     if not rwb.wait_for_port("127.0.0.1", port, timeout_sec=30.0):
         _stop_proc(proc)
         shutil.rmtree(data_dir, ignore_errors=True)
-        raise RuntimeError(f"s3-server ({durability}) did not start on port {port}")
+        raise RuntimeError(f"awanfs ({durability}) did not start on port {port}")
     conn = _connect_http("127.0.0.1", port, timeout=5.0)
     try:
         conn.request("PUT", f"/{BUCKET}")
@@ -605,6 +605,7 @@ def format_markdown_report(
     duration_sec: float,
     durability_notes: Sequence[str],
     pin_labels: Optional[Tuple[str, str]] = None,
+    mc_version: Optional[str] = None,
 ) -> str:
     lines = [
         f"Command: `{cmd}`",
@@ -617,6 +618,8 @@ def format_markdown_report(
         f"- **Schedule:** {runs} round(s), {duration_sec:.1f}s per phase, alternating server order across rounds (medians reported)",
         f"- **Data directory:** `{hw_info.get('data_dir', tempfile.gettempdir())}`",
     ]
+    if mc_version:
+        lines.append(f"- **mc:** {mc_version}")
     if pin_labels:
         lines.append(f"- **Core pinning:** server `{pin_labels[0]}`, client `{pin_labels[1]}`")
     for note in durability_notes:
@@ -673,10 +676,10 @@ def format_markdown_report(
 
 def _find_default_server_bin() -> Optional[str]:
     exe = ".exe" if sys.platform == "win32" else ""
-    cand = os.path.join(REPO_ROOT, "server", "target", "release", f"s3-server{exe}")
+    cand = os.path.join(REPO_ROOT, "server", "target", "release", f"awanfs{exe}")
     if os.path.isfile(cand):
         return cand
-    return shutil.which(f"s3-server{exe}")
+    return shutil.which(f"awanfs{exe}")
 
 
 def _awanfs_label(durability: str) -> str:
@@ -703,8 +706,8 @@ def _durability_notes(durabilities: Sequence[str], has_minio: bool, has_rustfs: 
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Small-PUT P50/P99 latency benchmark (#362)")
-    ap.add_argument("--server-bin", help="Path to s3-server binary (auto-detected if omitted)")
-    ap.add_argument("--build", action="store_true", help="Build s3-server (--release) before running")
+    ap.add_argument("--server-bin", help="Path to awanfs binary (auto-detected if omitted)")
+    ap.add_argument("--build", action="store_true", help="Build awanfs (--release) before running")
     ap.add_argument("--minio-bin", help="Path to minio binary")
     ap.add_argument("--mc-bin", help="Path to mc binary")
     ap.add_argument("--rustfs-bin", help="Path to rustfs binary")
@@ -743,13 +746,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if a.build:
         subprocess.run(
-            ["cargo", "build", "--locked", "--release", "--bin", "s3-server",
+            ["cargo", "build", "--locked", "--release", "--bin", "awanfs",
              "--manifest-path", os.path.join(REPO_ROOT, "server", "Cargo.toml")],
             check=True,
         )
     server_bin = a.server_bin or _find_default_server_bin()
     if not server_bin or not os.path.isfile(server_bin):
-        print("error: s3-server binary not found (pass --server-bin or --build)", file=sys.stderr)
+        print("error: awanfs binary not found (pass --server-bin or --build)", file=sys.stderr)
         return 2
 
     minio_bin, mc_bin = (a.minio_bin, a.mc_bin) if (a.minio_bin and a.mc_bin) else rwb.find_minio_binaries()
@@ -777,6 +780,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not a.awanfs_only and rustfs_bin and os.path.isfile(rustfs_bin) and mc_bin and os.path.isfile(mc_bin):
         has_rustfs = True
         targets.append(("RustFS", lambda: _start_rustfs(rustfs_bin, mc_bin, data_root, srv_mask)))
+
+    mc_version: Optional[str] = None
+    if (has_minio or has_rustfs) and mc_bin:
+        mc_version = rwb.binary_version(mc_bin)
+        print(f"mc version: {mc_version}", flush=True)
 
     rounds_by_target: Dict[str, List[Dict[str, SmallPutMetrics]]] = {label: [] for label, _ in targets}
     for r_idx in range(a.runs):
@@ -824,6 +832,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         duration_sec=duration_sec,
         durability_notes=_durability_notes(durabilities, has_minio, has_rustfs),
         pin_labels=pin_labels,
+        mc_version=mc_version,
     )
     print(report)
     if a.output:
@@ -841,6 +850,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "hw_info": hw_info,
             "runs": a.runs,
             "duration_sec": duration_sec,
+            **({"mc_version": mc_version} if mc_version else {}),
             "results": {
                 label: {
                     k: {

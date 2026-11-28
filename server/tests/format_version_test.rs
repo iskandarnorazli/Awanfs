@@ -67,7 +67,7 @@ fn a_newer_volume_format_is_refused_naming_both_versions() {
 fn the_binary_exits_2_on_a_newer_format() {
     let dir = temp_dir("binary");
     write_legacy_volume(&dir, FORMAT_VERSION + 1, "k", b"v");
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_s3-server"))
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_awanfs"))
         .args(["--port", "0", "--allow-anonymous", "--data-dir", dir.to_str().unwrap()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())

@@ -15,3 +15,12 @@ Against the thresholds in #464:
 - **PUT P99 more than doubled: not exceeded.** 2.65 to 2.70 ms and 2.47 to 2.75 ms. Only one pass overlapped each PUT phase, so this covers about 3 s of overlap.
 
 Not measured: a bucket with versioning; objects with tags (the sweep reads tags per object); Windows.
+
+## The period after #486
+
+The cost of one pass does not change with #486; how often it runs does. From the passes above (2.786 s and 2.844 s of CPU for 1M objects), computed, not measured separately:
+
+| Period | Passes per hour | CPU per hour at 1M objects | Share of one core |
+|---|---|---|---|
+| 60 s (before #486) | 60 | 167 to 171 s | 4.6% to 4.7% |
+| 1 h (default after #486: 1/24 of a 86,400 s day) | 1 | 2.8 s | 0.08% |
