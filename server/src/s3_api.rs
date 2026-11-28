@@ -3475,6 +3475,9 @@ impl S3ServiceState {
         self.volumes.write().insert(next_id, Arc::clone(&vm));
         *self.volume_manager.write() = Some(vm);
         self.active_volume_id.store(next_id, Ordering::SeqCst);
+        // Only the active volume needs pooled write buffers (#527); drop the full volume's
+        // pool and refuse any buffers returned later by in-flight writes.
+        full.retire_write_buffers();
         Ok(())
     }
 
