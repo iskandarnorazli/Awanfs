@@ -303,7 +303,13 @@ fn differential_100k_policy_and_authz_against_reference() {
             None
         };
         let id_pol = match principal {
-            Principal::User { .. } => PolicyMatch::Allow,
+            Principal::User { .. } => {
+                if rng.bool() {
+                    PolicyMatch::Allow
+                } else {
+                    PolicyMatch::NoOpinion
+                }
+            }
             _ => PolicyMatch::NoOpinion,
         };
         let ctx = AuthzContext { identity_policy: id_pol, _marker: PhantomData };
@@ -316,7 +322,13 @@ fn differential_100k_policy_and_authz_against_reference() {
         }
         // Invariant 2: independent authz reference agrees on every allow/deny.
         let is_owner = matches!(principal, Principal::Root);
-        let pol_ok = got_pol.allow && !(got_pol.is_public && restrict_public_buckets && !is_owner);
+        let cross_account_id_ok = match principal {
+            Principal::User { .. } if !is_owner => id_pol == PolicyMatch::Allow,
+            _ => true,
+        };
+        let pol_ok = got_pol.allow
+            && !(got_pol.is_public && restrict_public_buckets && !is_owner)
+            && cross_account_id_ok;
         let acl_ok = ownership != BucketOwnership::BucketOwnerEnforced
             && acl_grants.grants.iter().any(|g| {
                 let p_ok = sp.acl_permission.is_some_and(|req| g.permission == AclPermission::FullControl || g.permission == req);

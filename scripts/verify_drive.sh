@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Drives a fresh awanfs the way a user does (aws CLI) and keeps the evidence.
-#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle access encryption (default: all)
+#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle access cross_account encryption (default: all)
 # Needs: a built server (cargo build --release --manifest-path server/Cargo.toml), the aws CLI, curl.
 # Evidence: verification/evidence/<UTC timestamp>/ (kept after cleanup). Exit 0 only if every journey passed.
 set -uo pipefail
@@ -404,6 +404,67 @@ j_access() { local code;
   S3 get-bucket-acl --bucket verify-acl-own --query 'Grants[?Grantee.URI!=null].Permission' --output text | grep -q READ &&
   S3 put-bucket-acl --bucket verify-acl-own --acl private &&
   S3 delete-bucket-ownership-controls --bucket verify-acl-own; }
+j_cross_account() { local ca_dir ca_port ca_url ca_cfg ca_pid="" ok=0 reloaded=0;
+  ca_dir="$(mktemp -d)" &&
+  ca_port=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])') &&
+  ca_url="http://127.0.0.1:$ca_port" &&
+  ca_cfg="$ca_dir/users.toml" &&
+  cat >"$ca_cfg" <<'TOML' &&
+[[users]]
+name = "alice"
+account = "acct-a"
+id = "alice-id"
+access_key = "AKALICEDRIVE"
+secret_key = "SKALICEDRIVE"
+policy = '{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}'
+
+[[users]]
+name = "bob"
+account = "acct-b"
+id = "bob-id"
+access_key = "AKBOBDRIVE00"
+secret_key = "SKBOBDRIVE00"
+policy = '{"Statement":[]}'
+TOML
+  chmod 600 "$ca_cfg" &&
+  (
+    trap '[ -n "${ca_pid:-}" ] && kill "$ca_pid" 2>/dev/null; wait "${ca_pid:-}" 2>/dev/null; rm -rf "$ca_dir"' EXIT
+    "$BIN" --port "$ca_port" --data-dir "$ca_dir/data" --config "$ca_cfg" >>"$EVID/cross-acct-server.log" 2>&1 & ca_pid=$!
+    for _ in $(seq 1 100); do if curl -sf "$ca_url/_awanfs/health/ready" >/dev/null; then ok=1; break; fi; sleep 0.1; done
+    [ "$ok" -eq 1 ] &&
+    echo "cross-account-secret" >"$EVID/ca.bin" &&
+    AWS_ACCESS_KEY_ID=AKALICEDRIVE AWS_SECRET_ACCESS_KEY=SKALICEDRIVE aws --endpoint-url "$ca_url" s3api create-bucket --bucket verify-cross >/dev/null &&
+    AWS_ACCESS_KEY_ID=AKALICEDRIVE AWS_SECRET_ACCESS_KEY=SKALICEDRIVE aws --endpoint-url "$ca_url" s3api put-object --bucket verify-cross --key secret.txt --body "$EVID/ca.bin" >/dev/null &&
+    AWS_ACCESS_KEY_ID=AKALICEDRIVE AWS_SECRET_ACCESS_KEY=SKALICEDRIVE aws --endpoint-url "$ca_url" s3api put-bucket-policy --bucket verify-cross --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"bob-id"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::verify-cross/*"}]}' &&
+    ! AWS_ACCESS_KEY_ID=AKBOBDRIVE00 AWS_SECRET_ACCESS_KEY=SKBOBDRIVE00 aws --endpoint-url "$ca_url" s3api get-object --bucket verify-cross --key secret.txt "$EVID/ca-denied.out" 2>"$EVID/ca-denied.err" &&
+    grep -q AccessDenied "$EVID/ca-denied.err" &&
+    cat >"$ca_cfg" <<'TOML' &&
+[[users]]
+name = "alice"
+account = "acct-a"
+id = "alice-id"
+access_key = "AKALICEDRIVE"
+secret_key = "SKALICEDRIVE"
+policy = '{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}'
+
+[[users]]
+name = "bob"
+account = "acct-b"
+id = "bob-id"
+access_key = "AKBOBDRIVE00"
+secret_key = "SKBOBDRIVE00"
+policy = '{"Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::verify-cross/*"}]}'
+TOML
+    chmod 600 "$ca_cfg" &&
+    kill -HUP "$ca_pid" &&
+    for _ in $(seq 1 50); do
+      if AWS_ACCESS_KEY_ID=AKBOBDRIVE00 AWS_SECRET_ACCESS_KEY=SKBOBDRIVE00 aws --endpoint-url "$ca_url" s3api get-object --bucket verify-cross --key secret.txt "$EVID/ca.out" >/dev/null 2>&1; then
+        reloaded=1; break
+      fi
+      sleep 0.1
+    done &&
+    [ "$reloaded" -eq 1 ] && same "$EVID/ca.bin" "$EVID/ca.out"
+  ); }
 j_encryption() { local upid p1 p2 k1 k2;
   k1="pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=" && k2="6b+WOZ1T3cqZMxgThRcXAQBrS5mXKdDUphvpxptl9/4=" &&
   S3 create-bucket --bucket verify-ssec &&
@@ -435,7 +496,7 @@ masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:
 
 start || exit 1
 check doctor doctor
-features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle access encryption)
+features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle access cross_account encryption)
 [[ " ${features[*]} " == *" buckets "* ]] || check buckets j_buckets
 for f in "${features[@]}"; do check "$f" "j_$f"; done
 ls -la "$DATA" >"$EVID/data-dir.txt" 2>&1

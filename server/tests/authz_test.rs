@@ -315,10 +315,15 @@ fn reference_authorize(
         return true;
     }
 
-    // Step 4: Bucket policy allows for this principal and conditions hold (with RestrictPublicBuckets).
+    // Step 4: Bucket policy allows for this principal and conditions hold (with RestrictPublicBuckets;
+    // for a user of another account, its identity policy must also allow).
+    let cross_account_id_ok = match principal {
+        Principal::User { .. } if !caller_owns_bucket => identity_policy == PolicyMatch::Allow,
+        _ => true,
+    };
     if let Some(b) = bucket {
         let policy_blocked = b.policy.is_public && pab.restrict_public_buckets && !caller_owns_bucket;
-        if b.policy.allow && b.policy.conditions_hold && !policy_blocked {
+        if b.policy.allow && b.policy.conditions_hold && !policy_blocked && cross_account_id_ok {
             return true;
         }
     }
@@ -1236,4 +1241,142 @@ fn policy_pab_and_ownership_operations_ignore_acl_grants() {
     assert_eq!(spec(Operation::PutBucketAcl).acl_permission, Some(AclPermission::WriteAcp));
     assert_eq!(spec(Operation::GetObjectAcl).acl_permission, Some(AclPermission::ReadAcp));
     assert_eq!(spec(Operation::PutObjectAcl).acl_permission, Some(AclPermission::WriteAcp));
+}
+
+#[test]
+fn cross_account_bucket_policy_requires_identity_policy_allow() {
+    let user_a = Principal::User {
+        account: "acct-a".to_string(),
+        name: "alice".to_string(),
+        id: "id-alice".to_string(),
+    };
+    let user_b = Principal::User {
+        account: "acct-b".to_string(),
+        name: "bob".to_string(),
+        id: "id-bob".to_string(),
+    };
+    let allow_pol = BucketPolicyDecision {
+        explicit_deny: false,
+        allow: true,
+        is_public: false,
+        conditions_hold: true,
+    };
+    let empty_acl = AclGrants::default();
+    let b_enforced = BucketTarget {
+        name: "cross-bkt",
+        owner_account: "acct-a",
+        ownership: BucketOwnership::BucketOwnerEnforced,
+        public_access_block: PublicAccessBlock::default(),
+        policy: allow_pol,
+        acl: &empty_acl,
+    };
+    let obj_target = ObjectTarget {
+        key: "obj",
+        owner_account: "acct-a",
+        acl: &empty_acl,
+    };
+
+    // 1. User of account B with PolicyMatch::NoOpinion must be denied (DefaultDeny).
+    assert_eq!(
+        authorize(
+            &user_b,
+            Operation::GetObject,
+            Some(&b_enforced),
+            Some(&obj_target),
+            &AuthzContext {
+                identity_policy: PolicyMatch::NoOpinion,
+                _marker: PhantomData,
+            },
+        ),
+        Decision::Deny {
+            code: "AccessDenied",
+            reason: Reason::DefaultDeny,
+        }
+    );
+
+    // 2. Same user of account B with PolicyMatch::Allow is allowed via BucketPolicy.
+    assert_eq!(
+        authorize(
+            &user_b,
+            Operation::GetObject,
+            Some(&b_enforced),
+            Some(&obj_target),
+            &AuthzContext {
+                identity_policy: PolicyMatch::Allow,
+                _marker: PhantomData,
+            },
+        ),
+        Decision::Allow(Reason::BucketPolicy)
+    );
+
+    // 3. Same-account user (account A) with NoOpinion is still allowed via BucketPolicy.
+    assert_eq!(
+        authorize(
+            &user_a,
+            Operation::GetObject,
+            Some(&b_enforced),
+            Some(&obj_target),
+            &AuthzContext {
+                identity_policy: PolicyMatch::NoOpinion,
+                _marker: PhantomData,
+            },
+        ),
+        Decision::Allow(Reason::BucketPolicy)
+    );
+
+    // 4. ACL grants to B's user are unchanged (even with identity_policy = NoOpinion).
+    let b_acl = AclGrants {
+        grants: vec![AclGrant {
+            grantee: Grantee::CanonicalUser("id-bob".to_string()),
+            permission: AclPermission::Read,
+        }],
+    };
+    let b_with_acl = BucketTarget {
+        name: "acl-bkt",
+        owner_account: "acct-a",
+        ownership: BucketOwnership::ObjectWriter,
+        public_access_block: PublicAccessBlock::default(),
+        policy: BucketPolicyDecision::none(),
+        acl: &b_acl,
+    };
+    assert_eq!(
+        authorize(
+            &user_b,
+            Operation::GetObject,
+            Some(&b_with_acl),
+            Some(&ObjectTarget {
+                key: "obj",
+                owner_account: "acct-a",
+                acl: &b_acl,
+            }),
+            &AuthzContext {
+                identity_policy: PolicyMatch::NoOpinion,
+                _marker: PhantomData,
+            },
+        ),
+        Decision::Allow(Reason::Acl)
+    );
+
+    // Root and Anonymous remain unaffected by identity policy requirement at step 4.
+    assert_eq!(
+        authorize(
+            &Principal::Anonymous,
+            Operation::GetObject,
+            Some(&BucketTarget {
+                policy: BucketPolicyDecision {
+                    explicit_deny: false,
+                    allow: true,
+                    is_public: true,
+                    conditions_hold: true,
+                },
+                ..b_enforced.clone()
+            }),
+            Some(&obj_target),
+            &AuthzContext {
+                identity_policy: PolicyMatch::NoOpinion,
+                _marker: PhantomData,
+            },
+        ),
+        Decision::Allow(Reason::BucketPolicy)
+    );
 }
