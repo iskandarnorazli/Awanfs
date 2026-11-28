@@ -2,12 +2,14 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::io;
+use std::io::{self, BufRead, BufReader};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::pin::Pin;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use s3_server::{
     accept_backoff, start_s3_reactor_with_listener, AcceptListener, S3ServiceState,
@@ -204,3 +206,192 @@ async fn shutdown_interrupts_accept_backoff_wait_within_deadline() {
         "shutdown during accept backoff must stop the server within 2 s"
     );
 }
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_awanfs(args: &[&str], env: &[(&str, &str)]) -> (ChildGuard, u16, String) {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "awanfs_reactor_hardening_{}_{}_{}",
+        std::process::id(),
+        nanos,
+        args.len()
+    ));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_awanfs"));
+    cmd.args([
+        "--port",
+        "0",
+        "--listen",
+        "127.0.0.1",
+        "--allow-anonymous",
+    ])
+    .args(args)
+    .env_remove("AWANFS_MAX_CONNECTIONS")
+    .env("AWANFS_LOG", "off")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let _ = dir;
+    let mut child = ChildGuard(cmd.spawn().expect("spawn awanfs"));
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut max_line = String::new();
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if line.starts_with("Max connections:") {
+                max_line = line;
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("S3 Storage Server listening on ") {
+                // Format: "http://127.0.0.1:PORT (profile ...)" or "https://..."
+                let addr_part = rest.split_whitespace().next().unwrap_or("");
+                if let Some((_, port_s)) = addr_part.rsplit_once(':') {
+                    if let Ok(port) = port_s.parse::<u16>() {
+                        let _ = tx.send((port, max_line));
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    let (port, max_line) = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("server should print Max connections and listening port");
+    (child, port, max_line)
+}
+
+async fn read_http_head(stream: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut tmp))
+            .await
+            .expect("timed out waiting for HTTP response")
+            .expect("read HTTP response");
+        assert!(n > 0, "unexpected EOF waiting for HTTP response");
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            return String::from_utf8_lossy(&buf[..pos + 4]).into_owned();
+        }
+    }
+}
+
+#[tokio::test]
+async fn max_connections_two_holds_third_until_one_closes() {
+    let (_child, port, max_line) = spawn_awanfs(&["--max-connections", "2"], &[]);
+    assert_eq!(max_line, "Max connections: 2");
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    // Establish two active idle keep-alive connections (each has completed one request so we know
+    // both permits are held inside the connection tasks).
+    let mut c1 = TcpStream::connect(addr).await.unwrap();
+    c1.write_all(b"GET /_awanfs/health/live HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    assert!(read_http_head(&mut c1).await.starts_with("HTTP/1.1 200 OK"));
+
+    let mut c2 = TcpStream::connect(addr).await.unwrap();
+    c2.write_all(b"GET /_awanfs/health/live HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    assert!(read_http_head(&mut c2).await.starts_with("HTTP/1.1 200 OK"));
+
+    // Third connection waits in the kernel accept queue and gets no response while c1 and c2 are open.
+    let mut c3 = TcpStream::connect(addr).await.unwrap();
+    c3.write_all(b"GET /_awanfs/health/live HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let blocked = tokio::time::timeout(Duration::from_millis(250), c3.read(&mut buf)).await;
+    assert!(
+        blocked.is_err(),
+        "third connection must not get a response while 2 connections hold the limit"
+    );
+
+    // Closing c1 frees one permit and lets c3 complete immediately.
+    drop(c1);
+    assert!(
+        read_http_head(&mut c3).await.starts_with("HTTP/1.1 200 OK"),
+        "third connection must succeed after one idle connection closes"
+    );
+    drop(c2);
+}
+
+#[tokio::test]
+async fn max_connections_failed_tls_handshakes_do_not_leak_permits() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls");
+    let cert = fixtures.join("cert.pem");
+    let key = fixtures.join("key.pem");
+    let cert_s = cert.to_str().unwrap();
+    let key_s = key.to_str().unwrap();
+
+    let (_child, port, max_line) = spawn_awanfs(
+        &["--cert", cert_s, "--key", key_s, "--max-connections", "2"],
+        &[],
+    );
+    assert_eq!(max_line, "Max connections: 2");
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    // Send plain HTTP bytes twice to fail the TLS handshake twice; neither may leak a permit.
+    for _ in 0..2 {
+        let mut plain = TcpStream::connect(addr).await.unwrap();
+        plain.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        let mut sink = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), plain.read_to_end(&mut sink))
+            .await
+            .expect("failed TLS handshake should close promptly");
+    }
+
+    let pem = std::fs::read(&cert).unwrap();
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(&pem).unwrap())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client
+        .get(format!("https://localhost:{}/", port))
+        .send()
+        .await
+        .expect("good TLS connection after two failed TLS handshakes should succeed");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn max_connections_zero_allows_fifty_idle_connections() {
+    let (_child, port, max_line) = spawn_awanfs(&["--max-connections", "0"], &[]);
+    assert_eq!(max_line, "Max connections: no limit");
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let mut conns = Vec::with_capacity(50);
+    for i in 0..50 {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /_awanfs/health/live HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let head = read_http_head(&mut stream).await;
+        assert!(
+            head.starts_with("HTTP/1.1 200 OK"),
+            "connection {} failed with --max-connections 0: {}",
+            i,
+            head
+        );
+        conns.push(stream);
+    }
+    assert_eq!(conns.len(), 50);
+
+    // Env variable works as well when flag is absent.
+    let (_child_env, _port_env, max_env_line) = spawn_awanfs(&[], &[("AWANFS_MAX_CONNECTIONS", "7")]);
+    assert_eq!(max_env_line, "Max connections: 7");
+}
+
