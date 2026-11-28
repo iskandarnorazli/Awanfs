@@ -224,7 +224,8 @@ place access is decided. Handlers do not check access themselves. In order:
    applies to the owner's account.
 3. The caller's account owns the resource, and its identity policy allows the action
    (root: always): allow.
-4. The bucket policy allows the action for this principal and its conditions hold: allow.
+4. The bucket policy allows the action for this principal and its conditions hold; for a caller of
+   another account, its identity policy must also allow: allow.
 5. An ACL on the resource grants the permission the operation table names, to this
    principal, to AuthenticatedUsers (signed callers) or to AllUsers: allow. With
    `BucketOwnerEnforced` ownership, ACLs are not consulted.

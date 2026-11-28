@@ -182,7 +182,8 @@ fn acl_grants_permission(
 /// 1. Explicit `Deny` in the bucket policy or caller's identity policy -> Deny.
 /// 2. Public access block (`IgnorePublicAcls`, `RestrictPublicBuckets`).
 /// 3. Caller's account owns the resource and its identity policy allows (root: always) -> Allow.
-/// 4. Bucket policy allows for this principal and conditions hold -> Allow.
+/// 4. Bucket policy allows for this principal and conditions hold (for another account's user,
+///    its identity policy must also allow) -> Allow.
 /// 5. ACL on the resource grants the operation's permission (unless `BucketOwnerEnforced`) -> Allow.
 /// 6. Otherwise -> Deny (`AccessDenied`).
 pub fn authorize(
@@ -294,9 +295,16 @@ fn authorize_for(
     }
 
     // Step 4: Bucket policy allows the action for this principal and its conditions hold.
+    // For a user of another account, its identity policy must also allow (#541).
+    let cross_account_id_ok = match principal {
+        Principal::User { .. } if !caller_owns_bucket => {
+            context.identity_policy == PolicyMatch::Allow
+        }
+        _ => true,
+    };
     if let Some(b) = bucket {
         let public_blocked = b.policy.is_public && pab.restrict_public_buckets && !caller_owns_bucket;
-        if b.policy.allow && b.policy.conditions_hold && !public_blocked {
+        if b.policy.allow && b.policy.conditions_hold && !public_blocked && cross_account_id_ok {
             return Decision::Allow(Reason::BucketPolicy);
         }
     }
