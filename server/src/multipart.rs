@@ -51,6 +51,7 @@ pub struct MultipartUpload {
     pub checksum_type: Option<String>,
     pub attrs: crate::attrs::Attrs,
     pub tags: Option<crate::tagging::TagSet>,
+    pub sse: Option<crate::sse::SseAttr>,
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +62,13 @@ pub struct CompletedUploadResult {
     pub location: String,
     pub version_id: Option<String>,
     pub checksum: Option<(crate::checksum::ChecksumAlgorithm, String, String)>,
+    pub sse_headers: Vec<(&'static str, String)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadSseOp {
+    UploadPart,
+    Complete,
 }
 
 pub struct MultipartManager {
@@ -172,6 +180,16 @@ impl MultipartManager {
     /// Starts an upload. Its staging directory is created here, and only if it does not exist
     /// yet, so an id (and the parts of a completed object stored under it) is never reused.
     pub fn create_upload(&self, bucket: &str, bucket_id: u32, key: &str) -> std::io::Result<String> {
+        self.create_upload_with_sse(bucket, bucket_id, key, None)
+    }
+
+    pub fn create_upload_with_sse(
+        &self,
+        bucket: &str,
+        bucket_id: u32,
+        key: &str,
+        sse: Option<crate::sse::SseAttr>,
+    ) -> std::io::Result<String> {
         let mut id_gen = self.next_upload_id.write();
         let upload_id = loop {
             let id = format!("upload-{:016x}", *id_gen);
@@ -189,6 +207,11 @@ impl MultipartManager {
         let upload_dir = self.staging_dir.join(&upload_id);
         let _ = std::fs::create_dir_all(&upload_dir);
 
+        let fsm_enc = if sse.is_some() {
+            crate::fsm::UploadEncryption::SseC
+        } else {
+            crate::fsm::UploadEncryption::None
+        };
         let upload = MultipartUpload {
             upload_id: upload_id.clone(),
             bucket: bucket.to_string(),
@@ -200,11 +223,56 @@ impl MultipartManager {
             checksum_type: None,
             attrs: crate::attrs::Attrs::new(),
             tags: None,
+            sse,
         };
 
-        self.upload_states.write().insert(upload_id.clone(), crate::fsm::UploadState::Open);
+        self.upload_states
+            .write()
+            .insert(upload_id.clone(), crate::fsm::UploadState::Open(fsm_enc));
         self.uploads.write().insert(upload_id.clone(), upload);
         Ok(upload_id)
+    }
+
+    /// Checks multipart upload SSE-C parameters via `fsm::upload_step` (#121).
+    pub fn check_upload_sse(
+        &self,
+        upload_id: &str,
+        op: UploadSseOp,
+        provided: Option<&crate::sse::SseCKey>,
+    ) -> Result<Option<(crate::sse::SseAttr, crate::sse::SseDek)>, crate::fsm::Refusal> {
+        let st = self
+            .upload_states
+            .read()
+            .get(upload_id)
+            .copied()
+            .ok_or(crate::fsm::NO_SUCH_UPLOAD)?;
+        let sse_attr = self.uploads.read().get(upload_id).and_then(|u| u.sse.clone());
+        let part_sse = match (&sse_attr, provided) {
+            (Some(attr), Some(k)) => {
+                if attr.verify_ssec_key(k) {
+                    crate::fsm::PartSseC::Matched
+                } else {
+                    crate::fsm::PartSseC::Mismatched
+                }
+            }
+            (Some(_), None) => crate::fsm::PartSseC::Absent,
+            (None, Some(_)) => crate::fsm::PartSseC::Mismatched,
+            (None, None) => crate::fsm::PartSseC::Absent,
+        };
+        let event = match op {
+            UploadSseOp::UploadPart => crate::fsm::UploadEvent::UploadPart { sse_c: part_sse },
+            UploadSseOp::Complete => crate::fsm::UploadEvent::Complete { sse_c: part_sse },
+        };
+        let _next = crate::fsm::upload_step(st, event)?;
+        match (sse_attr, provided) {
+            (Some(attr), Some(k)) => {
+                let dek = attr
+                    .derive_dek(k)
+                    .map_err(|_| crate::fsm::SSE_C_MISMATCH)?;
+                Ok(Some((attr, dek)))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Writes a part to a temporary file, syncs it and renames it into place, so a failed
@@ -305,7 +373,11 @@ impl MultipartManager {
         {
             let states = self.upload_states.read();
             let st = states.get(upload_id).copied().ok_or("NoSuchUpload")?;
-            crate::fsm::upload_step(st, crate::fsm::UploadEvent::UploadPart).map_err(|r| r.code)?;
+            let sse_c = match st {
+                crate::fsm::UploadState::Open(crate::fsm::UploadEncryption::SseC) => crate::fsm::PartSseC::Matched,
+                _ => crate::fsm::PartSseC::Absent,
+            };
+            crate::fsm::upload_step(st, crate::fsm::UploadEvent::UploadPart { sse_c }).map_err(|r| r.code)?;
         }
         let mut uploads = self.uploads.write();
         let upload = uploads.get_mut(upload_id).ok_or("NoSuchUpload")?;
@@ -441,7 +513,11 @@ impl MultipartManager {
         {
             let mut states = self.upload_states.write();
             let st = states.get(upload_id).copied().ok_or("NoSuchUpload")?;
-            let next = crate::fsm::upload_step(st, crate::fsm::UploadEvent::Complete).map_err(|r| r.code)?;
+            let sse_c = match st {
+                crate::fsm::UploadState::Open(crate::fsm::UploadEncryption::SseC) => crate::fsm::PartSseC::Matched,
+                _ => crate::fsm::PartSseC::Absent,
+            };
+            let next = crate::fsm::upload_step(st, crate::fsm::UploadEvent::Complete { sse_c }).map_err(|r| r.code)?;
             states.insert(upload_id.to_string(), next);
         }
         let upload = self.uploads.write().remove(upload_id).ok_or("NoSuchUpload")?;
@@ -458,7 +534,14 @@ impl MultipartManager {
         if st != crate::fsm::UploadState::Completed {
             return None;
         }
-        if crate::fsm::upload_step(st, crate::fsm::UploadEvent::Complete).is_ok() {
+        if crate::fsm::upload_step(
+            st,
+            crate::fsm::UploadEvent::Complete {
+                sse_c: crate::fsm::PartSseC::Absent,
+            },
+        )
+        .is_ok()
+        {
             self.completed_results.read().get(upload_id).cloned()
         } else {
             None

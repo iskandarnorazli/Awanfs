@@ -56,6 +56,7 @@ pub mod sim;
 pub mod sim_gen;
 pub mod sim_harness;
 pub mod sim_model;
+pub mod sse;
 pub mod vfile;
 pub mod volume;
 pub mod stream_read;

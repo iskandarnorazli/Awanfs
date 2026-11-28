@@ -35,6 +35,8 @@ pub const TAG_ACL: u16 = 0x0031;
 pub const TAG_RETENTION: u16 = 0x0040;
 /// Object Lock legal hold (#120). Replaceable via `0x200` attribute-update needles (#203).
 pub const TAG_LEGAL_HOLD: u16 = 0x0041;
+/// Server-side encryption metadata (`SseAttr`, #121). Write-time.
+pub const TAG_SSE: u16 = 0x0050;
 /// Object storage class (#159). Replaceable via `0x200` attribute-update needles (#203).
 pub const TAG_STORAGE_CLASS: u16 = 0x0060;
 /// Object checksum (`<ALG>:<TYPE>:<base64>`), #117. Write-time.
@@ -218,6 +220,52 @@ impl Attrs {
 
     pub fn clear_owner(&mut self) {
         self.remove(TAG_OWNER);
+    }
+
+    /// Stores `TAG_SSE` (`0x0050`) write-time encryption metadata (#121).
+    pub fn set_sse(&mut self, sse: &crate::sse::SseAttr) {
+        self.set(TAG_SSE, &sse.encode());
+    }
+
+    /// Decodes `TAG_SSE` (`0x0050`) if present.
+    pub fn sse(&self) -> Result<Option<crate::sse::SseAttr>, AttrsError> {
+        let Some(bytes) = self.get(TAG_SSE) else {
+            return Ok(None);
+        };
+        crate::sse::SseAttr::decode(bytes)
+            .map(Some)
+            .map_err(|_| AttrsError::Corrupt("TAG_SSE decode failed"))
+    }
+
+    /// Scans an encoded attributes block (including its 4-byte CRC32C prefix) for `target_tag`
+    /// without allocating. Returns `None` if empty, corrupt, or absent.
+    pub fn raw_tag_value(block: &[u8], target_tag: u16) -> Option<&[u8]> {
+        if block.len() <= 4 || block.len() > MAX_BLOCK {
+            return None;
+        }
+        let stored = u32::from_le_bytes(block[0..4].try_into().ok()?);
+        if crc32c::crc32c(&block[4..]) != stored {
+            return None;
+        }
+        let mut rest = &block[4..];
+        let mut prev: Option<u16> = None;
+        while !rest.is_empty() {
+            if rest.len() < 4 {
+                return None;
+            }
+            let tag = u16::from_le_bytes([rest[0], rest[1]]);
+            let len = u16::from_le_bytes([rest[2], rest[3]]) as usize;
+            if rest.len() < 4 + len || prev.is_some_and(|p| p >= tag) {
+                return None;
+            }
+            prev = Some(tag);
+            let val = &rest[4..4 + len];
+            if tag == target_tag {
+                return Some(val);
+            }
+            rest = &rest[4 + len..];
+        }
+        None
     }
 
     pub fn storage_class(&self) -> Option<&str> {

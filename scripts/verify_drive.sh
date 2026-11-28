@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Drives a fresh awanfs the way a user does (aws CLI) and keeps the evidence.
-#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle (default: all)
+#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle encryption (default: all)
 # Needs: a built server (cargo build --release --manifest-path server/Cargo.toml), the aws CLI, curl.
 # Evidence: verification/evidence/<UTC timestamp>/ (kept after cleanup). Exit 0 only if every journey passed.
 set -uo pipefail
@@ -385,6 +385,30 @@ j_lifecycle() { local lc_data lc_port lc_url lc_pid="";
     done
     [ "$expired" -eq 1 ]
   ); }
+j_encryption() { local upid p1 p2 k1 k2;
+  k1="pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=" && k2="6b+WOZ1T3cqZMxgThRcXAQBrS5mXKdDUphvpxptl9/4=" &&
+  S3 create-bucket --bucket verify-ssec &&
+  echo "sse-c secret payload" >"$EVID/ssec.bin" &&
+  S3 put-object --bucket verify-ssec --key secret --body "$EVID/ssec.bin" --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" >"$EVID/ssec-put.json" &&
+  grep -q '"SSECustomerAlgorithm": "AES256"' "$EVID/ssec-put.json" &&
+  ! S3 get-object --bucket verify-ssec --key secret "$EVID/ssec-nokey.out" 2>"$EVID/ssec-nokey.err" &&
+  ! S3 head-object --bucket verify-ssec --key secret 2>/dev/null &&
+  ! S3 get-object --bucket verify-ssec --key secret --sse-customer-algorithm AES256 --sse-customer-key "$k2" --sse-customer-key-md5 "arxBvwY2V4SiOne6yppVPQ==" "$EVID/ssec-badkey.out" 2>/dev/null &&
+  S3 get-object --bucket verify-ssec --key secret --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" "$EVID/ssec.out" >"$EVID/ssec-get.json" &&
+  same "$EVID/ssec.bin" "$EVID/ssec.out" &&
+  S3 get-object --bucket verify-ssec --key secret --range "bytes=6-11" --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" "$EVID/ssec-range.out" >/dev/null &&
+  grep -qx "secret" "$EVID/ssec-range.out" &&
+  S3 copy-object --bucket verify-ssec --key rotated --copy-source "verify-ssec/secret" --copy-source-sse-customer-algorithm AES256 --copy-source-sse-customer-key "$k1" --copy-source-sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" --sse-customer-algorithm AES256 --sse-customer-key "$k2" --sse-customer-key-md5 "arxBvwY2V4SiOne6yppVPQ==" >/dev/null &&
+  S3 get-object --bucket verify-ssec --key rotated --sse-customer-algorithm AES256 --sse-customer-key "$k2" --sse-customer-key-md5 "arxBvwY2V4SiOne6yppVPQ==" "$EVID/ssec-rot.out" >/dev/null &&
+  same "$EVID/ssec.bin" "$EVID/ssec-rot.out" &&
+  upid=$(S3 create-multipart-upload --bucket verify-ssec --key mp-ssec --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" --query UploadId --output text) &&
+  head -c 5242880 /dev/urandom >"$EVID/ssec-p1.bin" &&
+  p1=$(S3 upload-part --bucket verify-ssec --key mp-ssec --part-number 1 --upload-id "$upid" --body "$EVID/ssec-p1.bin" --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" --query ETag --output text) &&
+  p2=$(S3 upload-part --bucket verify-ssec --key mp-ssec --part-number 2 --upload-id "$upid" --body "$EVID/ssec.bin" --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" --query ETag --output text) &&
+  S3 complete-multipart-upload --bucket verify-ssec --key mp-ssec --upload-id "$upid" --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$p1},{\"PartNumber\":2,\"ETag\":$p2}]}" >/dev/null &&
+  S3 get-object --bucket verify-ssec --key mp-ssec --sse-customer-algorithm AES256 --sse-customer-key "$k1" --sse-customer-key-md5 "DWygnHRtgiJ77HCm+1rvHw==" "$EVID/ssec-mp.out" >/dev/null &&
+  cat "$EVID/ssec-p1.bin" "$EVID/ssec.bin" >"$EVID/ssec-mp.want" &&
+  same "$EVID/ssec-mp.want" "$EVID/ssec-mp.out"; }
 
 # Refuse to run a journey whose && chain is split by a `local x;` (see the note above md5q).
 masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:]]+local [^;]*;|&& *local ' || true)
@@ -392,7 +416,7 @@ masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:
 
 start || exit 1
 check doctor doctor
-features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle)
+features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle encryption)
 [[ " ${features[*]} " == *" buckets "* ]] || check buckets j_buckets
 for f in "${features[@]}"; do check "$f" "j_$f"; done
 ls -la "$DATA" >"$EVID/data-dir.txt" 2>&1
