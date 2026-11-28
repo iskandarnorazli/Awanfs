@@ -110,8 +110,18 @@ pub async fn start_s3_reactor_with(
     state: Arc<S3ServiceState>,
     tls: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
+    start_s3_reactor_with_max_connections(addr, state, tls, 0).await
+}
+
+/// Like `start_s3_reactor_with`, capping open client connections at `max_connections` (`0` = no limit, #532).
+pub async fn start_s3_reactor_with_max_connections(
+    addr: SocketAddr,
+    state: Arc<S3ServiceState>,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    max_connections: usize,
+) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
-    start_s3_reactor_with_listener(listener, state, tls).await
+    start_s3_reactor_with_listener_and_max_connections(listener, state, tls, max_connections).await
 }
 
 /// Starts the S3 reactor over an injected `AcceptListener` (#531).
@@ -120,10 +130,21 @@ pub async fn start_s3_reactor_with_listener<L: AcceptListener>(
     state: Arc<S3ServiceState>,
     tls: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
+    start_s3_reactor_with_listener_and_max_connections(listener, state, tls, 0).await
+}
+
+/// Starts the S3 reactor over an injected `AcceptListener`, with an optional open-connection cap (#532).
+pub async fn start_s3_reactor_with_listener_and_max_connections<L: AcceptListener>(
+    listener: L,
+    state: Arc<S3ServiceState>,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    max_connections: usize,
+) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     let local_addr = listener.local_addr()?;
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let (done_tx, done_rx) = oneshot::channel();
     let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
+    let permits = (max_connections > 0).then(|| Arc::new(tokio::sync::Semaphore::new(max_connections)));
 
     let mut auto_builder = AutoConnBuilder::new(TokioExecutor::new());
     auto_builder
@@ -136,6 +157,18 @@ pub async fn start_s3_reactor_with_listener<L: AcceptListener>(
         let mut backoff: Option<Duration> = None;
         let mut last_logged: Option<(io::ErrorKind, Option<i32>, Duration)> = None;
         loop {
+            let permit = match &permits {
+                Some(sem) => tokio::select! {
+                    res = Arc::clone(sem).acquire_owned() => match res {
+                        Ok(p) => Some(p),
+                        Err(_) => break,
+                    },
+                    _ = &mut shutdown_rx => {
+                        break;
+                    }
+                },
+                None => None,
+            };
             tokio::select! {
                 accept_res = listener.accept() => {
                     match accept_res {
@@ -152,6 +185,7 @@ pub async fn start_s3_reactor_with_listener<L: AcceptListener>(
                             let watcher = graceful.watcher();
                             let acceptor = acceptor.clone();
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 match acceptor {
                                     Some(acc) => {
                                         // A failed handshake (untrusted client, plain HTTP on the
@@ -169,6 +203,7 @@ pub async fn start_s3_reactor_with_listener<L: AcceptListener>(
                             });
                         }
                         Err(err) => {
+                            drop(permit);
                             let wait = accept_backoff(backoff, &err);
                             let sig = (err.kind(), err.raw_os_error(), wait);
                             if last_logged.as_ref() != Some(&sig) {
@@ -192,6 +227,7 @@ pub async fn start_s3_reactor_with_listener<L: AcceptListener>(
                     }
                 }
                 _ = &mut shutdown_rx => {
+                    drop(permit);
                     break;
                 }
             }

@@ -2524,3 +2524,16 @@ default = "BucketOwnerEnforced"
 feature = "acl-ownership"
 what = "default ObjectOwnership for newly created buckets without x-amz-object-ownership (BucketOwnerEnforced, BucketOwnerPreferred, or ObjectWriter)"
 test = ["server/tests/access_control_test.rs::cli_default_bucket_ownership_flag_accepts_valid_and_rejects_invalid"]
+
+[[setting]]
+id = "max-connections"
+flags = ["--max-connections"]
+env = ["AWANFS_MAX_CONNECTIONS"]
+default = "0"
+feature = "server"
+what = "cap on open client connections (0 = no limit)"
+test = [
+  "server/tests/reactor_hardening_test.rs::max_connections_two_holds_third_until_one_closes",
+  "server/tests/reactor_hardening_test.rs::max_connections_failed_tls_handshakes_do_not_leak_permits",
+  "server/tests/reactor_hardening_test.rs::max_connections_zero_allows_fifty_idle_connections",
+]

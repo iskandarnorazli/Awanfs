@@ -1,7 +1,7 @@
 //! awan-storage/server/src/main.rs
 //! S3 Storage Server binary entry point
 
-use s3_server::{start_s3_reactor_with, AuthConfig, Durability, S3ServiceState};
+use s3_server::{start_s3_reactor_with_max_connections, AuthConfig, Durability, S3ServiceState};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -65,6 +65,7 @@ Options:
       --allow-small-parts          Allow multipart non-final parts under 5 MiB (off by default; for benchmarks)
       --worker-threads <n>         Tokio worker threads (or AWANFS_WORKER_THREADS); default: the cores the
                                    process may run on (its affinity)
+      --max-connections <N>        Cap open client connections, 0 = no limit (default: 0, or AWANFS_MAX_CONNECTIONS)
       --per-bucket-metrics         Always emit awanfs_bucket_* Prometheus gauges even above 1000 buckets (or AWANFS_PER_BUCKET_METRICS=1)
       --default-bucket-ownership <MODE>  Default ownership for new buckets: BucketOwnerEnforced (default), BucketOwnerPreferred, or ObjectWriter (or AWANFS_DEFAULT_BUCKET_OWNERSHIP)
   -h, --help                       Print this help message and exit"
@@ -132,6 +133,16 @@ async fn serve(
     let mut verify_payloads_at_boot = std::env::var("AWANFS_VERIFY_PAYLOADS_AT_BOOT").ok().as_deref() == Some("1");
     let mut default_ownership_raw = std::env::var("AWANFS_DEFAULT_BUCKET_OWNERSHIP")
         .unwrap_or_else(|_| "BucketOwnerEnforced".to_string());
+    let mut max_connections: usize = match std::env::var("AWANFS_MAX_CONNECTIONS") {
+        Ok(v) if !v.is_empty() => match v.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("AWANFS_MAX_CONNECTIONS must be a non-negative integer, not {:?}", v);
+                std::process::exit(2);
+            }
+        },
+        _ => 0,
+    };
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -215,6 +226,18 @@ async fn serve(
         } else if arg == "--worker-threads" {
             // Read before the runtime starts (#456).
             args.next();
+        } else if arg == "--max-connections" {
+            let Some(v) = args.next() else {
+                eprintln!("--max-connections requires a non-negative integer");
+                std::process::exit(2);
+            };
+            match v.parse::<usize>() {
+                Ok(n) => max_connections = n,
+                Err(_) => {
+                    eprintln!("--max-connections must be a non-negative integer, not {:?}", v);
+                    std::process::exit(2);
+                }
+            }
         } else if arg == "--verify-payloads-at-boot" {
             verify_payloads_at_boot = true;
         } else if arg == "--default-bucket-ownership" {
@@ -256,6 +279,11 @@ async fn serve(
     );
     println!("Allocator: {}", allocator);
     println!("Worker threads: {} ({})", workers, worker_source);
+    if max_connections == 0 {
+        println!("Max connections: no limit");
+    } else {
+        println!("Max connections: {}", max_connections);
+    }
 
     let auth = AuthConfig::from_env(allow_anonymous);
     // Users and policies (#53): --config <file> or AWANFS_CONFIG.
@@ -446,9 +474,9 @@ async fn serve(
         }
     }
     s3_server::profile::set_active(profile);
-    let handle = start_s3_reactor_with(addr, Arc::clone(&state), tls).await?;
+    let handle = start_s3_reactor_with_max_connections(addr, Arc::clone(&state), tls, max_connections).await?;
     let plain = match (https, http_port) {
-        (true, Some(p)) => Some(start_s3_reactor_with(format!("{}:{}", listen, p).parse()?, Arc::clone(&state), None).await?),
+        (true, Some(p)) => Some(start_s3_reactor_with_max_connections(format!("{}:{}", listen, p).parse()?, Arc::clone(&state), None, max_connections).await?),
         _ => None,
     };
     println!("S3 Storage Server listening on {}://{} (profile {})", if https { "https" } else { "http" }, handle.local_addr, profile.as_str());
