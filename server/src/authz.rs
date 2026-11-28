@@ -179,7 +179,9 @@ fn acl_grants_permission(
 /// Single authorization decision function (CONFORMANCE_DESIGN.md 5.2).
 ///
 /// Evaluation order:
-/// 1. Explicit `Deny` in the bucket policy or caller's identity policy -> Deny.
+/// 1. Explicit `Deny` in the bucket policy or caller's identity policy -> Deny (except
+///    `Principal::Root` on `GetBucketPolicy`/`PutBucketPolicy`/`DeleteBucketPolicy` for lockout
+///    recovery, #544).
 /// 2. Public access block (`IgnorePublicAcls`, `RestrictPublicBuckets`).
 /// 3. Caller's account owns the resource and its identity policy allows (root: always) -> Allow.
 /// 4. Bucket policy allows for this principal and conditions hold (for another account's user,
@@ -194,6 +196,23 @@ pub fn authorize(
     context: &AuthzContext<'_>,
 ) -> Decision {
     let op_spec = spec(op);
+    // Lockout recovery, as in AWS (#544, owner decision Option A): a bucket policy explicit deny
+    // cannot lock Principal::Root out of reading, replacing, or deleting that policy.
+    let recovering = matches!(principal, Principal::Root)
+        && matches!(
+            op,
+            Operation::GetBucketPolicy | Operation::PutBucketPolicy | Operation::DeleteBucketPolicy
+        );
+    let unlocked;
+    let bucket = match bucket {
+        Some(b) if recovering && b.policy.explicit_deny => {
+            let mut t = b.clone();
+            t.policy.explicit_deny = false;
+            unlocked = t;
+            Some(&unlocked)
+        }
+        other => other,
+    };
     authorize_for(
         principal,
         op_spec.target,

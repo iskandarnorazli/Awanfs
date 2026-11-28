@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Drives a fresh awanfs the way a user does (aws CLI) and keeps the evidence.
-#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle access cross_account encryption (default: all)
+#   bash scripts/verify_drive.sh [feature ...]     features: buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle access cross_account root_recovery encryption (default: all)
 # Needs: a built server (cargo build --release --manifest-path server/Cargo.toml), the aws CLI, curl.
 # Evidence: verification/evidence/<UTC timestamp>/ (kept after cleanup). Exit 0 only if every journey passed.
 set -uo pipefail
@@ -465,6 +465,17 @@ TOML
     done &&
     [ "$reloaded" -eq 1 ] && same "$EVID/ca.bin" "$EVID/ca.out"
   ); }
+j_root_recovery() {
+  echo "recover-me" >"$EVID/lockout.bin" &&
+  S3 create-bucket --bucket verify-lockout >/dev/null &&
+  S3 put-object --bucket verify-lockout --key locked.txt --body "$EVID/lockout.bin" >/dev/null &&
+  S3 put-bucket-policy --bucket verify-lockout --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::verify-lockout","arn:aws:s3:::verify-lockout/*"]}]}' &&
+  ! S3 get-object --bucket verify-lockout --key locked.txt "$EVID/lockout-denied.out" 2>"$EVID/lockout-denied.err" &&
+  grep -q AccessDenied "$EVID/lockout-denied.err" &&
+  S3 get-bucket-policy --bucket verify-lockout >/dev/null &&
+  S3 delete-bucket-policy --bucket verify-lockout &&
+  S3 get-object --bucket verify-lockout --key locked.txt "$EVID/lockout.out" >/dev/null &&
+  same "$EVID/lockout.bin" "$EVID/lockout.out"; }
 j_encryption() { local upid p1 p2 k1 k2;
   k1="pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=" && k2="6b+WOZ1T3cqZMxgThRcXAQBrS5mXKdDUphvpxptl9/4=" &&
   S3 create-bucket --bucket verify-ssec &&
@@ -496,7 +507,7 @@ masked=$(sed -n '/^j_buckets()/,/^start || exit 1/p' "$0" | grep -nE '^[[:space:
 
 start || exit 1
 check doctor doctor
-features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle access cross_account encryption)
+features=("$@"); [ ${#features[@]} -eq 0 ] && features=(buckets objects ranges multipart copy versioning listing tagging cors checksums metadata bucket_tagging list_buckets v1_prefix checksums_extra suspended restart quickstart conditional lock post lifecycle access cross_account root_recovery encryption)
 [[ " ${features[*]} " == *" buckets "* ]] || check buckets j_buckets
 for f in "${features[@]}"; do check "$f" "j_$f"; done
 ls -la "$DATA" >"$EVID/data-dir.txt" 2>&1
