@@ -73,3 +73,82 @@ fn a_sealed_volume_keeps_no_buffers() {
     assert_eq!(vm.needle_buffer_allocs(), 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn retired_or_sealed_volume_drops_pooled_and_returned_buffers() {
+    let dir = temp_dir("retire");
+    let vm = VolumeManager::open(&dir, 1).unwrap();
+    let payload = pattern(256 * 1024, 5);
+    vm.write_needle_with_attrs(1, "k1", &[], &payload, AWAN_FLAG_ACTIVE, 1, 2, None).unwrap();
+    assert!(vm.pooled_bytes() > 0, "active volume pools its write buffer");
+
+    vm.retire_write_buffers();
+    assert_eq!(vm.pooled_bytes(), 0, "retire_write_buffers must empty the pool immediately");
+
+    // Any buffer already in flight when retired must be dropped on return, never re-pooled.
+    let allocs_before = vm.needle_buffer_allocs();
+    vm.write_needle_with_attrs(1, "k2", &[], &payload, AWAN_FLAG_ACTIVE, 3, 4, None).unwrap();
+    assert_eq!(vm.needle_buffer_allocs(), allocs_before + 1);
+    assert_eq!(vm.pooled_bytes(), 0, "returned buffer on a retired volume must be dropped, not pooled");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn rolled_over_volume_holds_zero_pooled_bytes_while_remaining_readable() {
+    let dir = temp_dir("rollover");
+    let state = std::sync::Arc::new(s3_server::S3ServiceState::with_data_dir(&dir));
+    state.set_volume_span(512 * 1024);
+    let handle = s3_server::start_s3_reactor("127.0.0.1:0".parse().unwrap(), state.clone())
+        .await
+        .unwrap();
+    let url = format!("http://{}", handle.local_addr);
+    let client = reqwest::Client::new();
+
+    assert_eq!(
+        client.put(format!("{}/pool-roll-bkt", url)).send().await.unwrap().status(),
+        reqwest::StatusCode::OK
+    );
+
+    let first = pattern(256 * 1024, 1);
+    assert_eq!(
+        client
+            .put(format!("{}/pool-roll-bkt/k1", url))
+            .body(first.clone())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    let vol1 = state.volumes.read().get(&1).cloned().expect("volume 1 present");
+    assert!(vol1.pooled_bytes() > 0, "active volume 1 pools write buffers before rollover");
+
+    // Second write overflows volume 1's 512 KiB span and rolls over to volume 2.
+    let second = pattern(300 * 1024, 2);
+    assert_eq!(
+        client
+            .put(format!("{}/pool-roll-bkt/k2", url))
+            .body(second.clone())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    let vols = state.volumes.read().clone();
+    assert!(vols.len() >= 2, "expected rollover to volume 2");
+    assert_eq!(vol1.pooled_bytes(), 0, "rolled-over volume 1 must keep 0 pooled bytes");
+    let vol2 = vols.get(&2).cloned().expect("volume 2 present");
+    assert!(vol2.pooled_bytes() > 0, "new active volume 2 pools buffers");
+
+    // Reads from rolled-over volume 1 still succeed.
+    state.payload_cache.clear();
+    let res = client.get(format!("{}/pool-roll-bkt/k1", url)).send().await.unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.bytes().await.unwrap().as_ref(), &first[..]);
+
+    handle.shutdown();
+    drop(state);
+    let _ = std::fs::remove_dir_all(&dir);
+}

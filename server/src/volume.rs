@@ -826,6 +826,8 @@ const WRITE_POOL_MAX_BUFFER: usize = 4 * 1024 * 1024 + 2 * WRITE_POOL_STEP;
 struct WritePool {
     bufs: std::collections::VecDeque<AlignedBuffer>,
     bytes: usize,
+    /// Set once a volume is no longer active (#527); buffers returned afterwards are dropped.
+    retired: bool,
 }
 
 /// A buffer from `WritePool`, given back when dropped.
@@ -854,6 +856,9 @@ impl Drop for PooledBuffer<'_> {
             return;
         }
         let mut pool = self.pool.lock();
+        if pool.retired {
+            return;
+        }
         while pool.bytes + buf.len() > WRITE_POOL_BYTES {
             match pool.bufs.pop_front() {
                 Some(old) => pool.bytes -= old.len(),
@@ -1810,7 +1815,21 @@ impl<Fs: VolFs> VolumeManager<Fs> {
     /// volume it is about to list; writers still holding it are sent to the active volume.
     pub fn seal(&self) {
         self.sealed.store(true, Ordering::SeqCst);
-        *self.write_pool.lock() = WritePool::default();
+        self.retire_write_buffers();
+    }
+
+    /// Drops all pooled needle buffers and prevents buffers returned later (from in-flight
+    /// writes that finished after rollover or seal) from being re-pooled (#527).
+    pub fn retire_write_buffers(&self) {
+        let mut pool = self.write_pool.lock();
+        pool.retired = true;
+        pool.bufs.clear();
+        pool.bytes = 0;
+    }
+
+    /// Bytes currently retained in this volume's needle write buffer pool (#527).
+    pub fn pooled_bytes(&self) -> usize {
+        self.write_pool.lock().bytes
     }
 
     /// Needle buffers allocated for whole-needle writes, not reused from the pool (#454).
