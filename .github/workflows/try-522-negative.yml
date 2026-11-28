@@ -1,0 +1,40 @@
+name: try 522 negative control
+on:
+  push:
+    branches: [ "try/522-negative" ]
+jobs:
+  neg:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        patch: [none, acl-back, no-recovery]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply ${{ matrix.patch }}
+        shell: bash
+        run: |
+          python3 - "${{ matrix.patch }}" <<'PY'
+          import re, sys
+          if sys.argv[1] == "acl-back":
+              p = "server/src/ops/mod.rs"
+              s = open(p).read()
+              for op in ["GetBucketPolicy", "PutBucketPolicy", "DeleteBucketPolicy"]:
+                  s, n = re.subn(r'(op: Operation::%s,\s*name: "[^"]*",\s*iam_action: [^\n]*,\s*acl_permission: )None,' % op, r'\1Some(AclPermission::FullControl),', s)
+                  assert n == 1, op
+              open(p, "w").write(s)
+          elif sys.argv[1] == "no-recovery":
+              p = "server/src/authz.rs"
+              s = open(p).read()
+              old = "    let recovering = matches!(principal, Principal::Root)"
+              assert s.count(old) == 1
+              s = s.replace(old, "    let recovering = false && matches!(principal, Principal::Root)")
+              open(p, "w").write(s)
+          PY
+          git diff --stat
+      - name: authz tests
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --manifest-path server/Cargo.toml --test authz_test 2>&1 | grep -E "^test .*(FAILED|ok)$|test result|panicked|^error" | grep -v " ok$"
+          echo "exit=${PIPESTATUS[0]}"
