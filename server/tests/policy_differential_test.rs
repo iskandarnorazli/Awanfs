@@ -309,14 +309,7 @@ fn differential_100k_policy_and_authz_against_reference() {
         let ctx = AuthzContext { identity_policy: id_pol, _marker: PhantomData };
         let dec = authorize(principal, op, Some(&b_target), o_target.as_ref(), &ctx);
 
-        // Invariant 1: explicit Deny beats everything, except that root can always read,
-        // replace or delete the bucket policy itself (lockout recovery, #122 review).
-        let recovering = matches!(principal, Principal::Root)
-            && matches!(op, Operation::GetBucketPolicy | Operation::PutBucketPolicy | Operation::DeleteBucketPolicy);
-        if want_deny && recovering {
-            assert!(dec.is_allowed(), "seed {:#x} iter {} lockout recovery", seed, iter);
-            continue;
-        }
+        // Invariant 1: explicit Deny always beats everything.
         if want_deny {
             assert!(matches!(dec, Decision::Deny { reason: Reason::BucketPolicyDeny, .. }), "seed {:#x} iter {} deny", seed, iter);
             continue;

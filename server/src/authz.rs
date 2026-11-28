@@ -193,21 +193,6 @@ pub fn authorize(
     context: &AuthzContext<'_>,
 ) -> Decision {
     let op_spec = spec(op);
-    // Lockout recovery, as in AWS: a bucket policy that denies everything cannot keep the root
-    // account from reading, replacing or deleting that policy (#122 review). Every other step
-    // still applies.
-    let recovering = matches!(principal, Principal::Root)
-        && matches!(op, Operation::GetBucketPolicy | Operation::PutBucketPolicy | Operation::DeleteBucketPolicy);
-    let unlocked;
-    let bucket = match bucket {
-        Some(b) if recovering && b.policy.explicit_deny => {
-            let mut t = b.clone();
-            t.policy.explicit_deny = false;
-            unlocked = t;
-            Some(&unlocked)
-        }
-        other => other,
-    };
     authorize_for(
         principal,
         op_spec.target,
