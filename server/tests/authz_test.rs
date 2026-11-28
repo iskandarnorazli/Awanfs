@@ -323,16 +323,15 @@ fn reference_authorize(
         }
     }
 
-    // Step 5: ACL grants permission (unless BucketOwnerEnforced).
-    if let Some(b) = bucket {
+    // Step 5: ACL grants permission (unless BucketOwnerEnforced or op ignores ACLs).
+    if let (Some(b), Some(req_perm)) = (bucket, sp.acl_permission) {
         if b.ownership != BucketOwnership::BucketOwnerEnforced {
             let acl = match sp.target {
                 TargetKind::Object => object.map(|o| o.acl).unwrap_or(b.acl),
                 _ => b.acl,
             };
             for g in &acl.grants {
-                let perm_ok = g.permission == AclPermission::FullControl
-                    || g.permission == sp.acl_permission;
+                let perm_ok = g.permission == AclPermission::FullControl || g.permission == req_perm;
                 if !perm_ok {
                     continue;
                 }
@@ -416,7 +415,7 @@ fn decision_table_covers_every_op_row_and_matches_reference() {
                     for &acl_kind in &acls {
                         for &pab_kind in &pabs {
                             for &ownership in &ownerships {
-                                let acl = make_acl(acl_kind, &principal, sp.acl_permission);
+                                let acl = make_acl(acl_kind, &principal, sp.acl_permission.unwrap_or(AclPermission::FullControl));
                                 let b_target = BucketTarget {
                                     name: "test-bkt",
                                     owner_account: bucket_owner,
@@ -762,7 +761,7 @@ fn monotonicity_adding_deny_or_removing_allow_never_turns_deny_into_allow() {
         let b_acl = make_acl(
             if rng.next() & 1 == 1 { AclKind::AllUsers } else { AclKind::Private },
             &principal,
-            sp.acl_permission,
+            sp.acl_permission.unwrap_or(AclPermission::FullControl),
         );
         let bkt = BucketTarget {
             name: "b",
@@ -816,7 +815,7 @@ fn monotonicity_adding_deny_or_removing_allow_never_turns_deny_into_allow() {
             tightened
         );
         // Adding allows must satisfy base <= loosened (adding Allow never turns Allow into Deny).
-        let all_acl = make_acl(AclKind::AllUsers, &principal, sp.acl_permission);
+        let all_acl = make_acl(AclKind::AllUsers, &principal, sp.acl_permission.unwrap_or(AclPermission::FullControl));
         let bkt_allow = BucketTarget {
             policy: BucketPolicyDecision {
                 explicit_deny: false,
@@ -1074,4 +1073,118 @@ policy = '{"Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}}'
     assert_eq!(lines.len(), 2, "{:?}", lines);
     assert!(lines[0].contains("\"authz_reason\":"), "allow log missing authz_reason: {}", lines[0]);
     assert!(lines[1].contains("\"authz_reason\":\"step6-default-deny\""), "deny log missing authz_reason: {}", lines[1]);
+}
+
+#[test]
+fn bucket_config_mutations_are_owner_or_policy_only_and_deny_acl_grants() {
+    let config_ops = [
+        Operation::PutBucketVersioning,
+        Operation::PutBucketLifecycle,
+        Operation::DeleteBucketLifecycle,
+        Operation::PutBucketCors,
+        Operation::DeleteBucketCors,
+        Operation::PutBucketTagging,
+        Operation::DeleteBucketTagging,
+        Operation::PutObjectLockConfiguration,
+    ];
+    let caller = Principal::User {
+        account: "acct-other".to_string(),
+        name: "other".to_string(),
+        id: "id-other".to_string(),
+    };
+    let owner = Principal::User {
+        account: "acct-owner".to_string(),
+        name: "owner".to_string(),
+        id: "id-owner".to_string(),
+    };
+    let permissive_acl = AclGrants {
+        grants: vec![
+            AclGrant {
+                grantee: Grantee::AllUsers,
+                permission: AclPermission::Write,
+            },
+            AclGrant {
+                grantee: Grantee::CanonicalUser("id-other".to_string()),
+                permission: AclPermission::FullControl,
+            },
+        ],
+    };
+    for &ownership in &[BucketOwnership::ObjectWriter, BucketOwnership::BucketOwnerPreferred] {
+        let b_no_pol = BucketTarget {
+            name: "cfg-bkt",
+            owner_account: "acct-owner",
+            ownership,
+            public_access_block: PublicAccessBlock::default(),
+            policy: BucketPolicyDecision::none(),
+            acl: &permissive_acl,
+        };
+        let ctx_no_pol = AuthzContext {
+            identity_policy: PolicyMatch::Allow,
+            _marker: PhantomData,
+        };
+        for &op in &config_ops {
+            // Non-owner with WRITE + FULL_CONTROL ACLs must be denied (owner/policy-only).
+            assert_eq!(
+                authorize(&caller, op, Some(&b_no_pol), None, &ctx_no_pol),
+                Decision::Deny {
+                    code: "AccessDenied",
+                    reason: Reason::DefaultDeny,
+                },
+                "{:?} must deny non-owner ACL grantee under {:?}",
+                op,
+                ownership
+            );
+            assert_eq!(
+                authorize(
+                    &Principal::Anonymous,
+                    op,
+                    Some(&b_no_pol),
+                    None,
+                    &AuthzContext {
+                        identity_policy: PolicyMatch::NoOpinion,
+                        _marker: PhantomData,
+                    },
+                ),
+                Decision::Deny {
+                    code: "AccessDenied",
+                    reason: Reason::DefaultDeny,
+                },
+                "{:?} must deny Anonymous AllUsers WRITE grantee under {:?}",
+                op,
+                ownership
+            );
+            // Owner with identity policy allow succeeds.
+            assert_eq!(
+                authorize(&owner, op, Some(&b_no_pol), None, &ctx_no_pol),
+                Decision::Allow(Reason::OwnerAndIdentityPolicy),
+                "{:?} must allow owner",
+                op
+            );
+            // Explicit bucket policy Allow succeeds.
+            let b_pol = BucketTarget {
+                policy: BucketPolicyDecision {
+                    explicit_deny: false,
+                    allow: true,
+                    is_public: false,
+                    conditions_hold: true,
+                },
+                ..b_no_pol.clone()
+            };
+            assert_eq!(
+                authorize(&caller, op, Some(&b_pol), None, &ctx_no_pol),
+                Decision::Allow(Reason::BucketPolicy),
+                "{:?} must allow explicit bucket policy",
+                op
+            );
+        }
+        // Object writes still work via bucket WRITE ACL.
+        assert_eq!(
+            authorize(&caller, Operation::PutObject, Some(&b_no_pol), None, &ctx_no_pol),
+            Decision::Allow(Reason::Acl)
+        );
+        assert_eq!(
+            authorize(&caller, Operation::DeleteObjects, Some(&b_no_pol), None, &ctx_no_pol),
+            Decision::Allow(Reason::Acl)
+        );
+    }
 }

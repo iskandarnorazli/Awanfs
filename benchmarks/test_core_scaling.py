@@ -7,6 +7,8 @@ import tempfile
 import types
 import unittest
 from unittest import mock
+from contextlib import redirect_stdout
+import io
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import core_scaling as cs  # noqa: E402
@@ -350,6 +352,58 @@ class PinAtStartTests(unittest.TestCase):
             with open(out) as f:
                 self.assertEqual(f.read(), "[0]")
         self.assertEqual(psutil.Process().cpu_affinity(), before, "the parent's affinity is restored")
+
+
+class TwoBuildsTests(unittest.TestCase):
+    """#459: `--server-bin-b` runs a second AwanFS build next to the first, alternating, and the
+    report puts A, B and the change side by side."""
+
+    def _args(self, **kw):
+        base = dict(
+            pattern="seq-write", sizes="4KiB", concurrencies="16", prefill_size="1MiB", memory_budget="",
+            servers="AwanFS", fast_every_concurrency=False, runs=2, duration=1.0, seed=42, client_procs=1,
+            output="", durability="group", compare_fast=False, profile_threads_cores="", server_bin_b="/b/awanfs",
+        )
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    def test_builds_alternate_and_b_uses_its_binary(self):
+        started, measured = [], []
+
+        def fake_start_awanfs(server_bin, n, data_root, memory_budget=None, durability="group"):
+            started.append(server_bin)
+            return ("proc", 1, "log")
+
+        def fake_measure(server_name, starter, **kw):
+            starter()
+            measured.append(server_name)
+            ops = 1000.0 if server_name == "AwanFS" else 1100.0
+            return {("seq-write", 4 * cs.KIB, 16): cs.PointResult(ops_per_sec=ops, mib_per_sec=ops / 256, p50_ms=1.0, p99_ms=2.0, cpu_pct=100.0)}
+
+        with tempfile.TemporaryDirectory() as d:
+            a = self._args(output=os.path.join(d, "r.md"))
+            with mock.patch.object(cs, "_start_awanfs", side_effect=fake_start_awanfs), \
+                    mock.patch.object(cs, "measure_server_matrix_for_cores", side_effect=fake_measure), \
+                    mock.patch.object(cs, "write_matrix_charts", return_value=[]), \
+                    mock.patch.object(cs, "prefill_cache_check", return_value=None), \
+                    redirect_stdout(io.StringIO()):
+                rc = cs._run_matrix_mode(a, "cmd", [1], 4, d, "/a/awanfs", None, None, None, None, None)
+            self.assertEqual(rc, 0)
+            with open(a.output) as f:
+                md = f.read()
+        self.assertEqual(measured, ["AwanFS", cs.BUILD_B, cs.BUILD_B, "AwanFS"])
+        self.assertEqual(started, ["/a/awanfs", "/b/awanfs", "/b/awanfs", "/a/awanfs"])
+        self.assertIn("## Build A against build B", md)
+        self.assertIn("| seq-write | 4 KiB | 1 | 16 | 1,000 | 1,100 | +10.0% | 2.00 | 2.00 | 100.0% | 100.0% |", md)
+        self.assertEqual(sum(1 for l in md.splitlines() if l.startswith("- **Machine:**")), 1)
+
+    def test_b_needs_awanfs_in_the_servers(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self._args(servers="MinIO", output=os.path.join(d, "r.md"))
+            with mock.patch.object(cs, "prefill_cache_check", return_value=None):
+                with self.assertRaises(ValueError) as ctx:
+                    cs._run_matrix_mode(a, "cmd", [1], 4, d, "/a", None, None, None, None, None)
+            self.assertIn("--server-bin-b", str(ctx.exception))
 
 
 class ScalingAndCpuTests(unittest.TestCase):

@@ -51,7 +51,7 @@ decisions are numbered in [`ARCHITECTURE.md`](ARCHITECTURE.md); stored bytes are
 | Conformance map | `python3 tests/s3tests/test_conformance_map.py` |
 | Benchmark tooling | `python3 benchmarks/test_run_warp_benchmark.py` and the other `benchmarks/test_*.py` |
 | Conformance on the PR | the PR's `s3tests` check: its Ratchet line reads `0 of them no longer pass`, and every test the issue lists as its own is in its "Passing but not listed" list or in `passing.txt` (add them in the same PR) |
-| Speed and memory | `gh workflow run bench-ratio.yml --ref <branch>` when the issue asks for it per PR; otherwise the reviewer runs it once on `main` after a batch of PRs merges (one self-hosted runner: ten runs would queue for hours) |
+| Speed and memory | `gh workflow run bench-ratio.yml --ref <branch>` when the issue asks for it per PR; otherwise the reviewer runs it once on `main` after a batch of PRs merges (one self-hosted runner: ten runs would queue for hours). A before/after of one change runs both builds on one machine, alternating: `gh workflow run bench-scaling.yml --ref <branch> -f matrix=true -f build_b_ref=main` (build A is the branch, B is `main`; the report's "Build A against build B" table; #459) |
 
 A change to PUT, DELETE, CopyObject, multipart completion, `write_needle` or recovery also
 runs the `verify-object-versions` skill (`.claude/skills/verify-object-versions`). A

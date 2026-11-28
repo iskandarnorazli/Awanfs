@@ -44,6 +44,8 @@ KIB = 1024
 MIB = 1024 * 1024
 BUCKET = "core-scaling-bench"
 SERVERS: Tuple[str, ...] = ("AwanFS", "MinIO", "RustFS", "Garage", "SeaweedFS")
+# `--server-bin-b`: a second AwanFS build run next to the first, alternating (#459).
+BUILD_B = "AwanFS (B)"
 PATTERNS: Tuple[str, ...] = ("seq-write", "rand-write", "seq-read", "rand-read")
 
 DEFAULT_SIZES = "4KiB,1MiB"
@@ -3569,6 +3571,7 @@ def render_matrix_report(
     client_procs: int = 1,
     fast_by_size: Optional[Dict[int, Dict[int, Dict[int, PointResult]]]] = None,
     servers: Sequence[str] = SERVERS,
+    builds: Optional[Tuple[str, str]] = None,
 ) -> str:
     # `fast_by_size` is {size: {cores: {concurrency: point}}}; `fast_results` alone is 4 KiB.
     fast_sizes: Dict[int, Dict[int, Dict[int, PointResult]]] = dict(fast_by_size or {})
@@ -3683,6 +3686,8 @@ def render_matrix_report(
                     thread_entries.append(("fast", n, c, pt))
     lines.extend(_render_thread_breakdown_lines(thread_entries))
     lines.extend(_render_work_lines(results, patterns, sizes, cores, concurrencies, durability, fast_sizes, put_pat))
+    if BUILD_B in servers:
+        lines.extend(_render_build_comparison_lines(results, patterns, sizes, cores, concurrencies, builds))
 
     if chart_paths:
         lines.extend(["", "## Charts", ""])
@@ -3691,6 +3696,57 @@ def render_matrix_report(
 
     lines.append("")
     return "\n".join(lines)
+
+
+def _file_sha256(path: Optional[str]) -> str:
+    """The first 12 hex digits of a file's SHA-256, or "not found"."""
+    if not path or not os.path.isfile(path):
+        return "not found"
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:12]
+
+
+def _render_build_comparison_lines(
+    results: Dict[str, Dict[int, Dict[str, Dict[int, Dict[int, PointResult]]]]],
+    patterns: Sequence[str],
+    sizes: Sequence[int],
+    cores: Sequence[int],
+    concurrencies: Sequence[int],
+    builds: Optional[Tuple[str, str]],
+) -> List[str]:
+    """Build A (`--server-bin`) and build B (`--server-bin-b`) side by side, with the change in
+    ops/s, both measured alternately on this machine (#459)."""
+    lines = ["", "## Build A against build B", ""]
+    if builds:
+        lines.append(f"Build A (`--server-bin`) sha256 `{builds[0]}`; build B (`--server-bin-b`) sha256 `{builds[1]}`. Both ran alternately at every core count, on this machine.")
+        lines.append("")
+    lines.extend([
+        "| Pattern | Size | Cores | Concurrency | A ops/s | B ops/s | Change | A P99 (ms) | B P99 (ms) | A CPU % | B CPU % |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+    ])
+
+    def cpu(pt: PointResult) -> str:
+        return f"{pt.cpu_pct:.1f}%" if pt.cpu_pct is not None else "-"
+
+    for pat in patterns:
+        for sz in sizes:
+            for n in cores:
+                for c in concurrencies:
+                    pa = results.get(pat, {}).get(sz, {}).get("AwanFS", {}).get(n, {}).get(c)
+                    pb = results.get(pat, {}).get(sz, {}).get(BUILD_B, {}).get(n, {}).get(c)
+                    lbl = row_size_label(pat, sz)
+                    if not (pa and pa.measured and pb and pb.measured):
+                        lines.append(f"| {pat} | {lbl} | {n} | {c} | not measured | not measured | - | - | - | - | - |")
+                        continue
+                    change = f"{(pb.ops_per_sec / pa.ops_per_sec - 1.0) * 100.0:+.1f}%" if pa.ops_per_sec else "-"
+                    lines.append(
+                        f"| {pat} | {lbl} | {n} | {c} | {pa.ops_per_sec:,.0f} | {pb.ops_per_sec:,.0f} | {change} | "
+                        f"{pa.p99_ms:.2f} | {pb.p99_ms:.2f} | {cpu(pa)} | {cpu(pb)} |"
+                    )
+    return lines
 
 
 def _render_work_lines(
@@ -4187,9 +4243,12 @@ def _starter_for(
     seaweedfs_bin: Optional[str],
     memory_budget: Optional[str] = None,
     durability: str = "group",
+    awanfs_bin_b: Optional[str] = None,
 ) -> Callable[[], Tuple]:
     if srv == "AwanFS":
         return lambda: _start_awanfs(awanfs_bin, n, data_root, memory_budget=memory_budget, durability=durability)
+    if srv == BUILD_B:
+        return lambda: _start_awanfs(awanfs_bin_b, n, data_root, memory_budget=memory_budget, durability=durability)
     if srv == "MinIO":
         return lambda: _start_minio(minio_bin, mc_bin, n, data_root)
     if srv == "RustFS":
@@ -4223,6 +4282,12 @@ def _run_matrix_mode(
     put_pat = "seq-write" if "seq-write" in patterns else ("rand-write" if "rand-write" in patterns else None)
     servers = parse_servers(getattr(a, "servers", "") or "")
     fast_every = bool(getattr(a, "fast_every_concurrency", False))
+    awanfs_bin_b = getattr(a, "server_bin_b", "") or None
+    if awanfs_bin_b:
+        if "AwanFS" not in servers:
+            raise ValueError("--server-bin-b compares two AwanFS builds: --servers must include AwanFS")
+        # Next to build A, so the run order (reversed every other run) alternates A and B.
+        servers.insert(servers.index("AwanFS") + 1, BUILD_B)
     if "AwanFS" not in servers:
         compare_fast = False
 
@@ -4283,6 +4348,7 @@ def _run_matrix_mode(
                     starter = _starter_for(
                         srv, n, data_root, awanfs_bin, minio_bin, mc_bin, rustfs_bin,
                         garage_bin, seaweedfs_bin, memory_budget=a.memory_budget, durability=durability,
+                        awanfs_bin_b=awanfs_bin_b,
                     )
                     srv_prof = prof_points if srv == "AwanFS" else None
 
@@ -4301,7 +4367,7 @@ def _run_matrix_mode(
                         profile_threads_points=srv_prof,
                         client_procs=a.client_procs,
                         data_root=data_root,
-                        scrape_work=(srv == "AwanFS"),
+                        scrape_work=(srv in ("AwanFS", BUILD_B)),
                     )
                     for (pat, sz, c), pt in phase_map.items():
                         raw_runs[pat][sz][srv][n][c].append(pt)
@@ -4384,6 +4450,7 @@ def _run_matrix_mode(
         client_procs=a.client_procs,
         fast_by_size=fast_by_size,
         servers=servers,
+        builds=(_file_sha256(awanfs_bin), _file_sha256(awanfs_bin_b)) if awanfs_bin_b else None,
     )
     out_abs = os.path.abspath(a.output)
     os.makedirs(os.path.dirname(out_abs), exist_ok=True)
@@ -4424,6 +4491,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="Comma-separated core counts where AwanFS per-thread CPU is sampled during PUT 4 KiB (default: 4,8 on 16+ core split-client runs)")
     ap.add_argument("--no-fetch-minio", action="store_true", help="Do not auto-fetch missing MinIO/mc binaries from GitHub Releases")
     ap.add_argument("--server-bin", default="", help="Path to AwanFS release awanfs binary")
+    ap.add_argument("--server-bin-b", default="", help="Matrix only: a second AwanFS build (B), run alternately with --server-bin (A) at every core count and compared in the report (#459)")
     ap.add_argument("--minio-bin", default="", help="Path to MinIO binary")
     ap.add_argument("--mc-bin", default="", help="Path to MinIO mc binary")
     ap.add_argument("--rustfs-bin", default="", help="Path to RustFS binary")
