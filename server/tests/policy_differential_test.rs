@@ -309,7 +309,14 @@ fn differential_100k_policy_and_authz_against_reference() {
         let ctx = AuthzContext { identity_policy: id_pol, _marker: PhantomData };
         let dec = authorize(principal, op, Some(&b_target), o_target.as_ref(), &ctx);
 
-        // Invariant 1: explicit Deny always beats everything.
+        // Invariant 1: explicit Deny beats everything, except that root can always read,
+        // replace or delete the bucket policy itself (lockout recovery, #122 review).
+        let recovering = matches!(principal, Principal::Root)
+            && matches!(op, Operation::GetBucketPolicy | Operation::PutBucketPolicy | Operation::DeleteBucketPolicy);
+        if want_deny && recovering {
+            assert!(dec.is_allowed(), "seed {:#x} iter {} lockout recovery", seed, iter);
+            continue;
+        }
         if want_deny {
             assert!(matches!(dec, Decision::Deny { reason: Reason::BucketPolicyDeny, .. }), "seed {:#x} iter {} deny", seed, iter);
             continue;
@@ -319,7 +326,7 @@ fn differential_100k_policy_and_authz_against_reference() {
         let pol_ok = got_pol.allow && !(got_pol.is_public && restrict_public_buckets && !is_owner);
         let acl_ok = ownership != BucketOwnership::BucketOwnerEnforced
             && acl_grants.grants.iter().any(|g| {
-                let p_ok = g.permission == AclPermission::FullControl || g.permission == sp.acl_permission;
+                let p_ok = sp.acl_permission.is_some_and(|req| g.permission == AclPermission::FullControl || g.permission == req);
                 let w_ok = match &g.grantee {
                     Grantee::AllUsers => !ignore_public_acls,
                     Grantee::AuthenticatedUsers => !ignore_public_acls && !matches!(principal, Principal::Anonymous),
