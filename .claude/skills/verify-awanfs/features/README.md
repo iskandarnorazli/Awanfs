@@ -25,6 +25,7 @@
 | Object lock, retention & legal hold | `lock` | [object-lock.md](object-lock.md) |
 | POST object (browser form uploads, SigV4) | `post` | [post-object.md](post-object.md) |
 | Bucket lifecycle rules & expiration | `lifecycle` | [lifecycle.md](lifecycle.md) |
+| Access control: bucket policies, ACLs, Ownership Controls, PAB | `access` | [access.md](access.md) |
 
 Signatures are checked on every journey: `doctor` proves an unsigned request gets 403 and a signed one 200, and every journey runs signed with the keys the script gives the server.
 
@@ -35,6 +36,5 @@ Each has a source path, and none has a journey. The reason is in brackets.
 - Presigned URLs (`auth.rs`, `X-Amz-Expires`): the aws CLI can make one (`aws s3 presign`), not yet driven.
 - IAM users and policies, `--config` (`iam.rs`): needs a config file and a second key pair; covered by `iam_test.rs` (#53, #130).
 - Per-bucket compression, `[[buckets]] compression = "zstd"` (`compress.rs`): needs `--config`; covered by `compression_test.rs` (#51).
-- ACLs, policies: not implemented (#122).
 - `411 MissingContentLength` (`ops/object.rs`, #160) and raw invalid-UTF-8 key bytes (`400 InvalidURI`, `ops/mod.rs`, #140): cannot be driven with the `aws` CLI (`botocore` always sets `Content-Length` or `Transfer-Encoding: chunked`, rejects invalid UTF-8 surrogates, and percent-encodes `%`); covered by `server/tests/s3_details_test.rs` and `tests/s3tests/passing.txt`.
 - Operations surface, for an operator rather than an S3 client: health (`/_awanfs/health/live`, `/ready`), metrics (`/_awanfs/metrics`), TLS (`--cert`, `--key`, `--http-port`), the access log (`--access-log`), the request log on stderr (`AWANFS_LOG`, #138), compaction (`--auto-compaction`, `--compaction-rate`), traces (`--otlp-endpoint`). Covered by Rust tests, not by this skill.

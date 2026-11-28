@@ -43,6 +43,7 @@ pub async fn list_multipart_uploads(
     state: Arc<S3ServiceState>,
     bucket: &str,
     query_map: &HashMap<String, String>,
+    iam: Option<&crate::iam::Iam>,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let q = |k: &str| query_map.get(k).map(|s| s.as_str()).unwrap_or("");
     if let Some(et) = query_map.get("encoding-type") {
@@ -121,7 +122,7 @@ pub async fn list_multipart_uploads(
 
     let is_truncated = max_uploads > 0 && items.len() > max_uploads;
     let take_n = items.len().min(max_uploads);
-    let mut page_uploads: Vec<(String, String, u64)> = Vec::new();
+    let mut page_uploads: Vec<(String, String, u64, String, String, String, String)> = Vec::new();
     let mut page_prefixes: Vec<String> = Vec::new();
     let mut next_key_marker = String::new();
     let mut next_upload_id_marker = String::new();
@@ -135,7 +136,9 @@ pub async fn list_multipart_uploads(
                     next_key_marker = u.key.clone();
                     next_upload_id_marker = u.upload_id.clone();
                 }
-                page_uploads.push((enc(&u.key), u.upload_id.clone(), u.initiated_at));
+                let init = crate::acl::owner_for_account(&u.initiator_account, iam);
+                let own = crate::acl::owner_for_account(&u.owner_account, iam);
+                page_uploads.push((enc(&u.key), u.upload_id.clone(), u.initiated_at, init.id, init.display_name, own.id, own.display_name));
             }
             Item::Prefix(cp) => {
                 if is_truncated {
@@ -176,6 +179,7 @@ pub async fn create_multipart_upload(
     headers: &HeaderMap,
     writer_account: &str,
     bucket_owner: &str,
+    iam: Option<&crate::iam::Iam>,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let req_cksum = match crate::checksum::requested_checksum(headers) {
         Ok(Some(c)) => Some(c),
@@ -217,7 +221,10 @@ pub async fn create_multipart_upload(
     if let Err(resp) = super::object::apply_lock_headers_and_default(&state, b_id, key, headers, &mut attrs, false, false) {
         return Ok(resp);
     }
-    super::object::apply_owner_attr(&mut attrs, writer_account, bucket_owner);
+    let eff_owner = match super::object::apply_object_ownership_and_acl(&state, b_id, key, headers, writer_account, bucket_owner, iam, &mut attrs) {
+        Ok(o) => o,
+        Err(resp) => return Ok(resp),
+    };
     let tag_set = match crate::ops::tagging::parse_tagging_header_from(headers, key) {
         Ok(t) => t,
         Err(resp) => return Ok(resp),
@@ -226,6 +233,8 @@ pub async fn create_multipart_upload(
         Ok(id) => id,
         Err(e) => return Ok(internal_error_response(key, &format!("could not start the upload: {}", e))),
     };
+    let eff_init = if writer_account.is_empty() { crate::iam::ROOT_ACCOUNT } else { writer_account };
+    state.multipart.set_upload_owners(&upload_id, eff_init, &eff_owner);
     if !attrs.is_empty() {
         state.multipart.set_upload_attrs(&upload_id, attrs);
     }
@@ -253,6 +262,7 @@ pub async fn create_multipart_upload(
 #[allow(clippy::too_many_arguments)]
 pub async fn upload_part(
     state: Arc<S3ServiceState>,
+    bucket: &str,
     key: &str,
     path: &str,
     query_map: &HashMap<String, String>,
@@ -261,6 +271,14 @@ pub async fn upload_part(
     body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let upload_id = &query_map["uploadId"];
+    if state.multipart.validate_upload_target(upload_id, bucket, key).is_err() {
+        let xml = s3_error_xml("NoSuchUpload", "The specified upload does not exist.", key, "req-up-part");
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(CONTENT_TYPE, "application/xml")
+            .body(full_body(Bytes::from(xml)))
+            .unwrap());
+    }
     let part_num: u32 = match query_map["partNumber"].parse() {
         Ok(n) => n,
         Err(_) => {
@@ -872,6 +890,14 @@ pub async fn complete_multipart_upload(
         }
     }
 
+    if state.multipart.validate_upload_target(upload_id, bucket, key).is_err() {
+        let xml = s3_error_xml("NoSuchUpload", "The specified upload does not exist.", key, "req-cmp-part");
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(CONTENT_TYPE, "application/xml")
+            .body(full_body(Bytes::from(xml)))
+            .unwrap());
+    }
     if let Some(cached) = state.multipart.get_completed_result(upload_id) {
         if cached.bucket == bucket && cached.key == key {
             let xml = complete_multipart_upload_result_xml_with_checksum(
@@ -1184,11 +1210,20 @@ pub async fn complete_multipart_upload(
 pub async fn abort_multipart_upload(
     state: Arc<S3ServiceState>,
     b_id: u32,
+    bucket: &str,
     key: &str,
     query_map: &HashMap<String, String>,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let upload_id = &query_map["uploadId"];
     let _key_guard = state.lock_key(b_id, key).await;
+    if state.multipart.validate_upload_target(upload_id, bucket, key).is_err() {
+        let xml = s3_error_xml("NoSuchUpload", "The specified upload does not exist", key, "req-abort");
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(CONTENT_TYPE, "application/xml")
+            .body(full_body(Bytes::from(xml)))
+            .unwrap());
+    }
     match state.multipart.abort_upload(upload_id) {
         Ok(()) => Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -1229,6 +1264,7 @@ pub fn parse_copy_source_range(raw: &str) -> Result<(u64, u64), ()> {
 
 pub async fn upload_part_copy(
     state: Arc<S3ServiceState>,
+    bucket: &str,
     key: &str,
     query_map: &HashMap<String, String>,
     headers: &HeaderMap,
@@ -1240,6 +1276,15 @@ pub async fn upload_part_copy(
             return Ok(bad_request("InvalidArgument", "Invalid partNumber", key));
         }
     };
+
+    if state.multipart.validate_upload_target(upload_id, bucket, key).is_err() || state.multipart.get_upload(upload_id).is_none() {
+        let xml = s3_error_xml("NoSuchUpload", "The specified upload does not exist.", key, "req-upc");
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(CONTENT_TYPE, "application/xml")
+            .body(full_body(Bytes::from(xml)))
+            .unwrap());
+    }
     let dst_sse_key = match crate::sse::parse_write_sse_headers(headers) {
         Ok(k) => k,
         Err(e) => return Ok(sse_error_response(e, key, false)),
@@ -1498,6 +1543,7 @@ pub async fn list_parts(
     bucket: &str,
     key: &str,
     query_map: &HashMap<String, String>,
+    iam: Option<&crate::iam::Iam>,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     if let Some(et) = query_map.get("encoding-type") {
         if !et.is_empty() && et != "url" {
@@ -1553,10 +1599,16 @@ pub async fn list_parts(
                 0
             };
             let enc_key = if url_encode { s3_url_encode(key) } else { key.to_string() };
+            let init = crate::acl::owner_for_account(&u.initiator_account, iam);
+            let own = crate::acl::owner_for_account(&u.owner_account, iam);
             let xml = list_parts_result_xml(&ListPartsPage {
                 bucket,
                 key: &enc_key,
                 upload_id,
+                initiator_id: &init.id,
+                initiator_display_name: &init.display_name,
+                owner_id: &own.id,
+                owner_display_name: &own.display_name,
                 part_number_marker: marker,
                 next_part_number_marker: next_marker,
                 max_parts,

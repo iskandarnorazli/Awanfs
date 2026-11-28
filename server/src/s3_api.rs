@@ -696,6 +696,10 @@ pub struct S3ServiceState {
     pub stream_relocations: Arc<AtomicU64>,
     /// Who may call; `AuthConfig::open()` by default, the binary sets it from flags and env.
     pub auth: crate::auth::AuthConfig,
+    /// Default object ownership applied to buckets with no explicit ownership config (#122, D5).
+    pub default_bucket_ownership: crate::authz::BucketOwnership,
+    /// True when the server serves TLS (`--cert` / `--key`), reported in `aws:SecureTransport`.
+    pub is_https: bool,
     /// Why the server is not ready yet (`None` when it is); see `/_awanfs/health/ready` (#44).
     pub not_ready: Arc<RwLock<Option<&'static str>>>,
     /// Request counts, latencies and bytes for `/_awanfs/metrics` (#42).
@@ -1047,6 +1051,8 @@ impl S3ServiceState {
             streams: Arc::new(StreamsInFlight::default()),
             stream_relocations: Arc::new(AtomicU64::new(0)),
             auth: crate::auth::AuthConfig::open(),
+            default_bucket_ownership: crate::authz::DEFAULT_BUCKET_OWNERSHIP,
+            is_https: false,
             not_ready: Arc::new(RwLock::new(None)),
             metrics,
             access_log: Arc::new(RwLock::new(None)),
@@ -1562,6 +1568,8 @@ impl S3ServiceState {
             streams: Arc::new(StreamsInFlight::default()),
             stream_relocations: Arc::new(AtomicU64::new(0)),
             auth: crate::auth::AuthConfig::open(),
+            default_bucket_ownership: crate::authz::DEFAULT_BUCKET_OWNERSHIP,
+            is_https: false,
             not_ready: Arc::new(RwLock::new(None)),
             metrics,
             access_log: Arc::new(RwLock::new(None)),

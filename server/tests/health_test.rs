@@ -19,7 +19,7 @@ async fn live_and_ready_answer_without_credentials() {
     let state = Arc::new(st);
     let (url, _h) = server(Arc::clone(&state)).await;
     let c = reqwest::Client::new();
-    assert_eq!(c.get(format!("{}/", url)).send().await.unwrap().status(), StatusCode::FORBIDDEN, "S3 still needs a signature");
+    assert_eq!(c.put(format!("{}/health-unsigned-probe", url)).send().await.unwrap().status(), StatusCode::FORBIDDEN, "S3 still needs a signature");
     assert_eq!(c.get(format!("{}/_awanfs/health/live", url)).send().await.unwrap().status(), StatusCode::OK);
     let res = c.get(format!("{}/_awanfs/health/ready", url)).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);

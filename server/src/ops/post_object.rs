@@ -326,13 +326,24 @@ async fn read_small_file(
     Ok(buf.freeze())
 }
 
-fn object_headers(form: &FormFields, size: u64, path: &str) -> Result<HeaderMap, Response<ResponseBody>> {
+fn object_headers(
+    form: &FormFields,
+    size: u64,
+    path: &str,
+    forward_private_acl: bool,
+) -> Result<HeaderMap, Response<ResponseBody>> {
     let mut h = HeaderMap::new();
     h.insert(CONTENT_LENGTH, size.into());
     for (name, value) in po::object_header_fields(form) {
         let n = hyper::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| refusal_response(BAD_FIELD_VALUE, path))?;
         let v = hyper::header::HeaderValue::from_str(&value).map_err(|_| refusal_response(BAD_FIELD_VALUE, path))?;
         h.insert(n, v);
+    }
+    if let Some(acl) = form.get("acl") {
+        if forward_private_acl || acl.trim() != "private" {
+            let v = hyper::header::HeaderValue::from_str(acl).map_err(|_| refusal_response(BAD_FIELD_VALUE, path))?;
+            h.insert("x-amz-acl", v);
+        }
     }
     if let Some(xml) = form.get("tagging") {
         let tags = po::tagging_header(xml).map_err(|r| refusal_response(r, path))?;
@@ -354,6 +365,7 @@ pub async fn execute(
     req_headers: &HeaderMap,
     writer_account: &str,
     bucket_owner: &str,
+    iam: Option<&crate::iam::Iam>,
     form: Option<Box<PostForm>>,
     mut body: hyper::body::Incoming,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
@@ -415,7 +427,12 @@ pub async fn execute(
     if let Err(r) = po::check_size(form.policy.as_ref(), size) {
         return Ok(refusal_response(r, path));
     }
-    let headers = match object_headers(&form.fields, size, path) {
+    let ownership = state
+        .bucket_config_reader
+        .load_bucket(b_id)
+        .map_or(state.default_bucket_ownership, |c| c.ownership_or(state.default_bucket_ownership));
+    let forward_private_acl = ownership != crate::acl::BucketOwnership::BucketOwnerEnforced;
+    let headers = match object_headers(&form.fields, size, path, forward_private_acl) {
         Ok(h) => h,
         Err(resp) => return Ok(resp),
     };
@@ -428,6 +445,7 @@ pub async fn execute(
         &headers,
         writer_account,
         bucket_owner,
+        iam,
         None,
         file_body,
     )

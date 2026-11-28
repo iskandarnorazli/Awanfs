@@ -51,6 +51,8 @@ pub struct MultipartUpload {
     pub checksum_type: Option<String>,
     pub attrs: crate::attrs::Attrs,
     pub tags: Option<crate::tagging::TagSet>,
+    pub initiator_account: String,
+    pub owner_account: String,
     pub sse: Option<crate::sse::SseAttr>,
 }
 
@@ -223,6 +225,8 @@ impl MultipartManager {
             checksum_type: None,
             attrs: crate::attrs::Attrs::new(),
             tags: None,
+            initiator_account: crate::iam::ROOT_ACCOUNT.to_string(),
+            owner_account: crate::iam::ROOT_ACCOUNT.to_string(),
             sse,
         };
 
@@ -231,6 +235,24 @@ impl MultipartManager {
             .insert(upload_id.clone(), crate::fsm::UploadState::Open(fsm_enc));
         self.uploads.write().insert(upload_id.clone(), upload);
         Ok(upload_id)
+    }
+
+    pub fn set_upload_owners(&self, upload_id: &str, initiator_account: &str, owner_account: &str) {
+        if let Some(u) = self.uploads.write().get_mut(upload_id) {
+            u.initiator_account = initiator_account.to_string();
+            u.owner_account = owner_account.to_string();
+        }
+    }
+
+    pub fn upload_owner_account(&self, upload_id: &str) -> Option<String> {
+        self.uploads.read().get(upload_id).map(|u| u.owner_account.clone())
+    }
+
+    pub fn upload_owners(&self, upload_id: &str) -> Option<(String, String)> {
+        self.uploads
+            .read()
+            .get(upload_id)
+            .map(|u| (u.initiator_account.clone(), u.owner_account.clone()))
     }
 
     /// Checks multipart upload SSE-C parameters via `fsm::upload_step` (#121).
@@ -307,6 +329,25 @@ impl MultipartManager {
 
     pub fn get_upload(&self, upload_id: &str) -> Option<MultipartUpload> {
         self.uploads.read().get(upload_id).cloned()
+    }
+
+    /// Verifies that `upload_id` exists and belongs to `(bucket, key)` (#122).
+    pub fn validate_upload_target(&self, upload_id: &str, bucket: &str, key: &str) -> Result<(), &'static str> {
+        if let Some(u) = self.uploads.read().get(upload_id) {
+            return if u.bucket == bucket && u.key == key {
+                Ok(())
+            } else {
+                Err("NoSuchUpload")
+            };
+        }
+        if let Some(c) = self.completed_results.read().get(upload_id) {
+            return if c.bucket == bucket && c.key == key {
+                Ok(())
+            } else {
+                Err("NoSuchUpload")
+            };
+        }
+        Err("NoSuchUpload")
     }
 
     /// Returns `(checksum_alg, checksum_type)` if `upload_id` exists, without cloning the part map.
@@ -732,6 +773,10 @@ pub struct ListPartsPage<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
     pub upload_id: &'a str,
+    pub initiator_id: &'a str,
+    pub initiator_display_name: &'a str,
+    pub owner_id: &'a str,
+    pub owner_display_name: &'a str,
     pub part_number_marker: u32,
     pub next_part_number_marker: u32,
     pub max_parts: usize,
@@ -747,6 +792,8 @@ pub fn list_parts_result_xml(p: &ListPartsPage<'_>) -> String {
           <Bucket>{}</Bucket>\n  \
           <Key>{}</Key>\n  \
           <UploadId>{}</UploadId>\n  \
+          <Initiator><ID>{}</ID><DisplayName>{}</DisplayName></Initiator>\n  \
+          <Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner>\n  \
           <StorageClass>STANDARD</StorageClass>\n  \
           <PartNumberMarker>{}</PartNumberMarker>\n  \
           <NextPartNumberMarker>{}</NextPartNumberMarker>\n  \
@@ -755,6 +802,10 @@ pub fn list_parts_result_xml(p: &ListPartsPage<'_>) -> String {
         xml_escape(p.bucket),
         xml_escape(p.key),
         xml_escape(p.upload_id),
+        xml_escape(p.initiator_id),
+        xml_escape(p.initiator_display_name),
+        xml_escape(p.owner_id),
+        xml_escape(p.owner_display_name),
         p.part_number_marker,
         p.next_part_number_marker,
         p.max_parts,
@@ -788,7 +839,7 @@ pub struct ListUploadsPage<'a> {
     pub max_uploads: usize,
     pub is_truncated: bool,
     pub encoding_url: bool,
-    pub uploads: &'a [(String, String, u64)],
+    pub uploads: &'a [(String, String, u64, String, String, String, String)],
     pub common_prefixes: &'a [String],
 }
 
@@ -821,12 +872,20 @@ pub fn list_multipart_uploads_result_xml(p: &ListUploadsPage<'_>) -> String {
         out.push_str("  <EncodingType>url</EncodingType>\n");
     }
 
-    for (key, upload_id, initiated_at) in p.uploads {
+    for (key, upload_id, initiated_at, init_id, init_name, own_id, own_name) in p.uploads {
         out.push_str("  <Upload>\n");
         out.push_str(&format!("    <Key>{}</Key>\n", xml_escape(key)));
         out.push_str(&format!("    <UploadId>{}</UploadId>\n", xml_escape(upload_id)));
-        out.push_str("    <Initiator><ID>root</ID><DisplayName>root</DisplayName></Initiator>\n");
-        out.push_str("    <Owner><ID>root</ID><DisplayName>root</DisplayName></Owner>\n");
+        out.push_str(&format!(
+            "    <Initiator><ID>{}</ID><DisplayName>{}</DisplayName></Initiator>\n",
+            xml_escape(init_id),
+            xml_escape(init_name)
+        ));
+        out.push_str(&format!(
+            "    <Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner>\n",
+            xml_escape(own_id),
+            xml_escape(own_name)
+        ));
         out.push_str("    <StorageClass>STANDARD</StorageClass>\n");
         out.push_str(&format!("    <Initiated>{}</Initiated>\n", crate::versions::iso8601(initiated_at.saturating_mul(1_000_000))));
         out.push_str("  </Upload>\n");

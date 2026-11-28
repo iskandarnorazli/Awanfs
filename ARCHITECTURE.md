@@ -77,14 +77,16 @@ Owner decisions after the 2026-11-12 unattended run (#64-#83), each the recommen
 | 38 | **Encryption: SSE-S3 with a local master key that wraps per-object keys, and SSE-C;** SSE-KMS first from a local key file of named keys (decision 49, 2026-11-14, replacing "through an external service later"); an external KMS can replace the file without a format change. | #121 |
 | 39 | **Access: bucket policies (on the #53 evaluator), canned ACLs, per-grantee ACL grants and the public access block.** Per-grantee grants were ruled out here at first and allowed by decision 48 (2026-11-14); new buckets have ACLs off. | #122 |
 
-**Decision 40 (2026-11-13): `--allow-anonymous` is refused together with users in `--config`.**
-Policies are checked for `Principal::User` only, so an unsigned request accepted by
-`--allow-anonymous` would get more access than any user the config restricts. The server exits 2
-and names both flags. `--allow-anonymous` on its own is unchanged: the startup message already
-says anyone who can reach the port can read, write and delete. A config that sets only
-`[[buckets]]` restricts nobody, so it is not the combination. The policy model for public access
-is #122 (decision 39), which replaces this guard when it lands. Found by an adversarial review of
-#53, filed as #130.
+**Decision 40 (2026-11-13; updated 2026-11-27 for #122): `--allow-anonymous` is refused together with users in `--config`.**
+When users are configured in `--config` (or root keys are set), `--allow-anonymous` is
+still refused with exit code 2 (server with `--config` + `--allow-anonymous`) so an open-server
+switch cannot bypass restricted users. `#122` fulfills the replacement model: without
+`--allow-anonymous`, unsigned HTTP requests authenticate as `Principal::Anonymous` and pass
+through `authz::authorize`, denied by default unless granted by an explicit public bucket
+policy (`Principal: *`) or `AllUsers` ACL permitted by Public Access Block (and `BucketOwnership`
+defaults to `BucketOwnerEnforced` unless `--default-bucket-ownership` overrides it for
+compatibility profiles). `--allow-anonymous` on its own with no keys/users remains an open
+server for local dev/benchmarking. Found by an adversarial review of #53, filed as #130.
 
 **Decision 43 (2026-11-14): volume format 3 stores object attributes in the needle.** The
 reserved header bytes 18..20 become the length of an attributes block between the key and the

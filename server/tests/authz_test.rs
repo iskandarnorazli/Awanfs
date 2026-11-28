@@ -53,7 +53,15 @@ fn op_class(op: Operation) -> OpClass {
         | Operation::GetObjectTagging
         | Operation::GetObjectLockConfiguration
         | Operation::GetObjectRetention
-        | Operation::GetObjectLegalHold => OpClass::Read,
+        | Operation::GetObjectLegalHold
+        | Operation::GetBucketPolicy
+        | Operation::GetBucketPolicyStatus
+        | Operation::GetBucketOwnershipControls
+        | Operation::GetPublicAccessBlock => OpClass::Read,
+        Operation::GetBucketAcl
+        | Operation::GetObjectAcl => OpClass::ReadAcl,
+        Operation::PutBucketAcl
+        | Operation::PutObjectAcl => OpClass::WriteAcl,
         Operation::PutObject
         | Operation::PostObject
         | Operation::CopyObject
@@ -77,7 +85,13 @@ fn op_class(op: Operation) -> OpClass {
         | Operation::DeleteBucketCors
         | Operation::PutBucketTagging
         | Operation::DeleteBucketTagging
-        | Operation::PutObjectLockConfiguration => OpClass::BucketAdmin,
+        | Operation::PutObjectLockConfiguration
+        | Operation::PutBucketPolicy
+        | Operation::DeleteBucketPolicy
+        | Operation::PutBucketOwnershipControls
+        | Operation::DeleteBucketOwnershipControls
+        | Operation::PutPublicAccessBlock
+        | Operation::DeletePublicAccessBlock => OpClass::BucketAdmin,
     }
 }
 
@@ -1173,4 +1187,53 @@ fn bucket_config_mutations_are_owner_or_policy_only_and_deny_acl_grants() {
             Decision::Allow(Reason::Acl)
         );
     }
+}
+
+/// #122 review (Claude): a FULL_CONTROL grantee who does not own the bucket cannot read or
+/// change its policy, public access block or ownership controls; only the owner or a policy can
+/// (the same rule #521 set for the other configuration operations). Before this, these ops took
+/// `AclPermission::FullControl`, so an ACL grant could replace the bucket policy.
+#[test]
+fn policy_pab_and_ownership_operations_ignore_acl_grants() {
+    let ops = [
+        Operation::GetBucketPolicy,
+        Operation::PutBucketPolicy,
+        Operation::DeleteBucketPolicy,
+        Operation::GetBucketPolicyStatus,
+        Operation::GetBucketOwnershipControls,
+        Operation::PutBucketOwnershipControls,
+        Operation::DeleteBucketOwnershipControls,
+        Operation::GetPublicAccessBlock,
+        Operation::PutPublicAccessBlock,
+        Operation::DeletePublicAccessBlock,
+    ];
+    let caller = Principal::User { account: "acct-other".to_string(), name: "other".to_string(), id: "id-other".to_string() };
+    let acl = AclGrants {
+        grants: vec![
+            AclGrant { grantee: Grantee::CanonicalUser("id-other".to_string()), permission: AclPermission::FullControl },
+            AclGrant { grantee: Grantee::AllUsers, permission: AclPermission::FullControl },
+        ],
+    };
+    let b = BucketTarget {
+        name: "pol-bkt",
+        owner_account: "acct-owner",
+        ownership: BucketOwnership::ObjectWriter,
+        public_access_block: PublicAccessBlock::default(),
+        policy: BucketPolicyDecision::none(),
+        acl: &acl,
+    };
+    let ctx = AuthzContext { identity_policy: PolicyMatch::Allow, _marker: PhantomData };
+    for op in ops {
+        assert!(
+            matches!(authorize(&caller, op, Some(&b), None, &ctx), Decision::Deny { .. }),
+            "{:?}: a FULL_CONTROL grantee who does not own the bucket must be denied",
+            op
+        );
+        assert_eq!(spec(op).acl_permission, None, "{:?} must take no ACL permission", op);
+    }
+    // The ACL operations keep their ACP permissions.
+    assert_eq!(spec(Operation::GetBucketAcl).acl_permission, Some(AclPermission::ReadAcp));
+    assert_eq!(spec(Operation::PutBucketAcl).acl_permission, Some(AclPermission::WriteAcp));
+    assert_eq!(spec(Operation::GetObjectAcl).acl_permission, Some(AclPermission::ReadAcp));
+    assert_eq!(spec(Operation::PutObjectAcl).acl_permission, Some(AclPermission::WriteAcp));
 }

@@ -88,8 +88,6 @@ async fn unknown_subresources_answer_501_and_store_nothing() {
         (Method::GET, "/bkt/obj?fooBar"),
         (Method::PUT, "/bkt/new-obj?fooBar"),
         (Method::DELETE, "/bkt/obj?fooBar"),
-        (Method::GET, "/bkt?acl"),
-        (Method::PUT, "/bkt?policy"),
         (Method::GET, "/bkt?website"),
         (Method::GET, "/bkt?notification"),
         (Method::GET, "/bkt?replication"),

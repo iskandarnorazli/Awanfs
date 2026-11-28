@@ -194,7 +194,7 @@ fn call_list_buckets(query_map: &HashMap<String, String>) -> (StatusCode, String
     let rt = list_buckets_runtime();
     let state = Arc::clone(list_buckets_state());
     rt.block_on(async move {
-        let resp = list_buckets(state, query_map, None)
+        let resp = list_buckets(state, query_map, None, false, None)
             .await
             .expect("list_buckets never returns hyper::Error");
         let status = resp.status();
@@ -447,6 +447,20 @@ fn canonical_operation_cases() -> &'static [(
         (Operation::PutObjectRetention, Method::PUT, Some("bkt"), Some("obj"), "retention", None),
         (Operation::GetObjectLegalHold, Method::GET, Some("bkt"), Some("obj"), "legal-hold", None),
         (Operation::PutObjectLegalHold, Method::PUT, Some("bkt"), Some("obj"), "legal-hold", None),
+        (Operation::GetBucketPolicy, Method::GET, Some("bkt"), None, "policy", None),
+        (Operation::PutBucketPolicy, Method::PUT, Some("bkt"), None, "policy", None),
+        (Operation::DeleteBucketPolicy, Method::DELETE, Some("bkt"), None, "policy", None),
+        (Operation::GetBucketPolicyStatus, Method::GET, Some("bkt"), None, "policyStatus", None),
+        (Operation::GetBucketAcl, Method::GET, Some("bkt"), None, "acl", None),
+        (Operation::PutBucketAcl, Method::PUT, Some("bkt"), None, "acl", None),
+        (Operation::GetObjectAcl, Method::GET, Some("bkt"), Some("obj"), "acl", None),
+        (Operation::PutObjectAcl, Method::PUT, Some("bkt"), Some("obj"), "acl", None),
+        (Operation::GetBucketOwnershipControls, Method::GET, Some("bkt"), None, "ownershipControls", None),
+        (Operation::PutBucketOwnershipControls, Method::PUT, Some("bkt"), None, "ownershipControls", None),
+        (Operation::DeleteBucketOwnershipControls, Method::DELETE, Some("bkt"), None, "ownershipControls", None),
+        (Operation::GetPublicAccessBlock, Method::GET, Some("bkt"), None, "publicAccessBlock", None),
+        (Operation::PutPublicAccessBlock, Method::PUT, Some("bkt"), None, "publicAccessBlock", None),
+        (Operation::DeletePublicAccessBlock, Method::DELETE, Some("bkt"), None, "publicAccessBlock", None),
     ]
 }
 

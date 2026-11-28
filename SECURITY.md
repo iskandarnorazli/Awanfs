@@ -26,7 +26,7 @@ Every request follows a single pipeline: `authenticate` produces a `Principal` (
   4. Bucket policy allows the action for this principal and its conditions hold (when not blocked by Public Access Block `restrict_public_buckets`) -> `Allow`
   5. ACL on the resource grants the permission (when bucket ownership is not `BucketOwnerEnforced` and not ignored by Public Access Block `ignore_public_acls`) -> `Allow`
   6. Default deny -> `Deny`
-- **Anonymous access (Decision 40):** `--allow-anonymous` is refused at startup (exit code 2) whenever users are configured in `--config`, preventing unauthenticated callers from bypassing IAM or multi-account restrictions.
+- **Anonymous access (Decision 40 / #122):** When users are configured in `--config`, `--allow-anonymous` is refused at startup (exit code 2), preventing an open bypass of IAM or multi-account rules. When `--allow-anonymous` is not set, unsigned requests authenticate as `Principal::Anonymous` and are governed strictly by `authz::authorize` (allowed only by explicit public bucket policy with `Principal: "*"` or `AllUsers` ACL grant when allowed by Public Access Block, returning empty `<Buckets>` on `ListBuckets`).
 
 ## Server-Side Encryption (#121) Threat Model
 

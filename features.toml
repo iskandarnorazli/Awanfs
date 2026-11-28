@@ -145,6 +145,7 @@ ceph = [
   "test_s3::test_cors_presigned_get_object_tenant",
   "test_s3::test_cors_presigned_put_object_tenant",
   "test_s3::test_bucket_policy_different_tenant",
+  "test_s3::test_bucket_policy_tenanted_bucket",
   "test_s3::test_get_object_torrent",
 ]
 
@@ -495,7 +496,7 @@ ceph = [
   "test_s3::test_cors_presigned_put_object_tenant_with_acl",
 ]
 mint = [
-  "minio-go: testCors::SetBucketCors(bucketName, cors)",
+  "re:^minio-go: testCors(_|::)",
   "minio-go: testCorsSetGetDelete::SetBucketCors(bucketName, cors)",
   "minio-java::deleteBucketCors()",
   "minio-java::getBucketCors()",
@@ -670,22 +671,12 @@ fuzz = ["tagging_xml"]
 
 # Its other ceph tests pass; these fail only because each each calls PutBucketPolicy first (owner, 2026-11-21).
 [feature.waits_on]
-"test_s3::test_get_tags_acl_public" = "policy"
-"test_s3::test_put_tags_acl_public" = "policy"
-"test_s3::test_delete_tags_obj_public" = "policy"
-"test_s3::test_bucket_policy_get_obj_existing_tag" = "policy"
-"test_s3::test_bucket_policy_get_obj_tagging_existing_tag" = "policy"
-"test_s3::test_bucket_policy_put_obj_tagging_existing_tag" = "policy"
-"test_s3::test_bucket_policy_put_obj_copy_source" = "policy"
-"test_s3::test_bucket_policy_put_obj_copy_source_meta" = "policy"
-"test_s3::test_bucket_policy_put_obj_acl" = "policy"
 "test_s3::test_bucket_policy_put_obj_request_obj_tag" = "policy"
-"test_s3::test_bucket_policy_get_obj_acl_existing_tag" = "policy"
 
 [[feature]]
 id = "policy"
 name = "Bucket policies, policy status, and Public Access Block"
-status = "planned"
+status = "partial"
 issue = "#122"
 area = "policy"
 design_section = "5"
@@ -706,7 +697,6 @@ ceph = [
   "test_s3::test_bucket_policy_acl",
   "test_s3::test_bucketv2_policy_acl",
   "test_s3::test_bucket_policy_multipart",
-  "test_s3::test_bucket_policy_tenanted_bucket",
   "test_s3::test_bucket_policy_another_bucket",
   "test_s3::test_bucketv2_policy_another_bucket",
   "test_s3::test_bucket_policy_set_condition_operator_end_with_IfExists",
@@ -734,13 +724,26 @@ ceph = [
   "test_s3::test_head_object_404_with_policy_prefix",
 ]
 mint = [
-  "minio-go: testFunctional::GetBucketPolicy(ctx, bucketName)",
+  "re:^minio-go: testFunctional::",
   "minio-java::deleteBucketPolicy()",
   "minio-java::getBucketPolicy()",
   "minio-java::setBucketPolicy()",
   "minio-js::getBucketPolicy(bucketName, cb)",
   "minio-js::setBucketPolicy(bucketName, bucketPolicy, cb)",
 ]
+server_tests = [
+  "server/tests/access_control_test.rs::bucket_policy_crud_exact_bytes_and_validation",
+  "server/tests/access_control_test.rs::policy_conditions_operators_and_keys",
+  "server/tests/access_control_test.rs::ownership_controls_pab_expected_owner_anonymous_and_100_continue",
+  "server/tests/access_control_test.rs::policy_and_acl_live_update_and_restart_round_trip",
+  "server/tests/access_ported_test.rs::test_bucket_policy_set_condition_operator_end_with_if_exists",
+  "server/tests/policy_differential_test.rs::differential_100k_policy_and_authz_against_reference",
+]
+drive = ["access"]
+fuzz = ["bucket_policy"]
+
+[feature.ported]
+"test_s3::test_bucket_policy_set_condition_operator_end_with_IfExists" = "server/tests/access_ported_test.rs::test_bucket_policy_set_condition_operator_end_with_if_exists"
 
 [[feature]]
 id = "acl-ownership"
@@ -836,6 +839,13 @@ mint = [
   "minio-go: testGetObjectACLContext::GetObjectACL(ctx, bucketName, objectName)",
   "minio-java::getObjectAcl()",
 ]
+server_tests = [
+  "server/tests/access_control_test.rs::acl_canned_headers_xml_email_and_mtime",
+  "server/tests/access_control_test.rs::ownership_controls_pab_expected_owner_anonymous_and_100_continue",
+  "server/tests/access_control_test.rs::policy_and_acl_live_update_and_restart_round_trip",
+]
+drive = ["access"]
+fuzz = ["acl_xml"]
 
 [[feature]]
 id = "conditional"
@@ -1136,8 +1146,17 @@ mint = [
 ]
 server_tests = [
   "server/tests/multipart_sigv4_test.rs::test_sigv4_presigned_url_and_skew_checks",
+  "server/tests/access_control_test.rs::ownership_controls_pab_expected_owner_anonymous_and_100_continue",
+  "server/tests/access_ported_test.rs::test_object_raw_get_x_amz_expires_out_range_and_put_expired_port",
 ]
+drive = ["access"]
 fuzz = ["sigv4"]
+
+[feature.ported]
+"test_s3::test_object_raw_get_x_amz_expires_out_range_zero" = "server/tests/access_ported_test.rs::test_object_raw_get_x_amz_expires_out_range_and_put_expired_port"
+"test_s3::test_object_raw_get_x_amz_expires_out_max_range" = "server/tests/access_ported_test.rs::test_object_raw_get_x_amz_expires_out_range_and_put_expired_port"
+"test_s3::test_object_raw_get_x_amz_expires_out_positive_range" = "server/tests/access_ported_test.rs::test_object_raw_get_x_amz_expires_out_range_and_put_expired_port"
+"test_s3::test_object_raw_put_authenticated_expired" = "server/tests/access_ported_test.rs::test_object_raw_get_x_amz_expires_out_range_and_put_expired_port"
 
 [[feature]]
 id = "copy"
@@ -1272,10 +1291,6 @@ server_tests = [
 ]
 drive = ["versioning"]
 fuzz = ["version_id", "request_xml"]
-
-# Its other ceph tests pass; these fail only because each calls GetObjectAcl (owner, 2026-11-21).
-[feature.waits_on]
-"test_s3::test_bucket_list_return_data_versioning" = "acl-ownership"
 
 [[feature]]
 id = "listing"
@@ -1416,10 +1431,6 @@ server_tests = [
 drive = ["listing"]
 fuzz = ["list_objects_query"]
 
-# Its other ceph tests pass; these fail only because each calls GetObjectAcl (owner, 2026-11-21).
-[feature.waits_on]
-"test_s3::test_bucket_list_return_data" = "acl-ownership"
-
 [[feature]]
 id = "buckets"
 name = "Bucket operations (CreateBucket, ListBuckets, HeadBucket, DeleteBucket, GetBucketLocation)"
@@ -1520,10 +1531,6 @@ fuzz = ["s3_target"]
 moved = [
   { test = "test_s3::test_object_delete_key_bucket_gone", to = "anonymous-bucket-gone", decision = "https://github.com/iskandarnorazli/Awanfs/issues/140#issuecomment-6998945944" },
 ]
-
-# Its other ceph tests pass; these fail only because each calls PutObjectAcl (owner, 2026-11-21).
-[feature.waits_on]
-"test_s3::test_bucket_create_special_key_names" = "acl-ownership"
 
 [[feature]]
 id = "ranges"
@@ -1709,10 +1716,6 @@ server_tests = [
 ]
 drive = ["objects"]
 fuzz = ["request_xml", "s3_target"]
-
-# Its other ceph tests pass; these fail only because each calls PutBucketAcl (owner, 2026-11-21).
-[feature.waits_on]
-"test_s3::test_100_continue" = "acl-ownership"
 
 [[feature]]
 id = "restart"
@@ -2512,3 +2515,12 @@ feature = "volume-format"
 what = "1 prints the storage simulation's steps (server/src/sim_harness.rs, tests only)"
 test = ["server/tests/sim_storage_test.rs::seeded_storage_simulation_matches_model_and_covers_all_fault_points"]
 internal = "test harness output, not a server setting"
+
+[[setting]]
+id = "default-bucket-ownership"
+flags = ["--default-bucket-ownership"]
+env = ["AWANFS_DEFAULT_BUCKET_OWNERSHIP"]
+default = "BucketOwnerEnforced"
+feature = "acl-ownership"
+what = "default ObjectOwnership for newly created buckets without x-amz-object-ownership (BucketOwnerEnforced, BucketOwnerPreferred, or ObjectWriter)"
+test = ["server/tests/access_control_test.rs::cli_default_bucket_ownership_flag_accepts_valid_and_rejects_invalid"]

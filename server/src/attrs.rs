@@ -222,6 +222,18 @@ impl Attrs {
         self.remove(TAG_OWNER);
     }
 
+    pub fn acl_xml(&self) -> Option<&str> {
+        self.get_str(TAG_ACL).filter(|s| !s.is_empty())
+    }
+
+    pub fn set_acl_xml(&mut self, xml: &str) {
+        self.set(TAG_ACL, xml.as_bytes());
+    }
+
+    pub fn clear_acl(&mut self) {
+        self.set(TAG_ACL, &[]);
+    }
+
     /// Stores `TAG_SSE` (`0x0050`) write-time encryption metadata (#121).
     pub fn set_sse(&mut self, sse: &crate::sse::SseAttr) {
         self.set(TAG_SSE, &sse.encode());
